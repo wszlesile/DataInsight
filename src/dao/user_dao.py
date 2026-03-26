@@ -1,13 +1,16 @@
-from typing import Optional
+from typing import Optional, Any
+
 from sqlalchemy.orm import Session
+
 from dao.base_dao import BaseDAO
-from model.user import User
+from model import User
 
 
 class UserDAO(BaseDAO[User]):
     """用户数据访问层"""
 
-    def __init__(self, session: Session):
+    def __init__(self, session: Session, beanFactory: Any):
+        beanFactory.user_dao = self
         super().__init__(User, session)
 
     def find_by_username(self, username: str) -> Optional[User]:

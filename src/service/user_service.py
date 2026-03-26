@@ -1,13 +1,15 @@
-from typing import Optional, Dict
-from service.base_service import BaseService
+from typing import Optional, Dict, Any
+
 from dao.user_dao import UserDAO
-from model.user import User
+from model import User
+from service.base_service import BaseService
 
 
 class UserService(BaseService[UserDAO]):
     """用户业务逻辑层"""
 
-    def __init__(self, user_dao: UserDAO):
+    def __init__(self, user_dao: UserDAO,beanFactory: Any):
+        beanFactory.user_service = self
         super().__init__(user_dao)
 
     @property

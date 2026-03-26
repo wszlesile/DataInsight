@@ -1,9 +1,8 @@
-from typing import List, Optional, TypeVar, Generic
+from typing import List, Optional, Generic, TypeVar
+
 from sqlalchemy.orm import Session
-from config.database import Base
 
-POT = TypeVar('POT', bound=Base)
-
+from model import POT
 
 class BaseDAO(Generic[POT]):
     """DAO基类，基于SQLAlchemy"""
@@ -41,3 +40,6 @@ class BaseDAO(Generic[POT]):
             self._session.commit()
             return True
         return False
+
+
+DAOT = TypeVar('DAOT', bound=BaseDAO)

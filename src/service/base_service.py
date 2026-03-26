@@ -29,3 +29,4 @@ class BaseService(Generic[T]):
     def delete(self, id: int) -> bool:
         """删除"""
         return self._dao.delete(id)
+ST = TypeVar('ST', bound=BaseService)
