@@ -7,7 +7,7 @@ from langchain_openai import ChatOpenAI
 from langchain_qwq import ChatQwen
 from pydantic import BaseModel, Field
 
-from agent.context_engineering import get_history_message, CustomContext
+from agent.context_engineering import get_history_message, CustomContext, get_datasource_messages
 from agent.tools import execute_python, get_file_temp_save_path, save_insight_result, StructuredResult
 from config import Config
 
@@ -66,8 +66,14 @@ class InputMessage(Generic[MessageT]):
 
 
 def get_input(message: str) -> Any:
-    system_message = SystemMessage(
-        "你是一个数据洞察的专家;你的能力是根据用户的输入的对话，以及提供的文件分析软件：pandas，报表分析软件：pyecharts，和数据加载工具，执行python代码工具，为用户生成一段数据分析报表的python执行代码，以及对应报表的描述;要求生成的python执行代码保存生成的报表文件以及描述")
+    # 从 sys_prompt.txt 读取系统提示
+    import os
+    sys_prompt_path = os.path.join(os.path.dirname(__file__), '..', 'sys_prompt', 'sys_prompt.txt')
+    with open(sys_prompt_path, 'r', encoding='utf-8') as f:
+        system_prompt_content = f.read().strip()
+
+    system_message = SystemMessage(system_prompt_content)
+    datasource_message = get_datasource_messages(message)
     history_message = get_history_message()
     messages = [system_message, history_message, HumanMessage(message)]
     input_message = InputMessage()

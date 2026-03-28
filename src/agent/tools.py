@@ -12,27 +12,40 @@ from config.factory import beanFactory
 from utils import logger
 
 """结构化输出"""
+
+
 class StructuredResult(BaseModel):
     """洞察结果"""
     file_id: str = Field(description="报表文件路径或文件服务的文件ID")
     description: str = Field(description="报表内容描述")
 
+
 @tool(description='获取报表文件临时保存目录')
 def get_file_temp_save_path():
     return 'D:\PycharmProjects\DataInsight'
 
-@tool(description='保存报表文件以及描述',args_schema=StructuredResult)
-def save_insight_result(runtime: ToolRuntime[CustomContext],file_id: str,description: str):
 
+@tool(description='保存报表文件以及描述', args_schema=StructuredResult)
+def save_insight_result(runtime: ToolRuntime[CustomContext], file_id: str, description: str):
     pass
 
+
+
+
+@tool(description='获取本地存储的洞察数据文件路径')
+def get_sight_datasource_message():
+    return 'D:\\PycharmProjects\DataInsight\\xiaoshou.csv'
+
+
 class ExePythonCodeInput(BaseModel):
-    code:str=Field(description="python代码")
-    title:str=Field(description="python代码的内容主题摘要")
-    description:str=Field(description="python代码生成报告的详细介绍")
+    code: str = Field(description="python代码")
+    title: str = Field(description="python代码的内容主题摘要")
+    description: str = Field(description="python代码生成报告的详细介绍")
+
 
 @tool(description='执行python代码工具', args_schema=ExePythonCodeInput)
-def execute_python(runtime: ToolRuntime[CustomContext],code: str, title: str = '', description: str = "") -> Optional[ToolMessage]:
+def execute_python(runtime: ToolRuntime[CustomContext], code: str, title: str = '', description: str = "") -> Optional[
+    ToolMessage]:
     writer = get_stream_writer()
     start_time = time.time()
     logger.info(f"▶ 开始执行：{title or 'Python代码执行'}")

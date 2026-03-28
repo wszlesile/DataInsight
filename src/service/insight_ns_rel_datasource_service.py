@@ -21,7 +21,7 @@ class InsightNsRelDatasourceService(BaseService[InsightNsRelDatasourceDAO]):
         return self.rel_datasource_dao.find_by_namespace_id(insight_namespace_id)
 
     def add_datasource(self, insight_namespace_id: int, datasource_type: int, datasource_name: str,
-                        knowledge_tag: str, uns_node_alias: str, file_type: int, file_id: str) -> Dict:
+                       knowledge_tag: str, uns_node_alias: str, file_type: int, file_id: str) -> Dict:
         """添加数据源到洞察空间"""
         existing = self.rel_datasource_dao.find_by_namespace_id_and_name(insight_namespace_id, datasource_name)
         if existing:
@@ -31,6 +31,7 @@ class InsightNsRelDatasourceService(BaseService[InsightNsRelDatasourceDAO]):
             insight_namespace_id=insight_namespace_id,
             datasource_type=datasource_type,
             datasource_name=datasource_name,
+            datasource_schema='',
             knowledge_tag=knowledge_tag,
             uns_node_alias=uns_node_alias,
             file_type=file_type,
@@ -54,6 +55,7 @@ class InsightNsRelDatasourceService(BaseService[InsightNsRelDatasourceDAO]):
             "insight_namespace_id": rel.insight_namespace_id,
             "datasource_type": rel.datasource_type,
             "datasource_name": rel.datasource_name,
+            "datasource_schema": self.datasource_schema,
             "knowledge_tag": rel.knowledge_tag,
             "uns_node_alias": rel.uns_node_alias,
             "file_type": rel.file_type,

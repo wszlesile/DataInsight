@@ -73,6 +73,7 @@ class InsightNsRelDatasource(Base):
     insight_namespace_id = Column(Integer, nullable=False, comment='洞察空间名ID')
     datasource_type = Column(Integer, nullable=False, comment='数据源类型 0-uns 1-文件')
     datasource_name = Column(String(20), nullable=False, comment='数据源名称')
+    datasource_schema = Column(Text, nullable=False, comment='数据源JSON Schema')
     knowledge_tag = Column(String(20), nullable=False, comment='知识库tag')
     uns_node_alias = Column(String(20), nullable=False, comment='uns选择节点别名')
     file_type = Column(Integer, nullable=False, comment='文件类型 0-excel 1-csv')
@@ -85,6 +86,7 @@ class InsightNsRelDatasource(Base):
             "insight_namespace_id": self.insight_namespace_id,
             "datasource_type": self.datasource_type,
             "datasource_name": self.datasource_name,
+            "datasource_schema": self.datasource_schema,
             "knowledge_tag": self.knowledge_tag,
             "uns_node_alias": self.uns_node_alias,
             "file_type": self.file_type,
