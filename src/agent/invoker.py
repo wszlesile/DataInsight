@@ -40,5 +40,5 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Any:
 
 
 if __name__ == '__main__':
-    response = stream_invoke_agent(AgentRequest("John Smith", '', '', "给我一个简单的例子"))
+    response = invoke_agent(AgentRequest("John Smith", '', '', "分析2024年Q3季度的销售趋势"))
     print(response)
