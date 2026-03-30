@@ -157,7 +157,6 @@ class AnalysisResult(BaseModel):
     analysis_report: str = Field(description="分析报告内容")
 
 
-# @tool(description='分析结果保存函数', args_schema=AnalysisResult)
 def save_analysis_result(chart_path: str, analysis_report: str) -> StructuredResult:
     # 分析结果保存函数
     result = StructuredResult(file_id=chart_path, analysis_report=analysis_report)
@@ -194,6 +193,7 @@ def execute_python(runtime: ToolRuntime[CustomContext], code: str, title: str = 
             'load_minio_file': load_minio_file,
             'load_data_with_sql': load_data_with_sql,
             'load_data_with_api': load_data_with_api,
+            'save_analysis_result': save_analysis_result
         }
         exec(code, namespace)
         # 从 namespace 中取出 result（LLM 生成的代码最后会赋值 result）
