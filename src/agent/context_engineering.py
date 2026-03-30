@@ -28,7 +28,7 @@ class DataSourceSchema(BaseModel):
     required: list = Field(default_factory=list, description='必填属性')
 
 def get_system_config_messages():
-    path= '/Users/wangshuzheng/PycharmProjects/DataInsight'
+    path= 'D:\\PycharmProjects\DataInsight\\'
     return HumanMessage(f'图表文件临时保存目录：{path}')
 def get_datasource_messages(user_message: str):
     # rag 召回
@@ -49,5 +49,5 @@ def get_datasource_messages(user_message: str):
         required=[]
     )
     data_schema = json.dumps(s.model_dump(), indent=2, ensure_ascii=False)
-    schema = HumanMessage(f'文件数据源元数据结构说明：{datasource_message}\n'f'本地文件数据源{s.name}路径：/Users/wangshuzheng/PycharmProjects/DataInsight/xiaoshou.csv，元数据schema{data_schema}\n')
+    schema = HumanMessage(f'文件数据源元数据结构说明：{datasource_message}\n'f'本地文件数据源{s.name}路径：D:\\PycharmProjects\DataInsight\\xiaoshou.csv，元数据schema{data_schema}\n')
     return schema

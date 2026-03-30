@@ -1,11 +1,10 @@
-from dataclasses import dataclass
 from typing import TypeVar, Generic, Any, List
 
 from langchain.agents import create_agent, AgentState
 from langchain_core.messages import SystemMessage, BaseMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 from langchain_qwq import ChatQwen
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from agent.context_engineering import get_history_message, CustomContext, get_datasource_messages, \
     get_system_config_messages
@@ -50,7 +49,7 @@ def create_data_insight_agent():
         model=insight_model,
         state_schema=CustomAgentState,
         context_schema=CustomContext,
-        tools=[execute_python, save_analysis_result],
+        tools=[execute_python],
         response_format=StructuredResult
     )
     return agent
