@@ -1,10 +1,11 @@
+from dataclasses import dataclass
 from typing import TypeVar, Generic, Any, List
 
 from langchain.agents import create_agent, AgentState
 from langchain_core.messages import SystemMessage, BaseMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 from langchain_qwq import ChatQwen
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from agent.context_engineering import get_history_message, CustomContext, get_datasource_messages, \
     get_system_config_messages

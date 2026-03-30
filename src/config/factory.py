@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from config.config import Config
 from config.database import SessionLocal, init_db
 from controller.user_controller import create_user_controller
+from controller.agent_controller import create_agent_controller
 from dao.user_dao import UserDAO
 from service.user_service import UserService
 from utils import logger
@@ -49,6 +50,10 @@ def _init_components():
 def _register_routes(app: Flask):
     user_blueprint = create_user_controller(beanFactory.user_service)
     app.register_blueprint(user_blueprint)
+
+    # 注册 Agent 控制器
+    agent_blueprint = create_agent_controller()
+    app.register_blueprint(agent_blueprint)
 
     @app.route('/health')
     def health():

@@ -8,7 +8,6 @@ from langgraph.prebuilt import ToolRuntime
 from pydantic import BaseModel, Field
 
 from agent.context_engineering import CustomContext
-from config.factory import beanFactory
 from utils import logger
 
 
@@ -52,20 +51,8 @@ def load_minio_file(bucket: str, object_name: str, sheet_name: Optional[str] = N
     返回:
         pandas.DataFrame: 加载的数据，可直接用于数据分析和可视化
     """
-    import pandas as pd
-    import io
 
-    minio_client = beanFactory.get_bean('minio_client')
-    response = minio_client.get_object(bucket, object_name)
-
-    if object_name.endswith('.csv'):
-        df = pd.read_csv(io.BytesIO(response.read()))
-    elif object_name.endswith(('.xlsx', '.xls')):
-        df = pd.read_excel(io.BytesIO(response.read()), sheet_name=sheet_name if sheet_name else 0)
-    else:
-        raise ValueError(f"不支持的文件格式: {object_name}")
-
-    return df
+    pass
 
 
 def load_data_with_sql(sql: str, params: Optional[List] = None):
@@ -79,18 +66,8 @@ def load_data_with_sql(sql: str, params: Optional[List] = None):
     返回:
         pandas.DataFrame: 查询结果数据，可直接用于数据分析和可视化
     """
-    import pandas as pd
 
-    if not sql.strip().upper().startswith('SELECT'):
-        raise ValueError("仅支持 SELECT 查询语句，不允许执行数据修改操作")
-
-    db_session = beanFactory.get_bean('db_session')
-    if params:
-        df = pd.read_sql(sql, db_session.bind, params=params)
-    else:
-        df = pd.read_sql(sql, db_session.bind)
-
-    return df
+    pass
 
 
 def load_data_with_api(endpoint: str, method: str = "GET", params: Optional[dict] = None,

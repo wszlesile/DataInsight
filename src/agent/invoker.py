@@ -23,7 +23,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
     agent_invoke_response = insight_agent.invoke(input_message, context=CustomContext(username=agent_request.username))
     return AgentResponse(
         username=agent_request.username,
-        message=agent_invoke_response['messages']
+        message=agent_invoke_response['structured_response']
     )
 
 
