@@ -13,3 +13,9 @@ pyproject.toml
 # Generated files
 *.db
 *.html
+
+# Frontend
+frontend/node_modules
+frontend/dist
+frontend/.DS_Store
+*.log

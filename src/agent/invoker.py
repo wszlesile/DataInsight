@@ -32,11 +32,11 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
     ai_message = messages[-1] if messages else ''
     message_content = ai_message.content if hasattr(ai_message, 'content') else str(ai_message)
     structured_message = messages[-2] if messages else '{}'
-    structured_content = structured_message.content if hasattr(ai_message, 'content') else str(ai_message)
+    structured_content = structured_message.content if hasattr(structured_message, 'content') else str(structured_message)
 
     # 从消息中解析 StructuredResult（如果有）
     file_id = ''
-    analysis_report = structured_content
+    analysis_report = ''
 
     # 检查是否有结构化结果（file_id 和 analysis_report）
     import json
@@ -69,5 +69,5 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Any:
 
 
 if __name__ == '__main__':
-    response = invoke_agent(AgentRequest("John Smith", '', '', "今天一共有多少个报警？看一下明细"))
+    response = invoke_agent(AgentRequest("John Smith", '', '', "分析2024年Q4季度的销售趋势"))
     print(response)
