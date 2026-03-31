@@ -20,13 +20,14 @@ class CustomAgentState(AgentState):
 
 
 def create_data_insight_model():
-    if 'MiniMax-M2.5' == Config.LLM_MODEL_ACTIVE:
+    if 'MiniMax' == Config.LLM_MODEL_ACTIVE:
         """创建基于 MiniMax 的 LangChain LLM Model"""
         # 使用 OpenAI 兼容接口连接 MiniMax
         insight_model = ChatOpenAI(
             model=Config.MINIMAX_M2_5_MODEL,
             api_key=Config.MINIMAX_M2_5_API_KEY,
             base_url=Config.MINIMAX_M2_5_BASE_URL,
+            temperature=0.7
             # other params...
         )
         return insight_model

@@ -135,7 +135,17 @@ class AnalysisResult(BaseModel):
 
 
 def save_analysis_result(chart_path: str, analysis_report: str) -> StructuredResult:
-    # 分析结果保存函数
+    """
+    保存分析结果（必须调用此函数来结束分析）
+
+    参数:
+        chart_path: 图表文件的完整路径
+        analysis_report: 分析报告文本内容
+
+    返回:
+        StructuredResult 对象，代码中必须将此返回值赋值给变量 result
+        例如：result = save_analysis_result(chart_path=xxx, analysis_report=xxx)
+    """
     result = StructuredResult(file_id=chart_path, analysis_report=analysis_report)
     return result
 
@@ -206,4 +216,8 @@ def execute_python(runtime: ToolRuntime[CustomContext], code: str, title: str = 
                 content=exec_result.model_dump_json(),
                 tool_call_id=runtime.tool_call_id
             )
-        return None
+        else:
+            return ToolMessage(
+                content='请重新生成，没有按照代码输出模板严格生成执行代码',
+                tool_call_id=runtime.tool_call_id
+            )

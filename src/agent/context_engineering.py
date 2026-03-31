@@ -30,7 +30,11 @@ class DataSourceSchema(BaseModel):
 
 def get_system_config_messages():
     path = 'D:\\PycharmProjects\\DataInsight\\'
-    return SystemMessage(f'图表文件临时保存目录：{path}')
+    return HumanMessage(
+        f'''系统配置信息：
+- 图表文件临时保存目录：{path}
+- **重要**：在生成的代码中，必须将此目录赋值给变量 temp_dir，例如：temp_dir = "{path}"'''
+    )
 
 
 def get_test_local_file_datasource_schema() -> DataSourceSchema:
