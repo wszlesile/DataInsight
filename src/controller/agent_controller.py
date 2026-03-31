@@ -40,6 +40,8 @@ class AgentController(BaseController):
             return jsonify(Result.success(data={
                 'username': response.username,
                 'message': response.message,
+                'file_id': response.file_id,
+                'analysis_report': response.analysis_report,
             }).to_dict())
         except Exception as e:
             return self.error_response(f"Agent 执行失败: {str(e)}")
