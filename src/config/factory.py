@@ -6,10 +6,7 @@ import os
 
 from config.config import Config
 from config.database import SessionLocal, init_db
-from controller.user_controller import create_user_controller
 from controller.agent_controller import create_agent_controller
-from dao.user_dao import UserDAO
-from service.user_service import UserService
 from utils import logger
 
 
@@ -38,20 +35,10 @@ def create_app(config_class=Config) -> Flask:
     return app
 
 def _init_components():
-    session: Session = SessionLocal()
-    try:
-       user_dao = UserDAO(session,beanFactory)
-       UserService(user_dao,beanFactory)
-    except Exception as e:
-        session.close()
-        logger.error(f"组件初始化失败: {e}")
-        raise
+    pass
 
 
 def _register_routes(app: Flask):
-    user_blueprint = create_user_controller(beanFactory.user_service)
-    app.register_blueprint(user_blueprint)
-
     # 注册 Agent 控制器
     agent_blueprint = create_agent_controller()
     app.register_blueprint(agent_blueprint)

@@ -30,7 +30,7 @@ class DataSourceSchema(BaseModel):
     properties: Dict[str, SchemaProperty] = Field(default_factory=dict, description='数据属性')
     required: list = Field(default_factory=list, description='必填属性')
 
-
+#系统配置上下文
 def get_system_config_messages():
     path = Config.TEMP_DIR
     return HumanMessage(
