@@ -66,8 +66,12 @@ def load_data_with_sql(sql: str, params: Optional[List] = None):
     返回:
         pandas.DataFrame: 查询结果数据，可直接用于数据分析和可视化
     """
+    import pandas as pd
+    from config.database import engine
 
-    pass
+    with engine.connect() as connection:
+        df = pd.read_sql(sql, connection, params=params if params else None)
+    return df
 
 
 def load_data_with_api(endpoint: str, method: str = "GET", params: Optional[dict] = None,

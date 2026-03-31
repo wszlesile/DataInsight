@@ -311,34 +311,70 @@ LLM 需要理解数据源元数据的 JSON Schema 结构：
 
 #### 2.2 具体数据源上下文格式
 
+当前分析任务支持**一个或多个数据源**，所有数据源的上下文通过数组组织：
+
 ```json
 {
-  "数据源类型": "本地文件/MinIO/数据库/API",
-  "数据源名称": "如：销售记录表",
-  "数据源路径或连接信息": "如：D:\\path\\to\\file.csv 或 SQL 连接信息",
-  "元数据Schema": {
-    "schema_type": 1,
-    "name": "销售记录表",
-    "description": "统计了各个年月份各个产品的销售额",
-    "properties": {
-      "月份": {"property_type": "string", "name": "月份", "description": "月份"},
-      "产品名称": {"property_type": "string", "name": "产品名称", "description": "产品名称"},
-      "销售额(元)": {"property_type": "double", "name": "销售额", "description": "销售额(元)"},
-      "销量": {"property_type": "integer", "name": "销量", "description": "销量"},
-      "销售单价": {"property_type": "double", "name": "销售单价", "description": "销售单价"},
-      "区域": {"property_type": "string", "name": "区域", "description": "区域"}
+  "数据源列表": [
+    {
+      "数据源类型": "本地文件",
+      "数据源名称": "销售记录表",
+      "数据源标识": "D:\\PycharmProjects\\DataInsight\\xiaoshou.csv",
+      "元数据Schema": {
+        "schema_type": 1,
+        "identify": "xiaoshou",
+        "name": "销售记录表",
+        "description": "统计了各个年月份各个产品的销售额",
+        "properties": {
+          "月份": {"property_type": "string", "name": "月份", "description": "月份"},
+          "产品名称": {"property_type": "string", "name": "产品名称", "description": "产品名称"},
+          "销售额(元)": {"property_type": "double", "name": "销售额", "description": "销售额(元)"},
+          "销量": {"property_type": "integer", "name": "销量", "description": "销量"},
+          "销售单价": {"property_type": "double", "name": "销售单价", "description": "销售单价"},
+          "区域": {"property_type": "string", "name": "区域", "description": "区域"}
+        },
+        "required": []
+      }
     },
-    "required": []
-  }
+    {
+      "数据源类型": "数据库",
+      "数据源名称": "报警记录表",
+      "数据源标识": "baojingjilubiao",
+      "元数据Schema": {
+        "schema_type": 3,
+        "identify": "baojingjilubiao",
+        "name": "报警记录表",
+        "description": "记录设备或系统的报警事件，包含报警编码、位号、报警类型、优先级、触发值等信息",
+        "properties": {
+          "id": {"property_type": "integer", "name": "自增编码", "description": "自增编码，主键"},
+          "ar_code": {"property_type": "string", "name": "报警编码", "description": "报警编码"},
+          "tagname": {"property_type": "string", "name": "位号", "description": "位号"},
+          "alarm_type": {"property_type": "string", "name": "报警类型", "description": "报警类型：超限报警、ON/OFF报警"},
+          "priority": {"property_type": "integer", "name": "报警优先级", "description": "报警优先级：1-10，1为最高"},
+          "start_timestamp": {"property_type": "string", "name": "报警产生时间", "description": "报警产生时间"}
+        },
+        "required": ["id", "ar_code", "tagname", "start_timestamp"]
+      }
+    }
+  ]
 }
 ```
+
+**数据源标识说明**：
+- **本地文件**：`数据源标识`为文件完整路径或文件ID，用于定位文件
+- **数据库**：`数据源标识`为表名或 `数据库.表名`，用于定位数据表，LLM 需根据分析需求自行生成 SQL 语句（包含 JOIN、条件过滤、聚合等）
+
+**多数据源使用场景**：
+- 需要关联多个数据表进行分析时，从 `数据源列表` 中选择合适的数据源
+- 根据 `数据源类型` 选择对应的加载函数：本地文件用 `load_local_file`，数据库用 `load_data_with_sql`
+- 根据 `元数据Schema` 理解各数据源的字段含义和类型
 
 **LLM 分析数据源时的理解步骤**：
 1. 根据 `name` 和 `description` 理解这是什么数据
 2. 根据 `properties` 了解数据有哪些字段可以分析
 3. 根据 `properties[字段名].description` 理解每个字段的业务含义
 4. 根据 `properties[字段名].property_type` 确定数据处理方式（string 用 groupby，numeric 用 sum/avg 等）
-5. 根据数据源类型和数据源路径或连接信息选择对应的加载函数（如本地文件用 `load_local_file`）
+5. 根据 `数据源类型` 和 `数据源标识` 选择对应的加载函数（如本地文件用 `load_local_file`，数据库用 `load_data_with_sql` 并自行组装 SQL）
 
 ### 3. 知识库上下文 (如有)
 ```

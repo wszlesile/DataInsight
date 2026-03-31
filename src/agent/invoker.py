@@ -23,7 +23,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
     agent_invoke_response = insight_agent.invoke(input_message, context=CustomContext(username=agent_request.username))
     return AgentResponse(
         username=agent_request.username,
-        message=agent_invoke_response['structured_response']
+        message=agent_invoke_response['messages']
     )
 
 
@@ -40,5 +40,5 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Any:
 
 
 if __name__ == '__main__':
-    response = invoke_agent(AgentRequest("John Smith", '', '', "分析2024年Q4季度的销售趋势"))
+    response = invoke_agent(AgentRequest("John Smith", '', '', "1、今天一共有多少个报警？看一下明细"))
     print(response)
