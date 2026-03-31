@@ -364,6 +364,47 @@ LLM 需要理解数据源元数据的 JSON Schema 结构：
 - **本地文件**：`数据源标识`为文件完整路径或文件ID，用于定位文件
 - **数据库**：`数据源标识`为表名或 `数据库.表名`，用于定位数据表，LLM 需根据分析需求自行生成 SQL 语句（包含 JOIN、条件过滤、聚合等）
 
+**SQL 生成规则**：
+
+1. **日期时间条件处理**：
+   - 用户说"今天" → 转换为 `日期字段 >= 今日00:00:00`
+   - 用户说"本周" → 转换为 `日期字段 >= 本周一`
+   - 用户说"本月" → 转换为 `日期字段 >= 本月1日`
+   - 时间戳字段格式通常为 `YYYY-MM-DD HH:MM:SS`，过滤时用 `>=` 和 `<` 配合日期边界
+
+2. **SQL 生成示例**：
+
+   用户问："今天一共有多少个报警？看一下明细"
+
+   生成的 SQL：
+   ```sql
+   SELECT * FROM baojingjilubiao
+   WHERE start_timestamp >= date('now', 'start of day')
+   ORDER BY start_timestamp DESC
+   ```
+
+   用户问："本周超限报警有多少？按优先级统计"
+
+   生成的 SQL：
+   ```sql
+   SELECT priority, COUNT(*) as count
+   FROM baojingjilubiao
+   WHERE alarm_type = '超限报警'
+   AND start_timestamp >= date('now', 'weekday 0', '-6 days')
+   GROUP BY priority
+   ORDER BY priority
+   ```
+
+   用户问："查询报警工单及对应的报警明细"
+
+   生成的 SQL（多表关联）：
+   ```sql
+   SELECT t.*, r.ar_code, r.tagname, r.alarm_type, r.priority, r.start_timestamp
+   FROM baojinggongdanbiao t
+   LEFT JOIN baojingjilubiao r ON t.alarm_record_id = r.id
+   ORDER BY t.created_time DESC
+   ```
+
 **多数据源使用场景**：
 - 需要关联多个数据表进行分析时，从 `数据源列表` 中选择合适的数据源
 - 根据 `数据源类型` 选择对应的加载函数：本地文件用 `load_local_file`，数据库用 `load_data_with_sql`
