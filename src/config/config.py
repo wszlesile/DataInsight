@@ -44,6 +44,10 @@ class Config:
     APP_NAME = "DataInsight App"
     VERSION = "1.0.0"
 
+    # 用户系统配置
+    USER_SERVICE_URL = os.environ.get('USER_SERVICE_URL', 'http://localhost:8080')
+    USER_AUTH_ENDPOINT = '/os/inter-api/auth/v1/current-user/sessionInfo'
+
     # LLM配置
     LLM_MODEL_ACTIVE=os.environ.get('LLM_MODEL_ACTIVE', 'MiniMax-M2.5')
 

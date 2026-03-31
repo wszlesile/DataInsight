@@ -7,6 +7,7 @@ import os
 from config.config import Config
 from config.database import SessionLocal, init_db
 from controller.agent_controller import create_agent_controller
+from middleware.auth_middleware import init_auth_middleware
 from utils import logger
 
 
@@ -39,6 +40,9 @@ def _init_components():
 
 
 def _register_routes(app: Flask):
+    # 初始化认证中间件
+    init_auth_middleware(app)
+
     # 注册 Agent 控制器
     agent_blueprint = create_agent_controller()
     app.register_blueprint(agent_blueprint)

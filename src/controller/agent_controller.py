@@ -1,6 +1,7 @@
 from flask import Blueprint, jsonify, request, Response
 
 from controller.base_controller import BaseController
+from dto import get_current_user_context
 from utils.response import Result
 
 
@@ -20,7 +21,8 @@ class AgentController(BaseController):
 
     def invoke(self):
         data = self.get_json_data()
-        username = data.get('username', 'anonymous')
+        user_context = get_current_user_context()
+        username = user_context.username if user_context else 'anonymous'
         namespace_id = data.get('namespace_id', '')
         conversation_id = data.get('conversation_id', '')
         user_message = data.get('user_message', '')
@@ -48,7 +50,8 @@ class AgentController(BaseController):
 
     def stream_invoke(self):
         data = request.get_json()
-        username = data.get('username', 'anonymous')
+        user_context = get_current_user_context()
+        username = user_context.username if user_context else 'anonymous'
         namespace_id = data.get('namespace_id', '')
         conversation_id = data.get('conversation_id', '')
         user_message = data.get('user_message', '')
