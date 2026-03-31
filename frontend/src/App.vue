@@ -183,10 +183,12 @@ const onSendMessage = async (content) => {
     if (response.data.success) {
       const data = response.data.data
 
+      // 设置图表
       if (data.file_id) {
         currentChartUrl.value = `/files/${encodeURIComponent(data.file_id)}`
       }
 
+      // 设置报告内容：优先级 analysis_report > message
       if (data.analysis_report) {
         currentReport.value = data.analysis_report
       } else if (data.message) {
