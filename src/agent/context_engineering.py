@@ -4,6 +4,8 @@ from typing import Dict, List
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
+from config.config import Config
+
 
 class CustomContext(BaseModel):
     """自定义上下文"""
@@ -30,7 +32,7 @@ class DataSourceSchema(BaseModel):
 
 
 def get_system_config_messages():
-    path = 'D:\\PycharmProjects\\DataInsight\\'
+    path = Config.TEMP_DIR
     return HumanMessage(
         f'''系统配置信息：
 - 图表文件临时保存目录：{path}
