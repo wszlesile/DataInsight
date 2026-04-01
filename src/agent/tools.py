@@ -1,4 +1,6 @@
+import re
 import time
+from contextvars import ContextVar
 from typing import Optional, List
 
 from langchain_core.messages import ToolMessage
@@ -8,7 +10,12 @@ from langgraph.prebuilt import ToolRuntime
 from pydantic import BaseModel, Field
 
 from agent.context_engineering import CustomContext
+from config.config import Config
 from utils import logger
+
+
+CURRENT_USERNAME = ContextVar('current_username', default='anonymous')
+CURRENT_TEMP_DIR = ContextVar('current_temp_dir', default=Config.TEMP_DIR)
 
 
 def load_local_file(file_path: str, sheet_name: Optional[str] = None):
@@ -99,6 +106,21 @@ def load_data_with_api(endpoint: str, method: str = "GET", params: Optional[dict
     return df
 
 
+def generate_temp_file_name(prefix: str = 'analysis_chart', extension: str = 'html') -> str:
+    """
+    生成临时图表文件名，规则为：用户名_时间戳_业务前缀.扩展名
+    """
+    import os
+
+    safe_prefix = re.sub(r'[^0-9A-Za-z_-]+', '_', prefix).strip('_') or 'analysis_chart'
+    safe_extension = extension.lstrip('.') or 'html'
+    safe_username = re.sub(r'[^0-9A-Za-z_-]+', '_', CURRENT_USERNAME.get()).strip('_') or 'anonymous'
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    temp_dir = CURRENT_TEMP_DIR.get() or Config.TEMP_DIR
+    filename = f"{safe_username}_{timestamp}_{safe_prefix}.{safe_extension}"
+    return os.path.join(temp_dir, filename)
+
+
 class StructuredResult(BaseModel):
     """洞察结果"""
     file_id: str = Field(description="图表文件ID")
@@ -179,6 +201,8 @@ def execute_python(runtime: ToolRuntime[CustomContext], code: str, title: str = 
     old_stderr = sys_module.stderr
     sys_module.stdout = StringIO()
     sys_module.stderr = StringIO()
+    username_token = CURRENT_USERNAME.set(getattr(runtime.context, 'username', 'anonymous'))
+    temp_dir_token = CURRENT_TEMP_DIR.set(Config.TEMP_DIR)
 
     error_msg = None
     try:
@@ -187,6 +211,7 @@ def execute_python(runtime: ToolRuntime[CustomContext], code: str, title: str = 
             'load_minio_file': load_minio_file,
             'load_data_with_sql': load_data_with_sql,
             'load_data_with_api': load_data_with_api,
+            'generate_temp_file_name': generate_temp_file_name,
             'save_analysis_result': save_analysis_result
         }
         exec(code, namespace)
@@ -209,6 +234,8 @@ def execute_python(runtime: ToolRuntime[CustomContext], code: str, title: str = 
         stderr_result = sys_module.stderr.getvalue()
         sys_module.stdout = old_stdout
         sys_module.stderr = old_stderr
+        CURRENT_USERNAME.reset(username_token)
+        CURRENT_TEMP_DIR.reset(temp_dir_token)
 
     execution_time = time.time() - start_time
     logger.info(f"执行完成，耗时 {execution_time:.2f}秒")

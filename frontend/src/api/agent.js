@@ -1,8 +1,16 @@
 import axios from 'axios'
 
+const AUTHORIZATION_HEADER = 'Bearer test'
+
 const api = axios.create({
   baseURL: '/api',
   timeout: 120000
+})
+
+api.interceptors.request.use((config) => {
+  config.headers = config.headers || {}
+  config.headers.Authorization = AUTHORIZATION_HEADER
+  return config
 })
 
 export function invokeAgent(params) {
@@ -15,7 +23,8 @@ export function streamAgent(params, onMessage, onError, onDone) {
   fetch('/api/agent/stream', {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json'
+      'Content-Type': 'application/json',
+      Authorization: AUTHORIZATION_HEADER
     },
     body: JSON.stringify(params),
     signal: controller.signal
