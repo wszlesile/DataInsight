@@ -23,20 +23,26 @@ class Logger:
 
         self.logger.addHandler(handler)
 
+    @staticmethod
+    def _safe_message(message: str) -> str:
+        text = str(message)
+        encoding = getattr(sys.stdout, 'encoding', None) or 'utf-8'
+        return text.encode(encoding, errors='replace').decode(encoding, errors='replace')
+
     def debug(self, message: str):
-        self.logger.debug(message)
+        self.logger.debug(self._safe_message(message))
 
     def info(self, message: str):
-        self.logger.info(message)
+        self.logger.info(self._safe_message(message))
 
     def warning(self, message: str):
-        self.logger.warning(message)
+        self.logger.warning(self._safe_message(message))
 
     def error(self, message: str):
-        self.logger.error(message)
+        self.logger.error(self._safe_message(message))
 
     def critical(self, message: str):
-        self.logger.critical(message)
+        self.logger.critical(self._safe_message(message))
 
 
 logger = Logger()

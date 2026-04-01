@@ -18,70 +18,89 @@
       </div>
 
       <div class="content-body">
-        <!-- 左侧：数据源 -->
         <div class="left-panel">
           <DataSourcePanel @data-source-change="onDataSourceChange" />
         </div>
 
-        <!-- 右侧：聊天窗口 -->
         <div class="right-panel">
           <div class="chat-window">
-            <!-- 消息列表 -->
             <div class="messages" ref="messagesContainer">
-              <!-- 遍历所有对话记录 -->
               <template v-for="(item, index) in chatHistory" :key="index">
-                <!-- 用户消息 -->
                 <div class="message user">
                   <div class="message-avatar">👤</div>
                   <div class="message-content">{{ item.question }}</div>
                 </div>
 
-                <!-- 图表 -->
+                <div class="message progress-feed" v-if="item.progressItems?.length">
+                  <div class="message-avatar">🤖</div>
+                  <div class="message-content progress-content">
+                    <div class="progress-title">系统工作流</div>
+                    <div class="progress-list">
+                      <div
+                        v-for="progress in item.progressItems"
+                        :key="progress.id"
+                        class="progress-item"
+                        :class="progress.level"
+                      >
+                        {{ progress.message }}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
                 <div class="message-chart" v-if="item.chartUrl">
                   <ChartDisplay :chart-url="item.chartUrl" />
                 </div>
 
-                <!-- 分析报告 -->
                 <div class="message report" v-if="item.report">
                   <div class="message-avatar">🤖</div>
                   <div class="message-content" v-html="renderMarkdown(item.report)" />
                 </div>
               </template>
 
-              <!-- 当前进行中的对话 -->
               <template v-if="currentQuestion">
-                <!-- 用户消息 -->
                 <div class="message user">
                   <div class="message-avatar">👤</div>
                   <div class="message-content">{{ currentQuestion }}</div>
                 </div>
 
-                <!-- 加载状态 -->
-                <div class="message assistant loading" v-if="loading">
+                <div class="message progress-feed" v-if="loading || currentProgressItems.length">
                   <div class="message-avatar">🤖</div>
-                  <div class="message-content">分析中...</div>
+                  <div class="message-content progress-content">
+                    <div class="progress-title">
+                      系统工作中
+                      <span class="progress-subtitle" v-if="loading">实时更新中...</span>
+                    </div>
+                    <div class="progress-list" v-if="currentProgressItems.length">
+                      <div
+                        v-for="progress in currentProgressItems"
+                        :key="progress.id"
+                        class="progress-item"
+                        :class="progress.level"
+                      >
+                        {{ progress.message }}
+                      </div>
+                    </div>
+                    <div class="progress-empty" v-else>正在准备分析上下文...</div>
+                  </div>
                 </div>
 
-                <!-- 当前图表 -->
-                <div class="message-chart" v-if="currentChartUrl && !loading">
+                <div class="message-chart" v-if="currentChartUrl">
                   <ChartDisplay :chart-url="currentChartUrl" />
                 </div>
 
-                <!-- 当前分析报告 -->
-                <div class="message report" v-if="currentReport && !loading">
+                <div class="message report" v-if="currentReport">
                   <div class="message-avatar">🤖</div>
                   <div class="message-content" v-html="renderMarkdown(currentReport)" />
                 </div>
               </template>
 
-              <!-- 空状态提示 -->
               <div class="empty-tip" v-if="chatHistory.length === 0 && !currentQuestion">
                 <span class="tip-icon">💬</span>
-                <p>输入您的问题，开始数据分析</p>
+                <p>输入你的问题，开始数据分析</p>
               </div>
             </div>
 
-            <!-- 输入框 -->
             <div class="input-area">
               <ChatInput :loading="loading" @send="onSendMessage" />
             </div>
@@ -95,14 +114,14 @@
 <script setup>
 import { ref, nextTick } from 'vue'
 import { marked } from 'marked'
+import { ElMessage } from 'element-plus'
+
 import Sidebar from './components/Sidebar.vue'
 import DataSourcePanel from './components/DataSourcePanel.vue'
 import ChatInput from './components/ChatInput.vue'
 import ChartDisplay from './components/ChartDisplay.vue'
-import { invokeAgent } from './api/agent.js'
-import { ElMessage } from 'element-plus'
+import { streamAgent } from './api/agent.js'
 
-// 配置 marked
 marked.setOptions({
   breaks: true,
   gfm: true
@@ -120,19 +139,66 @@ const tabs = ref([
 
 const activeTab = ref('1')
 const loading = ref(false)
-const chatHistory = ref([])  // 历史对话记录 [{question, chartUrl, report}]
+const chatHistory = ref([])
 const currentQuestion = ref('')
 const currentChartUrl = ref('')
 const currentReport = ref('')
+const currentAssistantMessage = ref('')
 const currentDataSource = ref(null)
+const currentProgressItems = ref([])
+const currentStreamController = ref(null)
 const messagesContainer = ref(null)
 
-const onSelectSpace = (space) => {
-  activeTab.value = space.id
-  chatHistory.value = []
+const createProgressItem = (event) => ({
+  id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+  level: event.level || (event.type === 'assistant' ? 'assistant' : 'info'),
+  message: event.message
+})
+
+const addProgressItem = (event) => {
+  if (!event?.message) return
+
+  const lastItem = currentProgressItems.value[currentProgressItems.value.length - 1]
+  if (lastItem && lastItem.message === event.message) return
+
+  currentProgressItems.value.push(createProgressItem(event))
+  scrollToBottom()
+}
+
+const normalizeFileUrl = (fileId) => `/files/${encodeURIComponent(fileId)}`
+
+const pushCurrentConversationToHistory = () => {
+  if (!currentQuestion.value) return
+
+  chatHistory.value.push({
+    question: currentQuestion.value,
+    chartUrl: currentChartUrl.value,
+    report: currentReport.value,
+    progressItems: [...currentProgressItems.value]
+  })
+}
+
+const resetCurrentConversation = () => {
   currentQuestion.value = ''
   currentChartUrl.value = ''
   currentReport.value = ''
+  currentAssistantMessage.value = ''
+  currentProgressItems.value = []
+}
+
+const stopCurrentStream = () => {
+  if (currentStreamController.value) {
+    currentStreamController.value.abort()
+    currentStreamController.value = null
+  }
+}
+
+const onSelectSpace = (space) => {
+  stopCurrentStream()
+  activeTab.value = space.id
+  chatHistory.value = []
+  resetCurrentConversation()
+  loading.value = false
 }
 
 const onNavigate = (page) => {
@@ -151,63 +217,102 @@ const scrollToBottom = () => {
   })
 }
 
+const handleStreamEvent = (event) => {
+  if (!event || typeof event !== 'object') return
+
+  if (event.type === 'result') {
+    if (event.file_id) {
+      currentChartUrl.value = normalizeFileUrl(event.file_id)
+    }
+    if (event.analysis_report) {
+      currentReport.value = event.analysis_report
+    }
+    scrollToBottom()
+    return
+  }
+
+  if (event.type === 'done') {
+    if (!currentReport.value && currentAssistantMessage.value) {
+      currentReport.value = currentAssistantMessage.value
+    }
+    loading.value = false
+    currentStreamController.value = null
+    scrollToBottom()
+    return
+  }
+
+  if (event.type === 'error') {
+    addProgressItem(event)
+    if (!currentReport.value) {
+      currentReport.value = event.message || '分析过程中发生错误。'
+    }
+    loading.value = false
+    currentStreamController.value = null
+    return
+  }
+
+  if (['status', 'assistant', 'tool_log', 'message'].includes(event.type)) {
+    if (event.type === 'assistant' && event.message) {
+      currentAssistantMessage.value = event.message
+    }
+    addProgressItem(event)
+  }
+}
+
+const handleStreamError = (error) => {
+  console.error('Agent stream error:', error)
+  ElMessage.error('请求失败: ' + (error.message || '未知错误'))
+  addProgressItem({
+    type: 'error',
+    level: 'error',
+    message: '请求失败，无法获取实时分析结果。'
+  })
+  if (!currentReport.value) {
+    currentReport.value = '请求失败了。'
+  }
+  loading.value = false
+  currentStreamController.value = null
+}
+
+const handleStreamDone = () => {
+  if (!currentReport.value && currentAssistantMessage.value) {
+    currentReport.value = currentAssistantMessage.value
+  }
+  loading.value = false
+  currentStreamController.value = null
+  scrollToBottom()
+}
+
 const onSendMessage = async (content) => {
   if (!content.trim()) return
 
-  // 保存当前对话到历史（只有已完成的内容才保存）
-  // 如果已经有进行中的对话，先保存
+  stopCurrentStream()
+
   if (currentQuestion.value) {
-    chatHistory.value.push({
-      question: currentQuestion.value,
-      chartUrl: currentChartUrl.value,
-      report: currentReport.value
-    })
+    pushCurrentConversationToHistory()
   }
 
-  // 设置当前对话
+  resetCurrentConversation()
   currentQuestion.value = content
-  currentChartUrl.value = ''
-  currentReport.value = ''
-
-  scrollToBottom()
   loading.value = true
+  addProgressItem({
+    type: 'status',
+    level: 'info',
+    message: '正在建立流式分析连接...'
+  })
+  scrollToBottom()
 
-  try {
-    const response = await invokeAgent({
+  currentStreamController.value = streamAgent(
+    {
       username: 'user',
       namespace_id: activeTab.value,
       conversation_id: '',
       user_message: content
-    })
-
-    if (response.data.success) {
-      const data = response.data.data
-
-      // 设置图表
-      if (data.file_id) {
-        currentChartUrl.value = `/files/${encodeURIComponent(data.file_id)}`
-      }
-
-      // 设置报告内容：优先级 analysis_report > message
-      if (data.analysis_report) {
-        currentReport.value = data.analysis_report
-      } else if (data.message) {
-        currentReport.value = data.message
-      } else {
-        currentReport.value = '已完成分析'
-      }
-    } else {
-      ElMessage.error(response.data.message || '分析失败')
-      currentReport.value = '分析失败，请稍后重试。'
-    }
-  } catch (error) {
-    console.error('Agent invoke error:', error)
-    ElMessage.error('请求失败: ' + (error.message || '未知错误'))
-    currentReport.value = '请求失败了。'
-  } finally {
-    loading.value = false
-    scrollToBottom()
-  }
+    },
+    handleStreamEvent,
+    handleStreamError,
+    handleStreamDone
+  )
 }
 </script>
 
@@ -331,7 +436,8 @@ const onSendMessage = async (content) => {
   background: #409eff;
 }
 
-.message.report .message-avatar {
+.message.report .message-avatar,
+.message.progress-feed .message-avatar {
   background: #f0f2f5;
 }
 
@@ -349,15 +455,72 @@ const onSendMessage = async (content) => {
   color: #fff;
 }
 
-.message.report .message-content {
+.message.report .message-content,
+.message.progress-feed .message-content {
   background: #f5f7fa;
   color: #303133;
 }
 
-.message.loading .message-content {
+.progress-content {
+  min-width: 360px;
+}
+
+.progress-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+.progress-subtitle {
+  font-size: 12px;
   color: #909399;
-  font-style: italic;
-  background: #f0f2f5;
+  font-weight: 400;
+}
+
+.progress-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.progress-item {
+  padding: 8px 10px;
+  border-radius: 8px;
+  white-space: pre-wrap;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.progress-item.info {
+  background: #eef5ff;
+  color: #2f5f9e;
+}
+
+.progress-item.success {
+  background: #edf9f0;
+  color: #2f7d4d;
+}
+
+.progress-item.warning {
+  background: #fff7e8;
+  color: #9a6700;
+}
+
+.progress-item.error {
+  background: #fff0f0;
+  color: #c45656;
+}
+
+.progress-item.assistant {
+  background: #f7f4ff;
+  color: #5b45b0;
+}
+
+.progress-empty {
+  color: #909399;
+  font-size: 13px;
 }
 
 .message-chart {
@@ -373,7 +536,6 @@ const onSendMessage = async (content) => {
   border-top: 1px solid #e4e7ed;
 }
 
-/* Markdown 样式 */
 .message-content :deep(h1),
 .message-content :deep(h2),
 .message-content :deep(h3),

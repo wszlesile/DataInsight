@@ -22,14 +22,14 @@ def load_local_file(file_path: str, sheet_name: Optional[str] = None):
     返回:
         pandas.DataFrame: 加载的数据，可直接用于数据分析和可视化
     """
-    import pandas as pd
     import os
+
+    import pandas as pd
 
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"文件不存在: {file_path}")
 
     if file_path.endswith('.csv'):
-        # noinspection PyArgumentList
         df = pd.read_csv(file_path)
     elif file_path.endswith(('.xlsx', '.xls')):
         df = pd.read_excel(file_path, sheet_name=sheet_name if sheet_name else 0)
@@ -42,31 +42,16 @@ def load_local_file(file_path: str, sheet_name: Optional[str] = None):
 def load_minio_file(bucket: str, object_name: str, sheet_name: Optional[str] = None):
     """
     加载 MinIO 远程数据文件，返回 pandas DataFrame。
-
-    参数:
-        bucket: MinIO 存储桶名称
-        object_name: MinIO 对象名称（文件路径），如 'data/sales.xlsx'
-        sheet_name: Excel 文件时指定的工作表名称，不传则默认读取第一个工作表
-
-    返回:
-        pandas.DataFrame: 加载的数据，可直接用于数据分析和可视化
     """
-
     pass
 
 
 def load_data_with_sql(sql: str, params: Optional[List] = None):
     """
     通过 SQL 查询数据库，返回 pandas DataFrame。
-
-    参数:
-        sql: 要执行的 SQL 查询语句，支持 SELECT 查询
-        params: SQL 查询参数列表，用于参数化查询，防止 SQL 注入
-
-    返回:
-        pandas.DataFrame: 查询结果数据，可直接用于数据分析和可视化
     """
     import pandas as pd
+
     from config.database import engine
 
     with engine.connect() as connection:
@@ -78,20 +63,11 @@ def load_data_with_api(endpoint: str, method: str = "GET", params: Optional[dict
                        headers: Optional[dict] = None, timeout: int = 30):
     """
     通过 HTTP API 获取数据，返回 pandas DataFrame。
-
-    参数:
-        endpoint: API 端点地址，如 'https://api.example.com/data'
-        method: HTTP 请求方法，支持 GET、POST，默认为 GET
-        params: 请求参数，GET 请求会拼接为 URL 参数，POST 请求会作为 JSON body 发送
-        headers: HTTP 请求头，如 {'Authorization': 'Bearer xxx'}
-        timeout: 请求超时时间，单位秒，默认 30 秒
-
-    返回:
-        pandas.DataFrame: 获取的数据，可直接用于数据分析和可视化
     """
+    from io import StringIO
+
     import pandas as pd
     import requests
-    from io import StringIO
 
     response = requests.request(
         method=method.upper(),
@@ -123,9 +99,6 @@ def load_data_with_api(endpoint: str, method: str = "GET", params: Optional[dict
     return df
 
 
-"""结构化输出"""
-
-
 class StructuredResult(BaseModel):
     """洞察结果"""
     file_id: str = Field(description="图表文件ID")
@@ -141,14 +114,6 @@ class AnalysisResult(BaseModel):
 def save_analysis_result(chart_path: str, analysis_report: str) -> StructuredResult:
     """
     保存分析结果（必须调用此函数来结束分析）
-
-    参数:
-        chart_path: 图表文件的完整路径
-        analysis_report: 分析报告文本内容
-
-    返回:
-        StructuredResult 对象，代码中必须将此返回值赋值给变量 result
-        例如：result = save_analysis_result(chart_path=xxx, analysis_report=xxx)
     """
     result = StructuredResult(file_id=chart_path, analysis_report=analysis_report)
     return result
@@ -160,15 +125,53 @@ class ExePythonCodeInput(BaseModel):
     description: str = Field(description="python代码生成的分析报告内容")
 
 
-@tool(description='执行python代码工具', args_schema=ExePythonCodeInput)
+def _sanitize_tool_output(output: str) -> str:
+    if not output:
+        return ''
+
+    cleaned_lines = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("data: {") and '"type"' in stripped:
+            continue
+        if stripped.startswith("{'type':") and "'stage':" in stripped:
+            continue
+        cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines).strip()
+
+
+@tool(description='执行 python 代码工具', args_schema=ExePythonCodeInput)
 def execute_python(runtime: ToolRuntime[CustomContext], code: str, title: str = '', description: str = "") -> Optional[
     ToolMessage]:
-    writer = get_stream_writer()
+    try:
+        writer = get_stream_writer()
+    except Exception:
+        writer = None
+
+    def emit(event_type: str, **payload):
+        if writer:
+            writer({'type': event_type, **payload})
+
     start_time = time.time()
-    logger.info(f"▶ 开始执行：{title or 'Python代码执行'}")
-    logger.info(f"▶ 代码：\n```python\n{code}\n```")
-    logger.info("⚡ 代码已提交到本地执行器...")
-    # 捕获输出
+    emit(
+        'status',
+        stage='tool_start',
+        level='info',
+        tool='execute_python',
+        message=f"正在执行分析代码：{title or '数据分析任务'}"
+    )
+    logger.info(f"开始执行：{title or 'Python代码执行'}")
+    logger.info(f"代码：\n```python\n{code}\n```")
+    logger.info("代码已提交到本地执行器...")
+    emit(
+        'status',
+        stage='tool_running',
+        level='info',
+        tool='execute_python',
+        message='分析代码已提交到本地执行器'
+    )
+
     from io import StringIO
     import sys as sys_module
 
@@ -187,41 +190,79 @@ def execute_python(runtime: ToolRuntime[CustomContext], code: str, title: str = 
             'save_analysis_result': save_analysis_result
         }
         exec(code, namespace)
-        # 从 namespace 中取出 result（LLM 生成的代码最后会赋值 result）
         exec_result = namespace.get('result')
-    except Exception as e:
-        # 执行报错 进行重试
+    except Exception as exc:
+        error_msg = str(exc)
+        emit(
+            'status',
+            stage='tool_error',
+            level='error',
+            tool='execute_python',
+            message=f'代码执行失败：{error_msg}'
+        )
         return ToolMessage(
-            content=f"执行python代码工具错误：请检查重新生成。({str(e)})",
+            content=f"执行python代码工具错误：请检查重新生成。({error_msg})",
+            tool_call_id=runtime.tool_call_id
+        )
+    finally:
+        stdout_result = sys_module.stdout.getvalue()
+        stderr_result = sys_module.stderr.getvalue()
+        sys_module.stdout = old_stdout
+        sys_module.stderr = old_stderr
+
+    execution_time = time.time() - start_time
+    logger.info(f"执行完成，耗时 {execution_time:.2f}秒")
+    emit(
+        'status',
+        stage='tool_finished',
+        level='success',
+        tool='execute_python',
+        message=f'代码执行完成，耗时 {execution_time:.2f} 秒'
+    )
+
+    stdout_result = _sanitize_tool_output(stdout_result)
+    stderr_result = _sanitize_tool_output(stderr_result)
+
+    if stdout_result:
+        logger.info(stdout_result)
+        emit(
+            'tool_log',
+            stage='tool_output',
+            level='info',
+            tool='execute_python',
+            message=stdout_result[:1000]
+        )
+    if stderr_result:
+        logger.info(f"标准错误：\n{stderr_result}")
+        emit(
+            'tool_log',
+            stage='tool_output',
+            level='warning',
+            tool='execute_python',
+            message=stderr_result[:1000]
+        )
+
+    if exec_result and isinstance(exec_result, StructuredResult):
+        emit(
+            'status',
+            stage='tool_result',
+            level='success',
+            tool='execute_python',
+            message='分析结果已生成，正在整理最终报告'
+        )
+        return ToolMessage(
+            content=exec_result.model_dump_json(),
             tool_call_id=runtime.tool_call_id
         )
 
-    stdout_result = sys_module.stdout.getvalue()
-    stderr_result = sys_module.stderr.getvalue()
-
-    sys_module.stdout = old_stdout
-    sys_module.stderr = old_stderr
-
-    execution_time = time.time() - start_time
-    logger.info(f"✅ 执行完成，耗时 {execution_time:.2f}秒")
-
-    if error_msg:
-        logger.info(f"❌ 执行错误：\n{error_msg}")
-        return None
-    else:
-        if stdout_result:
-            logger.info(stdout_result)
-        if stderr_result:
-            logger.info(f"⚠️ 标准错误：\n{stderr_result}")
-
-        # 如果代码执行后有 result 变量，构建返回结果
-        if exec_result and isinstance(exec_result, StructuredResult):
-            return ToolMessage(
-                content=exec_result.model_dump_json(),
-                tool_call_id=runtime.tool_call_id
-            )
-        else:
-            return ToolMessage(
-                content='请重新生成，没有按照代码输出模板严格生成执行代码',
-                tool_call_id=runtime.tool_call_id
-            )
+    emit(
+        'status',
+        stage='tool_retry',
+        level='warning',
+        tool='execute_python',
+        message='生成的代码未按模板返回 result，正在请求模型修正'
+    )
+    return ToolMessage(
+        content='请重新生成，没有按照代码输出模板严格生成执行代码',
+        tool_call_id=runtime.tool_call_id
+    )
