@@ -306,8 +306,7 @@ chart = (
 
 # === 步骤1：保存图表 ===
 temp_dir = 'D:\\PycharmProjects\\DataInsight\\'
-chart_filename = "q4_sales_trend.html"
-chart_path = os.path.join(temp_dir, chart_filename)
+chart_path = generate_temp_file_name(prefix="q4_sales_trend", extension="html")
 chart.render(chart_path)
 
 # === 步骤2：保存分析结果 ===
