@@ -3,9 +3,10 @@ import re
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
-from datetime import datetime
+from datetime import datetime, time as datetime_time, timedelta
 from io import StringIO
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
@@ -106,6 +107,67 @@ def generate_temp_file_name(prefix: str = 'analysis_chart', extension: str = 'ht
     return os.path.join(temp_dir, filename)
 
 
+def get_day_range(days_ago: int = 0, timezone_name: str = 'Asia/Shanghai') -> tuple[datetime, datetime]:
+    """
+    返回某个自然日的起止时间。
+
+    `days_ago=0` 表示今天，`1` 表示昨天，`2` 表示前天。
+    返回值始终带时区信息，便于与带时区的时间列直接比较。
+    """
+    tz = ZoneInfo(timezone_name)
+    target_date = (datetime.now(tz) - timedelta(days=days_ago)).date()
+    start_at = datetime.combine(target_date, datetime_time.min, tzinfo=tz)
+    end_at = datetime.combine(target_date, datetime_time.max, tzinfo=tz)
+    return start_at, end_at
+
+
+def build_markdown_table(dataframe, columns: Optional[list[str]] = None, max_rows: int = 10) -> str:
+    """
+    把 DataFrame 转成 Markdown 表格文本。
+
+    这个辅助函数适合在“需要输出 Markdown 表格”的场景中直接复用，
+    用来减少手写表格拼接时的引号、换行和格式错误。
+    如果当前分析任务并不需要表格展示，则不必使用它。
+    """
+    import pandas as pd
+
+    if dataframe is None:
+        return ''
+
+    if not isinstance(dataframe, pd.DataFrame):
+        dataframe = pd.DataFrame(dataframe)
+
+    if columns:
+        available_columns = [column for column in columns if column in dataframe.columns]
+        table_df = dataframe[available_columns].copy()
+    else:
+        table_df = dataframe.copy()
+
+    if max_rows > 0:
+        table_df = table_df.head(max_rows)
+
+    if table_df.empty:
+        return ''
+
+    table_df = table_df.fillna('')
+
+    def _stringify(value: Any) -> str:
+        if isinstance(value, float):
+            return f"{value:,.2f}".rstrip('0').rstrip('.')
+        return str(value)
+
+    headers = [str(column) for column in table_df.columns]
+    header_line = "| " + " | ".join(headers) + " |"
+    separator_line = "| " + " | ".join(['---'] * len(headers)) + " |"
+
+    body_lines = []
+    for _, row in table_df.iterrows():
+        values = [_stringify(row[column]).replace('|', '&#124;') for column in table_df.columns]
+        body_lines.append("| " + " | ".join(values) + " |")
+
+    return "\n".join([header_line, separator_line, *body_lines])
+
+
 class StructuredResult(BaseModel):
     """当前 Agent 运行时消费的标准工具返回结构。"""
 
@@ -127,7 +189,10 @@ def save_analysis_result(chart_path: str, analysis_report: str) -> StructuredRes
     `sys_prompt.md` 当前要求大模型生成的 Python 代码必须调用这个函数，
     并把返回值赋值给 `result`。
     """
-    return StructuredResult(file_id=chart_path, analysis_report=analysis_report)
+    report_text = (analysis_report or '').strip()
+    if not report_text:
+        raise ValueError('analysis_report 不能为空，必须传入完整的 Markdown 分析报告。')
+    return StructuredResult(file_id=chart_path, analysis_report=report_text)
 
 
 class ExePythonCodeInput(BaseModel):
@@ -232,6 +297,8 @@ def _build_execution_namespace() -> dict[str, Any]:
         'load_data_with_sql': load_data_with_sql,
         'load_data_with_api': load_data_with_api,
         'generate_temp_file_name': generate_temp_file_name,
+        'get_day_range': get_day_range,
+        'build_markdown_table': build_markdown_table,
         'save_analysis_result': save_analysis_result,
     }
 

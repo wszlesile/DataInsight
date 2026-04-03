@@ -9,11 +9,12 @@ from service.conversation_context_service import ConversationContextService, Con
 from utils import logger
 
 THINK_BLOCK_PATTERN = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
+TOOL_CALL_BLOCK_PATTERN = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", flags=re.DOTALL)
 
 
 @dataclass
 class AgentRequest:
-    """从控制器层传入 Agent 层的标准化请求对象。"""
+    """从控制器层传给 Agent 层的标准化请求对象。"""
 
     username: str
     namespace_id: str
@@ -37,6 +38,27 @@ def _clean_message_content(content: Any) -> str:
     """去掉模型内部思考块，仅保留对用户可见的最终消息。"""
     text = content if isinstance(content, str) else str(content)
     return THINK_BLOCK_PATTERN.sub("", text).strip()
+
+
+def _extract_raw_tool_call(content: Any) -> dict[str, Any] | None:
+    """识别模型误输出的原始工具调用文本，并尽量解析其中的 JSON 载荷。"""
+    text = _clean_message_content(content)
+    if not text or '<tool_call>' not in text:
+        return None
+
+    match = TOOL_CALL_BLOCK_PATTERN.search(text)
+    if not match:
+        return {'name': 'unknown_tool', 'args': {}}
+
+    try:
+        payload = json.loads(match.group(1))
+    except Exception:
+        return {'name': 'unknown_tool', 'args': {}}
+
+    return {
+        'name': payload.get('name', 'unknown_tool'),
+        'args': payload.get('arguments') or payload.get('args') or {},
+    }
 
 
 def _parse_structured_content(content: Any) -> tuple[str, str]:
@@ -103,6 +125,13 @@ def _finalize_run(
     )
 
 
+def _ensure_analysis_result_ready(file_id: str, analysis_report: str) -> None:
+    """分析型请求必须真实产出图表文件和分析报告。"""
+    if file_id and analysis_report:
+        return
+    raise ValueError('本轮未生成完整分析产物：缺少图表文件或分析报告，请重新执行分析。')
+
+
 def _format_tool_call_message(tool_call: dict[str, Any]) -> str:
     """把工具调用元数据转换成前端可直接展示的执行阶段文案。"""
     tool_name = tool_call.get('name', 'unknown_tool')
@@ -115,27 +144,41 @@ def _format_tool_call_message(tool_call: dict[str, Any]) -> str:
     return f"准备调用工具：{tool_name}"
 
 
-def _extract_invoke_result(messages: list[Any]) -> tuple[str, str, str]:
+def _extract_invoke_result(messages: list[Any]) -> tuple[str, str, str, bool]:
     """
     从 invoke 返回结果中提取最终助手消息和结构化工具结果。
 
     当前工具契约仍然是 StructuredResult(file_id, analysis_report)，
-    所以这里只解释现有约定，不改变既有主流程。
+    所以这里仅解析现有约定，不改变既有主流程。
     """
     if not messages:
-        return '', '', ''
+        return '', '', '', False
 
-    ai_message = messages[-1]
-    assistant_message = _clean_message_content(
-        ai_message.content if hasattr(ai_message, 'content') else str(ai_message)
-    )
+    assistant_message = ''
+    analysis_report = ''
+    file_id = ''
+    raw_tool_call_detected = False
 
-    structured_message = messages[-2] if len(messages) >= 2 else '{}'
-    structured_content = (
-        structured_message.content if hasattr(structured_message, 'content') else str(structured_message)
-    )
-    file_id, analysis_report = _parse_structured_content(structured_content)
-    return assistant_message, analysis_report, file_id
+    for message in reversed(messages):
+        content = message.content if hasattr(message, 'content') else str(message)
+        cleaned = _clean_message_content(content)
+        if not cleaned:
+            continue
+
+        if _extract_raw_tool_call(cleaned):
+            raw_tool_call_detected = True
+            continue
+
+        parsed_file_id, parsed_analysis_report = _parse_structured_content(cleaned)
+        if parsed_file_id or parsed_analysis_report:
+            file_id = parsed_file_id or file_id
+            analysis_report = parsed_analysis_report or analysis_report
+            continue
+
+        if not assistant_message:
+            assistant_message = cleaned
+
+    return assistant_message, analysis_report, file_id, raw_tool_call_detected
 
 
 def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
@@ -156,7 +199,12 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
             _build_agent_input(agent_request, runtime),
             context=_build_agent_context(agent_request, runtime),
         )
-        assistant_message, analysis_report, file_id = _extract_invoke_result(agent_response.get('messages', []))
+        assistant_message, analysis_report, file_id, raw_tool_call_detected = _extract_invoke_result(
+            agent_response.get('messages', [])
+        )
+        if raw_tool_call_detected and not (file_id or analysis_report):
+            raise ValueError('模型返回了未执行的工具调用内容，未生成最终分析结果，请重试。')
+        _ensure_analysis_result_ready(file_id=file_id, analysis_report=analysis_report)
         return _finalize_run(
             service=service,
             runtime=runtime,
@@ -185,6 +233,7 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]
     assistant_message = ''
     file_id = ''
     analysis_report = ''
+    raw_tool_call_detected = False
 
     yield _build_progress_event(
         'session',
@@ -215,6 +264,7 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]
                     messages = payload.get("messages", [])
                     for message in messages:
                         tool_calls = getattr(message, 'tool_calls', None)
+                        raw_tool_call = _extract_raw_tool_call(getattr(message, 'content', ''))
                         cleaned = _clean_message_content(getattr(message, 'content', ''))
 
                         if tool_calls:
@@ -237,6 +287,19 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]
                                     tool=tool_call.get('name', ''),
                                     message=_format_tool_call_message(tool_call),
                                 )
+                            continue
+
+                        if raw_tool_call:
+                            raw_tool_call_detected = True
+                            yield _build_progress_event(
+                                'status',
+                                conversation_id=runtime.conversation.id,
+                                turn_id=runtime.turn.id,
+                                stage='tool_call',
+                                level='info',
+                                tool=raw_tool_call.get('name', ''),
+                                message=_format_tool_call_message(raw_tool_call),
+                            )
                             continue
 
                         if not cleaned:
@@ -282,6 +345,10 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]
                         level='info',
                         message=str(chunk),
                     )
+
+        if raw_tool_call_detected and not (file_id or analysis_report):
+            raise ValueError('模型返回了未执行的工具调用内容，未生成最终分析结果，请重试。')
+        _ensure_analysis_result_ready(file_id=file_id, analysis_report=analysis_report)
 
         _finalize_run(
             service=service,

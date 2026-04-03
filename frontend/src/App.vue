@@ -328,6 +328,17 @@ const createProgressItem = (event) => ({
   message: event.message
 })
 
+const isInternalAssistantMessage = (message) => {
+  if (!message) return false
+  const text = String(message)
+  return (
+    text.includes('<tool_call>') ||
+    text.includes('save_analysis_result(') ||
+    text.includes('load_data_with_') ||
+    text.includes('import pandas as pd')
+  )
+}
+
 const isCollected = (collectType, targetId) => {
   if (!targetId) return false
   return collects.value.some(
@@ -599,7 +610,9 @@ const handleStreamEvent = async (event) => {
     return
   }
   if (event.type === 'done') {
-    if (!currentReport.value && currentAssistantMessage.value) currentReport.value = currentAssistantMessage.value
+    if (!currentReport.value && !currentChartUrl.value) {
+      currentReport.value = '本轮分析未生成可展示的图表或分析报告，请重试。'
+    }
     loading.value = false
     currentStreamController.value = null
     finalizeCurrentConversation()
@@ -616,7 +629,10 @@ const handleStreamEvent = async (event) => {
     return
   }
   if (['status', 'assistant', 'tool_log', 'message'].includes(event.type)) {
-    if (event.type === 'assistant' && event.message) currentAssistantMessage.value = event.message
+    if (event.type === 'assistant' && event.message) {
+      if (isInternalAssistantMessage(event.message)) return
+      currentAssistantMessage.value = event.message
+    }
     addProgressItem(event)
   }
 }
@@ -638,7 +654,9 @@ const handleStreamError = async (error) => {
 
 const handleStreamDone = async () => {
   if (!loading.value) return
-  if (!currentReport.value && currentAssistantMessage.value) currentReport.value = currentAssistantMessage.value
+  if (!currentReport.value && !currentChartUrl.value) {
+    currentReport.value = '本轮分析未生成可展示的图表或分析报告，请重试。'
+  }
   loading.value = false
   currentStreamController.value = null
   finalizeCurrentConversation()

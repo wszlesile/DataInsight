@@ -271,8 +271,24 @@ class ConversationContextService:
         ).order_by(
             InsightNsMessage.created_at.desc(),
             InsightNsMessage.id.desc(),
-        ).limit(limit_messages).all()
-        return list(reversed(rows))
+        ).limit(limit_messages * 3).all()
+
+        successful_turn_ids = self._get_successful_execution_turn_ids(conversation_id_int)
+        filtered_rows: list[InsightNsMessage] = []
+        for row in rows:
+            content = (row.content or '').strip()
+            if row.role == 'assistant':
+                # 只有真正成功执行过分析任务的轮次，才把助手最终回答纳入历史重放。
+                # 这样可以避免“未真正执行、仅靠记忆复述”的回答继续污染后续上下文。
+                if row.turn_id not in successful_turn_ids:
+                    continue
+                if '<tool_call>' in content:
+                    continue
+            filtered_rows.append(row)
+            if len(filtered_rows) >= limit_messages:
+                break
+
+        return list(reversed(filtered_rows))
 
     def get_recent_artifacts(self, conversation_id: Any, limit_items: int = 3) -> list[InsightNsArtifact]:
         conversation_id_int = to_int(conversation_id, 0)
@@ -324,6 +340,32 @@ class ConversationContextService:
             InsightNsMemory.memory_type == memory_type,
             InsightNsMemory.is_deleted == 0,
         ).first()
+
+    def build_runtime_summary_text(self, conversation_id: Any) -> str:
+        """实时根据当前有效轮次重建摘要，避免旧记忆污染当前 Prompt。"""
+        conversation_id_int = to_int(conversation_id, 0)
+        if conversation_id_int <= 0:
+            return ''
+        return self._build_summary_text(conversation_id_int)
+
+    def build_runtime_analysis_state(self, conversation_id: Any) -> dict[str, Any]:
+        """实时根据数据库状态重建当前分析状态，而不是直接复用旧记忆快照。"""
+        conversation_id_int = to_int(conversation_id, 0)
+        conversation = self._get_conversation_by_id(conversation_id_int)
+        if conversation is None:
+            return {}
+
+        return {
+            "active_datasource_snapshot": safe_json_loads(conversation.active_datasource_snapshot, {}),
+            "recent_turn_datasource_usage": self._build_recent_turn_datasource_usage(conversation_id_int, limit_turns=3),
+            "recent_execution_summaries": self._build_recent_execution_summaries(conversation_id_int, limit_items=3),
+            "latest_execution": self._build_latest_execution_summary(conversation_id_int),
+            "latest_artifacts": [
+                artifact.to_dict()
+                for artifact in self.get_recent_artifacts(conversation_id_int, limit_items=3)
+            ],
+            "last_turn_no": conversation.last_turn_no,
+        }
 
     def get_active_datasource_snapshot(self, conversation_id: Any) -> dict[str, Any]:
         conversation = self._get_conversation_by_id(to_int(conversation_id, 0))
@@ -592,7 +634,7 @@ class ConversationContextService:
 
     def _refresh_memories(self, conversation: InsightNsConversation) -> None:
         """刷新下一轮 Prompt 组装要使用的压缩记忆。"""
-        summary_text = self._build_summary_text(conversation.id)
+        summary_text = self.build_runtime_summary_text(conversation.id)
         conversation.summary_text = summary_text
 
         # `rolling_summary` 保存自然语言压缩后的历史摘要。
@@ -602,17 +644,11 @@ class ConversationContextService:
         })
 
         # `analysis_state` 保存下一轮继续分析时要读取的结构化状态。
-        self._upsert_memory(conversation.id, 'analysis_state', {
-            "active_datasource_snapshot": safe_json_loads(conversation.active_datasource_snapshot, {}),
-            "recent_turn_datasource_usage": self._build_recent_turn_datasource_usage(conversation.id, limit_turns=3),
-            "recent_execution_summaries": self._build_recent_execution_summaries(conversation.id, limit_items=3),
-            "latest_execution": self._build_latest_execution_summary(conversation.id),
-            "latest_artifacts": [
-                artifact.to_dict()
-                for artifact in self.get_recent_artifacts(conversation.id, limit_items=3)
-            ],
-            "last_turn_no": conversation.last_turn_no,
-        })
+        self._upsert_memory(
+            conversation.id,
+            'analysis_state',
+            self.build_runtime_analysis_state(conversation.id),
+        )
 
     def _build_summary_text(self, conversation_id: int) -> str:
         """根据最近几轮构建紧凑的自然语言摘要。"""
@@ -624,11 +660,12 @@ class ConversationContextService:
         if not turns:
             return ''
 
+        successful_turn_ids = self._get_successful_execution_turn_ids(conversation_id)
         parts: list[str] = []
         for turn in turns:
             question = (turn.user_query or '').strip().replace('\n', ' ')[:120]
             answer = (turn.final_answer or turn.error_message or '').strip().replace('\n', ' ')[:200]
-            if answer:
+            if turn.id in successful_turn_ids and answer and '<tool_call>' not in answer:
                 parts.append(f"第{turn.turn_no}轮 用户: {question}；系统结论: {answer}")
             else:
                 parts.append(f"第{turn.turn_no}轮 用户: {question}")
@@ -709,4 +746,13 @@ class ConversationContextService:
             memory.updated_at = _now()
 
         self.session.flush()
+
+    def _get_successful_execution_turn_ids(self, conversation_id: int) -> set[int]:
+        """返回当前会话中真正完成过分析执行的轮次集合。"""
+        rows = self.session.query(InsightNsExecution.turn_id).filter(
+            InsightNsExecution.conversation_id == conversation_id,
+            InsightNsExecution.execution_status == 'success',
+            InsightNsExecution.is_deleted == 0,
+        ).all()
+        return {to_int(row[0], 0) for row in rows if to_int(row[0], 0) > 0}
 

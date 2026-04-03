@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -14,6 +15,12 @@ from utils.datasource_utils import (
     normalize_datasource_type,
     safe_json_loads,
     to_int,
+)
+
+
+NEW_ANALYSIS_SIGNAL_PATTERN = re.compile(
+    r"(今天|昨天|前天|近\d+天|最近|本周|上周|本月|上月|Q[1-4]|季度|今年|去年|同比|环比|"
+    r"\d{1,2}月\d{1,2}号|\d{4}[-/年]\d{1,2}([-/月]\d{1,2})?|明细|详情|图表|趋势|统计|分析)"
 )
 
 
@@ -57,6 +64,32 @@ def _build_execution_context_item(execution: InsightNsExecution, include_code: b
     else:
         payload["generated_code_preview"] = (execution.generated_code or '')[:1200]
     return payload
+
+
+def _should_inject_execution_context(user_message: str) -> bool:
+    """
+    判断当前问题是否应该注入最近执行代码与执行产物。
+
+    只有明显承接上一轮逻辑的追问，才应该把最近执行代码完整带回给模型。
+    如果用户当前问题出现了新的日期、过滤条件、统计口径、明细或图表要求，
+    更适合按一轮新的分析任务处理，此时只保留摘要记忆，不注入旧执行代码。
+    """
+    text = (user_message or '').strip()
+    if not text:
+        return True
+
+    lower_text = text.lower()
+    carry_on_keywords = (
+        "继续", "刚才", "上次", "上一轮", "沿用", "基于刚才", "按刚才",
+        "continue", "previous", "last result", "same logic",
+    )
+    if any(keyword in text for keyword in carry_on_keywords) or any(keyword in lower_text for keyword in carry_on_keywords):
+        return True
+
+    if NEW_ANALYSIS_SIGNAL_PATTERN.search(text):
+        return False
+
+    return True
 
 
 def _load_conversation(conversation_id: int) -> InsightNsConversation | None:
@@ -183,7 +216,7 @@ def get_history_messages(conversation_id: int) -> list[Any]:
     return result
 
 
-def get_memory_messages(conversation_id: int) -> list[SystemMessage]:
+def get_memory_messages(conversation_id: int, user_message: str = '') -> list[SystemMessage]:
     """
     构造下一轮分析使用的压缩记忆消息。
 
@@ -197,46 +230,46 @@ def get_memory_messages(conversation_id: int) -> list[SystemMessage]:
         service = ConversationContextService(session)
         messages: list[SystemMessage] = []
 
-        summary_memory = service.get_memory(conversation_id, 'rolling_summary')
-        if summary_memory:
-            payload = json.loads(summary_memory.content_json or '{}')
-            summary_text = payload.get('summary_text', '')
-            if summary_text:
-                messages.append(SystemMessage(f"历史摘要：\n{summary_text}"))
+        summary_text = service.build_runtime_summary_text(conversation_id)
+        if summary_text:
+            messages.append(SystemMessage(f"历史摘要：\n{summary_text}"))
 
-        analysis_state_memory = service.get_memory(conversation_id, 'analysis_state')
-        if analysis_state_memory:
-            payload = json.loads(analysis_state_memory.content_json or '{}')
+        analysis_state_payload = service.build_runtime_analysis_state(conversation_id)
+        if analysis_state_payload:
             messages.append(SystemMessage(
                 "当前分析状态：\n"
-                f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+                f"{json.dumps(analysis_state_payload, ensure_ascii=False, indent=2)}"
             ))
 
-        recent_executions = service.get_recent_executions(conversation_id, limit_items=3)
-        if recent_executions:
-            execution_payload = [
-                _build_execution_context_item(execution)
-                for execution in recent_executions
-            ]
-            messages.append(SystemMessage(
-                "最近代码执行记录：\n"
-                f"{json.dumps(execution_payload, ensure_ascii=False, indent=2)}"
-            ))
-
-            latest_execution = recent_executions[-1]
-            if latest_execution.generated_code:
+        # 执行代码和派生产物属于更强的历史承接信息。
+        # 只有明显“继续上一轮”的追问，才把它们完整注入；
+        # 如果当前问题已经是新的分析请求，则避免旧执行逻辑把模型带偏。
+        if _should_inject_execution_context(user_message):
+            recent_executions = service.get_recent_executions(conversation_id, limit_items=3)
+            if recent_executions:
+                execution_payload = [
+                    _build_execution_context_item(execution)
+                    for execution in recent_executions
+                ]
                 messages.append(SystemMessage(
-                    "最近一次成功或最新执行的 Python 分析代码：\n"
-                    f"{latest_execution.generated_code}"
+                    "最近代码执行记录：\n"
+                    f"{json.dumps(execution_payload, ensure_ascii=False, indent=2)}"
                 ))
 
-        recent_artifacts = service.get_recent_artifacts(conversation_id, limit_items=3)
-        if recent_artifacts:
-            artifact_payload = [artifact.to_dict() for artifact in recent_artifacts]
-            messages.append(SystemMessage(
-                "最近派生产物摘要：\n"
-                f"{json.dumps(artifact_payload, ensure_ascii=False, indent=2)}"
-            ))
+                latest_execution = recent_executions[-1]
+                if latest_execution.generated_code:
+                    messages.append(SystemMessage(
+                        "最近一次成功或最新执行的 Python 分析代码：\n"
+                        f"{latest_execution.generated_code}"
+                    ))
+
+            recent_artifacts = service.get_recent_artifacts(conversation_id, limit_items=3)
+            if recent_artifacts:
+                artifact_payload = [artifact.to_dict() for artifact in recent_artifacts]
+                messages.append(SystemMessage(
+                    "最近派生产物摘要：\n"
+                    f"{json.dumps(artifact_payload, ensure_ascii=False, indent=2)}"
+                ))
 
         return messages
     finally:

@@ -19,53 +19,63 @@ SEED_NAMESPACE_NAME = '默认测试数据源空间'
 
 
 def get_test_local_file_datasource_schema() -> DataSourceSchema:
-    """本地销售文件的测试元数据。"""
+    """销售记录文件的真实元数据定义。"""
     return DataSourceSchema(
         name='销售记录文件元数据',
-        description='销售记录文件包含订单维度的销售统计信息，可用于销售趋势、区域分布和产品表现分析。',
+        description='销售记录文件包含月度销售明细，可用于销售趋势、产品表现和区域分布分析。',
         properties={
-            'order_date': PropertySchema(type='string', description='订单日期，格式为 YYYY-MM-DD', example='2026-03-31'),
-            'region': PropertySchema(type='string', description='销售区域名称', example='华东'),
-            'product_name': PropertySchema(type='string', description='产品名称', example='智能传感器A'),
-            'sales_amount': PropertySchema(type='number', description='销售金额', example=128000.5),
-            'sales_count': PropertySchema(type='integer', description='销售数量', example=96),
+            '月份': PropertySchema(type='string', description='销售月份，格式通常为 YYYY-MM', example='2024-10'),
+            '产品名称': PropertySchema(type='string', description='产品名称', example='产品A'),
+            '销售额(元)': PropertySchema(type='number', description='销售金额，单位为元', example=128000.5),
+            '销量': PropertySchema(type='integer', description='销售数量', example=250),
+            '销售单价': PropertySchema(type='number', description='产品销售单价', example=500),
+            '区域': PropertySchema(type='string', description='销售区域名称', example='华东'),
         },
-        required=['order_date', 'region', 'product_name', 'sales_amount'],
+        required=['月份', '产品名称', '销售额(元)', '区域'],
     )
 
 
 def get_test_local_sql_alarm_record_schema() -> DataSourceSchema:
-    """报警记录表的测试元数据。"""
+    """报警记录表的真实元数据定义。"""
     return DataSourceSchema(
         name='报警记录表元数据',
-        description='报警记录表保存设备报警事件，可用于分析报警频次、等级、发生时间与分布情况。',
+        description='报警记录表保存报警事件及其时间、类型、优先级和测点信息，可用于报警数量统计、明细查询和异常分析。',
         properties={
-            'alarm_id': PropertySchema(type='string', description='报警记录唯一标识', example='ALARM-20260401-0001'),
-            'device_name': PropertySchema(type='string', description='设备名称', example='1号压缩机'),
-            'alarm_level': PropertySchema(type='string', description='报警等级', example='高'),
-            'alarm_type': PropertySchema(type='string', description='报警类型', example='温度超限'),
-            'alarm_time': PropertySchema(type='string', description='报警发生时间', example='2026-04-01 08:30:00'),
-            'status': PropertySchema(type='string', description='报警当前状态', example='待处理'),
+            'id': PropertySchema(type='integer', description='报警记录主键 ID', example=31),
+            'ar_code': PropertySchema(type='string', description='报警编码', example='AR-20260224-001'),
+            'tagname': PropertySchema(type='string', description='测点标签名', example='poly1-R101-TT'),
+            'show_name': PropertySchema(type='string', description='测点显示名称', example='温度传感器1'),
+            'description': PropertySchema(type='string', description='报警描述信息', example='温度超过上限阈值'),
+            'alarm_type': PropertySchema(type='string', description='报警类型', example='高温报警'),
+            'priority': PropertySchema(type='integer', description='报警优先级，数值越小优先级越高', example=1),
+            'limit_condition': PropertySchema(type='string', description='报警触发条件', example='> 85°C'),
+            'start_timestamp': PropertySchema(type='string', description='报警开始时间', example='2026-02-24 08:30:15+00'),
+            'new_value': PropertySchema(type='number', description='报警触发时的新值', example=92.5),
+            'disappeared_timestamp': PropertySchema(type='string', description='报警消失时间', example='2026-02-24 09:15:23+00'),
+            'created_time': PropertySchema(type='string', description='记录创建时间', example='2026-02-24 08:30:15+00'),
         },
-        required=['alarm_id', 'device_name', 'alarm_level', 'alarm_time'],
+        required=['id', 'tagname', 'alarm_type', 'priority', 'start_timestamp'],
     )
 
 
 def get_test_local_sql_alarm_treatment_schema() -> DataSourceSchema:
-    """报警处置工单表的测试元数据。"""
+    """报警处置工单表的真实元数据定义。"""
     return DataSourceSchema(
         name='报警处置工单表元数据',
-        description='报警处置工单表记录报警的处理过程，可用于分析处理时效、责任人和闭环情况。',
+        description='报警处置工单表记录报警闭环处理过程，可用于分析处理状态、原因、处置措施和完成时效。',
         properties={
-            'work_order_id': PropertySchema(type='string', description='工单唯一标识', example='WO-20260401-0001'),
-            'alarm_id': PropertySchema(type='string', description='关联的报警记录 ID', example='ALARM-20260401-0001'),
-            'handler': PropertySchema(type='string', description='处理人', example='张三'),
-            'department': PropertySchema(type='string', description='处理部门', example='运维部'),
-            'handle_status': PropertySchema(type='string', description='工单处理状态', example='已关闭'),
-            'handle_start_time': PropertySchema(type='string', description='处理开始时间', example='2026-04-01 08:35:00'),
-            'handle_finish_time': PropertySchema(type='string', description='处理完成时间', example='2026-04-01 09:20:00'),
+            'id': PropertySchema(type='integer', description='工单主键 ID', example=1),
+            'work_order_code': PropertySchema(type='string', description='工单编号', example='WO-20260224-001'),
+            'alarm_record_id': PropertySchema(type='integer', description='关联的报警记录主键 ID', example=1),
+            'alarm_status': PropertySchema(type='integer', description='报警处理状态编码', example=2),
+            'completion_time': PropertySchema(type='string', description='处理完成时间', example='2026-02-24 11:30:00+00'),
+            'alarm_cause': PropertySchema(type='string', description='报警原因分析', example='散热风扇故障导致温度升高'),
+            'corrective_action': PropertySchema(type='string', description='纠正措施', example='更换散热风扇，清理灰尘'),
+            'remarks': PropertySchema(type='string', description='处理备注', example='已恢复正常运行'),
+            'attachments': PropertySchema(type='string', description='附件文件名或路径', example='fan_inspection_report.pdf'),
+            'created_time': PropertySchema(type='string', description='工单创建时间', example='2026-02-24 09:20:00+00'),
         },
-        required=['work_order_id', 'alarm_id', 'handle_status'],
+        required=['id', 'work_order_code', 'alarm_record_id', 'alarm_status'],
     )
 
 
@@ -161,7 +171,7 @@ def _upsert_default_conversation_datasource(
 
 def seed_default_conversation_zero_datasources(namespace_id: int) -> list[dict]:
     """
-    为指定空间初始化默认的 conversation_id == 0 数据源资源。
+    为指定空间初始化默认的 `conversation_id == 0` 数据源资源。
 
     这些默认关系会在后续真实会话没有绑定任何数据源时，
     作为该空间的默认数据源集合被自动复制到会话级关系表。
@@ -241,7 +251,7 @@ def seed_default_namespace_resources() -> dict:
 
 
 class DefaultConversationDatasourceSeedTestCase(unittest.TestCase):
-    """验证默认 conversation_id == 0 数据源资源可以稳定入库。"""
+    """验证默认 `conversation_id == 0` 数据源资源可以稳定入库。"""
 
     def test_seed_default_namespace_resources(self) -> None:
         result = seed_default_namespace_resources()

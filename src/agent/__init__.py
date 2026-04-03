@@ -47,6 +47,7 @@ class InputMessage(BaseModel, Generic[MessageT]):
 @lru_cache(maxsize=1)
 def load_system_prompt() -> str:
     """从磁盘加载系统提示词，并做进程级缓存。"""
+    # 系统提示词由独立文档维护，这里只负责读取与缓存。
     return SYS_PROMPT_PATH.read_text(encoding='utf-8').strip()
 
 
@@ -111,7 +112,7 @@ def build_prompt_messages(
 
     # 记忆消息是从执行记录、派生产物和历史消息中提炼出的压缩上下文，
     # 因此应该放在原始历史消息之前。
-    messages.extend(get_memory_messages(conversation_id))
+    messages.extend(get_memory_messages(conversation_id, user_message=user_message))
     messages.extend(get_history_messages(conversation_id))
     messages.append(HumanMessage(user_message))
     return messages
