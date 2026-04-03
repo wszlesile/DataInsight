@@ -40,6 +40,7 @@ const message = ref('')
 const sendMessage = () => {
   if (message.value.trim() && !props.loading) {
     emit('send', message.value)
+    message.value = ''
   }
 }
 </script>

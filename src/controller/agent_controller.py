@@ -1,6 +1,6 @@
 import json
 
-from flask import Blueprint, jsonify, request, Response
+from flask import Blueprint, Response, jsonify
 
 from controller.base_controller import BaseController
 from dto import get_current_user_context
@@ -8,44 +8,47 @@ from utils.response import Result
 
 
 def create_agent_controller() -> Blueprint:
-    """创建 Agent 控制器"""
     blueprint = Blueprint('agent', __name__, url_prefix='/api/agent')
     controller = AgentController(blueprint)
 
     blueprint.route('/invoke', methods=['POST'])(controller.invoke)
     blueprint.route('/stream', methods=['POST'])(controller.stream_invoke)
-
     return blueprint
 
 
+def _get_username() -> str:
+    user_context = get_current_user_context()
+    return user_context.username if user_context else 'anonymous'
+
+
+def _build_agent_request(data: dict):
+    """
+    构造标准化 Agent 请求对象。
+    """
+    from agent.invoker import AgentRequest
+
+    return AgentRequest(
+        # 用户名
+        username=_get_username(),
+        # 命名空间 ID
+        namespace_id=data.get('namespace_id', ''),
+        # 会话 ID
+        conversation_id=data.get('conversation_id', ''),
+        # 用户消息
+        user_message=(data.get('user_message') or '').strip(),
+    )
+
+
 class AgentController(BaseController):
-    """Agent 接口控制器"""
-
-    def _build_agent_request(self, data: dict) -> tuple:
-        """构建 AgentRequest，失败返回 (None, error_response)"""
-        user_context = get_current_user_context()
-        username = user_context.username if user_context else 'anonymous'
-        namespace_id = data.get('namespace_id', '')
-        conversation_id = data.get('conversation_id', '')
-        user_message = data.get('user_message', '')
-
-        if not user_message:
-            return None, self.error_response("user_message 不能为空")
-
-        from agent.invoker import AgentRequest
-        agent_request = AgentRequest(
-            username=username,
-            namespace_id=namespace_id,
-            conversation_id=conversation_id,
-            user_message=user_message
-        )
-        return agent_request, None
+    """负责接收 Agent 调用请求并下发同步或流式响应。"""
 
     def invoke(self):
+        """处理一次同步分析请求。"""
         data = self.get_json_data()
-        agent_request, error = self._build_agent_request(data)
-        if error:
-            return error
+        agent_request = _build_agent_request(data)
+        if not agent_request.user_message:
+            return self.error_response('user_message 不能为空')
+
         from agent.invoker import invoke_agent
 
         try:
@@ -53,38 +56,25 @@ class AgentController(BaseController):
             return jsonify(Result.success(data={
                 'username': response.username,
                 'message': response.message,
+                'conversation_id': response.conversation_id,
+                'turn_id': response.turn_id,
                 'file_id': response.file_id,
                 'analysis_report': response.analysis_report,
             }).to_dict())
-        except Exception as e:
-            return self.error_response(f"Agent 执行失败: {str(e)}")
+        except Exception as exc:
+            return self.error_response(f'Agent 执行失败: {str(exc)}')
 
     def stream_invoke(self):
-        data = request.get_json()
-        agent_request, error = self._build_agent_request(data)
-        if error:
-            return error
+        """处理一次流式分析请求，并按 SSE 事件持续输出进度。"""
+        data = self.get_json_data()
+        agent_request = _build_agent_request(data)
+        if not agent_request.user_message:
+            return self.error_response('user_message 不能为空')
+
+        from agent.invoker import stream_invoke_agent
 
         def generate():
-            from agent.invoker import stream_invoke_agent
-            try:
-                for event in stream_invoke_agent(agent_request):
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-            except Exception as e:
-                error_event = {
-                    'type': 'error',
-                    'stage': 'error',
-                    'level': 'error',
-                    'message': f'流式分析失败: {str(e)}'
-                }
-                yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
-                yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+            for event in stream_invoke_agent(agent_request):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
-        return Response(
-            generate(),
-            mimetype='text/event-stream',
-            headers={
-                'Cache-Control': 'no-cache',
-                'X-Accel-Buffering': 'no'
-            }
-        )
+        return Response(generate(), mimetype='text/event-stream')

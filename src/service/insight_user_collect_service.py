@@ -1,49 +1,86 @@
-from typing import Optional, Dict, Any, List
+import json
+from typing import Any
 
-from dao.insight_user_collect_dao import InsightUserCollectDAO
+from sqlalchemy.orm import Session
+
 from model import InsightUserCollect
-from service.base_service import BaseService
 
 
-class InsightUserCollectService(BaseService[InsightUserCollectDAO]):
-    """用户收藏业务逻辑层"""
+def _to_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
-    def __init__(self, dao: InsightUserCollectDAO, beanFactory: Any = None):
-        if beanFactory:
-            beanFactory.insight_user_collect_service = self
-        super().__init__(dao)
 
-    @property
-    def collect_dao(self) -> InsightUserCollectDAO:
-        return self._get_dao()
+def _dump_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
 
-    def find_by_username(self, username: str) -> List[InsightUserCollect]:
-        return self.collect_dao.find_by_username(username)
 
-    def add_collect(self, username: str, insight_context_id: int) -> Dict:
-        """添加收藏"""
-        existing = self.collect_dao.find_by_username_and_context_id(username, insight_context_id)
+class InsightUserCollectService:
+    """收藏查询与操作服务。"""
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    def list_collects(self, username: str, namespace_id: Any = None) -> list[dict[str, Any]]:
+        query = self.session.query(InsightUserCollect).filter(
+            InsightUserCollect.username == username,
+            InsightUserCollect.is_deleted == 0,
+        )
+        namespace_id_int = _to_int(namespace_id, 0)
+        if namespace_id is not None and namespace_id_int > 0:
+            query = query.filter(InsightUserCollect.insight_namespace_id == namespace_id_int)
+        collects = query.order_by(InsightUserCollect.created_at.desc(), InsightUserCollect.id.desc()).all()
+        return [collect.to_dict() for collect in collects]
+
+    def create_collect(
+        self,
+        username: str,
+        collect_type: str,
+        target_id: Any,
+        title: str = '',
+        summary_text: str = '',
+        namespace_id: Any = 0,
+        conversation_id: Any = 0,
+        message_id: Any = 0,
+        artifact_id: Any = 0,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        target_id_int = _to_int(target_id, 0)
+        existing = self.session.query(InsightUserCollect).filter(
+            InsightUserCollect.username == username,
+            InsightUserCollect.collect_type == collect_type,
+            InsightUserCollect.target_id == target_id_int,
+            InsightUserCollect.is_deleted == 0,
+        ).first()
         if existing:
-            return {"success": False, "message": "已收藏"}
+            return existing.to_dict()
 
-        collect = InsightUserCollect(username=username, insight_context_id=insight_context_id)
-        saved = self.collect_dao.save(collect)
-        return {"success": True, "message": "收藏成功", "data": self._to_dict(saved)}
+        collect = InsightUserCollect(
+            username=username,
+            collect_type=collect_type,
+            target_id=target_id_int,
+            title=title or '',
+            summary_text=summary_text or '',
+            insight_namespace_id=_to_int(namespace_id, 0),
+            insight_conversation_id=_to_int(conversation_id, 0),
+            insight_message_id=_to_int(message_id, 0),
+            insight_artifact_id=_to_int(artifact_id, 0),
+            metadata_json=_dump_json(metadata or {}),
+        )
+        self.session.add(collect)
+        self.session.commit()
+        self.session.refresh(collect)
+        return collect.to_dict()
 
-    def remove_collect(self, username: str, insight_context_id: int) -> Dict:
-        """移除收藏"""
-        if self.collect_dao.delete_by_username_and_context_id(username, insight_context_id):
-            return {"success": True, "message": "取消收藏成功"}
-        return {"success": False, "message": "收藏不存在"}
-
-    def is_collected(self, username: str, insight_context_id: int) -> bool:
-        """检查是否已收藏"""
-        return self.collect_dao.find_by_username_and_context_id(username, insight_context_id) is not None
-
-    def _to_dict(self, collect: InsightUserCollect) -> dict:
-        return {
-            "id": collect.id,
-            "username": collect.username,
-            "insight_context_id": collect.insight_context_id,
-            "created_at": collect.created_at.isoformat() if collect.created_at else None
-        }
+    def remove_collect(self, username: str, collect_type: str, target_id: Any) -> bool:
+        target_id_int = _to_int(target_id, 0)
+        deleted = self.session.query(InsightUserCollect).filter(
+            InsightUserCollect.username == username,
+            InsightUserCollect.collect_type == collect_type,
+            InsightUserCollect.target_id == target_id_int,
+            InsightUserCollect.is_deleted == 0,
+        ).update({"is_deleted": 1}, synchronize_session=False)
+        self.session.commit()
+        return bool(deleted)

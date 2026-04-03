@@ -1,84 +1,85 @@
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request
 
+from config.database import SessionLocal
 from controller.base_controller import BaseController
+from dto import get_current_user_context
 from service.insight_ns_conversation_service import InsightNsConversationService
 from utils.response import Result
 
 
-def create_insight_ns_conversation_controller(service: InsightNsConversationService) -> Blueprint:
-    """创建会话控制器"""
-    blueprint = Blueprint('insight_ns_conversation', __name__, url_prefix='/api/insight/conversation')
-    controller = InsightNsConversationController(blueprint, service)
+def create_insight_ns_conversation_controller() -> Blueprint:
+    blueprint = Blueprint('insight_ns_conversation', __name__, url_prefix='/api/insight/conversations')
+    controller = InsightNsConversationController(blueprint)
 
-    blueprint.route('/', methods=['GET'])(controller.get_by_namespace)
-    blueprint.route('/', methods=['POST'])(controller.create)
-    blueprint.route('/<int:conversation_id>', methods=['GET'])(controller.get_by_id)
-    blueprint.route('/<int:conversation_id>', methods=['PUT'])(controller.update)
-    blueprint.route('/<int:conversation_id>', methods=['DELETE'])(controller.delete)
-
+    blueprint.route('', methods=['GET'])(controller.list_conversations)
+    blueprint.route('/<int:conversation_id>', methods=['PUT'])(controller.rename_conversation)
+    blueprint.route('/<int:conversation_id>/history', methods=['GET'])(controller.get_history)
+    blueprint.route('/<int:conversation_id>/turns/<int:turn_id>', methods=['GET'])(controller.get_turn_detail)
     return blueprint
 
 
 class InsightNsConversationController(BaseController):
-    """会话接口控制器"""
+    """会话历史、详情和重命名相关的查询控制器。"""
 
-    def __init__(self, blueprint: Blueprint, service: InsightNsConversationService):
-        super().__init__(blueprint)
-        self._service = service
+    def _get_username(self) -> str:
+        user_context = get_current_user_context()
+        return user_context.username if user_context else 'anonymous'
 
-    def get_by_namespace(self):
+    def list_conversations(self):
+        namespace_id = request.args.get('namespace_id', '0')
+        session = SessionLocal()
+        try:
+            service = InsightNsConversationService(session)
+            conversations = service.list_conversations(
+                username=self._get_username(),
+                namespace_id=namespace_id,
+            )
+            return jsonify(Result.success(data=conversations).to_dict())
+        finally:
+            session.close()
+
+    def rename_conversation(self, conversation_id: int):
         data = self.get_json_data()
-        insight_namespace_id = data.get('insight_namespace_id')
+        title = data.get('title', '')
+        session = SessionLocal()
+        try:
+            service = InsightNsConversationService(session)
+            conversation = service.rename_conversation(
+                username=self._get_username(),
+                conversation_id=conversation_id,
+                title=title,
+            )
+            if conversation is None:
+                return self.error_response('会话不存在', 404)
+            return jsonify(Result.success(data=conversation, message='会话标题已更新').to_dict())
+        finally:
+            session.close()
 
-        if not insight_namespace_id:
-            return self.error_response("缺少insight_namespace_id参数")
+    def get_history(self, conversation_id: int):
+        session = SessionLocal()
+        try:
+            service = InsightNsConversationService(session)
+            history = service.get_conversation_history(
+                username=self._get_username(),
+                conversation_id=conversation_id,
+            )
+            if history is None:
+                return self.error_response('会话不存在', 404)
+            return jsonify(Result.success(data=history).to_dict())
+        finally:
+            session.close()
 
-        conversations = self._service.find_by_namespace_id(insight_namespace_id)
-        return jsonify(Result.success(data=[self._to_dict(c) for c in conversations]).to_dict())
-
-    def get_by_id(self, conversation_id: int):
-        conversation = self._service.find_by_id(conversation_id)
-        if conversation:
-            return self.success_response(self._to_dict(conversation))
-        return self.error_response("会话不存在", 404)
-
-    def create(self):
-        data = self.get_json_data()
-        username = data.get('username')
-        insight_namespace_id = data.get('insight_namespace_id')
-        user_message = data.get('user_message')
-        insight_result = data.get('insight_result', '')
-
-        if not all([username, insight_namespace_id, user_message]):
-            return self.error_response("缺少必要参数")
-
-        result = self._service.create_conversation(username, insight_namespace_id, user_message, insight_result)
-        if result['success']:
-            return self.success_response(result['data'], result['message'], 201)
-        return self.error_response(result['message'], 400)
-
-    def update(self, conversation_id: int):
-        data = self.get_json_data()
-        user_message = data.get('user_message')
-        insight_result = data.get('insight_result')
-
-        result = self._service.update_conversation(conversation_id, user_message, insight_result)
-        if result['success']:
-            return self.success_response(result['data'], result['message'])
-        return self.error_response(result['message'], 400)
-
-    def delete(self, conversation_id: int):
-        result = self._service.delete_conversation(conversation_id)
-        if result['success']:
-            return self.success_response(None, result['message'])
-        return self.error_response(result['message'], 400)
-
-    def _to_dict(self, conversation) -> dict:
-        return {
-            "id": conversation.id,
-            "username": conversation.username,
-            "insight_namespace_id": conversation.insight_namespace_id,
-            "user_message": conversation.user_message,
-            "insight_result": conversation.insight_result,
-            "created_at": conversation.created_at.isoformat() if conversation.created_at else None
-        }
+    def get_turn_detail(self, conversation_id: int, turn_id: int):
+        session = SessionLocal()
+        try:
+            service = InsightNsConversationService(session)
+            detail = service.get_turn_detail(
+                username=self._get_username(),
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+            )
+            if detail is None:
+                return self.error_response('轮次详情不存在', 404)
+            return jsonify(Result.success(data=detail).to_dict())
+        finally:
+            session.close()

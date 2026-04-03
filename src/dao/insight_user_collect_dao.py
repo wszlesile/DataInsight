@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -7,7 +7,7 @@ from model import InsightUserCollect
 
 
 class InsightUserCollectDAO(BaseDAO[InsightUserCollect]):
-    """用户收藏数据访问层"""
+    """用户收藏数据访问层。"""
 
     def __init__(self, session: Session, beanFactory=None):
         if beanFactory:
@@ -15,30 +15,30 @@ class InsightUserCollectDAO(BaseDAO[InsightUserCollect]):
         super().__init__(InsightUserCollect, session)
 
     def find_by_username(self, username: str) -> List[InsightUserCollect]:
-        """根据用户名查询收藏列表"""
-        return self._session.query(InsightUserCollect).filter(
-            InsightUserCollect.username == username
-        ).all()
-
-    def find_by_username_and_context_id(self, username: str, insight_context_id: int) -> Optional[InsightUserCollect]:
-        """根据用户名和上下文ID查询"""
         return self._session.query(InsightUserCollect).filter(
             InsightUserCollect.username == username,
-            InsightUserCollect.insight_context_id == insight_context_id
+            InsightUserCollect.is_deleted == 0,
+        ).all()
+
+    def find_by_username_and_message_id(self, username: str, insight_message_id: int) -> Optional[InsightUserCollect]:
+        return self._session.query(InsightUserCollect).filter(
+            InsightUserCollect.username == username,
+            InsightUserCollect.insight_message_id == insight_message_id,
+            InsightUserCollect.is_deleted == 0,
         ).first()
 
-    def find_by_username_and_context_id_in(self, username: str, context_ids: List[int]) -> List[InsightUserCollect]:
-        """根据用户名和上下文ID列表批量查询"""
+    def find_by_username_and_message_id_in(self, username: str, message_ids: List[int]) -> List[InsightUserCollect]:
         return self._session.query(InsightUserCollect).filter(
             InsightUserCollect.username == username,
-            InsightUserCollect.insight_context_id.in_(context_ids)
+            InsightUserCollect.insight_message_id.in_(message_ids),
+            InsightUserCollect.is_deleted == 0,
         ).all()
 
-    def delete_by_username_and_context_id(self, username: str, insight_context_id: int) -> bool:
-        """根据用户名和上下文ID删除收藏"""
+    def delete_by_username_and_message_id(self, username: str, insight_message_id: int) -> bool:
         self._session.query(InsightUserCollect).filter(
             InsightUserCollect.username == username,
-            InsightUserCollect.insight_context_id == insight_context_id
-        ).delete()
+            InsightUserCollect.insight_message_id == insight_message_id,
+            InsightUserCollect.is_deleted == 0,
+        ).update({"is_deleted": 1}, synchronize_session=False)
         self._session.commit()
         return True

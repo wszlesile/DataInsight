@@ -1,69 +1,85 @@
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request
 
+from config.database import SessionLocal
 from controller.base_controller import BaseController
+from dto import get_current_user_context
 from service.insight_user_collect_service import InsightUserCollectService
 from utils.response import Result
 
 
-def create_insight_user_collect_controller(service: InsightUserCollectService) -> Blueprint:
-    """创建用户收藏控制器"""
-    blueprint = Blueprint('insight_user_collect', __name__, url_prefix='/api/insight/collect')
-    controller = InsightUserCollectController(blueprint, service)
+def create_insight_user_collect_controller() -> Blueprint:
+    blueprint = Blueprint('insight_user_collect', __name__, url_prefix='/api/insight/collects')
+    controller = InsightUserCollectController(blueprint)
 
-    blueprint.route('/', methods=['GET'])(controller.get_by_username)
-    blueprint.route('/', methods=['POST'])(controller.add)
-    blueprint.route('/', methods=['DELETE'])(controller.remove)
-
+    blueprint.route('', methods=['GET'])(controller.list_collects)
+    blueprint.route('', methods=['POST'])(controller.create_collect)
+    blueprint.route('', methods=['DELETE'])(controller.remove_collect)
     return blueprint
 
 
 class InsightUserCollectController(BaseController):
-    """用户收藏接口控制器"""
+    """用户收藏相关接口控制器。"""
 
-    def __init__(self, blueprint: Blueprint, service: InsightUserCollectService):
-        super().__init__(blueprint)
-        self._service = service
+    def _get_username(self) -> str:
+        user_context = get_current_user_context()
+        return user_context.username if user_context else 'anonymous'
 
-    def get_by_username(self):
+    def list_collects(self):
+        namespace_id = request.args.get('namespace_id')
+        session = SessionLocal()
+        try:
+            service = InsightUserCollectService(session)
+            collects = service.list_collects(
+                username=self._get_username(),
+                namespace_id=namespace_id,
+            )
+            return jsonify(Result.success(data=collects).to_dict())
+        finally:
+            session.close()
+
+    def create_collect(self):
         data = self.get_json_data()
-        username = data.get('username')
+        collect_type = data.get('collect_type', '')
+        target_id = data.get('target_id', 0)
+        if not collect_type or not target_id:
+            return self.error_response('缺少 collect_type 或 target_id')
 
-        if not username:
-            return self.error_response("缺少username参数")
+        session = SessionLocal()
+        try:
+            service = InsightUserCollectService(session)
+            collect = service.create_collect(
+                username=self._get_username(),
+                collect_type=collect_type,
+                target_id=target_id,
+                title=data.get('title', ''),
+                summary_text=data.get('summary_text', ''),
+                namespace_id=data.get('insight_namespace_id', 0),
+                conversation_id=data.get('insight_conversation_id', 0),
+                message_id=data.get('insight_message_id', data.get('insight_context_id', 0)),
+                artifact_id=data.get('insight_artifact_id', 0),
+                metadata=data.get('metadata_json') or {},
+            )
+            return jsonify(Result.success(data=collect, message='收藏成功').to_dict())
+        finally:
+            session.close()
 
-        collects = self._service.find_by_username(username)
-        return jsonify(Result.success(data=[self._to_dict(c) for c in collects]).to_dict())
-
-    def add(self):
+    def remove_collect(self):
         data = self.get_json_data()
-        username = data.get('username')
-        insight_context_id = data.get('insight_context_id')
+        collect_type = data.get('collect_type', '')
+        target_id = data.get('target_id', 0)
+        if not collect_type or not target_id:
+            return self.error_response('缺少 collect_type 或 target_id')
 
-        if not all([username, insight_context_id]):
-            return self.error_response("缺少必要参数")
-
-        result = self._service.add_collect(username, insight_context_id)
-        if result['success']:
-            return self.success_response(result['data'], result['message'], 201)
-        return self.error_response(result['message'], 400)
-
-    def remove(self):
-        data = self.get_json_data()
-        username = data.get('username')
-        insight_context_id = data.get('insight_context_id')
-
-        if not all([username, insight_context_id]):
-            return self.error_response("缺少必要参数")
-
-        result = self._service.remove_collect(username, insight_context_id)
-        if result['success']:
-            return self.success_response(None, result['message'])
-        return self.error_response(result['message'], 400)
-
-    def _to_dict(self, collect) -> dict:
-        return {
-            "id": collect.id,
-            "username": collect.username,
-            "insight_context_id": collect.insight_context_id,
-            "created_at": collect.created_at.isoformat() if collect.created_at else None
-        }
+        session = SessionLocal()
+        try:
+            service = InsightUserCollectService(session)
+            removed = service.remove_collect(
+                username=self._get_username(),
+                collect_type=collect_type,
+                target_id=target_id,
+            )
+            if not removed:
+                return self.error_response('收藏不存在', 404)
+            return jsonify(Result.success(message='取消收藏成功').to_dict())
+        finally:
+            session.close()

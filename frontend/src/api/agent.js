@@ -1,20 +1,48 @@
 import axios from 'axios'
 
-const AUTHORIZATION_HEADER = 'Bearer test'
-
 const api = axios.create({
   baseURL: '/api',
   timeout: 120000
 })
 
-api.interceptors.request.use((config) => {
-  config.headers = config.headers || {}
-  config.headers.Authorization = AUTHORIZATION_HEADER
-  return config
-})
-
 export function invokeAgent(params) {
   return api.post('/agent/invoke', params)
+}
+
+export function listConversations(namespaceId) {
+  return api.get('/insight/conversations', {
+    params: {
+      namespace_id: namespaceId
+    }
+  })
+}
+
+export function renameConversation(conversationId, title) {
+  return api.put(`/insight/conversations/${conversationId}`, { title })
+}
+
+export function getConversationHistory(conversationId) {
+  return api.get(`/insight/conversations/${conversationId}/history`)
+}
+
+export function getTurnDetail(conversationId, turnId) {
+  return api.get(`/insight/conversations/${conversationId}/turns/${turnId}`)
+}
+
+export function listCollects(namespaceId) {
+  return api.get('/insight/collects', {
+    params: {
+      namespace_id: namespaceId
+    }
+  })
+}
+
+export function createCollect(payload) {
+  return api.post('/insight/collects', payload)
+}
+
+export function removeCollect(payload) {
+  return api.delete('/insight/collects', { data: payload })
 }
 
 export function streamAgent(params, onMessage, onError, onDone) {
@@ -23,57 +51,30 @@ export function streamAgent(params, onMessage, onError, onDone) {
   fetch('/api/agent/stream', {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
-      Authorization: AUTHORIZATION_HEADER
+      'Content-Type': 'application/json'
     },
     body: JSON.stringify(params),
     signal: controller.signal
   })
     .then(response => {
-      if (!response.ok || !response.body) {
-        throw new Error(`Stream request failed: ${response.status}`)
-      }
-
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
-
-      const emitEvent = (rawEvent) => {
-        const dataLines = rawEvent
-          .split('\n')
-          .filter(line => line.startsWith('data: '))
-          .map(line => line.slice(6))
-
-        if (!dataLines.length) return
-
-        const payload = dataLines.join('\n')
-        try {
-          onMessage(JSON.parse(payload))
-        } catch {
-          onMessage({ type: 'message', message: payload })
-        }
-      }
 
       const read = () => {
         reader.read().then(({ done, value }) => {
           if (done) {
             if (buffer.trim()) {
-              emitEvent(buffer.trim())
+              parseEvents(buffer, onMessage)
             }
             if (onDone) onDone()
             return
           }
 
           buffer += decoder.decode(value, { stream: true })
-          const events = buffer.split('\n\n')
-          buffer = events.pop() || ''
-
-          for (const rawEvent of events) {
-            if (rawEvent.trim()) {
-              emitEvent(rawEvent.trim())
-            }
-          }
-
+          const segments = buffer.split('\n\n')
+          buffer = segments.pop() || ''
+          segments.forEach(segment => parseEvents(segment, onMessage))
           read()
         })
       }
@@ -87,6 +88,24 @@ export function streamAgent(params, onMessage, onError, onDone) {
     })
 
   return controller
+}
+
+function parseEvents(segment, onMessage) {
+  const lines = segment.split('\n')
+  lines.forEach(line => {
+    if (!line.startsWith('data: ')) return
+    const payload = line.slice(6).trim()
+    if (!payload) return
+    try {
+      onMessage(JSON.parse(payload))
+    } catch (error) {
+      onMessage({
+        type: 'message',
+        level: 'warning',
+        message: payload
+      })
+    }
+  })
 }
 
 export default api

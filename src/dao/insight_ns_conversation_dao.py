@@ -17,25 +17,29 @@ class InsightNsConversationDAO(BaseDAO[InsightNsConversation]):
     def find_by_namespace_id(self, insight_namespace_id: int) -> List[InsightNsConversation]:
         """根据洞察空间ID查询会话列表"""
         return self._session.query(InsightNsConversation).filter(
-            InsightNsConversation.insight_namespace_id == insight_namespace_id
+            InsightNsConversation.insight_namespace_id == insight_namespace_id,
+            InsightNsConversation.is_deleted == 0,
         ).all()
 
     def find_by_username(self, username: str) -> List[InsightNsConversation]:
         """根据用户名查询会话列表"""
         return self._session.query(InsightNsConversation).filter(
-            InsightNsConversation.username == username
+            InsightNsConversation.username == username,
+            InsightNsConversation.is_deleted == 0,
         ).all()
 
     def find_by_namespace_id_and_created_at_desc(self, insight_namespace_id: int) -> List[InsightNsConversation]:
         """根据洞察空间ID查询会话列表（按创建时间倒序）"""
         return self._session.query(InsightNsConversation).filter(
-            InsightNsConversation.insight_namespace_id == insight_namespace_id
+            InsightNsConversation.insight_namespace_id == insight_namespace_id,
+            InsightNsConversation.is_deleted == 0,
         ).order_by(InsightNsConversation.created_at.desc()).all()
 
     def delete_by_namespace_id(self, insight_namespace_id: int) -> bool:
         """根据洞察空间ID删除所有会话"""
         self._session.query(InsightNsConversation).filter(
-            InsightNsConversation.insight_namespace_id == insight_namespace_id
-        ).delete()
+            InsightNsConversation.insight_namespace_id == insight_namespace_id,
+            InsightNsConversation.is_deleted == 0,
+        ).update({"is_deleted": 1}, synchronize_session=False)
         self._session.commit()
         return True

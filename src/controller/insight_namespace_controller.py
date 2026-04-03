@@ -6,7 +6,7 @@ from utils.response import Result
 
 
 def create_insight_namespace_controller(service: InsightNamespaceService) -> Blueprint:
-    """创建洞察空间控制器"""
+    """创建洞察空间控制器。"""
     blueprint = Blueprint('insight_namespace', __name__, url_prefix='/api/insight/namespace')
     controller = InsightNamespaceController(blueprint, service)
 
@@ -20,7 +20,7 @@ def create_insight_namespace_controller(service: InsightNamespaceService) -> Blu
 
 
 class InsightNamespaceController(BaseController):
-    """洞察空间接口控制器"""
+    """洞察空间接口控制器。"""
 
     def __init__(self, blueprint: Blueprint, service: InsightNamespaceService):
         super().__init__(blueprint)
@@ -29,7 +29,7 @@ class InsightNamespaceController(BaseController):
     def get_by_username(self):
         username = self.get_json_data().get('username')
         if not username:
-            return self.error_response("缺少username参数")
+            return self.error_response("缺少 username 参数")
 
         namespaces = self._service.find_by_username(username)
         return jsonify(Result.success(data=[self._to_dict(ns) for ns in namespaces]).to_dict())
@@ -58,7 +58,7 @@ class InsightNamespaceController(BaseController):
         name = data.get('name')
 
         if not name:
-            return self.error_response("缺少name参数")
+            return self.error_response("缺少 name 参数")
 
         result = self._service.update_namespace(namespace_id, name)
         if result['success']:
@@ -76,5 +76,5 @@ class InsightNamespaceController(BaseController):
             "id": namespace.id,
             "username": namespace.username,
             "name": namespace.name,
-            "created_at": namespace.created_at.isoformat() if namespace.created_at else None
+            "created_at": namespace.created_at.isoformat() if namespace.created_at else None,
         }

@@ -2,10 +2,25 @@ from utils.json_utils import JSONEncoder, to_json, from_json
 from utils.validators import Validators
 from utils.response import Result
 from utils.logger import Logger, logger
+from utils.datasource_utils import (
+    DEFAULT_CONVERSATION_TITLE,
+    DATASOURCE_TYPE_MAPPING,
+    build_conversation_title,
+    dump_json,
+    extract_datasource_identifier,
+    extract_datasource_schema,
+    normalize_datasource_type,
+    safe_json_loads,
+    to_int,
+)
 
 __all__ = [
     'JSONEncoder', 'to_json', 'from_json',
     'Validators',
     'Result',
-    'Logger', 'logger'
+    'Logger', 'logger',
+    'DEFAULT_CONVERSATION_TITLE', 'DATASOURCE_TYPE_MAPPING',
+    'build_conversation_title', 'dump_json', 'extract_datasource_identifier',
+    'extract_datasource_schema', 'normalize_datasource_type',
+    'safe_json_loads', 'to_int',
 ]

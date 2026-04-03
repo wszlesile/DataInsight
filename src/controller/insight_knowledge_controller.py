@@ -6,7 +6,7 @@ from utils.response import Result
 
 
 def create_insight_knowledge_controller(service: InsightKnowledgeService) -> Blueprint:
-    """创建知识库控制器"""
+    """创建知识资源控制器。"""
     blueprint = Blueprint('insight_knowledge', __name__, url_prefix='/api/insight/knowledge')
     controller = InsightKnowledgeController(blueprint, service)
 
@@ -20,7 +20,7 @@ def create_insight_knowledge_controller(service: InsightKnowledgeService) -> Blu
 
 
 class InsightKnowledgeController(BaseController):
-    """知识库接口控制器"""
+    """知识资源接口控制器。"""
 
     def __init__(self, blueprint: Blueprint, service: InsightKnowledgeService):
         super().__init__(blueprint)
@@ -34,7 +34,7 @@ class InsightKnowledgeController(BaseController):
         knowledge = self._service.find_by_id(knowledge_id)
         if knowledge:
             return self.success_response(self._to_dict(knowledge))
-        return self.error_response("知识库不存在", 404)
+        return self.error_response("知识资源不存在", 404)
 
     def create(self):
         data = self.get_json_data()
@@ -62,12 +62,12 @@ class InsightKnowledgeController(BaseController):
     def delete(self, knowledge_id: int):
         if self._service.delete(knowledge_id):
             return self.success_response(None, "删除成功")
-        return self.error_response("知识库不存在", 404)
+        return self.error_response("知识资源不存在", 404)
 
     def _to_dict(self, knowledge) -> dict:
         return {
             "id": knowledge.id,
             "knowledge_name": knowledge.knowledge_name,
             "file_id": knowledge.file_id,
-            "created_at": knowledge.created_at.isoformat() if knowledge.created_at else None
+            "created_at": knowledge.created_at.isoformat() if knowledge.created_at else None,
         }

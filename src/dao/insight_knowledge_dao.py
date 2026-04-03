@@ -17,11 +17,13 @@ class InsightKnowledgeDAO(BaseDAO[InsightKnowledge]):
     def find_by_name(self, knowledge_name: str) -> Optional[InsightKnowledge]:
         """根据知识库名称查询"""
         return self._session.query(InsightKnowledge).filter(
-            InsightKnowledge.knowledge_name == knowledge_name
+            InsightKnowledge.knowledge_name == knowledge_name,
+            InsightKnowledge.is_deleted == 0,
         ).first()
 
     def find_by_file_id(self, file_id: str) -> Optional[InsightKnowledge]:
         """根据文件ID查询"""
         return self._session.query(InsightKnowledge).filter(
-            InsightKnowledge.file_id == file_id
+            InsightKnowledge.file_id == file_id,
+            InsightKnowledge.is_deleted == 0,
         ).first()

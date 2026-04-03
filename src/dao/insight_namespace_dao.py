@@ -16,11 +16,15 @@ class InsightNamespaceDAO(BaseDAO[InsightNamespace]):
 
     def find_by_username(self, username: str) -> List[InsightNamespace]:
         """根据用户名查询洞察空间列表"""
-        return self._session.query(InsightNamespace).filter(InsightNamespace.username == username).all()
+        return self._session.query(InsightNamespace).filter(
+            InsightNamespace.username == username,
+            InsightNamespace.is_deleted == 0,
+        ).all()
 
     def find_by_username_and_name(self, username: str, name: str) -> Optional[InsightNamespace]:
         """根据用户名和名称查询洞察空间"""
         return self._session.query(InsightNamespace).filter(
             InsightNamespace.username == username,
-            InsightNamespace.name == name
+            InsightNamespace.name == name,
+            InsightNamespace.is_deleted == 0,
         ).first()

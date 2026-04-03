@@ -1,138 +1,243 @@
 import json
-from typing import Dict, List
+from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from pydantic import BaseModel
 
 from config.config import Config
+from config.database import SessionLocal
+from model import InsightDatasource, InsightNsConversation, InsightNsExecution, InsightNsRelDatasource
+from service.conversation_context_service import ConversationContextService
+from utils.datasource_utils import (
+    extract_datasource_identifier,
+    extract_datasource_schema,
+    normalize_datasource_type,
+    safe_json_loads,
+    to_int,
+)
 
 
 class CustomContext(BaseModel):
-    """自定义上下文"""
+    """在 Agent 编排与工具执行链路中传递的运行时上下文。"""
+
     username: str
+    namespace_id: int = 0
+    conversation_id: int = 0
+    turn_id: int = 0
 
 
-def get_history_message():
-    return HumanMessage("无历史对话记录")
-
-
-class SchemaProperty(BaseModel):
-    property_type: str = Field(description='属性类型')
-    name: str = Field(description='属性名称')
-    description: str = Field(description='属性描述')
-
-
-class DataSourceSchema(BaseModel):
-    schema_type: int = Field(description='数据类型')
-    identify:str = Field(description='数据标识')
-    name: str = Field(description='数据名称')
-    description: str = Field(description='数据描述')
-    properties: Dict[str, SchemaProperty] = Field(default_factory=dict, description='数据属性')
-    required: list = Field(default_factory=list, description='必填属性')
-
-#系统配置上下文
-def get_system_config_messages():
-    path = Config.TEMP_DIR
-    return HumanMessage(
-        f'''系统配置信息：
-- 图表文件临时保存目录：{path}
-- **重要**：在生成的代码中，必须将此目录赋值给变量 temp_dir，例如：temp_dir = "{path}"'''
-    )
-
-
-def get_test_local_file_datasource_schema() -> DataSourceSchema:
-    properties = {
-        '月份': SchemaProperty(property_type='string', name='月份', description='月份'),
-        '产品名称': SchemaProperty(property_type='string', name='产品名称', description='产品名称'),
-        '销售额(元)': SchemaProperty(property_type='double', name='销售额', description='销售额(元)'),
-        '销量': SchemaProperty(property_type='integer', name='销量', description='销量'),
-        '销售单价': SchemaProperty(property_type='double', name='销售单价', description='销售单价'),
-        '区域': SchemaProperty(property_type='string', name='区域', description='区域'),
+def _build_datasource_payload_item(datasource: InsightDatasource) -> dict[str, Any]:
+    """把数据源实体转换成 Prompt 约定的 JSON 结构。"""
+    config_json = safe_json_loads(datasource.datasource_config_json, {})
+    return {
+        "datasource_id": datasource.id,
+        "datasource_type": normalize_datasource_type(datasource.datasource_type),
+        "datasource_name": datasource.datasource_name,
+        "datasource_identifier": extract_datasource_identifier(datasource, config_json),
+        "metadata_schema": extract_datasource_schema(datasource, config_json),
     }
-    s = DataSourceSchema(
-        schema_type=1,
-        identify='xiaoshou',
-        name='销售记录表',
-        description='统计了各个年月份各个产品的销售额',
-        properties=properties,
-        required=[]
-    )
-    return s
-def get_test_local_sql_datasource_schema() -> List[DataSourceSchema]:
-    # 报警记录表 schema
-    alarm_record_properties = {
-        'id': SchemaProperty(property_type='integer', name='自增编码', description='自增编码，主键'),
-        'ar_code': SchemaProperty(property_type='string', name='报警编码', description='报警编码，规则：ARCode + YYYYMMDD + 4位日序号'),
-        'tagname': SchemaProperty(property_type='string', name='位号', description='位号'),
-        'show_name': SchemaProperty(property_type='string', name='报警名称', description='报警名称'),
-        'description': SchemaProperty(property_type='string', name='报警描述', description='报警描述'),
-        'alarm_type': SchemaProperty(property_type='string', name='报警类型', description='报警类型：超限报警、ON/OFF报警'),
-        'priority': SchemaProperty(property_type='integer', name='报警优先级', description='报警优先级：1-10，1为最高'),
-        'limit_condition': SchemaProperty(property_type='string', name='报警条件', description='报警条件'),
-        'start_timestamp': SchemaProperty(property_type='string', name='报警产生时间', description='报警产生时间'),
-        'new_value': SchemaProperty(property_type='double', name='触发报警的值', description='触发报警的值'),
-        'disappeared_timestamp': SchemaProperty(property_type='string', name='报警消除时间', description='报警消除时间'),
-        'created_time': SchemaProperty(property_type='string', name='创建时间', description='创建时间'),
+
+
+def _build_execution_context_item(execution: InsightNsExecution, include_code: bool = False) -> dict[str, Any]:
+    """构造一条适合写入记忆消息的执行摘要。"""
+    payload = {
+        "execution_id": execution.id,
+        "turn_id": execution.turn_id,
+        "title": execution.title,
+        "description": execution.description,
+        "execution_status": execution.execution_status,
+        "analysis_report": execution.analysis_report,
+        "result_file_id": execution.result_file_id,
+        "error_message": execution.error_message,
+        "execution_seconds": execution.execution_seconds,
+        "finished_at": execution.finished_at.isoformat() if execution.finished_at else None,
     }
-    alarm_record_schema = DataSourceSchema(
-        schema_type=3,
-        identify='baojingjilubiao',
-        name='报警记录表',
-        description='记录设备或系统的报警事件，包含报警编码、位号、报警类型、优先级、触发值等信息',
-        properties=alarm_record_properties,
-        required=['id', 'ar_code', 'tagname', 'start_timestamp']
+    if include_code:
+        payload["generated_code"] = execution.generated_code or ''
+    else:
+        payload["generated_code_preview"] = (execution.generated_code or '')[:1200]
+    return payload
+
+
+def _load_conversation(conversation_id: int) -> InsightNsConversation | None:
+    """按会话 ID 加载一条未删除的会话记录。"""
+    if conversation_id <= 0:
+        return None
+
+    session = SessionLocal()
+    try:
+        return session.query(InsightNsConversation).filter(
+            InsightNsConversation.id == conversation_id,
+            InsightNsConversation.is_deleted == 0,
+        ).first()
+    finally:
+        session.close()
+
+
+def _load_conversation_datasources(conversation_id: int) -> list[InsightDatasource]:
+    """加载当前会话绑定的全部有效数据源。"""
+    if conversation_id <= 0:
+        return []
+
+    session = SessionLocal()
+    try:
+        return session.query(InsightDatasource).join(
+            InsightNsRelDatasource,
+            InsightNsRelDatasource.datasource_id == InsightDatasource.id,
+        ).filter(
+            InsightNsRelDatasource.insight_conversation_id == conversation_id,
+            InsightNsRelDatasource.is_deleted == 0,
+            InsightDatasource.is_deleted == 0,
+        ).order_by(
+            InsightNsRelDatasource.sort_no.asc(),
+            InsightNsRelDatasource.id.asc(),
+        ).all()
+    finally:
+        session.close()
+
+
+def get_system_config_message() -> SystemMessage:
+    """注入代码生成阶段需要读取的运行时系统配置。"""
+    temp_dir = Config.TEMP_DIR
+    return SystemMessage(
+        "\n".join([
+            "系统配置：",
+            f"- 图表临时目录: {temp_dir}",
+            f'- 生成代码时必须显式设置 temp_dir = "{temp_dir}"',
+        ])
     )
 
-    # 报警工单表 schema
-    alarm_treatment_properties = {
-        'id': SchemaProperty(property_type='integer', name='自增编码', description='自增编码，主键'),
-        'work_order_code': SchemaProperty(property_type='string', name='工单编码', description='工单编码，规则：AROrder + YYYYMMDD + 4位日序号'),
-        'alarm_record_id': SchemaProperty(property_type='integer', name='报警记录ID', description='报警编码，关联报警记录表ID'),
-        'alarm_status': SchemaProperty(property_type='integer', name='工单处理状态', description='工单处理状态：1-未处理，2-已确认'),
-        'completion_time': SchemaProperty(property_type='string', name='处理完成时间', description='处理完成时间'),
-        'alarm_cause': SchemaProperty(property_type='string', name='问题原因', description='问题原因'),
-        'corrective_action': SchemaProperty(property_type='string', name='纠正预防措施', description='纠正预防措施'),
-        'remarks': SchemaProperty(property_type='string', name='备注', description='备注'),
-        'attachments': SchemaProperty(property_type='string', name='附件', description='附件，存储JSON格式'),
-        'created_time': SchemaProperty(property_type='string', name='创建时间', description='创建时间'),
-    }
-    alarm_treatment_schema = DataSourceSchema(
-        schema_type=3,
-        identify='baojinggongdanbiao',
-        name='报警工单表',
-        description='记录报警工单的处理信息，包含工单编码、报警记录ID、处理状态、问题原因、纠正预防措施等',
-        properties=alarm_treatment_properties,
-        required=['id', 'work_order_code', 'alarm_record_id']
-    )
 
-    return [alarm_record_schema, alarm_treatment_schema]
-def get_datasource_messages(user_message: str):
-    # rag 召回 todo
-    # 本地文件数据源
-    local_schema: DataSourceSchema = get_test_local_file_datasource_schema()
-    # 数据库数据源（报警记录表、报警工单表）
-    sql_schemas: List[DataSourceSchema] = get_test_local_sql_datasource_schema()
+def get_datasource_message(namespace_id: int, conversation_id: int) -> SystemMessage | None:
+    """
+    注入 `sys_prompt.md` 约定的数据源上下文。
 
-    # 构建符合数据源上下文格式的消息
-    datasource_list = [
-        {
-            "数据源类型": "本地文件",
-            "数据源名称": local_schema.name,
-            "数据源标识": "D:\\PycharmProjects\\DataInsight\\xiaoshou.csv",
-            "元数据Schema": local_schema.model_dump()
-        }
+    前端不会直接传入完整数据源定义，
+    运行时数据源信息以后端数据库中的会话绑定关系为准。
+    """
+    namespace_id_int = to_int(namespace_id, 0)
+    conversation_id_int = to_int(conversation_id, 0)
+    if conversation_id_int <= 0 and namespace_id_int <= 0:
+        return None
+
+    snapshot: dict[str, Any] = {}
+    session = SessionLocal()
+    try:
+        snapshot = ConversationContextService(session).get_active_datasource_snapshot(conversation_id_int)
+    finally:
+        session.close()
+
+    conversation = _load_conversation(conversation_id_int)
+    if conversation is not None:
+        namespace_id_int = conversation.insight_namespace_id
+    elif namespace_id_int <= 0:
+        namespace_id_int = to_int(snapshot.get('namespace_id'), 0)
+
+    datasource_items = [
+        _build_datasource_payload_item(datasource)
+        for datasource in _load_conversation_datasources(conversation_id_int)
     ]
+    if not datasource_items:
+        return None
 
-    # 添加数据库数据源
-    for sql_schema in sql_schemas:
-        datasource_list.append({
-            "数据源类型": "数据库",
-            "数据源名称": sql_schema.name,
-            "数据源标识": sql_schema.identify,
-            "元数据Schema": sql_schema.model_dump()
-        })
+    payload: dict[str, Any] = {"datasources": datasource_items}
+    selected_ids = [
+        to_int(item, 0)
+        for item in snapshot.get('selected_datasource_ids', [])
+        if to_int(item, 0) > 0
+    ]
+    if selected_ids:
+        payload["selected_datasource_ids"] = selected_ids
+    if namespace_id_int > 0:
+        payload["namespace_id"] = namespace_id_int
 
-    datasource_context = {"数据源列表": datasource_list}
-    datasource_json = json.dumps(datasource_context, indent=2, ensure_ascii=False)
-    schema = HumanMessage(f'数据源上下文：\n{datasource_json}')
-    return schema
+    return SystemMessage(
+        "当前洞察空间可用的数据源信息：\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def get_history_messages(conversation_id: int) -> list[Any]:
+    """加载最近的用户问题和最终回答消息，用于历史上下文重放。"""
+    if not conversation_id:
+        return []
+
+    session = SessionLocal()
+    try:
+        service = ConversationContextService(session)
+        messages = service.get_recent_prompt_messages(conversation_id, limit_messages=10)
+    finally:
+        session.close()
+
+    result: list[Any] = []
+    for item in messages:
+        text = (item.content or '').strip()
+        if not text:
+            continue
+        # 原始历史重放只带用户问题和助手最终回答。
+        # 工具与执行细节会通过记忆消息单独注入。
+        if item.role == 'user':
+            result.append(HumanMessage(text))
+        elif item.role == 'assistant':
+            result.append(AIMessage(text))
+    return result
+
+
+def get_memory_messages(conversation_id: int) -> list[SystemMessage]:
+    """
+    构造下一轮分析使用的压缩记忆消息。
+
+    这里负责把数据库中的上下文工程结果重新翻译成可直接注入 Prompt 的系统消息。
+    """
+    if not conversation_id:
+        return []
+
+    session = SessionLocal()
+    try:
+        service = ConversationContextService(session)
+        messages: list[SystemMessage] = []
+
+        summary_memory = service.get_memory(conversation_id, 'rolling_summary')
+        if summary_memory:
+            payload = json.loads(summary_memory.content_json or '{}')
+            summary_text = payload.get('summary_text', '')
+            if summary_text:
+                messages.append(SystemMessage(f"历史摘要：\n{summary_text}"))
+
+        analysis_state_memory = service.get_memory(conversation_id, 'analysis_state')
+        if analysis_state_memory:
+            payload = json.loads(analysis_state_memory.content_json or '{}')
+            messages.append(SystemMessage(
+                "当前分析状态：\n"
+                f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+            ))
+
+        recent_executions = service.get_recent_executions(conversation_id, limit_items=3)
+        if recent_executions:
+            execution_payload = [
+                _build_execution_context_item(execution)
+                for execution in recent_executions
+            ]
+            messages.append(SystemMessage(
+                "最近代码执行记录：\n"
+                f"{json.dumps(execution_payload, ensure_ascii=False, indent=2)}"
+            ))
+
+            latest_execution = recent_executions[-1]
+            if latest_execution.generated_code:
+                messages.append(SystemMessage(
+                    "最近一次成功或最新执行的 Python 分析代码：\n"
+                    f"{latest_execution.generated_code}"
+                ))
+
+        recent_artifacts = service.get_recent_artifacts(conversation_id, limit_items=3)
+        if recent_artifacts:
+            artifact_payload = [artifact.to_dict() for artifact in recent_artifacts]
+            messages.append(SystemMessage(
+                "最近派生产物摘要：\n"
+                f"{json.dumps(artifact_payload, ensure_ascii=False, indent=2)}"
+            ))
+
+        return messages
+    finally:
+        session.close()
