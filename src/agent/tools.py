@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import time
@@ -338,9 +339,100 @@ def _get_stream_emitter():
     return emit
 
 
-def _tool_error_message(message: str, tool_call_id: str) -> ToolMessage:
-    """构造统一的工具错误消息，供 Agent 循环继续处理。"""
-    return ToolMessage(content=message, tool_call_id=tool_call_id)
+def _classify_execution_error(error: Exception | None, error_message: str) -> str:
+    """把执行失败归类成更容易被模型理解的错误类型。"""
+    if isinstance(error, SyntaxError):
+        return 'syntax_error'
+    if isinstance(error, ModuleNotFoundError):
+        return 'missing_dependency'
+    if isinstance(error, FileNotFoundError):
+        return 'data_source_not_found'
+    if isinstance(error, KeyError):
+        return 'schema_or_column_mismatch'
+    if isinstance(error, NameError):
+        return 'undefined_name'
+
+    lowered = (error_message or '').lower()
+    if 'invalid comparison' in lowered or ('datetime' in lowered and 'timestamp' in lowered):
+        return 'data_type_or_time_mismatch'
+    if 'not in index' in lowered or 'no such column' in lowered:
+        return 'schema_or_column_mismatch'
+    if 'save_analysis_result' in lowered or 'analysis_report' in lowered or 'result' in lowered:
+        return 'result_contract_error'
+    return 'runtime_error'
+
+
+def _build_repair_instructions(error_type: str) -> list[str]:
+    """根据错误类型生成定向修复建议。"""
+    common_instructions = [
+        '重新生成完整可执行代码，不要只修改局部片段。',
+        '保留 save_analysis_result(...) 并把返回值赋给 result。',
+        '如果当前修正思路与上一次相同且未解决错误，请更换实现方式后再重试。',
+    ]
+
+    specific_instructions = {
+        'syntax_error': [
+            '先检查引号、括号、缩进和多行字符串是否闭合，再重新生成代码。',
+            '构造分析报告时优先使用 report_sections/report_lines 加 "\\n\\n".join(...)，避免手写长字符串拼接。',
+        ],
+        'missing_dependency': [
+            '不要依赖执行环境中未注入或未安装的第三方模块。',
+            '优先使用当前工具已提供的内置辅助函数，而不是额外 import 新库。',
+        ],
+        'data_source_not_found': [
+            '检查数据源标识、文件路径、表名或接口地址是否与当前数据源上下文一致。',
+            '不要凭空假设新的文件路径或表名。',
+        ],
+        'schema_or_column_mismatch': [
+            '字段选择必须以 metadata_schema.properties 中提供的真实字段名为准。',
+            '重新检查 DataFrame 列名后再生成过滤、聚合和展示逻辑。',
+        ],
+        'undefined_name': [
+            '重新检查变量名、函数名和 import 是否一致，避免引用未定义对象。',
+            '尽量复用前面已经定义好的中间变量，不要混用多个命名。',
+        ],
+        'data_type_or_time_mismatch': [
+            '先统一时间列或比较字段的数据类型，再进行过滤或比较。',
+            '遇到相对日期或时区处理时，优先考虑使用 get_day_range() 并保证两侧都是可比较的带时区时间对象。',
+        ],
+        'result_contract_error': [
+            '最终必须产出完整 analysis_report，并调用 save_analysis_result(chart_path, analysis_report)。',
+            '不要遗漏 result 变量，也不要返回空的 analysis_report。',
+        ],
+        'runtime_error': [
+            '根据 error_message 直接修正导致失败的那一步，再重新生成完整代码。',
+            '如果错误发生在数据处理阶段，请先验证中间结果再进入图表和报告生成。',
+        ],
+    }
+    return [*specific_instructions.get(error_type, specific_instructions['runtime_error']), *common_instructions]
+
+
+def _tool_error_message(
+    *,
+    tool_call_id: str,
+    error_type: str,
+    error_message: str,
+    repair_instructions: list[str],
+    stdout_text: str = '',
+    stderr_text: str = '',
+) -> ToolMessage:
+    """构造统一的结构化工具错误反馈，供 Agent 循环继续修正。"""
+    payload = {
+        'tool': 'execute_python',
+        'status': 'failed',
+        'error_type': error_type,
+        'error_message': error_message,
+        'repair_instructions': repair_instructions,
+    }
+    if stdout_text:
+        payload['stdout_text'] = stdout_text[:1000]
+    if stderr_text:
+        payload['stderr_text'] = stderr_text[:1000]
+
+    return ToolMessage(
+        content=json.dumps(payload, ensure_ascii=False),
+        tool_call_id=tool_call_id,
+    )
 
 
 @tool(description='执行 Python 代码工具', args_schema=ExePythonCodeInput)
@@ -397,6 +489,8 @@ def execute_python(
             exec_result = namespace.get('result')
         except Exception as exc:
             error_message = str(exc)
+            error_type = _classify_execution_error(exc, error_message)
+            repair_instructions = _build_repair_instructions(error_type)
             stdout_text = _sanitize_tool_output(stdout_buffer.getvalue())
             stderr_text = _sanitize_tool_output(stderr_buffer.getvalue())
             _update_execution_record(
@@ -412,11 +506,15 @@ def execute_python(
                 stage='tool_error',
                 level='error',
                 tool='execute_python',
-                message=f'代码执行失败：{error_message}',
+                message=f'代码执行失败（{error_type}）：{error_message}',
             )
             return _tool_error_message(
-                f"执行 Python 代码工具错误，请检查后重新生成：{error_message}",
-                runtime.tool_call_id,
+                tool_call_id=runtime.tool_call_id,
+                error_type=error_type,
+                error_message=error_message,
+                repair_instructions=repair_instructions,
+                stdout_text=stdout_text,
+                stderr_text=stderr_text,
             )
         finally:
             stdout_text = _sanitize_tool_output(stdout_buffer.getvalue())
@@ -493,6 +591,10 @@ def execute_python(
         message='生成的代码未按模板返回 result，正在请求模型修正。',
     )
     return _tool_error_message(
-        '请重新生成，没有按照代码输出模板严格生成执行代码。',
-        runtime.tool_call_id,
+        tool_call_id=runtime.tool_call_id,
+        error_type='result_contract_error',
+        error_message='生成的代码未按模板产出 result',
+        repair_instructions=_build_repair_instructions('result_contract_error'),
+        stdout_text=stdout_text,
+        stderr_text=stderr_text,
     )
