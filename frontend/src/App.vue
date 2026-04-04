@@ -1,86 +1,106 @@
 <template>
-  <div class="app-container">
-    <Sidebar
-      :spaces="spaces"
-      :active-space="activeNamespace"
-      :conversations="conversations"
-      :collects="collects"
-      :active-conversation-id="activeConversationId"
-      @select-space="onSelectSpace"
-      @delete-space="onDeleteSpace"
-      @select-conversation="onSelectConversation"
-      @rename-conversation="onRenameConversation"
-      @select-collect="onSelectCollect"
-      @new-space="onNewSpace"
-    />
-
-    <div class="main-content">
-      <div class="content-header">
-        <div class="tabs">
-          <span
-            v-for="tab in spaces"
-            :key="tab.id"
-            class="tab"
-            :class="{ active: activeNamespace === tab.id }"
-            @click="onSelectSpace(tab)"
-          >
-            {{ tab.name }}
-          </span>
-        </div>
-
-        <div class="header-meta">
-          <span v-if="activeConversation">
-            当前会话：{{ activeConversation.title || `会话 #${activeConversation.id}` }}
-          </span>
-          <span v-else>新会话草稿</span>
-          <el-button v-if="activeConversation" size="small" @click="onRenameConversation(activeConversation)">
-            重命名
-          </el-button>
-          <el-button
-            v-if="activeConversation"
-            size="small"
-            @click="toggleConversationCollect"
-          >
-            {{ isCollected('conversation', activeConversation.id) ? '取消收藏会话' : '收藏会话' }}
-          </el-button>
+  <div class="app-shell">
+    <header class="top-nav">
+      <div class="logo">
+        <div class="logo-icon">DI</div>
+        <div>
+          <div class="logo-title">Data Insight</div>
+          <div class="logo-subtitle">数据洞察智能助手</div>
         </div>
       </div>
 
-      <div class="content-body">
-        <div class="left-panel">
-          <DataSourcePanel @data-source-change="onDataSourceChange" />
-        </div>
+      <div class="nav-actions">
+        <button class="nav-icon" type="button" @click="showHelp">?</button>
+        <button class="nav-icon" type="button" @click="favoritesPanelVisible = true">
+          ★
+          <span v-if="collects.length" class="badge">{{ collects.length }}</span>
+        </button>
+        <div class="user-avatar">AI</div>
+      </div>
+    </header>
 
-        <div class="right-panel">
-          <div class="chat-window">
-            <div ref="messagesContainer" class="messages">
-              <template v-for="(item, index) in chatHistory" :key="`${item.turnId || index}-${index}`">
-                <div class="message user">
-                  <div class="message-avatar">U</div>
-                  <div class="message-content">{{ item.question }}</div>
-                </div>
+    <div class="main-container">
+      <Sidebar
+        :spaces="spaces"
+        :active-space="activeNamespace"
+        :conversations="conversations"
+        :collects="collects"
+        :active-conversation-id="activeConversationId"
+        @select-space="onSelectSpace"
+        @delete-space="onDeleteSpace"
+        @new-space="onNewSpace"
+        @open-favorites="favoritesPanelVisible = true"
+        @open-knowledge="showKnowledgePlaceholder"
+      />
 
-                <div class="message-actions">
-                  <el-button size="small" text @click="openTurnDetail(item.turnId)">查看详情</el-button>
-                  <el-button
-                    size="small"
-                    text
-                    @click="toggleCollect({
-                      collectType: 'turn',
-                      targetId: item.turnId,
-                      title: item.question,
-                      summaryText: item.report,
-                      conversationId: activeConversationId,
-                      metadata: { turn_id: item.turnId }
-                    })"
-                  >
-                    {{ isCollected('turn', item.turnId) ? '取消收藏' : '收藏本轮' }}
-                  </el-button>
-                </div>
+      <div class="right-area">
+        <DataSourcePanel
+          :active-space-name="activeSpaceName"
+          :active-conversation="activeConversation"
+          :selected-data-source="currentDataSource"
+          @data-source-change="onDataSourceChange"
+        />
 
-                <div v-if="item.progressItems?.length" class="message progress-feed">
-                  <div class="message-avatar">AI</div>
-                  <div class="message-content">
+        <section class="chat-panel">
+          <div class="chat-header">
+            <div class="chat-title">
+              <span class="chat-title-icon">🤖</span>
+              <div>
+                <div>数据洞察助手</div>
+                <div class="chat-subtitle">{{ activeConversation?.title || '新会话已创建，输入问题开始分析' }}</div>
+              </div>
+            </div>
+
+            <div class="chat-header-actions">
+              <button
+                v-if="activeConversation"
+                class="action-btn"
+                type="button"
+                @click="onRenameConversation(activeConversation)"
+              >
+                重命名
+              </button>
+              <button
+                v-if="activeConversation"
+                class="action-btn"
+                type="button"
+                @click="toggleConversationCollect"
+              >
+                {{ isCollected('conversation', activeConversation.id) ? '取消收藏会话' : '收藏会话' }}
+              </button>
+            </div>
+          </div>
+
+          <div ref="messagesContainer" class="chat-messages">
+            <div v-if="chatHistory.length === 0 && !currentQuestion" class="welcome-card">
+              <div class="welcome-icon">📊</div>
+              <div class="welcome-title">你好，我是数据洞察助手</div>
+              <div class="welcome-subtitle">
+                我会结合当前洞察空间、会话上下文和分析执行能力，帮助你完成多轮持续的数据分析与图表生成。
+              </div>
+              <div class="quick-actions">
+                <button
+                  v-for="prompt in quickPrompts"
+                  :key="prompt"
+                  class="quick-action"
+                  type="button"
+                  @click="useQuickPrompt(prompt)"
+                >
+                  {{ prompt }}
+                </button>
+              </div>
+            </div>
+
+            <template v-for="(item, index) in chatHistory" :key="`${item.turnId || index}-${index}`">
+              <div class="chat-message user">
+                <div class="message-avatar user">U</div>
+                <div class="message-bubble user">{{ item.question }}</div>
+              </div>
+
+              <div v-if="item.progressItems?.length" class="chat-message ai">
+                <div class="message-avatar ai">AI</div>
+                <div class="message-body">
+                  <div class="progress-card">
                     <div class="progress-title">系统工作流</div>
                     <div class="progress-list">
                       <div
@@ -94,30 +114,51 @@
                     </div>
                   </div>
                 </div>
+              </div>
 
-                <div v-if="item.chartUrl" class="message-chart">
-                  <ChartDisplay :chart-url="item.chartUrl" />
+              <div v-if="item.chartUrl" class="result-card">
+                <div class="result-header">
+                  <div class="result-title">分析图表</div>
+                  <div class="result-actions">
+                    <button class="action-btn" type="button" @click="openTurnDetail(item.turnId)">查看详情</button>
+                    <button
+                      class="action-btn"
+                      type="button"
+                      @click="toggleCollect({
+                        collectType: 'turn',
+                        targetId: item.turnId,
+                        title: item.question,
+                        summaryText: item.report,
+                        conversationId: activeConversationId,
+                        metadata: { turn_id: item.turnId }
+                      })"
+                    >
+                      {{ isCollected('turn', item.turnId) ? '取消收藏' : '收藏本轮' }}
+                    </button>
+                  </div>
                 </div>
+                <ChartDisplay :chart-url="item.chartUrl" />
+              </div>
 
-                <div v-if="item.report" class="message report">
-                  <div class="message-avatar">AI</div>
-                  <div class="message-content" v-html="renderMarkdown(item.report)" />
+              <div v-if="item.report" class="chat-message ai">
+                <div class="message-avatar ai">AI</div>
+                <div class="message-body">
+                  <div class="message-bubble ai report-text" v-html="renderMarkdown(item.report)" />
                 </div>
-              </template>
+              </div>
+            </template>
 
-              <template v-if="currentQuestion">
-                <div class="message user">
-                  <div class="message-avatar">U</div>
-                  <div class="message-content">{{ currentQuestion }}</div>
-                </div>
+            <template v-if="currentQuestion">
+              <div class="chat-message user">
+                <div class="message-avatar user">U</div>
+                <div class="message-bubble user">{{ currentQuestion }}</div>
+              </div>
 
-                <div v-if="loading || currentProgressItems.length" class="message progress-feed">
-                  <div class="message-avatar">AI</div>
-                  <div class="message-content">
-                    <div class="progress-title">
-                      系统工作流
-                      <span v-if="loading" class="progress-subtitle">实时更新中...</span>
-                    </div>
+              <div v-if="loading || currentProgressItems.length" class="chat-message ai">
+                <div class="message-avatar ai">AI</div>
+                <div class="message-body">
+                  <div class="progress-card">
+                    <div class="progress-title">系统工作流</div>
                     <div v-if="currentProgressItems.length" class="progress-list">
                       <div
                         v-for="progress in currentProgressItems"
@@ -131,48 +172,101 @@
                     <div v-else class="progress-empty">正在准备分析上下文...</div>
                   </div>
                 </div>
-
-                <div v-if="currentTurnId && !loading" class="message-actions">
-                  <el-button size="small" text @click="openTurnDetail(currentTurnId)">查看详情</el-button>
-                  <el-button
-                    size="small"
-                    text
-                    @click="toggleCollect({
-                      collectType: 'turn',
-                      targetId: currentTurnId,
-                      title: currentQuestion,
-                      summaryText: currentReport,
-                      conversationId: activeConversationId,
-                      metadata: { turn_id: currentTurnId }
-                    })"
-                  >
-                    {{ isCollected('turn', currentTurnId) ? '取消收藏' : '收藏本轮' }}
-                  </el-button>
-                </div>
-
-                <div v-if="currentChartUrl" class="message-chart">
-                  <ChartDisplay :chart-url="currentChartUrl" />
-                </div>
-
-                <div v-if="currentReport" class="message report">
-                  <div class="message-avatar">AI</div>
-                  <div class="message-content" v-html="renderMarkdown(currentReport)" />
-                </div>
-              </template>
-
-              <div v-if="chatHistory.length === 0 && !currentQuestion" class="empty-tip">
-                <span class="tip-icon">DI</span>
-                <p>输入你的问题，开始一段可持续追问的数据洞察会话。</p>
               </div>
-            </div>
 
-            <div class="input-area">
-              <ChatInput :loading="loading" @send="onSendMessage" />
-            </div>
+              <div v-if="currentChartUrl" class="result-card">
+                <div class="result-header">
+                  <div class="result-title">本轮图表结果</div>
+                  <div class="result-actions">
+                    <button v-if="currentTurnId" class="action-btn" type="button" @click="openTurnDetail(currentTurnId)">
+                      查看详情
+                    </button>
+                    <button
+                      v-if="currentTurnId"
+                      class="action-btn"
+                      type="button"
+                      @click="toggleCollect({
+                        collectType: 'turn',
+                        targetId: currentTurnId,
+                        title: currentQuestion,
+                        summaryText: currentReport,
+                        conversationId: activeConversationId,
+                        metadata: { turn_id: currentTurnId }
+                      })"
+                    >
+                      {{ isCollected('turn', currentTurnId) ? '取消收藏' : '收藏本轮' }}
+                    </button>
+                  </div>
+                </div>
+                <ChartDisplay :chart-url="currentChartUrl" />
+              </div>
+
+              <div v-if="currentReport" class="chat-message ai">
+                <div class="message-avatar ai">AI</div>
+                <div class="message-body">
+                  <div class="message-bubble ai report-text" v-html="renderMarkdown(currentReport)" />
+                </div>
+              </div>
+            </template>
           </div>
-        </div>
+
+          <ChatInput :loading="loading" @send="onSendMessage" />
+        </section>
       </div>
     </div>
+
+    <div v-if="favoritesPanelVisible" class="favorites-mask" @click="favoritesPanelVisible = false" />
+    <aside class="favorites-panel" :class="{ show: favoritesPanelVisible }">
+      <div class="favorites-header">
+        <h3>★ 我的收藏</h3>
+        <div class="favorites-tabs">
+          <button class="favorites-tab" :class="{ active: activeFavoriteTab === 'snapshot' }" type="button" @click="activeFavoriteTab = 'snapshot'">
+            图表快照
+          </button>
+          <button class="favorites-tab" :class="{ active: activeFavoriteTab === 'report' }" type="button" @click="activeFavoriteTab = 'report'">
+            报告收藏
+          </button>
+        </div>
+        <button class="favorites-close" type="button" @click="favoritesPanelVisible = false">×</button>
+      </div>
+
+      <div class="favorites-content">
+        <template v-if="visibleFavorites.length">
+          <div
+            v-for="collect in visibleFavorites"
+            :key="collect.id"
+            class="favorite-item"
+            @click="onSelectCollect(collect)"
+          >
+            <div class="favorite-header-row">
+              <div class="favorite-title">
+                <span class="favorite-type-icon">{{ collect.collect_type === 'artifact' ? '📈' : '📝' }}</span>
+                {{ collect.title || `收藏 ${collect.id}` }}
+              </div>
+            </div>
+            <div class="favorite-preview">
+              <div v-if="collect.collect_type === 'artifact'" class="chart-placeholder">
+                <span class="bar" style="height: 26px;" />
+                <span class="bar" style="height: 44px;" />
+                <span class="bar" style="height: 34px;" />
+                <span class="bar" style="height: 58px;" />
+              </div>
+              <div v-else class="favorite-preview-text">洞察结论 / 历史轮次 / 会话摘要</div>
+            </div>
+            <div v-if="collect.summary_text" class="favorite-summary">{{ collect.summary_text }}</div>
+            <div class="favorite-meta">
+              <span>{{ collect.collect_type }}</span>
+              <span>{{ collect.target_id }}</span>
+            </div>
+          </div>
+        </template>
+        <div v-else class="favorites-empty">
+          <div class="empty-icon">📁</div>
+          <p>当前还没有可展示的收藏</p>
+          <span>图表收藏会展示在“图表快照”，其他收藏展示在“报告收藏”。</span>
+        </div>
+      </div>
+    </aside>
 
     <el-drawer v-model="turnDetailVisible" title="轮次详情" size="48%" destroy-on-close>
       <div v-if="turnDetailLoading" class="detail-empty">正在加载详情...</div>
@@ -180,12 +274,11 @@
         <div class="detail-header">
           <div>
             <div class="detail-title">第 {{ turnDetail.turn.turn_no }} 轮分析</div>
-            <div class="detail-meta">
-              状态：{{ turnDetail.turn.status }} | 开始时间：{{ formatDateTime(turnDetail.turn.started_at) }}
-            </div>
+            <div class="detail-meta">状态：{{ turnDetail.turn.status }} | 开始时间：{{ formatDateTime(turnDetail.turn.started_at) }}</div>
           </div>
-          <el-button
-            size="small"
+          <button
+            class="action-btn"
+            type="button"
             @click="toggleCollect({
               collectType: 'turn',
               targetId: turnDetail.turn.id,
@@ -196,7 +289,7 @@
             })"
           >
             {{ isCollected('turn', turnDetail.turn.id) ? '取消收藏' : '收藏本轮' }}
-          </el-button>
+          </button>
         </div>
 
         <div class="detail-section">
@@ -228,11 +321,11 @@
             <div v-for="artifact in turnDetail.artifacts" :key="artifact.id" class="detail-list-item">
               <div class="detail-list-actions">
                 <span class="detail-pill">{{ artifact.artifact_type }}</span>
-                <el-button v-if="artifact.file_id" size="small" text @click="previewChartArtifact(artifact)">预览</el-button>
-                <el-button v-if="artifact.file_id" size="small" text @click="openArtifactFile(artifact)">打开</el-button>
-                <el-button
-                  size="small"
-                  text
+                <button v-if="artifact.file_id" class="action-btn" type="button" @click="previewChartArtifact(artifact)">预览</button>
+                <button v-if="artifact.file_id" class="action-btn" type="button" @click="openArtifactFile(artifact)">打开</button>
+                <button
+                  class="action-btn"
+                  type="button"
                   @click="toggleCollect({
                     collectType: 'artifact',
                     targetId: artifact.id,
@@ -244,7 +337,7 @@
                   })"
                 >
                   {{ isCollected('artifact', artifact.id) ? '取消收藏' : '收藏产物' }}
-                </el-button>
+                </button>
               </div>
               <div class="detail-card">
                 <div class="artifact-title">{{ artifact.title || '未命名产物' }}</div>
@@ -257,7 +350,7 @@
 
         <div v-if="previewArtifact?.file_id" class="detail-section">
           <div class="section-title">产物预览</div>
-          <div class="detail-card preview-card">
+          <div class="detail-card">
             <div class="artifact-title">{{ previewArtifact.title || '图表预览' }}</div>
             <ChartDisplay :chart-url="normalizeFileUrl(previewArtifact.file_id)" />
           </div>
@@ -294,7 +387,6 @@ import {
 marked.setOptions({ breaks: true, gfm: true })
 
 const spaces = ref([])
-
 const activeNamespace = ref('')
 const conversations = ref([])
 const collects = ref([])
@@ -314,12 +406,30 @@ const turnDetailVisible = ref(false)
 const turnDetailLoading = ref(false)
 const turnDetail = ref(null)
 const previewArtifact = ref(null)
+const favoritesPanelVisible = ref(false)
+const activeFavoriteTab = ref('snapshot')
+
+const quickPrompts = [
+  '分析2024年Q4季度的销售趋势',
+  '前天一共有多少个报警？看一下明细',
+  '总结当前会话里最重要的洞察结论'
+]
 
 const activeConversation = computed(() =>
   conversations.value.find((item) => item.id === activeConversationId.value) || null
 )
 
-const renderMarkdown = (content) => content ? marked.parse(content) : ''
+const activeSpaceName = computed(() =>
+  spaces.value.find((item) => String(item.id) === activeNamespace.value)?.name || ''
+)
+
+const visibleFavorites = computed(() => (
+  activeFavoriteTab.value === 'snapshot'
+    ? collects.value.filter((item) => item.collect_type === 'artifact')
+    : collects.value.filter((item) => item.collect_type !== 'artifact')
+))
+
+const renderMarkdown = (content) => (content ? marked.parse(content) : '')
 const normalizeFileUrl = (fileId) => `/files/${encodeURIComponent(fileId)}`
 const collectKey = (collectType, targetId) => `${collectType}:${targetId}`
 
@@ -336,7 +446,9 @@ const isInternalAssistantMessage = (message) => {
     text.includes('<tool_call>') ||
     text.includes('save_analysis_result(') ||
     text.includes('load_data_with_') ||
-    text.includes('import pandas as pd')
+    text.includes('import pandas as pd') ||
+    text.includes('"tool": "execute_python"') ||
+    text.includes('"status": "failed"')
   )
 }
 
@@ -577,13 +689,8 @@ const onSelectSpace = async (space) => {
   }
 }
 
-const onSelectConversation = async (conversation) => {
-  stopCurrentStream()
-  loading.value = false
-  await loadConversationHistory(conversation.id)
-}
-
 const onSelectCollect = async (collect) => {
+  favoritesPanelVisible.value = false
   if (collect.insight_conversation_id) {
     await loadConversationHistory(collect.insight_conversation_id)
   }
@@ -621,11 +728,9 @@ const onNewSpace = async () => {
       ElMessage.error(response.data.message || '创建洞察空间失败')
       return
     }
-
     const namespace = response.data.data?.namespace
     const conversation = response.data.data?.conversation
     await fetchSpaces()
-
     activeNamespace.value = namespace ? String(namespace.id) : ''
     conversations.value = conversation ? [conversation] : []
     activeConversationId.value = conversation?.id || 0
@@ -651,16 +756,11 @@ const onDeleteSpace = async (space) => {
     await ElMessageBox.confirm(
       `删除洞察空间“${space.name}”后，会同步删除该空间下的会话，是否继续？`,
       '删除洞察空间',
-      {
-        confirmButtonText: '删除',
-        cancelButtonText: '取消',
-        type: 'warning'
-      }
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' }
     )
     const deletingCurrent = activeNamespace.value === String(space.id)
     await deleteNamespace(space.id)
     await fetchSpaces()
-
     if (deletingCurrent) {
       activeConversationId.value = 0
       chatHistory.value = []
@@ -739,11 +839,7 @@ const handleStreamEvent = async (event) => {
 const handleStreamError = async (error) => {
   console.error('Agent stream error:', error)
   ElMessage.error(`请求失败: ${error.message || '未知错误'}`)
-  addProgressItem({
-    type: 'error',
-    level: 'error',
-    message: '请求失败，无法获取实时分析结果。'
-  })
+  addProgressItem({ type: 'error', level: 'error', message: '请求失败，无法获取实时分析结果。' })
   if (!currentReport.value) currentReport.value = '请求失败了。'
   loading.value = false
   currentStreamController.value = null
@@ -774,11 +870,7 @@ const onSendMessage = (content) => {
   resetCurrentConversationState()
   currentQuestion.value = content
   loading.value = true
-  addProgressItem({
-    type: 'status',
-    level: 'info',
-    message: '正在建立分析会话并加载上下文...'
-  })
+  addProgressItem({ type: 'status', level: 'info', message: '正在建立分析会话并加载上下文...' })
   scrollToBottom()
 
   currentStreamController.value = streamAgent(
@@ -792,6 +884,18 @@ const onSendMessage = (content) => {
     handleStreamError,
     handleStreamDone
   )
+}
+
+const useQuickPrompt = (prompt) => {
+  onSendMessage(prompt)
+}
+
+const showHelp = () => {
+  ElMessage.info('当前页面已切换为新版原型布局，帮助和设置面板后续再细化。')
+}
+
+const showKnowledgePlaceholder = () => {
+  ElMessage.info('知识库区域已预留，后续按统一知识资源接口接入。')
 }
 
 onMounted(async () => {
@@ -810,49 +914,86 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.app-container { display: flex; height: 100vh; overflow: hidden; }
-.main-content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-.content-header { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 12px 16px; background: #fff; border-bottom: 1px solid #e4e7ed; }
-.tabs { display: flex; gap: 20px; }
-.tab { padding: 8px 12px; font-size: 14px; color: #606266; cursor: pointer; border-bottom: 2px solid transparent; }
-.tab.active, .tab:hover { color: #409eff; border-bottom-color: #409eff; }
-.header-meta { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 12px; color: #909399; }
-.content-body { flex: 1; display: flex; overflow: hidden; }
-.left-panel { width: 280px; flex-shrink: 0; overflow: hidden; background: #f5f7fa; }
-.right-panel { flex: 1; padding: 16px; background: #f5f7fa; overflow: hidden; }
-.chat-window { display: flex; flex-direction: column; height: 100%; background: #fff; border-radius: 8px; overflow: hidden; }
-.messages { flex: 1; padding: 16px; overflow-y: auto; }
-.input-area { padding: 12px 16px; border-top: 1px solid #e4e7ed; }
-.empty-tip { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #909399; }
-.tip-icon { width: 56px; height: 56px; border-radius: 18px; display: inline-flex; align-items: center; justify-content: center; margin-bottom: 16px; background: #eef5ff; color: #409eff; font-weight: 700; }
-.message { display: flex; gap: 10px; margin-bottom: 16px; }
-.message.user { flex-direction: row-reverse; }
-.message-avatar { width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; flex-shrink: 0; }
-.message.user .message-avatar { background: #409eff; color: #fff; }
-.message.report .message-avatar, .message.progress-feed .message-avatar { background: #f0f2f5; color: #4f5b6b; }
-.message-content { max-width: 80%; padding: 10px 14px; border-radius: 8px; line-height: 1.6; font-size: 14px; word-break: break-word; background: #f5f7fa; color: #303133; }
-.message.user .message-content { background: #409eff; color: #fff; }
-.message-actions { margin: -8px 0 12px 42px; display: flex; gap: 8px; }
-.progress-title { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; font-weight: 600; }
-.progress-subtitle, .progress-empty { font-size: 12px; color: #909399; }
+:global(body) { margin: 0; background: #eef3f9; color: #0f172a; }
+.app-shell { min-height: 100vh; background: linear-gradient(180deg, #f3f7fc 0%, #edf3fa 100%); }
+.top-nav { position: fixed; inset: 0 0 auto 0; z-index: 30; height: 56px; padding: 0 20px; display: flex; align-items: center; justify-content: space-between; background: rgba(11, 18, 32, 0.94); color: #fff; }
+.logo { display: flex; align-items: center; gap: 12px; }
+.logo-icon { width: 36px; height: 36px; border-radius: 12px; background: linear-gradient(135deg, #2563eb, #0ea5e9); display: inline-flex; align-items: center; justify-content: center; font-weight: 800; }
+.logo-title { font-size: 15px; font-weight: 700; }
+.logo-subtitle { margin-top: 2px; font-size: 11px; color: rgba(255, 255, 255, 0.64); }
+.nav-actions { display: flex; align-items: center; gap: 12px; }
+.nav-icon { position: relative; width: 34px; height: 34px; border: none; border-radius: 12px; background: rgba(255, 255, 255, 0.08); color: #fff; cursor: pointer; }
+.nav-icon:hover { background: rgba(255, 255, 255, 0.14); }
+.badge { position: absolute; top: -6px; right: -6px; min-width: 18px; height: 18px; padding: 0 6px; border-radius: 999px; background: #ef4444; display: inline-flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; }
+.user-avatar { width: 36px; height: 36px; border-radius: 50%; background: linear-gradient(135deg, #6366f1, #8b5cf6); display: inline-flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; }
+.main-container { display: flex; height: calc(100vh - 56px); margin-top: 56px; }
+.right-area { flex: 1; display: flex; overflow: hidden; }
+.chat-panel { flex: 1; min-width: 420px; display: flex; flex-direction: column; background: linear-gradient(180deg, #f7fbff 0%, #eef5fb 100%); overflow: hidden; }
+.chat-header { padding: 16px 20px; background: rgba(255,255,255,0.98); border-bottom: 1px solid #dbe3ef; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.chat-title { display: flex; align-items: center; gap: 12px; font-size: 16px; font-weight: 700; color: #0f172a; }
+.chat-title-icon { width: 40px; height: 40px; border-radius: 14px; background: linear-gradient(135deg, #2563eb, #0ea5e9); display: inline-flex; align-items: center; justify-content: center; color: #fff; }
+.chat-subtitle { margin-top: 4px; font-size: 12px; color: #64748b; font-weight: 500; }
+.chat-header-actions, .result-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.action-btn { border: 1px solid #dbe3ef; background: #fff; border-radius: 10px; padding: 8px 12px; font-size: 12px; color: #475569; cursor: pointer; }
+.chat-messages { flex: 1; overflow-y: auto; padding: 20px; background: radial-gradient(circle at top center, rgba(37, 99, 235, 0.08), transparent 24%), linear-gradient(180deg, #f7fbff 0%, #eef5fb 100%); }
+.welcome-card { text-align: center; padding: 48px 24px; color: #1e293b; }
+.welcome-icon { width: 84px; height: 84px; margin: 0 auto 20px; border-radius: 24px; background: linear-gradient(135deg, #2563eb, #0ea5e9); display: inline-flex; align-items: center; justify-content: center; font-size: 36px; }
+.welcome-title { font-size: 26px; font-weight: 700; }
+.welcome-subtitle { max-width: 560px; margin: 14px auto 0; line-height: 1.8; color: #64748b; font-size: 14px; }
+.quick-actions { margin-top: 24px; display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
+.quick-action { border: 1px solid #d7e4f3; background: #ffffff; color: #475569; border-radius: 999px; padding: 10px 16px; font-size: 13px; cursor: pointer; }
+.quick-action:hover { border-color: #60a5fa; color: #1d4ed8; background: #eff6ff; }
+.chat-message { margin-bottom: 18px; display: flex; gap: 12px; }
+.chat-message.user { flex-direction: row-reverse; }
+.message-avatar { width: 36px; height: 36px; border-radius: 12px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 12px; font-weight: 700; }
+.message-avatar.user { background: linear-gradient(135deg, #6366f1, #8b5cf6); color: #fff; }
+.message-avatar.ai { background: linear-gradient(135deg, #2563eb, #0ea5e9); color: #fff; }
+.message-body { flex: 1; }
+.message-bubble { max-width: 72%; border-radius: 16px; padding: 14px 16px; line-height: 1.75; font-size: 14px; }
+.message-bubble.user { margin-left: auto; background: linear-gradient(135deg, #2563eb, #1d4ed8); color: #fff; }
+.message-bubble.ai { background: #f8fbff; color: #0f172a; }
+.report-text :deep(p:first-child) { margin-top: 0; }
+.progress-card, .result-card { border-radius: 18px; padding: 16px; background: #fff; border: 1px solid #dbe3ef; }
+.progress-title, .result-title { font-size: 14px; font-weight: 700; color: #0f172a; margin-bottom: 12px; }
 .progress-list, .detail-list, .turn-detail, .detail-section { display: flex; flex-direction: column; gap: 12px; }
-.progress-item { padding: 8px 10px; border-radius: 8px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
-.progress-item.info { background: #eef5ff; color: #2f5f9e; }
+.progress-item { padding: 10px 12px; border-radius: 12px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+.progress-item.info { background: #eef5ff; color: #245b9f; }
 .progress-item.success { background: #edf9f0; color: #2f7d4d; }
 .progress-item.warning { background: #fff7e8; color: #9a6700; }
 .progress-item.error { background: #fff0f0; color: #c45656; }
-.progress-item.assistant { background: #f7f4ff; color: #5b45b0; }
-.message-chart { margin: 12px 0; min-height: 200px; border-radius: 8px; overflow: hidden; }
-.detail-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
-.detail-title { font-size: 18px; font-weight: 700; color: #1f2a37; }
-.detail-meta { font-size: 12px; color: #6b7280; margin-top: 6px; }
-.section-title { font-size: 14px; font-weight: 700; color: #374151; }
-.detail-card { padding: 14px 16px; border-radius: 12px; background: #f8fafc; color: #1f2937; line-height: 1.7; white-space: pre-wrap; }
+.progress-item.assistant { background: #f5f3ff; color: #5b45b0; }
+.progress-empty { font-size: 12px; color: #64748b; }
+.result-card { margin: 14px 0 18px 48px; }
+.result-header, .favorites-header, .detail-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }
+.favorites-mask { position: fixed; inset: 56px 0 0 0; background: rgba(15, 23, 42, 0.28); z-index: 34; }
+.favorites-panel { position: fixed; top: 56px; right: -400px; width: 380px; height: calc(100vh - 56px); background: #fff; border-left: 1px solid #dbe3ef; z-index: 35; transition: right 0.28s ease; display: flex; flex-direction: column; }
+.favorites-panel.show { right: 0; }
+.favorites-header { padding: 16px 20px; border-bottom: 1px solid #e5edf7; margin-bottom: 0; }
+.favorites-header h3 { margin: 0; font-size: 16px; color: #0f172a; }
+.favorites-tabs { display: flex; gap: 6px; }
+.favorites-tab { border: none; background: transparent; border-radius: 999px; padding: 8px 12px; font-size: 12px; color: #64748b; cursor: pointer; }
+.favorites-tab.active { background: #edf4ff; color: #1d4ed8; }
+.favorites-close { border: none; background: transparent; color: #64748b; font-size: 18px; cursor: pointer; }
+.favorites-content { flex: 1; overflow-y: auto; padding: 16px; }
+.favorite-item { border: 1px solid #e5edf7; border-radius: 16px; padding: 14px; margin-bottom: 12px; background: #f8fbff; cursor: pointer; }
+.favorite-item:hover { border-color: #60a5fa; transform: translateY(-2px); }
+.favorite-header-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.favorite-title, .detail-title, .artifact-title { font-size: 14px; font-weight: 700; color: #0f172a; display: flex; align-items: center; gap: 8px; }
+.favorite-type-icon { color: #f59e0b; }
+.favorite-preview { background: #eef4ff; border-radius: 10px; padding: 10px; margin-bottom: 10px; min-height: 78px; display: flex; align-items: center; justify-content: center; }
+.chart-placeholder { display: flex; align-items: flex-end; gap: 8px; height: 58px; }
+.chart-placeholder .bar { width: 18px; border-radius: 4px 4px 0 0; background: linear-gradient(180deg, #60a5fa, #2563eb); display: inline-block; }
+.favorite-preview-text { font-size: 12px; color: #64748b; line-height: 1.7; text-align: center; }
+.favorite-summary, .artifact-summary { margin-top: 8px; font-size: 12px; line-height: 1.7; color: #64748b; }
+.favorite-meta, .detail-meta, .artifact-link, .detail-empty { font-size: 12px; color: #64748b; }
+.favorite-meta { display: flex; justify-content: space-between; margin-top: 10px; }
+.favorites-empty { min-height: 240px; border: 1px dashed #dbe3ef; border-radius: 18px; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; color: #64748b; padding: 24px; }
+.empty-icon { width: 56px; height: 56px; border-radius: 18px; background: #edf4ff; display: inline-flex; align-items: center; justify-content: center; color: #1d4ed8; font-size: 24px; margin-bottom: 14px; }
+.section-title { font-size: 14px; font-weight: 700; color: #334155; }
+.detail-card { padding: 14px 16px; border-radius: 16px; background: #f8fbff; color: #0f172a; line-height: 1.75; white-space: pre-wrap; border: 1px solid #e5edf7; }
 .detail-list-item { display: flex; flex-direction: column; gap: 8px; }
 .detail-list-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .detail-pill { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #e2e8f0; color: #334155; }
 .detail-pill.muted { background: #f1f5f9; color: #64748b; }
-.artifact-title { font-weight: 700; margin-bottom: 6px; }
-.artifact-summary { margin-bottom: 8px; }
-.artifact-link, .detail-empty { font-size: 12px; color: #64748b; }
+@media (max-width: 1440px) { .result-card { margin-left: 0; } }
 </style>

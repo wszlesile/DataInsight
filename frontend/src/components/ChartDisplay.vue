@@ -1,39 +1,28 @@
 <template>
   <div class="chart-display">
     <div v-if="chartUrl" class="chart-container">
-      <div class="chart-header">
-        <span>图表展示</span>
-        <el-button text size="small" @click="refreshChart">刷新</el-button>
-      </div>
       <iframe
         ref="chartIframe"
-        :src="chartUrl"
-        frameborder="0"
+        :src="iframeSrc"
         class="chart-iframe"
+        frameborder="0"
         @load="onIframeLoad"
         @error="onIframeError"
       />
-      <div v-if="loading" class="chart-loading">
-        <el-icon class="is-loading"><Loading /></el-icon>
-        加载中...
-      </div>
-      <div v-if="error" class="chart-error">
-        图表加载失败: {{ error }}
-      </div>
+
+      <div v-if="loading" class="chart-overlay">图表加载中...</div>
+      <div v-else-if="error" class="chart-overlay error">{{ error }}</div>
     </div>
+
     <div v-else class="chart-placeholder">
-      <div class="placeholder-content">
-        <span class="placeholder-icon">📈</span>
-        <p>图表将在这里展示</p>
-        <p class="debug-url" v-if="debugUrl">URL: {{ debugUrl }}</p>
-      </div>
+      <span class="placeholder-icon">📈</span>
+      <p>分析图表将在这里展示</p>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, watch, onMounted } from 'vue'
-import { Loading } from '@element-plus/icons-vue'
+import { computed, ref, watch } from 'vue'
 
 const props = defineProps({
   chartUrl: {
@@ -43,122 +32,91 @@ const props = defineProps({
 })
 
 const chartIframe = ref(null)
-const loading = ref(false)
+const loading = ref(Boolean(props.chartUrl))
 const error = ref('')
-const debugUrl = ref('')
+const cacheKey = ref(Date.now())
 
-watch(() => props.chartUrl, (newUrl) => {
-  debugUrl.value = newUrl
-  if (newUrl) {
-    loading.value = true
+const iframeSrc = computed(() => {
+  if (!props.chartUrl) return ''
+  const separator = props.chartUrl.includes('?') ? '&' : '?'
+  return `${props.chartUrl}${separator}t=${cacheKey.value}`
+})
+
+watch(
+  () => props.chartUrl,
+  (value) => {
+    loading.value = Boolean(value)
     error.value = ''
-  }
-})
-
-onMounted(() => {
-  debugUrl.value = props.chartUrl
-})
+    cacheKey.value = Date.now()
+  },
+  { immediate: true }
+)
 
 const onIframeLoad = () => {
   loading.value = false
-  console.log('Chart iframe loaded:', props.chartUrl)
 }
 
-const onIframeError = (e) => {
+const onIframeError = () => {
   loading.value = false
-  error.value = 'iframe加载错误'
-  console.error('Chart iframe error:', e)
-}
-
-const refreshChart = () => {
-  if (chartIframe.value) {
-    loading.value = true
-    error.value = ''
-    chartIframe.value.src = props.chartUrl + '?t=' + new Date().getTime()
-  }
+  error.value = '图表加载失败，请稍后重试。'
 }
 </script>
 
 <style scoped>
 .chart-display {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  background: #fff;
-  border-radius: 8px;
+  min-height: 280px;
+  border: 1px solid #dbe3ef;
+  border-radius: 18px;
   overflow: hidden;
-  min-height: 400px;
+  background: linear-gradient(180deg, #f8fbff 0%, #ffffff 100%);
 }
 
 .chart-container {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
   position: relative;
-}
-
-.chart-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 8px 16px;
-  background: #f5f7fa;
-  border-bottom: 1px solid #e4e7ed;
-  font-size: 14px;
-  color: #606266;
+  min-height: 280px;
 }
 
 .chart-iframe {
-  flex: 1;
   width: 100%;
-  min-height: 400px;
+  min-height: 320px;
   border: none;
+  display: block;
+  background: #ffffff;
 }
 
-.chart-placeholder {
-  flex: 1;
+.chart-overlay {
+  position: absolute;
+  inset: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 400px;
-  background: #fafafa;
+  background: rgba(248, 251, 255, 0.92);
+  color: #475569;
+  font-size: 14px;
 }
 
-.placeholder-content {
-  text-align: center;
-  color: #909399;
+.chart-overlay.error {
+  color: #dc2626;
+}
+
+.chart-placeholder {
+  min-height: 280px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: #94a3b8;
 }
 
 .placeholder-icon {
-  font-size: 48px;
-  display: block;
-  margin-bottom: 16px;
-}
-
-.debug-url {
-  font-size: 12px;
-  color: #c0c4cc;
-  margin-top: 8px;
-  word-break: break-all;
-}
-
-.chart-loading {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  display: flex;
+  width: 56px;
+  height: 56px;
+  border-radius: 18px;
+  background: #e0edff;
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
-  color: #409eff;
-}
-
-.chart-error {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  color: #f56c6c;
-  text-align: center;
+  justify-content: center;
+  font-size: 24px;
 }
 </style>

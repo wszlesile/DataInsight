@@ -1,101 +1,74 @@
 <template>
-  <div class="sidebar">
-    <div class="sidebar-header">
-      <div class="logo">
-        <span class="logo-icon">DI</span>
-        <span class="logo-text">DataInsight</span>
+  <aside class="left-panel" :class="{ collapsed }">
+    <div class="panel-section">
+      <div class="panel-header">
+        <span v-if="!collapsed" class="panel-title">📚 洞察空间</span>
+        <div class="panel-actions">
+          <button class="panel-icon-btn" type="button" title="新建洞察" @click="$emit('new-space')">
+            +
+          </button>
+          <button
+            class="panel-icon-btn"
+            type="button"
+            :title="collapsed ? '展开侧边栏' : '折叠侧边栏'"
+            @click="collapsed = !collapsed"
+          >
+            {{ collapsed ? '›' : '‹' }}
+          </button>
+        </div>
       </div>
-    </div>
 
-    <div class="sidebar-content">
-      <el-button type="primary" class="new-insight-btn" @click="$emit('new-space')">
-        <span>+</span> 新建洞察
-      </el-button>
-
-      <div class="nav-section">
-        <div class="nav-title">洞察空间</div>
+      <div class="notebook-list">
         <div
           v-for="space in spaces"
           :key="space.id"
-          class="nav-item"
-          :class="{ active: activeSpace === space.id }"
+          class="notebook-item"
+          :class="{ active: activeSpace === String(space.id) }"
           @click="$emit('select-space', space)"
         >
-          <span class="nav-icon">NS</span>
-          <span class="nav-text">{{ space.name }}</span>
-          <el-button
-            size="small"
-            text
-            class="space-delete-btn"
+          <div class="notebook-icon" :style="{ background: notebookGradient(space.id) }">
+            {{ collapsed ? 'DI' : notebookAbbr(space.name) }}
+          </div>
+
+          <div v-if="!collapsed" class="notebook-info">
+            <div class="notebook-name">{{ space.name }}</div>
+            <div class="notebook-count">
+              {{ activeSpace === String(space.id) ? currentConversationHint : '点击进入洞察' }}
+            </div>
+          </div>
+
+          <button
+            v-if="!collapsed"
+            class="notebook-more"
+            type="button"
+            title="删除空间"
             @click.stop="$emit('delete-space', space)"
           >
             删除
-          </el-button>
+          </button>
         </div>
       </div>
 
-      <div class="nav-section">
-        <div class="nav-title">会话列表</div>
-        <div v-if="conversations.length === 0" class="sidebar-empty">当前空间还没有历史会话</div>
-        <div
-          v-for="conversation in conversations"
-          :key="conversation.id"
-          class="conversation-item"
-          :class="{ active: activeConversationId === conversation.id }"
-          @click="$emit('select-conversation', conversation)"
-        >
-          <div class="conversation-row">
-            <div class="conversation-title">{{ conversation.title || `会话 ${conversation.id}` }}</div>
-            <el-button
-              size="small"
-              text
-              class="rename-btn"
-              @click.stop="$emit('rename-conversation', conversation)"
-            >
-              重命名
-            </el-button>
-          </div>
-          <div v-if="conversation.summary_text" class="conversation-summary">
-            {{ conversation.summary_text }}
-          </div>
-          <div v-if="conversation.last_message_at" class="conversation-time">
-            {{ formatTime(conversation.last_message_at) }}
+      <div class="panel-footer-links">
+        <div class="notebook-item footer-item" @click="$emit('open-knowledge')">
+          <div class="notebook-icon footer-icon knowledge">KB</div>
+          <div v-if="!collapsed" class="notebook-info">
+            <div class="notebook-name">知识库</div>
+            <div class="notebook-count">后续接入统一资源</div>
           </div>
         </div>
-      </div>
 
-      <div class="nav-section">
-        <div class="nav-title">我的收藏</div>
-        <div class="collect-toolbar">
-          <el-input v-model="collectKeyword" size="small" clearable placeholder="搜索收藏" />
-          <el-select v-model="collectTypeFilter" size="small">
-            <el-option label="全部" value="all" />
-            <el-option label="会话" value="conversation" />
-            <el-option label="轮次" value="turn" />
-            <el-option label="产物" value="artifact" />
-          </el-select>
-        </div>
-
-        <div v-if="filteredCollectGroups.length === 0" class="sidebar-empty">
-          当前空间还没有符合条件的收藏
-        </div>
-
-        <div v-for="group in filteredCollectGroups" :key="group.type" class="collect-group">
-          <div class="collect-group-title">{{ collectTypeLabel(group.type) }}</div>
-          <div
-            v-for="collect in group.items"
-            :key="collect.id"
-            class="collect-item"
-            @click="$emit('select-collect', collect)"
-          >
-            <div class="collect-title">{{ collect.title || `收藏 ${collect.id}` }}</div>
-            <div v-if="collect.summary_text" class="collect-summary">{{ collect.summary_text }}</div>
-            <div class="collect-meta">ID: {{ collect.target_id }}</div>
+        <div class="notebook-item footer-item" @click="$emit('open-favorites')">
+          <div class="notebook-icon footer-icon favorite">★</div>
+          <div v-if="!collapsed" class="notebook-info">
+            <div class="notebook-name">我的收藏</div>
+            <div class="notebook-count">{{ collects.length }} 个收藏</div>
           </div>
+          <span v-if="!collapsed && collects.length" class="favorites-badge">{{ collects.length }}</span>
         </div>
       </div>
     </div>
-  </div>
+  </aside>
 </template>
 
 <script setup>
@@ -112,70 +85,242 @@ const props = defineProps({
 defineEmits([
   'select-space',
   'delete-space',
-  'select-conversation',
-  'rename-conversation',
   'new-space',
-  'select-collect'
+  'open-favorites',
+  'open-knowledge'
 ])
 
-const collectKeyword = ref('')
-const collectTypeFilter = ref('all')
+const collapsed = ref(false)
 
-const collectTypeLabel = (type) => ({
-  conversation: '会话收藏',
-  turn: '轮次收藏',
-  artifact: '产物收藏'
-}[type] || '其他收藏')
-
-const filteredCollectGroups = computed(() => {
-  const keyword = collectKeyword.value.trim().toLowerCase()
-  const filtered = props.collects.filter((item) => {
-    const typeMatched = collectTypeFilter.value === 'all' || item.collect_type === collectTypeFilter.value
-    if (!typeMatched) return false
-    if (!keyword) return true
-    const haystack = `${item.title || ''} ${item.summary_text || ''}`.toLowerCase()
-    return haystack.includes(keyword)
-  })
-
-  const groups = new Map()
-  filtered.forEach((item) => {
-    if (!groups.has(item.collect_type)) groups.set(item.collect_type, [])
-    groups.get(item.collect_type).push(item)
-  })
-
-  return Array.from(groups.entries()).map(([type, items]) => ({ type, items }))
+const currentConversationHint = computed(() => {
+  if (!props.activeConversationId) return '新会话已创建'
+  const activeConversation = props.conversations.find((item) => item.id === props.activeConversationId)
+  if (!activeConversation) return '会话已就绪'
+  return activeConversation.title || `会话 #${activeConversation.id}`
 })
 
-const formatTime = (value) => {
-  if (!value) return ''
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+const gradients = [
+  'linear-gradient(135deg, #f59e0b, #ef4444)',
+  'linear-gradient(135deg, #3b82f6, #1d4ed8)',
+  'linear-gradient(135deg, #10b981, #059669)',
+  'linear-gradient(135deg, #8b5cf6, #6d28d9)',
+  'linear-gradient(135deg, #ec4899, #db2777)',
+  'linear-gradient(135deg, #f97316, #ea580c)'
+]
+
+const notebookGradient = (id) => gradients[Number(id) % gradients.length]
+
+const notebookAbbr = (name) => {
+  if (!name) return 'DI'
+  return String(name).slice(0, 2).toUpperCase()
 }
 </script>
 
 <style scoped>
-.sidebar { width: 300px; height: 100vh; background: #1a1a2e; color: #fff; display: flex; flex-direction: column; }
-.sidebar-header { padding: 20px; border-bottom: 1px solid rgba(255, 255, 255, 0.1); }
-.logo { display: flex; align-items: center; gap: 10px; }
-.logo-icon { width: 30px; height: 30px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; background: rgba(74, 144, 226, 0.25); font-size: 12px; font-weight: 700; }
-.logo-text { font-size: 18px; font-weight: 700; }
-.sidebar-content { flex: 1; padding: 16px; overflow-y: auto; }
-.new-insight-btn { width: 100%; margin-bottom: 24px; background: #4a90e2; border: none; }
-.nav-section { margin-bottom: 24px; }
-.nav-title { padding: 8px 12px; font-size: 12px; color: rgba(255, 255, 255, 0.55); text-transform: uppercase; }
-.nav-item, .conversation-item, .collect-item { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: 10px; cursor: pointer; transition: background 0.2s; }
-.nav-item { flex-direction: row; align-items: center; gap: 8px; }
-.nav-item:hover, .conversation-item:hover, .collect-item:hover { background: rgba(255, 255, 255, 0.08); }
-.nav-item.active, .conversation-item.active { background: rgba(74, 144, 226, 0.28); }
-.nav-icon { width: 24px; color: rgba(255, 255, 255, 0.7); font-size: 12px; }
-.nav-text, .conversation-title, .collect-title { font-size: 13px; font-weight: 600; color: #fff; }
-.space-delete-btn { margin-left: auto; color: rgba(255, 255, 255, 0.72); }
-.conversation-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.rename-btn { color: rgba(255, 255, 255, 0.75); }
-.conversation-summary, .collect-summary { font-size: 12px; line-height: 1.5; color: rgba(255, 255, 255, 0.65); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-.conversation-time, .collect-meta, .collect-group-title { font-size: 11px; color: rgba(255, 255, 255, 0.45); }
-.collect-toolbar { display: flex; flex-direction: column; gap: 8px; padding: 0 12px 12px; }
-.collect-group { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
-.collect-group-title { padding: 0 12px; text-transform: uppercase; }
-.sidebar-empty { padding: 10px 12px; font-size: 12px; color: rgba(255, 255, 255, 0.5); }
+.left-panel {
+  width: 280px;
+  min-width: 280px;
+  background: #ffffff;
+  border-right: 1px solid #dbe3ef;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition: width 0.3s ease, min-width 0.3s ease;
+}
+
+.left-panel.collapsed {
+  width: 72px;
+  min-width: 72px;
+}
+
+.panel-section {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 18px 16px 12px;
+  background:
+    radial-gradient(circle at top left, rgba(37, 99, 235, 0.1), transparent 32%),
+    linear-gradient(180deg, #f9fbff 0%, #ffffff 58%);
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.panel-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #4b5563;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.panel-icon-btn {
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: 9px;
+  background: #eef4ff;
+  color: #52637d;
+  cursor: pointer;
+  font-size: 16px;
+  transition: background 0.2s ease, color 0.2s ease, transform 0.2s ease;
+}
+
+.panel-icon-btn:hover {
+  background: #dce9ff;
+  color: #1d4ed8;
+  transform: translateY(-1px);
+}
+
+.notebook-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-right: 2px;
+}
+
+.notebook-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 14px;
+  cursor: pointer;
+  transition: transform 0.2s ease, background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.notebook-item:hover {
+  background: #f2f7ff;
+  transform: translateX(2px);
+}
+
+.notebook-item.active {
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.14), rgba(14, 165, 233, 0.08));
+  box-shadow: inset 0 0 0 1px rgba(59, 130, 246, 0.18);
+}
+
+.notebook-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.notebook-info {
+  min-width: 0;
+  flex: 1;
+}
+
+.notebook-name {
+  font-size: 14px;
+  font-weight: 700;
+  color: #0f172a;
+  line-height: 1.35;
+}
+
+.notebook-count {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.45;
+}
+
+.notebook-more {
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+  font-size: 12px;
+  opacity: 0;
+  transition: opacity 0.2s ease, color 0.2s ease;
+}
+
+.notebook-item:hover .notebook-more,
+.notebook-item.active .notebook-more {
+  opacity: 1;
+}
+
+.notebook-more:hover {
+  color: #dc2626;
+}
+
+.panel-footer-links {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 12px;
+  margin-top: 12px;
+  border-top: 1px solid #e5edf7;
+}
+
+.footer-item {
+  background: #f8fbff;
+}
+
+.footer-icon.knowledge {
+  background: linear-gradient(135deg, #06b6d4, #0891b2);
+}
+
+.footer-icon.favorite {
+  background: linear-gradient(135deg, #ec4899, #db2777);
+}
+
+.favorites-badge {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #ef4444;
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.left-panel.collapsed .panel-section {
+  padding: 18px 10px 12px;
+}
+
+.left-panel.collapsed .panel-header {
+  flex-direction: column;
+  align-items: center;
+}
+
+.left-panel.collapsed .panel-actions {
+  flex-direction: column;
+}
+
+.left-panel.collapsed .notebook-item {
+  justify-content: center;
+  padding: 10px 8px;
+}
+
+.left-panel.collapsed .panel-footer-links {
+  margin-top: auto;
+}
 </style>
