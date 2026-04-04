@@ -379,11 +379,12 @@ const resetCurrentConversationState = () => {
 
 const finalizeCurrentConversation = () => {
   if (!currentQuestion.value) return
+  const finalReply = currentReport.value || currentAssistantMessage.value
   chatHistory.value.push({
     turnId: currentTurnId.value,
     question: currentQuestion.value,
     chartUrl: currentChartUrl.value,
-    report: currentReport.value,
+    report: finalReply,
     progressItems: [...currentProgressItems.value]
   })
   resetCurrentConversationState()
@@ -610,7 +611,9 @@ const handleStreamEvent = async (event) => {
     return
   }
   if (event.type === 'done') {
-    if (!currentReport.value && !currentChartUrl.value) {
+    if (!currentReport.value && currentAssistantMessage.value) {
+      currentReport.value = currentAssistantMessage.value
+    } else if (!currentReport.value && !currentChartUrl.value) {
       currentReport.value = '本轮分析未生成可展示的图表或分析报告，请重试。'
     }
     loading.value = false
@@ -654,7 +657,9 @@ const handleStreamError = async (error) => {
 
 const handleStreamDone = async () => {
   if (!loading.value) return
-  if (!currentReport.value && !currentChartUrl.value) {
+  if (!currentReport.value && currentAssistantMessage.value) {
+    currentReport.value = currentAssistantMessage.value
+  } else if (!currentReport.value && !currentChartUrl.value) {
     currentReport.value = '本轮分析未生成可展示的图表或分析报告，请重试。'
   }
   loading.value = false
