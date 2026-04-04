@@ -41,6 +41,16 @@
             v-if="!collapsed"
             class="notebook-more"
             type="button"
+            title="重命名空间"
+            @click.stop="$emit('rename-space', space)"
+          >
+            重命名
+          </button>
+
+          <button
+            v-if="!collapsed"
+            class="notebook-more danger"
+            type="button"
             title="删除空间"
             @click.stop="$emit('delete-space', space)"
           >
@@ -85,6 +95,7 @@ const props = defineProps({
 defineEmits([
   'select-space',
   'delete-space',
+  'rename-space',
   'new-space',
   'open-favorites',
   'open-knowledge'
@@ -253,6 +264,10 @@ const notebookAbbr = (name) => {
   font-size: 12px;
   opacity: 0;
   transition: opacity 0.2s ease, color 0.2s ease;
+}
+
+.danger {
+  color: #c2410c;
 }
 
 .notebook-item:hover .notebook-more,

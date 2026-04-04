@@ -81,6 +81,7 @@ class InsightNsConversationService:
                 "selected_datasource_snapshot": turn_dict.get("selected_datasource_snapshot", []),
                 "report": turn_artifacts.get('analysis_report') or turn.final_answer,
                 "file_id": turn_artifacts.get('file_id', ''),
+                "chart_artifact_id": turn_artifacts.get('chart_artifact_id', 0),
                 "latest_execution": self._build_execution_summary(turn_executions[-1]) if turn_executions else None,
                 "execution_count": len(turn_executions),
                 "status": turn.status,
@@ -159,13 +160,14 @@ class InsightNsConversationService:
             execution_map.setdefault(execution.turn_id, []).append(execution.to_dict())
         return execution_map
 
-    def _group_artifacts_by_turn(self, artifacts: list[InsightNsArtifact]) -> dict[int, dict[str, str]]:
+    def _group_artifacts_by_turn(self, artifacts: list[InsightNsArtifact]) -> dict[int, dict[str, Any]]:
         """按 turn 对派生产物分组，供历史卡片级展示使用。"""
-        artifact_map: dict[int, dict[str, str]] = {}
+        artifact_map: dict[int, dict[str, Any]] = {}
         for artifact in artifacts:
             turn_artifacts = artifact_map.setdefault(artifact.turn_id, {})
             if artifact.artifact_type == 'chart' and artifact.file_id:
                 turn_artifacts['file_id'] = artifact.file_id
+                turn_artifacts['chart_artifact_id'] = artifact.id
             if artifact.artifact_type == 'report' and artifact.summary_text:
                 turn_artifacts['analysis_report'] = artifact.summary_text
         return artifact_map

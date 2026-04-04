@@ -86,6 +86,33 @@ class InsightNamespaceService:
             "conversation": conversation.to_dict(),
         }
 
+    def rename_namespace(self, username: str, namespace_id: Any, name: str) -> dict[str, Any] | None:
+        normalized_name = (name or '').strip()[:128]
+        if not normalized_name:
+            raise ValueError('洞察空间名称不能为空')
+
+        namespace = self.session.query(InsightNamespace).filter(
+            InsightNamespace.id == int(namespace_id),
+            InsightNamespace.username == username,
+            InsightNamespace.is_deleted == 0,
+        ).first()
+        if namespace is None:
+            return None
+
+        duplicated = self.session.query(InsightNamespace.id).filter(
+            InsightNamespace.username == username,
+            InsightNamespace.name == normalized_name,
+            InsightNamespace.is_deleted == 0,
+            InsightNamespace.id != namespace.id,
+        ).first()
+        if duplicated is not None:
+            raise ValueError('洞察空间名称已存在')
+
+        namespace.name = normalized_name
+        self.session.commit()
+        self.session.refresh(namespace)
+        return self._to_dict(namespace)
+
     def delete_namespace(self, username: str, namespace_id: Any) -> bool:
         namespace = self.session.query(InsightNamespace).filter(
             InsightNamespace.id == int(namespace_id),

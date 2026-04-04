@@ -210,7 +210,7 @@ class ConversationContextService:
                 artifact_type='chart',
                 title=f"{conversation.title} 图表",
                 file_id=file_id,
-                summary_text=analysis_report or assistant_message,
+                summary_text='',
                 metadata={"turn_no": turn.turn_no},
             ))
         if analysis_report:

@@ -17,6 +17,10 @@ export function createNamespace(name) {
   return api.post('/insight/namespaces', { name })
 }
 
+export function renameNamespace(namespaceId, name) {
+  return api.put(`/insight/namespaces/${namespaceId}`, { name })
+}
+
 export function deleteNamespace(namespaceId) {
   return api.delete(`/insight/namespaces/${namespaceId}`)
 }

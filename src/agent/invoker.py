@@ -33,6 +33,7 @@ class AgentResponse:
     turn_id: int
     file_id: str = ''
     analysis_report: str = ''
+    chart_artifact_id: int = 0
 
 
 def _clean_message_content(content: Any) -> str:
@@ -151,13 +152,18 @@ def _finalize_run(
     file_id: str,
 ) -> AgentResponse:
     """写回本轮最终结果，并转换成控制器层可直接使用的响应对象。"""
-    service.complete_run(
+    run_result = service.complete_run(
         conversation_id=runtime.conversation.id,
         turn_id=runtime.turn.id,
         assistant_message=assistant_message,
         analysis_report=analysis_report,
         file_id=file_id,
     )
+    chart_artifact_id = 0
+    for artifact in run_result.get('artifacts', []):
+        if artifact.get('artifact_type') == 'chart':
+            chart_artifact_id = int(artifact.get('id', 0) or 0)
+            break
     return AgentResponse(
         username=runtime.conversation.username,
         message=assistant_message,
@@ -165,6 +171,7 @@ def _finalize_run(
         turn_id=runtime.turn.id,
         file_id=file_id,
         analysis_report=analysis_report,
+        chart_artifact_id=chart_artifact_id,
     )
 
 
@@ -544,13 +551,23 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]
 
             break
 
-        _finalize_run(
+        response = _finalize_run(
             service=service,
             runtime=runtime,
             assistant_message=assistant_message,
             analysis_report=analysis_report,
             file_id=file_id,
         )
+        if response.chart_artifact_id:
+            yield _build_progress_event(
+                'result',
+                conversation_id=runtime.conversation.id,
+                turn_id=runtime.turn.id,
+                stage='result',
+                file_id=file_id,
+                analysis_report=analysis_report,
+                chart_artifact_id=response.chart_artifact_id,
+            )
         yield _build_progress_event(
             'done',
             conversation_id=runtime.conversation.id,

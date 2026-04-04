@@ -28,6 +28,7 @@
         :active-conversation-id="activeConversationId"
         @select-space="onSelectSpace"
         @delete-space="onDeleteSpace"
+        @rename-space="onRenameSpace"
         @new-space="onNewSpace"
         @open-favorites="favoritesPanelVisible = true"
         @open-knowledge="showKnowledgePlaceholder"
@@ -116,34 +117,49 @@
                 </div>
               </div>
 
-              <div v-if="item.chartUrl" class="result-card">
-                <div class="result-header">
-                  <div class="result-title">分析图表</div>
-                  <div class="result-actions">
-                    <button class="action-btn" type="button" @click="openTurnDetail(item.turnId)">查看详情</button>
-                    <button
-                      class="action-btn"
-                      type="button"
-                      @click="toggleCollect({
-                        collectType: 'turn',
-                        targetId: item.turnId,
-                        title: item.question,
-                        summaryText: item.report,
-                        conversationId: activeConversationId,
-                        metadata: { turn_id: item.turnId }
-                      })"
-                    >
-                      {{ isCollected('turn', item.turnId) ? '取消收藏' : '收藏本轮' }}
-                    </button>
-                  </div>
-                </div>
-                <ChartDisplay :chart-url="item.chartUrl" />
-              </div>
-
-              <div v-if="item.report" class="chat-message ai">
+              <div v-if="item.chartUrl || item.report" class="chat-message ai">
                 <div class="message-avatar ai">AI</div>
                 <div class="message-body">
-                  <div class="message-bubble ai report-text" v-html="renderMarkdown(item.report)" />
+                  <div class="result-card answer-card">
+                    <div class="result-header">
+                      <div class="result-title">分析结果</div>
+                      <div class="result-actions">
+                        <button class="action-btn" type="button" @click="openTurnDetail(item.turnId)">查看详情</button>
+                        <button
+                          class="action-btn"
+                          type="button"
+                          @click="toggleCollect({
+                            collectType: 'turn',
+                            targetId: item.turnId,
+                            title: item.question,
+                            summaryText: item.report,
+                            conversationId: activeConversationId,
+                            metadata: { turn_id: item.turnId, file_id: item.fileId || '' }
+                          })"
+                        >
+                          {{ isCollected('turn', item.turnId) ? '取消收藏' : '收藏本轮' }}
+                        </button>
+                        <button
+                          v-if="item.chartUrl"
+                          class="action-btn"
+                          type="button"
+                          @click="toggleChartCollectForTurn(item)"
+                        >
+                          {{ item.chartArtifactId && isCollected('artifact', item.chartArtifactId) ? '取消收藏图表' : '收藏图表' }}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div v-if="item.chartUrl" class="answer-chart">
+                      <ChartDisplay :chart-url="item.chartUrl" />
+                    </div>
+
+                    <div
+                      v-if="item.report"
+                      class="message-bubble ai report-text answer-report"
+                      v-html="renderMarkdown(item.report)"
+                    />
+                  </div>
                 </div>
               </div>
             </template>
@@ -174,37 +190,52 @@
                 </div>
               </div>
 
-              <div v-if="currentChartUrl" class="result-card">
-                <div class="result-header">
-                  <div class="result-title">本轮图表结果</div>
-                  <div class="result-actions">
-                    <button v-if="currentTurnId" class="action-btn" type="button" @click="openTurnDetail(currentTurnId)">
-                      查看详情
-                    </button>
-                    <button
-                      v-if="currentTurnId"
-                      class="action-btn"
-                      type="button"
-                      @click="toggleCollect({
-                        collectType: 'turn',
-                        targetId: currentTurnId,
-                        title: currentQuestion,
-                        summaryText: currentReport,
-                        conversationId: activeConversationId,
-                        metadata: { turn_id: currentTurnId }
-                      })"
-                    >
-                      {{ isCollected('turn', currentTurnId) ? '取消收藏' : '收藏本轮' }}
-                    </button>
-                  </div>
-                </div>
-                <ChartDisplay :chart-url="currentChartUrl" />
-              </div>
-
-              <div v-if="currentReport" class="chat-message ai">
+              <div v-if="currentChartUrl || currentReport" class="chat-message ai">
                 <div class="message-avatar ai">AI</div>
                 <div class="message-body">
-                  <div class="message-bubble ai report-text" v-html="renderMarkdown(currentReport)" />
+                  <div class="result-card answer-card">
+                    <div class="result-header">
+                      <div class="result-title">本轮分析结果</div>
+                      <div class="result-actions">
+                        <button v-if="currentTurnId" class="action-btn" type="button" @click="openTurnDetail(currentTurnId)">
+                          查看详情
+                        </button>
+                        <button
+                          v-if="currentTurnId"
+                          class="action-btn"
+                          type="button"
+                          @click="toggleCollect({
+                            collectType: 'turn',
+                            targetId: currentTurnId,
+                            title: currentQuestion,
+                            summaryText: currentReport,
+                            conversationId: activeConversationId,
+                            metadata: { turn_id: currentTurnId, file_id: currentResultFileId || '' }
+                          })"
+                        >
+                          {{ isCollected('turn', currentTurnId) ? '取消收藏' : '收藏本轮' }}
+                        </button>
+                        <button
+                          v-if="currentTurnId && currentChartUrl"
+                          class="action-btn"
+                          type="button"
+                          @click="toggleCurrentChartCollect"
+                        >
+                          {{ currentChartArtifactId && isCollected('artifact', currentChartArtifactId) ? '取消收藏图表' : '收藏图表' }}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div v-if="currentChartUrl" class="answer-chart">
+                      <ChartDisplay :chart-url="currentChartUrl" />
+                    </div>
+
+                    <div
+                      v-if="currentReport"
+                      class="message-bubble ai report-text answer-report"
+                      v-html="renderMarkdown(currentReport)"
+                    />
+                  </div>
                 </div>
               </div>
             </template>
@@ -219,14 +250,6 @@
     <aside class="favorites-panel" :class="{ show: favoritesPanelVisible }">
       <div class="favorites-header">
         <h3>★ 我的收藏</h3>
-        <div class="favorites-tabs">
-          <button class="favorites-tab" :class="{ active: activeFavoriteTab === 'snapshot' }" type="button" @click="activeFavoriteTab = 'snapshot'">
-            图表快照
-          </button>
-          <button class="favorites-tab" :class="{ active: activeFavoriteTab === 'report' }" type="button" @click="activeFavoriteTab = 'report'">
-            报告收藏
-          </button>
-        </div>
         <button class="favorites-close" type="button" @click="favoritesPanelVisible = false">×</button>
       </div>
 
@@ -234,36 +257,86 @@
         <template v-if="visibleFavorites.length">
           <div
             v-for="collect in visibleFavorites"
-            :key="collect.id"
+            :key="`enhanced-${collect.id}`"
             class="favorite-item"
+            :class="`favorite-item-${collect.collect_type}`"
             @click="onSelectCollect(collect)"
           >
-            <div class="favorite-header-row">
-              <div class="favorite-title">
-                <span class="favorite-type-icon">{{ collect.collect_type === 'artifact' ? '📈' : '📝' }}</span>
-                {{ collect.title || `收藏 ${collect.id}` }}
+            <template v-if="collect.collect_type === 'turn'">
+              <div class="favorite-header-row">
+                <div class="favorite-title">
+                  <span class="favorite-type-icon">📑</span>
+                  {{ collect.title || `收藏 ${collect.id}` }}
+                </div>
+                <span class="detail-pill">{{ favoriteTypeLabel(collect) }}</span>
               </div>
-            </div>
-            <div class="favorite-preview">
-              <div v-if="collect.collect_type === 'artifact'" class="chart-placeholder">
-                <span class="bar" style="height: 26px;" />
-                <span class="bar" style="height: 44px;" />
-                <span class="bar" style="height: 34px;" />
-                <span class="bar" style="height: 58px;" />
+
+              <div v-if="favoriteChartUrl(collect)" class="favorite-turn-chart">
+                <ChartDisplay :chart-url="favoriteChartUrl(collect)" />
               </div>
-              <div v-else class="favorite-preview-text">洞察结论 / 历史轮次 / 会话摘要</div>
-            </div>
-            <div v-if="collect.summary_text" class="favorite-summary">{{ collect.summary_text }}</div>
-            <div class="favorite-meta">
-              <span>{{ collect.collect_type }}</span>
-              <span>{{ collect.target_id }}</span>
-            </div>
+
+              <div
+                v-if="collect.summary_text"
+                class="message-bubble ai report-text favorite-result-report"
+                v-html="renderMarkdown(collect.summary_text)"
+              />
+
+              <div class="favorite-meta">
+                <span>Turn ID {{ collect.target_id }}</span>
+                <span>{{ formatDateTime(collect.created_at) }}</span>
+              </div>
+            </template>
+
+            <template v-else-if="collect.collect_type === 'artifact'">
+              <div class="favorite-header-row">
+                <div class="favorite-title">
+                  <span class="favorite-type-icon">📊</span>
+                  {{ collect.title || `收藏 ${collect.id}` }}
+                </div>
+                <span class="detail-pill">{{ favoriteTypeLabel(collect) }}</span>
+              </div>
+
+              <div class="favorite-preview favorite-artifact-preview">
+                <ChartDisplay v-if="favoriteChartUrl(collect)" :chart-url="favoriteChartUrl(collect)" />
+                <div v-else class="chart-placeholder">
+                  <span class="bar" style="height: 26px;" />
+                  <span class="bar" style="height: 44px;" />
+                  <span class="bar" style="height: 34px;" />
+                  <span class="bar" style="height: 58px;" />
+                </div>
+              </div>
+
+              <div class="favorite-meta">
+                <span>Artifact ID {{ collect.target_id }}</span>
+                <span>{{ formatDateTime(collect.created_at) }}</span>
+              </div>
+            </template>
+
+            <template v-else>
+              <div class="favorite-header-row">
+                <div class="favorite-title">
+                  <span class="favorite-type-icon">💬</span>
+                  {{ collect.title || `收藏 ${collect.id}` }}
+                </div>
+                <span class="detail-pill">{{ favoriteTypeLabel(collect) }}</span>
+              </div>
+
+              <div class="favorite-preview">
+                <div class="favorite-preview-text">会话收藏可直接打开并继续对话。</div>
+              </div>
+
+              <div class="favorite-meta">
+                <span>Conversation ID {{ collect.target_id }}</span>
+                <span>{{ formatDateTime(collect.created_at) }}</span>
+              </div>
+            </template>
           </div>
+
         </template>
         <div v-else class="favorites-empty">
           <div class="empty-icon">📁</div>
           <p>当前还没有可展示的收藏</p>
-          <span>图表收藏会展示在“图表快照”，其他收藏展示在“报告收藏”。</span>
+          <span>整体分析结果会展示在“分析结果”，单独图表会展示在“图表收藏”。</span>
         </div>
       </div>
     </aside>
@@ -285,7 +358,10 @@
               title: turnDetail.turn.user_query,
               summaryText: turnDetail.turn.final_answer,
               conversationId: turnDetail.conversation.id,
-              metadata: { turn_id: turnDetail.turn.id }
+              metadata: {
+                turn_id: turnDetail.turn.id,
+                file_id: turnDetail.artifacts.find((artifact) => artifact.artifact_type === 'chart' && artifact.file_id)?.file_id || ''
+              }
             })"
           >
             {{ isCollected('turn', turnDetail.turn.id) ? '取消收藏' : '收藏本轮' }}
@@ -381,6 +457,7 @@ import {
   listNamespaces,
   removeCollect,
   renameConversation,
+  renameNamespace,
   streamAgent
 } from './api/agent.js'
 
@@ -394,6 +471,8 @@ const activeConversationId = ref(0)
 const loading = ref(false)
 const chatHistory = ref([])
 const currentQuestion = ref('')
+const currentResultFileId = ref('')
+const currentChartArtifactId = ref(0)
 const currentChartUrl = ref('')
 const currentReport = ref('')
 const currentAssistantMessage = ref('')
@@ -407,7 +486,6 @@ const turnDetailLoading = ref(false)
 const turnDetail = ref(null)
 const previewArtifact = ref(null)
 const favoritesPanelVisible = ref(false)
-const activeFavoriteTab = ref('snapshot')
 
 const quickPrompts = [
   '分析2024年Q4季度的销售趋势',
@@ -423,15 +501,35 @@ const activeSpaceName = computed(() =>
   spaces.value.find((item) => String(item.id) === activeNamespace.value)?.name || ''
 )
 
-const visibleFavorites = computed(() => (
-  activeFavoriteTab.value === 'snapshot'
-    ? collects.value.filter((item) => item.collect_type === 'artifact')
-    : collects.value.filter((item) => item.collect_type !== 'artifact')
-))
+const visibleFavorites = computed(() => collects.value)
 
 const renderMarkdown = (content) => (content ? marked.parse(content) : '')
 const normalizeFileUrl = (fileId) => `/files/${encodeURIComponent(fileId)}`
 const collectKey = (collectType, targetId) => `${collectType}:${targetId}`
+const parseCollectMetadata = (collect) => {
+  if (!collect?.metadata_json) return {}
+  if (typeof collect.metadata_json === 'string') {
+    try {
+      return JSON.parse(collect.metadata_json || '{}')
+    } catch (error) {
+      console.error('Parse collect metadata error:', error)
+      return {}
+    }
+  }
+  return collect.metadata_json || {}
+}
+
+const favoriteChartUrl = (collect) => {
+  const metadata = parseCollectMetadata(collect)
+  return metadata.file_id ? normalizeFileUrl(metadata.file_id) : ''
+}
+
+const favoriteTypeLabel = (collect) => {
+  if (collect.collect_type === 'turn') return '整体结果'
+  if (collect.collect_type === 'artifact') return '图表收藏'
+  if (collect.collect_type === 'conversation') return '会话收藏'
+  return collect.collect_type || '收藏'
+}
 
 const createProgressItem = (event) => ({
   id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -483,6 +581,8 @@ const formatDateTime = (value) => {
 
 const resetCurrentConversationState = () => {
   currentQuestion.value = ''
+  currentResultFileId.value = ''
+  currentChartArtifactId.value = 0
   currentChartUrl.value = ''
   currentReport.value = ''
   currentAssistantMessage.value = ''
@@ -496,6 +596,8 @@ const finalizeCurrentConversation = () => {
   chatHistory.value.push({
     turnId: currentTurnId.value,
     question: currentQuestion.value,
+    fileId: currentResultFileId.value,
+    chartArtifactId: currentChartArtifactId.value,
     chartUrl: currentChartUrl.value,
     report: finalReply,
     progressItems: [...currentProgressItems.value]
@@ -514,6 +616,8 @@ const stopCurrentStream = () => {
 const mapHistoryItem = (item) => ({
   turnId: item.turn_id,
   question: item.question,
+  fileId: item.file_id || '',
+  chartArtifactId: item.chart_artifact_id || 0,
   chartUrl: item.file_id ? normalizeFileUrl(item.file_id) : '',
   report: item.report,
   progressItems: []
@@ -639,6 +743,97 @@ const toggleConversationCollect = async () => {
   })
 }
 
+const resolveChartArtifactForTurn = async (turnId, fallbackFileId = '') => {
+  if (!activeConversationId.value || !turnId) return null
+  const response = await getTurnDetail(activeConversationId.value, turnId)
+  if (!response.data?.success) return null
+  const detail = response.data.data
+  const chartArtifact = (detail?.artifacts || []).find((artifact) => artifact.artifact_type === 'chart' && artifact.file_id)
+  if (!chartArtifact) return null
+  return {
+    artifactId: chartArtifact.id,
+    fileId: chartArtifact.file_id || fallbackFileId || '',
+    title: chartArtifact.title || '',
+    summaryText: ''
+  }
+}
+
+const toggleChartCollectForTurn = async (item) => {
+  if (!item?.turnId || !item.chartUrl) return
+  let artifactId = item.chartArtifactId || 0
+  let fileId = item.fileId || ''
+  let title = `${item.question} 图表`
+  let summaryText = ''
+
+  if (!artifactId) {
+    try {
+      const chartArtifact = await resolveChartArtifactForTurn(item.turnId, item.fileId || '')
+      if (!chartArtifact) {
+        ElMessage.warning('当前轮次未找到可收藏的图表产物')
+        return
+      }
+      artifactId = chartArtifact.artifactId
+      fileId = chartArtifact.fileId
+      title = chartArtifact.title || title
+      summaryText = chartArtifact.summaryText || ''
+      item.chartArtifactId = artifactId
+      item.fileId = fileId || item.fileId || ''
+    } catch (error) {
+      console.error('Resolve chart artifact error:', error)
+      ElMessage.error('获取图表产物信息失败')
+      return
+    }
+  }
+
+  await toggleCollect({
+    collectType: 'artifact',
+    targetId: artifactId,
+    title,
+    summaryText,
+    conversationId: activeConversationId.value,
+    artifactId,
+    metadata: { turn_id: item.turnId, file_id: fileId }
+  })
+}
+
+const toggleCurrentChartCollect = async () => {
+  if (!currentTurnId.value || !currentChartUrl.value) return
+  let artifactId = currentChartArtifactId.value || 0
+  let fileId = currentResultFileId.value || ''
+  let title = `${currentQuestion.value} 图表`
+  let summaryText = ''
+
+  if (!artifactId) {
+    try {
+      const chartArtifact = await resolveChartArtifactForTurn(currentTurnId.value, currentResultFileId.value || '')
+      if (!chartArtifact) {
+        ElMessage.warning('当前轮次未找到可收藏的图表产物')
+        return
+      }
+      artifactId = chartArtifact.artifactId
+      fileId = chartArtifact.fileId
+      title = chartArtifact.title || title
+      summaryText = chartArtifact.summaryText || ''
+      currentChartArtifactId.value = artifactId
+      currentResultFileId.value = fileId || currentResultFileId.value
+    } catch (error) {
+      console.error('Resolve current chart artifact error:', error)
+      ElMessage.error('获取图表产物信息失败')
+      return
+    }
+  }
+
+  await toggleCollect({
+    collectType: 'artifact',
+    targetId: artifactId,
+    title,
+    summaryText,
+    conversationId: activeConversationId.value,
+    artifactId,
+    metadata: { turn_id: currentTurnId.value, file_id: fileId }
+  })
+}
+
 const onRenameConversation = async (conversation) => {
   if (!conversation?.id) return
   try {
@@ -699,18 +894,12 @@ const onSelectCollect = async (collect) => {
     return
   }
   if (collect.collect_type !== 'artifact') return
-  try {
-    const metadata = typeof collect.metadata_json === 'string'
-      ? JSON.parse(collect.metadata_json || '{}')
-      : (collect.metadata_json || {})
-    if (metadata.turn_id) {
-      await openTurnDetail(metadata.turn_id)
-    }
-    if (metadata.file_id && turnDetail.value?.artifacts?.length) {
-      previewArtifact.value = turnDetail.value.artifacts.find((item) => item.file_id === metadata.file_id) || null
-    }
-  } catch (error) {
-    console.error('Parse collect metadata error:', error)
+  const metadata = parseCollectMetadata(collect)
+  if (metadata.turn_id) {
+    await openTurnDetail(metadata.turn_id)
+  }
+  if (metadata.file_id && turnDetail.value?.artifacts?.length) {
+    previewArtifact.value = turnDetail.value.artifacts.find((item) => item.file_id === metadata.file_id) || null
   }
 }
 
@@ -787,6 +976,34 @@ const onDeleteSpace = async (space) => {
   }
 }
 
+const onRenameSpace = async (space) => {
+  if (!space?.id) return
+  try {
+    const { value } = await ElMessageBox.prompt('请输入新的洞察空间名称', '重命名洞察空间', {
+      inputValue: space.name || '',
+      confirmButtonText: '保存',
+      cancelButtonText: '取消',
+      inputPattern: /.*\S.*/,
+      inputErrorMessage: '空间名称不能为空'
+    })
+    const response = await renameNamespace(space.id, value)
+    if (!response.data.success) {
+      ElMessage.error(response.data.message || '重命名洞察空间失败')
+      return
+    }
+    await fetchSpaces()
+    if (activeNamespace.value === String(space.id)) {
+      activeNamespace.value = String(space.id)
+    }
+    ElMessage.success('洞察空间名称已更新')
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') {
+      console.error('Rename namespace error:', error)
+      ElMessage.error('重命名洞察空间失败')
+    }
+  }
+}
+
 const onDataSourceChange = (dataSource) => {
   currentDataSource.value = dataSource
 }
@@ -800,11 +1017,15 @@ const handleStreamEvent = async (event) => {
     await Promise.all([fetchConversations(), fetchCollects()])
     return
   }
-  if (event.type === 'result') {
-    if (event.file_id) currentChartUrl.value = normalizeFileUrl(event.file_id)
-    if (event.analysis_report) currentReport.value = event.analysis_report
-    scrollToBottom()
-    return
+    if (event.type === 'result') {
+      if (event.file_id) {
+        currentResultFileId.value = event.file_id
+        currentChartUrl.value = normalizeFileUrl(event.file_id)
+      }
+      if (event.chart_artifact_id) currentChartArtifactId.value = Number(event.chart_artifact_id)
+      if (event.analysis_report) currentReport.value = event.analysis_report
+      scrollToBottom()
+      return
   }
   if (event.type === 'done') {
     if (!currentReport.value && currentAssistantMessage.value) {
@@ -948,7 +1169,7 @@ onMounted(async () => {
 .message-avatar { width: 36px; height: 36px; border-radius: 12px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 12px; font-weight: 700; }
 .message-avatar.user { background: linear-gradient(135deg, #6366f1, #8b5cf6); color: #fff; }
 .message-avatar.ai { background: linear-gradient(135deg, #2563eb, #0ea5e9); color: #fff; }
-.message-body { flex: 1; }
+.message-body { flex: 1; min-width: 0; }
 .message-bubble { max-width: 72%; border-radius: 16px; padding: 14px 16px; line-height: 1.75; font-size: 14px; }
 .message-bubble.user { margin-left: auto; background: linear-gradient(135deg, #2563eb, #1d4ed8); color: #fff; }
 .message-bubble.ai { background: #f8fbff; color: #0f172a; }
@@ -964,6 +1185,38 @@ onMounted(async () => {
 .progress-item.assistant { background: #f5f3ff; color: #5b45b0; }
 .progress-empty { font-size: 12px; color: #64748b; }
 .result-card { margin: 14px 0 18px 48px; }
+.answer-card { width: 100%; margin: 0; }
+.answer-chart { margin-bottom: 14px; }
+.answer-report {
+  max-width: 100%;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 4px 6px 2px;
+  margin: 0;
+  background: transparent;
+  border-radius: 0;
+}
+.answer-report :deep(p),
+.answer-report :deep(ul),
+.answer-report :deep(ol),
+.answer-report :deep(pre),
+.answer-report :deep(blockquote) {
+  margin: 0 0 12px;
+}
+.answer-report :deep(p:last-child),
+.answer-report :deep(ul:last-child),
+.answer-report :deep(ol:last-child),
+.answer-report :deep(pre:last-child),
+.answer-report :deep(blockquote:last-child) {
+  margin-bottom: 0;
+}
+.answer-report :deep(h1),
+.answer-report :deep(h2),
+.answer-report :deep(h3),
+.answer-report :deep(h4) {
+  margin: 0 0 12px;
+  color: #0f172a;
+}
 .result-header, .favorites-header, .detail-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }
 .favorites-mask { position: fixed; inset: 56px 0 0 0; background: rgba(15, 23, 42, 0.28); z-index: 34; }
 .favorites-panel { position: fixed; top: 56px; right: -400px; width: 380px; height: calc(100vh - 56px); background: #fff; border-left: 1px solid #dbe3ef; z-index: 35; transition: right 0.28s ease; display: flex; flex-direction: column; }
@@ -977,10 +1230,15 @@ onMounted(async () => {
 .favorites-content { flex: 1; overflow-y: auto; padding: 16px; }
 .favorite-item { border: 1px solid #e5edf7; border-radius: 16px; padding: 14px; margin-bottom: 12px; background: #f8fbff; cursor: pointer; }
 .favorite-item:hover { border-color: #60a5fa; transform: translateY(-2px); }
+.favorite-item-turn { background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%); }
+.favorite-item-artifact { background: linear-gradient(180deg, #f8fbff 0%, #f3f8ff 100%); }
 .favorite-header-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
 .favorite-title, .detail-title, .artifact-title { font-size: 14px; font-weight: 700; color: #0f172a; display: flex; align-items: center; gap: 8px; }
 .favorite-type-icon { color: #f59e0b; }
 .favorite-preview { background: #eef4ff; border-radius: 10px; padding: 10px; margin-bottom: 10px; min-height: 78px; display: flex; align-items: center; justify-content: center; }
+.favorite-turn-chart { margin-bottom: 12px; }
+.favorite-artifact-preview { min-height: 180px; padding: 12px; align-items: stretch; }
+.favorite-result-report { width: 100%; max-width: 100%; box-sizing: border-box; margin-top: 0; }
 .chart-placeholder { display: flex; align-items: flex-end; gap: 8px; height: 58px; }
 .chart-placeholder .bar { width: 18px; border-radius: 4px 4px 0 0; background: linear-gradient(180deg, #60a5fa, #2563eb); display: inline-block; }
 .favorite-preview-text { font-size: 12px; color: #64748b; line-height: 1.7; text-align: center; }

@@ -13,6 +13,7 @@ def create_insight_namespace_controller() -> Blueprint:
 
     blueprint.route('', methods=['GET'])(controller.list_namespaces)
     blueprint.route('', methods=['POST'])(controller.create_namespace)
+    blueprint.route('/<int:namespace_id>', methods=['PUT'])(controller.rename_namespace)
     blueprint.route('/<int:namespace_id>', methods=['DELETE'])(controller.delete_namespace)
     return blueprint
 
@@ -65,5 +66,25 @@ class InsightNamespaceController(BaseController):
             if not deleted:
                 return jsonify(Result.error('洞察空间不存在', 404).to_dict()), 404
             return jsonify(Result.success(message='洞察空间已删除').to_dict())
+        finally:
+            session.close()
+
+    def rename_namespace(self, namespace_id: int):
+        data = self.get_json_data()
+        name = data.get('name', '')
+        session = SessionLocal()
+        try:
+            service = InsightNamespaceService(session)
+            namespace = service.rename_namespace(
+                username=self._get_username(),
+                namespace_id=namespace_id,
+                name=name,
+            )
+            if namespace is None:
+                return jsonify(Result.error('洞察空间不存在', 404).to_dict()), 404
+            return jsonify(Result.success(data=namespace, message='洞察空间已更新').to_dict())
+        except ValueError as exc:
+            session.rollback()
+            return jsonify(Result.error(str(exc), 400).to_dict()), 400
         finally:
             session.close()
