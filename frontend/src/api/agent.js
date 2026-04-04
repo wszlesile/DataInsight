@@ -9,6 +9,18 @@ export function invokeAgent(params) {
   return api.post('/agent/invoke', params)
 }
 
+export function listNamespaces() {
+  return api.get('/insight/namespaces')
+}
+
+export function createNamespace(name) {
+  return api.post('/insight/namespaces', { name })
+}
+
+export function deleteNamespace(namespaceId) {
+  return api.delete(`/insight/namespaces/${namespaceId}`)
+}
+
 export function listConversations(namespaceId) {
   return api.get('/insight/conversations', {
     params: {

@@ -76,6 +76,33 @@ def _parse_structured_content(content: Any) -> tuple[str, str]:
     return result_data.get('file_id', ''), result_data.get('analysis_report', '')
 
 
+def _is_internal_tool_feedback(content: Any) -> bool:
+    """
+    识别只用于模型自修正的工具错误反馈 JSON。
+
+    这类内容属于内部协议，不应展示给前端，也不应作为最终助手回复保存。
+    """
+    text = content if isinstance(content, str) else str(content)
+    if not text.startswith('{'):
+        return False
+
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return False
+
+    if not isinstance(payload, dict):
+        return False
+
+    return (
+        payload.get('tool') == 'execute_python'
+        and payload.get('status') == 'failed'
+        and isinstance(payload.get('error_type'), str)
+        and isinstance(payload.get('error_message'), str)
+        and isinstance(payload.get('repair_instructions'), list)
+    )
+
+
 def _build_progress_event(event_type: str, **payload: Any) -> dict[str, Any]:
     """构造一条适合通过 SSE 下发的事件载荷。"""
     return {'type': event_type, **payload}
@@ -198,6 +225,9 @@ def _extract_invoke_result(messages: list[Any]) -> tuple[str, str, str, bool]:
         if parsed_file_id or parsed_analysis_report:
             file_id = parsed_file_id or file_id
             analysis_report = parsed_analysis_report or analysis_report
+            continue
+
+        if _is_internal_tool_feedback(cleaned):
             continue
 
         if not assistant_message:
@@ -350,6 +380,9 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]
                                 file_id=file_id,
                                 analysis_report=analysis_report,
                             )
+                            continue
+
+                        if _is_internal_tool_feedback(cleaned):
                             continue
 
                         assistant_message = cleaned

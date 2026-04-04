@@ -6,6 +6,7 @@ from flask import Flask, abort, send_from_directory
 from config.config import Config
 from config.database import init_db
 from controller.agent_controller import create_agent_controller
+from controller.insight_namespace_controller import create_insight_namespace_controller
 from controller.insight_ns_conversation_controller import create_insight_ns_conversation_controller
 from controller.insight_user_collect_controller import create_insight_user_collect_controller
 from middleware.auth_middleware import init_auth_middleware
@@ -47,6 +48,7 @@ def _register_routes(app: Flask):
     init_auth_middleware(app)
 
     app.register_blueprint(create_agent_controller())
+    app.register_blueprint(create_insight_namespace_controller())
     app.register_blueprint(create_insight_ns_conversation_controller())
     app.register_blueprint(create_insight_user_collect_controller())
 

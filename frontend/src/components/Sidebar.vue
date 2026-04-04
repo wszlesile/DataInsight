@@ -8,7 +8,7 @@
     </div>
 
     <div class="sidebar-content">
-      <el-button type="primary" class="new-insight-btn" @click="$emit('new-conversation')">
+      <el-button type="primary" class="new-insight-btn" @click="$emit('new-space')">
         <span>+</span> 新建洞察
       </el-button>
 
@@ -23,6 +23,14 @@
         >
           <span class="nav-icon">NS</span>
           <span class="nav-text">{{ space.name }}</span>
+          <el-button
+            size="small"
+            text
+            class="space-delete-btn"
+            @click.stop="$emit('delete-space', space)"
+          >
+            删除
+          </el-button>
         </div>
       </div>
 
@@ -103,9 +111,10 @@ const props = defineProps({
 
 defineEmits([
   'select-space',
+  'delete-space',
   'select-conversation',
   'rename-conversation',
-  'new-conversation',
+  'new-space',
   'select-collect'
 ])
 
@@ -155,11 +164,12 @@ const formatTime = (value) => {
 .nav-section { margin-bottom: 24px; }
 .nav-title { padding: 8px 12px; font-size: 12px; color: rgba(255, 255, 255, 0.55); text-transform: uppercase; }
 .nav-item, .conversation-item, .collect-item { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: 10px; cursor: pointer; transition: background 0.2s; }
-.nav-item { flex-direction: row; align-items: center; }
+.nav-item { flex-direction: row; align-items: center; gap: 8px; }
 .nav-item:hover, .conversation-item:hover, .collect-item:hover { background: rgba(255, 255, 255, 0.08); }
 .nav-item.active, .conversation-item.active { background: rgba(74, 144, 226, 0.28); }
 .nav-icon { width: 24px; color: rgba(255, 255, 255, 0.7); font-size: 12px; }
 .nav-text, .conversation-title, .collect-title { font-size: 13px; font-weight: 600; color: #fff; }
+.space-delete-btn { margin-left: auto; color: rgba(255, 255, 255, 0.72); }
 .conversation-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .rename-btn { color: rgba(255, 255, 255, 0.75); }
 .conversation-summary, .collect-summary { font-size: 12px; line-height: 1.5; color: rgba(255, 255, 255, 0.65); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }

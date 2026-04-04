@@ -184,8 +184,21 @@ def get_datasource_message(namespace_id: int, conversation_id: int) -> SystemMes
     if namespace_id_int > 0:
         payload["namespace_id"] = namespace_id_int
 
+    instruction_lines = [
+        "当前洞察空间可用的数据源信息：",
+        "- `datasources` 是当前会话可直接使用的数据源全集。",
+    ]
+    if selected_ids:
+        instruction_lines.append(
+            f"- `selected_datasource_ids` 当前为 {selected_ids}，表示这些数据源已经被当前会话选中，可直接用于本轮分析，不需要再次向用户确认数据源。"
+        )
+    else:
+        instruction_lines.append(
+            "- 当前没有显式选中的数据源；只有在 `selected_datasource_ids` 缺失或为空时，才需要判断是否向用户补充确认。"
+        )
+
     return SystemMessage(
-        "当前洞察空间可用的数据源信息：\n"
+        "\n".join(instruction_lines) + "\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
 

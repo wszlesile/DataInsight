@@ -7,10 +7,11 @@
       :collects="collects"
       :active-conversation-id="activeConversationId"
       @select-space="onSelectSpace"
+      @delete-space="onDeleteSpace"
       @select-conversation="onSelectConversation"
       @rename-conversation="onRenameConversation"
       @select-collect="onSelectCollect"
-      @new-conversation="onNewConversation"
+      @new-space="onNewSpace"
     />
 
     <div class="main-content">
@@ -277,11 +278,14 @@ import DataSourcePanel from './components/DataSourcePanel.vue'
 import ChatInput from './components/ChatInput.vue'
 import ChartDisplay from './components/ChartDisplay.vue'
 import {
+  createNamespace,
   createCollect,
+  deleteNamespace,
   getConversationHistory,
   getTurnDetail,
   listCollects,
   listConversations,
+  listNamespaces,
   removeCollect,
   renameConversation,
   streamAgent
@@ -289,12 +293,9 @@ import {
 
 marked.setOptions({ breaks: true, gfm: true })
 
-const spaces = ref([
-  { id: '1', name: '销售数据分析' },
-  { id: '2', name: '报警数据分析' }
-])
+const spaces = ref([])
 
-const activeNamespace = ref('1')
+const activeNamespace = ref('')
 const conversations = ref([])
 const collects = ref([])
 const activeConversationId = ref(0)
@@ -407,6 +408,10 @@ const mapHistoryItem = (item) => ({
 })
 
 const fetchConversations = async () => {
+  if (!activeNamespace.value) {
+    conversations.value = []
+    return
+  }
   try {
     const response = await listConversations(activeNamespace.value)
     if (response.data.success) conversations.value = response.data.data || []
@@ -416,11 +421,30 @@ const fetchConversations = async () => {
 }
 
 const fetchCollects = async () => {
+  if (!activeNamespace.value) {
+    collects.value = []
+    return
+  }
   try {
     const response = await listCollects(activeNamespace.value)
     if (response.data.success) collects.value = response.data.data || []
   } catch (error) {
     console.error('List collects error:', error)
+  }
+}
+
+const fetchSpaces = async () => {
+  try {
+    const response = await listNamespaces()
+    if (response.data.success) {
+      spaces.value = (response.data.data || []).map((item) => ({
+        ...item,
+        id: String(item.id)
+      }))
+    }
+  } catch (error) {
+    console.error('List namespaces error:', error)
+    ElMessage.error('加载洞察空间失败')
   }
 }
 
@@ -540,7 +564,7 @@ const openArtifactFile = (artifact) => {
 const onSelectSpace = async (space) => {
   stopCurrentStream()
   loading.value = false
-  activeNamespace.value = space.id
+  activeNamespace.value = String(space.id)
   activeConversationId.value = 0
   chatHistory.value = []
   resetCurrentConversationState()
@@ -548,6 +572,9 @@ const onSelectSpace = async (space) => {
   turnDetail.value = null
   previewArtifact.value = null
   await Promise.all([fetchConversations(), fetchCollects()])
+  if (conversations.value.length > 0) {
+    await loadConversationHistory(conversations.value[0].id)
+  }
 }
 
 const onSelectConversation = async (conversation) => {
@@ -580,15 +607,84 @@ const onSelectCollect = async (collect) => {
   }
 }
 
-const onNewConversation = () => {
+const onNewSpace = async () => {
   stopCurrentStream()
-  loading.value = false
-  activeConversationId.value = 0
-  chatHistory.value = []
-  resetCurrentConversationState()
-  turnDetailVisible.value = false
-  turnDetail.value = null
-  previewArtifact.value = null
+  try {
+    const { value } = await ElMessageBox.prompt('请输入新的洞察空间名称', '新建洞察', {
+      confirmButtonText: '创建',
+      cancelButtonText: '取消',
+      inputPattern: /.*\S.*/,
+      inputErrorMessage: '空间名称不能为空'
+    })
+    const response = await createNamespace(value)
+    if (!response.data.success) {
+      ElMessage.error(response.data.message || '创建洞察空间失败')
+      return
+    }
+
+    const namespace = response.data.data?.namespace
+    const conversation = response.data.data?.conversation
+    await fetchSpaces()
+
+    activeNamespace.value = namespace ? String(namespace.id) : ''
+    conversations.value = conversation ? [conversation] : []
+    activeConversationId.value = conversation?.id || 0
+    chatHistory.value = []
+    loading.value = false
+    resetCurrentConversationState()
+    turnDetailVisible.value = false
+    turnDetail.value = null
+    previewArtifact.value = null
+    await fetchCollects()
+    ElMessage.success('洞察空间已创建')
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') {
+      console.error('Create namespace error:', error)
+      ElMessage.error('创建洞察空间失败')
+    }
+  }
+}
+
+const onDeleteSpace = async (space) => {
+  if (!space?.id) return
+  try {
+    await ElMessageBox.confirm(
+      `删除洞察空间“${space.name}”后，会同步删除该空间下的会话，是否继续？`,
+      '删除洞察空间',
+      {
+        confirmButtonText: '删除',
+        cancelButtonText: '取消',
+        type: 'warning'
+      }
+    )
+    const deletingCurrent = activeNamespace.value === String(space.id)
+    await deleteNamespace(space.id)
+    await fetchSpaces()
+
+    if (deletingCurrent) {
+      activeConversationId.value = 0
+      chatHistory.value = []
+      resetCurrentConversationState()
+      turnDetailVisible.value = false
+      turnDetail.value = null
+      previewArtifact.value = null
+      if (spaces.value.length > 0) {
+        await onSelectSpace(spaces.value[0])
+      } else {
+        activeNamespace.value = ''
+        conversations.value = []
+        collects.value = []
+      }
+    } else {
+      await Promise.all([fetchConversations(), fetchCollects()])
+    }
+    ElMessage.success('洞察空间已删除')
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') {
+      console.error('Delete namespace error:', error)
+      ElMessage.error('删除洞察空间失败')
+    }
+  }
 }
 
 const onDataSourceChange = (dataSource) => {
@@ -670,6 +766,10 @@ const handleStreamDone = async () => {
 
 const onSendMessage = (content) => {
   if (!content.trim()) return
+  if (!activeNamespace.value) {
+    ElMessage.warning('请先创建或选择一个洞察空间')
+    return
+  }
   stopCurrentStream()
   resetCurrentConversationState()
   currentQuestion.value = content
@@ -695,7 +795,17 @@ const onSendMessage = (content) => {
 }
 
 onMounted(async () => {
-  await Promise.all([fetchConversations(), fetchCollects()])
+  await fetchSpaces()
+  if (spaces.value.length > 0) {
+    await onSelectSpace(spaces.value[0])
+    return
+  }
+  activeNamespace.value = ''
+  activeConversationId.value = 0
+  conversations.value = []
+  collects.value = []
+  chatHistory.value = []
+  resetCurrentConversationState()
 })
 </script>
 

@@ -637,8 +637,8 @@ def _run_sqlite_schema_migrations() -> None:
     _backfill_knowledge_relations()
     _backfill_knowledge_tags()
     _rebuild_ns_rel_knowledge_table()
-    _backfill_conversation_binding_ids('insight_ns_rel_datasource')
-    _backfill_conversation_binding_ids('insight_ns_rel_knowledge')
+    # 当前设计中，`insight_conversation_id = 0` 是合法且必须保留的虚拟默认会话资源绑定。
+    # 这里不再把 `0` 视为“待补全的缺失值”去回填到真实会话，避免破坏默认资源关系。
 
     with engine.begin() as connection:
         connection.execute(text(
