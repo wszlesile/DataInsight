@@ -132,6 +132,31 @@ def _ensure_analysis_result_ready(file_id: str, analysis_report: str) -> None:
     raise ValueError('本轮未生成完整分析产物：缺少图表文件或分析报告，请重新执行分析。')
 
 
+def _did_enter_analysis_flow(
+    service: ConversationContextService,
+    runtime: ConversationRunContext,
+    raw_tool_call_detected: bool,
+    file_id: str,
+    analysis_report: str,
+) -> bool:
+    """
+    判断本轮是否已经进入真实分析执行链。
+
+    这里不再额外请求模型做意图分类，也不在代码里重复维护意图分流规则。
+    单次请求中：
+    - 如果模型真实调用了工具并留下执行记录，说明它已经按分析任务处理
+    - 如果模型输出了原始工具调用文本或已经产出了结构化分析结果，也视为分析链路
+    - 否则就把它解释为普通自然语言回复
+    """
+    if service.get_latest_execution(runtime.turn.id) is not None:
+        return True
+    if raw_tool_call_detected:
+        return True
+    if file_id or analysis_report:
+        return True
+    return False
+
+
 def _format_tool_call_message(tool_call: dict[str, Any]) -> str:
     """把工具调用元数据转换成前端可直接展示的执行阶段文案。"""
     tool_name = tool_call.get('name', 'unknown_tool')
@@ -204,7 +229,14 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
         )
         if raw_tool_call_detected and not (file_id or analysis_report):
             raise ValueError('模型返回了未执行的工具调用内容，未生成最终分析结果，请重试。')
-        _ensure_analysis_result_ready(file_id=file_id, analysis_report=analysis_report)
+        if _did_enter_analysis_flow(
+            service=service,
+            runtime=runtime,
+            raw_tool_call_detected=raw_tool_call_detected,
+            file_id=file_id,
+            analysis_report=analysis_report,
+        ):
+            _ensure_analysis_result_ready(file_id=file_id, analysis_report=analysis_report)
         return _finalize_run(
             service=service,
             runtime=runtime,
@@ -348,7 +380,14 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]
 
         if raw_tool_call_detected and not (file_id or analysis_report):
             raise ValueError('模型返回了未执行的工具调用内容，未生成最终分析结果，请重试。')
-        _ensure_analysis_result_ready(file_id=file_id, analysis_report=analysis_report)
+        if _did_enter_analysis_flow(
+            service=service,
+            runtime=runtime,
+            raw_tool_call_detected=raw_tool_call_detected,
+            file_id=file_id,
+            analysis_report=analysis_report,
+        ):
+            _ensure_analysis_result_ready(file_id=file_id, analysis_report=analysis_report)
 
         _finalize_run(
             service=service,
