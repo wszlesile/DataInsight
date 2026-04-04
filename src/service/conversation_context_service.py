@@ -560,7 +560,6 @@ class ConversationContextService:
         ).first()
         if has_datasource_rows is None:
             namespace_rows = self.session.query(InsightNsRelDatasource).filter(
-                InsightNsRelDatasource.insight_namespace_id == conversation.insight_namespace_id,
                 InsightNsRelDatasource.insight_conversation_id == 0,
                 InsightNsRelDatasource.is_deleted == 0,
             ).order_by(
