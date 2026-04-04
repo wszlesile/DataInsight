@@ -86,6 +86,7 @@ def build_prompt_messages(
     user_message: str,
     namespace_id: int = 0,
     conversation_id: int = 0,
+    extra_system_messages: list[str] | None = None,
 ) -> list[BaseMessage]:
     """
     为单次分析请求组装完整 Prompt 上下文。
@@ -114,6 +115,9 @@ def build_prompt_messages(
     # 因此应该放在原始历史消息之前。
     messages.extend(get_memory_messages(conversation_id, user_message=user_message))
     messages.extend(get_history_messages(conversation_id))
+    for extra_message in extra_system_messages or []:
+        if extra_message:
+            messages.append(SystemMessage(extra_message))
     messages.append(HumanMessage(user_message))
     return messages
 
@@ -122,6 +126,7 @@ def get_input(
     message: str,
     namespace_id: int = 0,
     conversation_id: int = 0,
+    extra_system_messages: list[str] | None = None,
 ) -> Any:
     """构建供 invoke/stream 调用使用的 Agent 输入载荷。"""
     return InputMessage(
@@ -129,5 +134,6 @@ def get_input(
             user_message=message,
             namespace_id=namespace_id,
             conversation_id=conversation_id,
+            extra_system_messages=extra_system_messages,
         )
     )

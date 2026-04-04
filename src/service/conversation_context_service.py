@@ -331,6 +331,20 @@ class ConversationContextService:
             InsightNsExecution.id.desc(),
         ).first()
 
+    def get_turn_executions(self, turn_id: Any) -> list[InsightNsExecution]:
+        """返回某一轮内全部代码执行记录，按发生顺序排列。"""
+        turn_id_int = to_int(turn_id, 0)
+        if turn_id_int <= 0:
+            return []
+
+        return self.session.query(InsightNsExecution).filter(
+            InsightNsExecution.turn_id == turn_id_int,
+            InsightNsExecution.is_deleted == 0,
+        ).order_by(
+            InsightNsExecution.created_at.asc(),
+            InsightNsExecution.id.asc(),
+        ).all()
+
     def get_memory(self, conversation_id: Any, memory_type: str) -> InsightNsMemory | None:
         conversation_id_int = to_int(conversation_id, 0)
         if conversation_id_int <= 0:
@@ -754,4 +768,3 @@ class ConversationContextService:
             InsightNsExecution.is_deleted == 0,
         ).all()
         return {to_int(row[0], 0) for row in rows if to_int(row[0], 0) > 0}
-

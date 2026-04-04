@@ -10,6 +10,7 @@ from utils import logger
 
 THINK_BLOCK_PATTERN = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
 TOOL_CALL_BLOCK_PATTERN = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", flags=re.DOTALL)
+MAX_ANALYSIS_AGENT_ROUNDS = 3
 
 
 @dataclass
@@ -127,6 +128,21 @@ def _build_agent_input(agent_request: AgentRequest, runtime: ConversationRunCont
     )
 
 
+def _build_agent_input_with_runtime_instruction(
+    agent_request: AgentRequest,
+    runtime: ConversationRunContext,
+    runtime_instruction: str = '',
+):
+    """在必要时为当前轮追加极短的运行时约束消息。"""
+    extra_system_messages = [runtime_instruction] if runtime_instruction else None
+    return get_input(
+        agent_request.user_message,
+        namespace_id=runtime.conversation.insight_namespace_id,
+        conversation_id=runtime.conversation.id,
+        extra_system_messages=extra_system_messages,
+    )
+
+
 def _finalize_run(
     service: ConversationContextService,
     runtime: ConversationRunContext,
@@ -196,6 +212,44 @@ def _format_tool_call_message(tool_call: dict[str, Any]) -> str:
     return f"准备调用工具：{tool_name}"
 
 
+def _build_analysis_recovery_instruction(
+    service: ConversationContextService,
+    runtime: ConversationRunContext,
+    round_index: int,
+) -> str:
+    """
+    为同一轮分析的后续修正回合构造运行时控制消息。
+
+    这里只描述当前轮必须继续完成分析闭环，不复制系统业务规则。
+    """
+    executions = service.get_turn_executions(runtime.turn.id)
+    failed_errors = [
+        execution.error_message.strip()
+        for execution in executions
+        if execution.execution_status != 'success' and (execution.error_message or '').strip()
+    ]
+    latest_errors = failed_errors[-3:]
+
+    lines = [
+        '本轮已经进入数据分析执行阶段。',
+        f'当前轮次已累计执行 {len(executions)} 次 Python 分析代码，但仍未成功生成完整分析产物。',
+    ]
+    if latest_errors:
+        lines.append('最近的执行错误如下：')
+        lines.extend(f'- {item}' for item in latest_errors)
+
+    lines.extend([
+        '请直接根据这些执行错误修正完整 Python 代码，并再次调用 execute_python。',
+        '不要向用户解释工具错误，不要再次询问用户，也不要用自然语言提前结束本轮。',
+        '只有成功生成完整的 file_id 和 analysis_report，这一轮分析才算完成。',
+    ])
+
+    if round_index >= MAX_ANALYSIS_AGENT_ROUNDS - 1:
+        lines.append('这已经是本轮最后一次修正机会；如果仍无法完成，请让本轮以失败结束，而不是伪装成成功。')
+
+    return '\n'.join(lines)
+
+
 def _extract_invoke_result(messages: list[Any]) -> tuple[str, str, str, bool]:
     """
     从 invoke 返回结果中提取最终助手消息和结构化工具结果。
@@ -250,23 +304,56 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
     try:
         # 先把本轮 turn 落库，再执行 Agent。
         # 这样工具层从一开始就能拿到最新的 conversation_id 与 turn_id。
-        agent_response = insight_agent.invoke(
-            _build_agent_input(agent_request, runtime),
-            context=_build_agent_context(agent_request, runtime),
-        )
-        assistant_message, analysis_report, file_id, raw_tool_call_detected = _extract_invoke_result(
-            agent_response.get('messages', [])
-        )
-        if raw_tool_call_detected and not (file_id or analysis_report):
-            raise ValueError('模型返回了未执行的工具调用内容，未生成最终分析结果，请重试。')
-        if _did_enter_analysis_flow(
-            service=service,
-            runtime=runtime,
-            raw_tool_call_detected=raw_tool_call_detected,
-            file_id=file_id,
-            analysis_report=analysis_report,
-        ):
-            _ensure_analysis_result_ready(file_id=file_id, analysis_report=analysis_report)
+        assistant_message = ''
+        analysis_report = ''
+        file_id = ''
+        analysis_flow_started = False
+
+        for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
+            runtime_instruction = ''
+            if analysis_flow_started:
+                runtime_instruction = _build_analysis_recovery_instruction(
+                    service=service,
+                    runtime=runtime,
+                    round_index=round_index,
+                )
+
+            agent_response = insight_agent.invoke(
+                _build_agent_input_with_runtime_instruction(
+                    agent_request=agent_request,
+                    runtime=runtime,
+                    runtime_instruction=runtime_instruction,
+                ),
+                context=_build_agent_context(agent_request, runtime),
+            )
+            assistant_message, analysis_report, file_id, raw_tool_call_detected = _extract_invoke_result(
+                agent_response.get('messages', [])
+            )
+
+            entered_analysis_flow = _did_enter_analysis_flow(
+                service=service,
+                runtime=runtime,
+                raw_tool_call_detected=raw_tool_call_detected,
+                file_id=file_id,
+                analysis_report=analysis_report,
+            )
+            analysis_flow_started = analysis_flow_started or entered_analysis_flow
+
+            if raw_tool_call_detected and not (file_id or analysis_report):
+                if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
+                    continue
+                raise ValueError('模型返回了未执行的工具调用内容，未生成最终分析结果，请重试。')
+
+            if analysis_flow_started:
+                if file_id and analysis_report:
+                    break
+                if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
+                    continue
+                _ensure_analysis_result_ready(file_id=file_id, analysis_report=analysis_report)
+                break
+
+            break
+
         return _finalize_run(
             service=service,
             runtime=runtime,
@@ -295,7 +382,7 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]
     assistant_message = ''
     file_id = ''
     analysis_report = ''
-    raw_tool_call_detected = False
+    analysis_flow_started = False
 
     yield _build_progress_event(
         'session',
@@ -314,113 +401,148 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]
     )
 
     try:
-        for stream_mode, chunk in insight_agent.stream(
-            _build_agent_input(agent_request, runtime),
-            context=_build_agent_context(agent_request, runtime),
-            stream_mode=["updates", "custom"],
-        ):
-            if stream_mode == "updates":
-                # `updates` 承载模型与工具节点的增量消息。
-                # 这里会把内部消息转换成前端可直接消费的进度事件。
-                for _, payload in chunk.items():
-                    messages = payload.get("messages", [])
-                    for message in messages:
-                        tool_calls = getattr(message, 'tool_calls', None)
-                        raw_tool_call = _extract_raw_tool_call(getattr(message, 'content', ''))
-                        cleaned = _clean_message_content(getattr(message, 'content', ''))
+        for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
+            raw_tool_call_detected = False
+            runtime_instruction = ''
+            if analysis_flow_started:
+                runtime_instruction = _build_analysis_recovery_instruction(
+                    service=service,
+                    runtime=runtime,
+                    round_index=round_index,
+                )
+                yield _build_progress_event(
+                    'status',
+                    conversation_id=runtime.conversation.id,
+                    turn_id=runtime.turn.id,
+                    stage='retry',
+                    level='warning',
+                    message='本轮分析尚未完成，正在根据最近执行错误继续修正代码。',
+                )
 
-                        if tool_calls:
-                            if cleaned:
-                                assistant_message = cleaned
-                                yield _build_progress_event(
-                                    'assistant',
-                                    conversation_id=runtime.conversation.id,
-                                    turn_id=runtime.turn.id,
-                                    stage='planning',
-                                    message=cleaned,
-                                )
-                            for tool_call in tool_calls:
+            for stream_mode, chunk in insight_agent.stream(
+                _build_agent_input_with_runtime_instruction(
+                    agent_request=agent_request,
+                    runtime=runtime,
+                    runtime_instruction=runtime_instruction,
+                ),
+                context=_build_agent_context(agent_request, runtime),
+                stream_mode=["updates", "custom"],
+            ):
+                if stream_mode == "updates":
+                    # `updates` 承载模型与工具节点的增量消息。
+                    # 这里会把内部消息转换成前端可直接消费的进度事件。
+                    for _, payload in chunk.items():
+                        messages = payload.get("messages", [])
+                        for message in messages:
+                            tool_calls = getattr(message, 'tool_calls', None)
+                            raw_tool_call = _extract_raw_tool_call(getattr(message, 'content', ''))
+                            cleaned = _clean_message_content(getattr(message, 'content', ''))
+
+                            if tool_calls:
+                                if cleaned:
+                                    assistant_message = cleaned
+                                    yield _build_progress_event(
+                                        'assistant',
+                                        conversation_id=runtime.conversation.id,
+                                        turn_id=runtime.turn.id,
+                                        stage='planning',
+                                        message=cleaned,
+                                    )
+                                for tool_call in tool_calls:
+                                    yield _build_progress_event(
+                                        'status',
+                                        conversation_id=runtime.conversation.id,
+                                        turn_id=runtime.turn.id,
+                                        stage='tool_call',
+                                        level='info',
+                                        tool=tool_call.get('name', ''),
+                                        message=_format_tool_call_message(tool_call),
+                                    )
+                                continue
+
+                            if raw_tool_call:
+                                raw_tool_call_detected = True
                                 yield _build_progress_event(
                                     'status',
                                     conversation_id=runtime.conversation.id,
                                     turn_id=runtime.turn.id,
                                     stage='tool_call',
                                     level='info',
-                                    tool=tool_call.get('name', ''),
-                                    message=_format_tool_call_message(tool_call),
+                                    tool=raw_tool_call.get('name', ''),
+                                    message=_format_tool_call_message(raw_tool_call),
                                 )
-                            continue
+                                continue
 
-                        if raw_tool_call:
-                            raw_tool_call_detected = True
+                            if not cleaned:
+                                continue
+
+                            # 工具返回值仍然遵循 StructuredResult(file_id, analysis_report)。
+                            parsed_file_id, parsed_analysis_report = _parse_structured_content(cleaned)
+                            if parsed_file_id or parsed_analysis_report:
+                                file_id = parsed_file_id or file_id
+                                analysis_report = parsed_analysis_report or analysis_report
+                                yield _build_progress_event(
+                                    'result',
+                                    conversation_id=runtime.conversation.id,
+                                    turn_id=runtime.turn.id,
+                                    stage='result',
+                                    file_id=file_id,
+                                    analysis_report=analysis_report,
+                                )
+                                continue
+
+                            if _is_internal_tool_feedback(cleaned):
+                                continue
+
+                            assistant_message = cleaned
                             yield _build_progress_event(
-                                'status',
+                                'assistant',
                                 conversation_id=runtime.conversation.id,
                                 turn_id=runtime.turn.id,
-                                stage='tool_call',
-                                level='info',
-                                tool=raw_tool_call.get('name', ''),
-                                message=_format_tool_call_message(raw_tool_call),
+                                stage='planning',
+                                message=cleaned,
                             )
-                            continue
 
-                        if not cleaned:
-                            continue
-
-                        # 工具返回值仍然遵循 StructuredResult(file_id, analysis_report)。
-                        parsed_file_id, parsed_analysis_report = _parse_structured_content(cleaned)
-                        if parsed_file_id or parsed_analysis_report:
-                            file_id = parsed_file_id or file_id
-                            analysis_report = parsed_analysis_report or analysis_report
-                            yield _build_progress_event(
-                                'result',
-                                conversation_id=runtime.conversation.id,
-                                turn_id=runtime.turn.id,
-                                stage='result',
-                                file_id=file_id,
-                                analysis_report=analysis_report,
-                            )
-                            continue
-
-                        if _is_internal_tool_feedback(cleaned):
-                            continue
-
-                        assistant_message = cleaned
+                elif stream_mode == "custom":
+                    # `custom` 承载工具侧主动发出的事件，
+                    # 比如 execute_python 的执行进度。
+                    if isinstance(chunk, dict):
+                        chunk.setdefault('conversation_id', runtime.conversation.id)
+                        chunk.setdefault('turn_id', runtime.turn.id)
+                        yield chunk
+                    elif chunk:
                         yield _build_progress_event(
-                            'assistant',
+                            'status',
                             conversation_id=runtime.conversation.id,
                             turn_id=runtime.turn.id,
-                            stage='planning',
-                            message=cleaned,
+                            stage='tool',
+                            level='info',
+                            message=str(chunk),
                         )
 
-            elif stream_mode == "custom":
-                # `custom` 承载工具侧主动发出的事件，
-                # 比如 execute_python 的执行进度。
-                if isinstance(chunk, dict):
-                    chunk.setdefault('conversation_id', runtime.conversation.id)
-                    chunk.setdefault('turn_id', runtime.turn.id)
-                    yield chunk
-                elif chunk:
-                    yield _build_progress_event(
-                        'status',
-                        conversation_id=runtime.conversation.id,
-                        turn_id=runtime.turn.id,
-                        stage='tool',
-                        level='info',
-                        message=str(chunk),
-                    )
+            entered_analysis_flow = _did_enter_analysis_flow(
+                service=service,
+                runtime=runtime,
+                raw_tool_call_detected=raw_tool_call_detected,
+                file_id=file_id,
+                analysis_report=analysis_report,
+            )
+            analysis_flow_started = analysis_flow_started or entered_analysis_flow
 
-        if raw_tool_call_detected and not (file_id or analysis_report):
-            raise ValueError('模型返回了未执行的工具调用内容，未生成最终分析结果，请重试。')
-        if _did_enter_analysis_flow(
-            service=service,
-            runtime=runtime,
-            raw_tool_call_detected=raw_tool_call_detected,
-            file_id=file_id,
-            analysis_report=analysis_report,
-        ):
-            _ensure_analysis_result_ready(file_id=file_id, analysis_report=analysis_report)
+            if raw_tool_call_detected and not (file_id or analysis_report):
+                if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
+                    continue
+                raise ValueError('模型返回了未执行的工具调用内容，未生成最终分析结果，请重试。')
+
+            if analysis_flow_started:
+                if file_id and analysis_report:
+                    break
+                if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
+                    continue
+                _ensure_analysis_result_ready(file_id=file_id, analysis_report=analysis_report)
+                break
+
+            break
 
         _finalize_run(
             service=service,
