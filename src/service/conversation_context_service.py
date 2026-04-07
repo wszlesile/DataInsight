@@ -46,6 +46,8 @@ class ConversationRunContext:
     conversation: InsightNsConversation
     turn: InsightNsTurn
     active_datasource_snapshot: dict[str, Any]
+    is_rerun: bool = False
+    history_turn_limit: int | None = None
 
 
 class ConversationContextService:
@@ -127,6 +129,55 @@ class ConversationContextService:
             conversation=conversation,
             turn=turn,
             active_datasource_snapshot=active_snapshot,
+        )
+
+    def start_rerun(
+        self,
+        username: str,
+        conversation_id: Any,
+        turn_id: Any,
+    ) -> ConversationRunContext | None:
+        """在同一轮次内重新执行分析，并复用该轮原始问题与数据源快照。"""
+        conversation = self._get_accessible_conversation(username, conversation_id)
+        if conversation is None:
+            return None
+
+        turn_id_int = to_int(turn_id, 0)
+        if turn_id_int <= 0:
+            return None
+
+        turn = self.session.query(InsightNsTurn).filter(
+            InsightNsTurn.id == turn_id_int,
+            InsightNsTurn.conversation_id == conversation.id,
+            InsightNsTurn.is_deleted == 0,
+        ).first()
+        if turn is None:
+            return None
+
+        selected_ids = safe_json_loads(turn.selected_datasource_ids_json, [])
+        selected_snapshot = safe_json_loads(turn.selected_datasource_snapshot_json, [])
+        active_snapshot = {
+            "namespace_id": conversation.insight_namespace_id,
+            "conversation_id": conversation.id,
+            "selected_datasource_ids": selected_ids,
+            "selected_datasource_snapshot": selected_snapshot,
+            "updated_at": _now().isoformat(),
+        }
+
+        self._reset_turn_runtime_state(conversation, turn)
+        conversation.active_datasource_snapshot = dump_json(active_snapshot)
+        conversation.last_message_at = _now()
+        conversation.updated_at = _now()
+        conversation.user_message = turn.user_query
+        conversation.status = 'active'
+
+        self.session.commit()
+        return ConversationRunContext(
+            conversation=conversation,
+            turn=turn,
+            active_datasource_snapshot=active_snapshot,
+            is_rerun=True,
+            history_turn_limit=max(turn.turn_no - 1, 0),
         )
 
     def add_message(
@@ -258,17 +309,30 @@ class ConversationContextService:
         self._refresh_memories(conversation)
         self.session.commit()
 
-    def get_recent_prompt_messages(self, conversation_id: Any, limit_messages: int = 10) -> list[InsightNsMessage]:
+    def get_recent_prompt_messages(
+        self,
+        conversation_id: Any,
+        limit_messages: int = 10,
+        max_turn_no: int | None = None,
+    ) -> list[InsightNsMessage]:
         conversation_id_int = to_int(conversation_id, 0)
         if conversation_id_int <= 0:
             return []
 
-        rows = self.session.query(InsightNsMessage).filter(
+        query = self.session.query(InsightNsMessage).join(
+            InsightNsTurn,
+            InsightNsTurn.id == InsightNsMessage.turn_id,
+        ).filter(
             InsightNsMessage.insight_conversation_id == conversation_id_int,
             InsightNsMessage.role.in_(['user', 'assistant']),
             InsightNsMessage.message_kind.in_(['prompt', 'final_answer']),
             InsightNsMessage.is_deleted == 0,
-        ).order_by(
+            InsightNsTurn.is_deleted == 0,
+        )
+        if max_turn_no is not None and max_turn_no >= 0:
+            query = query.filter(InsightNsTurn.turn_no <= max_turn_no)
+
+        rows = query.order_by(
             InsightNsMessage.created_at.desc(),
             InsightNsMessage.id.desc(),
         ).limit(limit_messages * 3).all()
@@ -290,29 +354,55 @@ class ConversationContextService:
 
         return list(reversed(filtered_rows))
 
-    def get_recent_artifacts(self, conversation_id: Any, limit_items: int = 3) -> list[InsightNsArtifact]:
+    def get_recent_artifacts(
+        self,
+        conversation_id: Any,
+        limit_items: int = 3,
+        max_turn_no: int | None = None,
+    ) -> list[InsightNsArtifact]:
         conversation_id_int = to_int(conversation_id, 0)
         if conversation_id_int <= 0:
             return []
 
-        rows = self.session.query(InsightNsArtifact).filter(
+        query = self.session.query(InsightNsArtifact).join(
+            InsightNsTurn,
+            InsightNsTurn.id == InsightNsArtifact.turn_id,
+        ).filter(
             InsightNsArtifact.conversation_id == conversation_id_int,
             InsightNsArtifact.is_deleted == 0,
-        ).order_by(
+            InsightNsTurn.is_deleted == 0,
+        )
+        if max_turn_no is not None and max_turn_no >= 0:
+            query = query.filter(InsightNsTurn.turn_no <= max_turn_no)
+
+        rows = query.order_by(
             InsightNsArtifact.created_at.desc(),
             InsightNsArtifact.id.desc(),
         ).limit(limit_items).all()
         return list(reversed(rows))
 
-    def get_recent_executions(self, conversation_id: Any, limit_items: int = 3) -> list[InsightNsExecution]:
+    def get_recent_executions(
+        self,
+        conversation_id: Any,
+        limit_items: int = 3,
+        max_turn_no: int | None = None,
+    ) -> list[InsightNsExecution]:
         conversation_id_int = to_int(conversation_id, 0)
         if conversation_id_int <= 0:
             return []
 
-        rows = self.session.query(InsightNsExecution).filter(
+        query = self.session.query(InsightNsExecution).join(
+            InsightNsTurn,
+            InsightNsTurn.id == InsightNsExecution.turn_id,
+        ).filter(
             InsightNsExecution.conversation_id == conversation_id_int,
             InsightNsExecution.is_deleted == 0,
-        ).order_by(
+            InsightNsTurn.is_deleted == 0,
+        )
+        if max_turn_no is not None and max_turn_no >= 0:
+            query = query.filter(InsightNsTurn.turn_no <= max_turn_no)
+
+        rows = query.order_by(
             InsightNsExecution.created_at.desc(),
             InsightNsExecution.id.desc(),
         ).limit(limit_items).all()
@@ -355,14 +445,19 @@ class ConversationContextService:
             InsightNsMemory.is_deleted == 0,
         ).first()
 
-    def build_runtime_summary_text(self, conversation_id: Any) -> str:
+    def build_runtime_summary_text(self, conversation_id: Any, max_turn_no: int | None = None) -> str:
         """实时根据当前有效轮次重建摘要，避免旧记忆污染当前 Prompt。"""
         conversation_id_int = to_int(conversation_id, 0)
         if conversation_id_int <= 0:
             return ''
-        return self._build_summary_text(conversation_id_int)
+        return self._build_summary_text(conversation_id_int, max_turn_no=max_turn_no)
 
-    def build_runtime_analysis_state(self, conversation_id: Any) -> dict[str, Any]:
+    def build_runtime_analysis_state(
+        self,
+        conversation_id: Any,
+        max_turn_no: int | None = None,
+        active_snapshot_override: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """实时根据数据库状态重建当前分析状态，而不是直接复用旧记忆快照。"""
         conversation_id_int = to_int(conversation_id, 0)
         conversation = self._get_conversation_by_id(conversation_id_int)
@@ -370,15 +465,30 @@ class ConversationContextService:
             return {}
 
         return {
-            "active_datasource_snapshot": safe_json_loads(conversation.active_datasource_snapshot, {}),
-            "recent_turn_datasource_usage": self._build_recent_turn_datasource_usage(conversation_id_int, limit_turns=3),
-            "recent_execution_summaries": self._build_recent_execution_summaries(conversation_id_int, limit_items=3),
-            "latest_execution": self._build_latest_execution_summary(conversation_id_int),
+            "active_datasource_snapshot": active_snapshot_override or safe_json_loads(conversation.active_datasource_snapshot, {}),
+            "recent_turn_datasource_usage": self._build_recent_turn_datasource_usage(
+                conversation_id_int,
+                limit_turns=3,
+                max_turn_no=max_turn_no,
+            ),
+            "recent_execution_summaries": self._build_recent_execution_summaries(
+                conversation_id_int,
+                limit_items=3,
+                max_turn_no=max_turn_no,
+            ),
+            "latest_execution": self._build_latest_execution_summary(
+                conversation_id_int,
+                max_turn_no=max_turn_no,
+            ),
             "latest_artifacts": [
                 artifact.to_dict()
-                for artifact in self.get_recent_artifacts(conversation_id_int, limit_items=3)
+                for artifact in self.get_recent_artifacts(
+                    conversation_id_int,
+                    limit_items=3,
+                    max_turn_no=max_turn_no,
+                )
             ],
-            "last_turn_no": conversation.last_turn_no,
+            "last_turn_no": max_turn_no if max_turn_no is not None else conversation.last_turn_no,
         }
 
     def get_active_datasource_snapshot(self, conversation_id: Any) -> dict[str, Any]:
@@ -419,6 +529,49 @@ class ConversationContextService:
             InsightNsTurn.id == turn_id,
             InsightNsTurn.is_deleted == 0,
         ).first()
+
+    def _reset_turn_runtime_state(
+        self,
+        conversation: InsightNsConversation,
+        turn: InsightNsTurn,
+    ) -> None:
+        """重跑前清空该轮旧结果，仅保留原始问题与数据源快照。"""
+        now = _now()
+
+        self.session.query(InsightNsMessage).filter(
+            InsightNsMessage.insight_conversation_id == conversation.id,
+            InsightNsMessage.turn_id == turn.id,
+            InsightNsMessage.role == 'assistant',
+            InsightNsMessage.is_deleted == 0,
+        ).update(
+            {InsightNsMessage.is_deleted: 1},
+            synchronize_session=False,
+        )
+        self.session.query(InsightNsExecution).filter(
+            InsightNsExecution.conversation_id == conversation.id,
+            InsightNsExecution.turn_id == turn.id,
+            InsightNsExecution.is_deleted == 0,
+        ).update(
+            {
+                InsightNsExecution.is_deleted: 1,
+                InsightNsExecution.updated_at: now,
+            },
+            synchronize_session=False,
+        )
+        self.session.query(InsightNsArtifact).filter(
+            InsightNsArtifact.conversation_id == conversation.id,
+            InsightNsArtifact.turn_id == turn.id,
+            InsightNsArtifact.is_deleted == 0,
+        ).update(
+            {InsightNsArtifact.is_deleted: 1},
+            synchronize_session=False,
+        )
+
+        turn.final_answer = ''
+        turn.status = 'running'
+        turn.error_message = ''
+        turn.started_at = now
+        turn.finished_at = None
 
     def _next_seq_no(self, conversation_id: int, turn_no: int) -> int:
         last_seq = self.session.query(func.max(InsightNsMessage.seq_no)).filter(
@@ -663,12 +816,15 @@ class ConversationContextService:
             self.build_runtime_analysis_state(conversation.id),
         )
 
-    def _build_summary_text(self, conversation_id: int) -> str:
+    def _build_summary_text(self, conversation_id: int, max_turn_no: int | None = None) -> str:
         """根据最近几轮构建紧凑的自然语言摘要。"""
-        turns = self.session.query(InsightNsTurn).filter(
+        query = self.session.query(InsightNsTurn).filter(
             InsightNsTurn.conversation_id == conversation_id,
             InsightNsTurn.is_deleted == 0,
-        ).order_by(InsightNsTurn.turn_no.desc()).limit(6).all()
+        )
+        if max_turn_no is not None and max_turn_no >= 0:
+            query = query.filter(InsightNsTurn.turn_no <= max_turn_no)
+        turns = query.order_by(InsightNsTurn.turn_no.desc()).limit(6).all()
         turns.reverse()
         if not turns:
             return ''
@@ -684,12 +840,20 @@ class ConversationContextService:
                 parts.append(f"第{turn.turn_no}轮 用户: {question}")
         return '\n'.join(parts)
 
-    def _build_recent_turn_datasource_usage(self, conversation_id: int, limit_turns: int = 3) -> list[dict[str, Any]]:
+    def _build_recent_turn_datasource_usage(
+        self,
+        conversation_id: int,
+        limit_turns: int = 3,
+        max_turn_no: int | None = None,
+    ) -> list[dict[str, Any]]:
         """收集最近几轮使用过的数据源 ID。"""
-        turns = self.session.query(InsightNsTurn).filter(
+        query = self.session.query(InsightNsTurn).filter(
             InsightNsTurn.conversation_id == conversation_id,
             InsightNsTurn.is_deleted == 0,
-        ).order_by(InsightNsTurn.turn_no.desc()).limit(limit_turns).all()
+        )
+        if max_turn_no is not None and max_turn_no >= 0:
+            query = query.filter(InsightNsTurn.turn_no <= max_turn_no)
+        turns = query.order_by(InsightNsTurn.turn_no.desc()).limit(limit_turns).all()
         turns.reverse()
         return [
             {
@@ -700,14 +864,27 @@ class ConversationContextService:
             for turn in turns
         ]
 
-    def _build_recent_execution_summaries(self, conversation_id: int, limit_items: int = 3) -> list[dict[str, Any]]:
+    def _build_recent_execution_summaries(
+        self,
+        conversation_id: int,
+        limit_items: int = 3,
+        max_turn_no: int | None = None,
+    ) -> list[dict[str, Any]]:
         """收集最近的执行摘要，供结构化记忆使用。"""
-        executions = self.get_recent_executions(conversation_id, limit_items=limit_items)
+        executions = self.get_recent_executions(
+            conversation_id,
+            limit_items=limit_items,
+            max_turn_no=max_turn_no,
+        )
         return [self._build_execution_summary_item(execution) for execution in executions]
 
-    def _build_latest_execution_summary(self, conversation_id: int) -> dict[str, Any]:
+    def _build_latest_execution_summary(self, conversation_id: int, max_turn_no: int | None = None) -> dict[str, Any]:
         """返回最近一次执行摘要，并附带完整代码以支撑后续追问。"""
-        executions = self.get_recent_executions(conversation_id, limit_items=1)
+        executions = self.get_recent_executions(
+            conversation_id,
+            limit_items=1,
+            max_turn_no=max_turn_no,
+        )
         if not executions:
             return {}
         return self._build_execution_summary_item(executions[-1], include_code=True)

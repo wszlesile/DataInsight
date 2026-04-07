@@ -126,6 +126,8 @@ def _build_agent_input(agent_request: AgentRequest, runtime: ConversationRunCont
         agent_request.user_message,
         namespace_id=runtime.conversation.insight_namespace_id,
         conversation_id=runtime.conversation.id,
+        history_turn_limit=runtime.history_turn_limit,
+        datasource_snapshot_override=runtime.active_datasource_snapshot,
     )
 
 
@@ -141,6 +143,8 @@ def _build_agent_input_with_runtime_instruction(
         namespace_id=runtime.conversation.insight_namespace_id,
         conversation_id=runtime.conversation.id,
         extra_system_messages=extra_system_messages,
+        history_turn_limit=runtime.history_turn_limit,
+        datasource_snapshot_override=runtime.active_datasource_snapshot,
     )
 
 
@@ -375,21 +379,16 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
         session.close()
 
 
-def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]:
-    """执行一次流式分析请求，并持续产出适合 SSE 下发的进度事件。"""
-    session = SessionLocal()
-    service = ConversationContextService(session)
-    runtime = service.start_run(
-        username=agent_request.username,
-        namespace_id=agent_request.namespace_id,
-        conversation_id=agent_request.conversation_id,
-        user_message=agent_request.user_message,
-    )
-
+def _stream_with_runtime(
+    service: ConversationContextService,
+    runtime: ConversationRunContext,
+    agent_request: AgentRequest,
+) -> Iterator[dict[str, Any]]:
+    """在给定运行上下文下执行流式分析或重跑，并持续产出 SSE 事件。"""
     assistant_message = ''
     file_id = ''
     analysis_report = ''
-    analysis_flow_started = False
+    analysis_flow_started = runtime.is_rerun
 
     yield _build_progress_event(
         'session',
@@ -583,5 +582,47 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]
             level='error',
             message=str(exc),
         )
+
+
+def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]:
+    """执行一次流式分析请求，并持续产出适合 SSE 下发的进度事件。"""
+    session = SessionLocal()
+    service = ConversationContextService(session)
+    runtime = service.start_run(
+        username=agent_request.username,
+        namespace_id=agent_request.namespace_id,
+        conversation_id=agent_request.conversation_id,
+        user_message=agent_request.user_message,
+    )
+
+    try:
+        yield from _stream_with_runtime(service, runtime, agent_request)
+    finally:
+        session.close()
+
+
+def stream_rerun_turn(username: str, conversation_id: Any, turn_id: Any) -> Iterator[dict[str, Any]]:
+    """在同一轮次内重新执行一次分析，并把新结果回写到该轮。"""
+    session = SessionLocal()
+    service = ConversationContextService(session)
+    runtime = service.start_rerun(
+        username=username,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+    )
+
+    if runtime is None:
+        session.close()
+        raise ValueError('轮次详情不存在')
+
+    agent_request = AgentRequest(
+        username=username,
+        namespace_id=str(runtime.conversation.insight_namespace_id),
+        conversation_id=str(runtime.conversation.id),
+        user_message=runtime.turn.user_query,
+    )
+
+    try:
+        yield from _stream_with_runtime(service, runtime, agent_request)
     finally:
         session.close()

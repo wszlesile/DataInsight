@@ -45,6 +45,50 @@ export function getTurnDetail(conversationId, turnId) {
   return api.get(`/insight/conversations/${conversationId}/turns/${turnId}`)
 }
 
+export function bindConversationDatasource(conversationId, datasourceId) {
+  return api.post('/insight/conversation/datasource/', {
+    insight_conversation_id: conversationId,
+    datasource_id: datasourceId
+  })
+}
+
+export function unbindConversationDatasource(conversationId, datasourceId) {
+  return api.delete('/insight/conversation/datasource/', {
+    data: {
+      insight_conversation_id: conversationId,
+      datasource_id: datasourceId
+    }
+  })
+}
+
+export function listNamespaceDatasources(namespaceId, conversationId) {
+  return api.get(`/insight/namespaces/${namespaceId}/datasources`, {
+    params: conversationId
+      ? {
+          insight_conversation_id: conversationId
+        }
+      : {}
+  })
+}
+
+export function uploadNamespaceDatasource(namespaceId, file) {
+  const formData = new FormData()
+  formData.append('file', file)
+  return api.post(`/insight/namespaces/${namespaceId}/datasources/upload`, formData, {
+    headers: {
+      'Content-Type': 'multipart/form-data'
+    }
+  })
+}
+
+export function exportTurnPdf(conversationId, turnId, payload) {
+  return api.post(
+    `/insight/conversations/${conversationId}/turns/${turnId}/export/pdf`,
+    payload || {},
+    { responseType: 'blob' }
+  )
+}
+
 export function listCollects(namespaceId) {
   return api.get('/insight/collects', {
     params: {
@@ -62,14 +106,28 @@ export function removeCollect(payload) {
 }
 
 export function streamAgent(params, onMessage, onError, onDone) {
+  return streamRequest('/api/agent/stream', params, onMessage, onError, onDone)
+}
+
+export function streamRerunTurn(conversationId, turnId, onMessage, onError, onDone) {
+  return streamRequest(
+    `/api/insight/conversations/${conversationId}/turns/${turnId}/rerun/stream`,
+    {},
+    onMessage,
+    onError,
+    onDone
+  )
+}
+
+function streamRequest(url, params, onMessage, onError, onDone) {
   const controller = new AbortController()
 
-  fetch('/api/agent/stream', {
+  fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify(params),
+    body: JSON.stringify(params || {}),
     signal: controller.signal
   })
     .then(response => {

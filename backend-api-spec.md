@@ -1,31 +1,48 @@
 # DataInsight 后端接口文档
 
-本文档用于前后端联调，说明当前 Flask 后端实际暴露的 Web 接口、请求参数、响应结构与流式事件格式。
+本文档用于前后端联调，整理当前项目中：
 
-## 1. 文档范围
+- 后端已经实现并注册到 Flask 的接口
+- 前端当前已经对接并实际使用的接口
 
-当前应用真正注册并可访问的接口，以运行时路由表为准，包含：
+文档以当前代码为准，工作区路径：`D:\PycharmProjects\DataInsight`
 
-- `POST /api/agent/invoke`
-- `POST /api/agent/stream`
-- `GET /api/insight/conversations`
-- `PUT /api/insight/conversations/{conversation_id}`
-- `GET /api/insight/conversations/{conversation_id}/history`
-- `GET /api/insight/conversations/{conversation_id}/turns/{turn_id}`
-- `GET /api/insight/collects`
-- `POST /api/insight/collects`
-- `DELETE /api/insight/collects`
-- `GET /health`
-- `GET /files/{filename}`
+## 1. 接口范围
 
-说明：
+当前 Flask 应用实际注册的接口主要包括：
 
-- 代码仓库中还存在其他 controller 文件，但它们目前没有注册到 Flask 应用中，不属于当前对外接口范围。
-- 当前 Agent 相关主链路围绕 `conversation -> turn -> message -> execution -> artifact -> memory` 运转。
+- Agent 分析
+  - `POST /api/agent/invoke`
+  - `POST /api/agent/stream`
+- 洞察空间
+  - `GET /api/insight/namespaces`
+  - `POST /api/insight/namespaces`
+  - `PUT /api/insight/namespaces/{namespace_id}`
+  - `DELETE /api/insight/namespaces/{namespace_id}`
+  - `GET /api/insight/namespaces/{namespace_id}/datasources`
+  - `POST /api/insight/namespaces/{namespace_id}/datasources/upload`
+- 会话
+  - `GET /api/insight/conversations`
+  - `PUT /api/insight/conversations/{conversation_id}`
+  - `GET /api/insight/conversations/{conversation_id}/history`
+  - `GET /api/insight/conversations/{conversation_id}/turns/{turn_id}`
+  - `POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/export/pdf`
+  - `POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/rerun/stream`
+- 会话数据源绑定
+  - `GET /api/insight/conversation/datasource/`
+  - `POST /api/insight/conversation/datasource/`
+  - `DELETE /api/insight/conversation/datasource/`
+- 收藏
+  - `GET /api/insight/collects`
+  - `POST /api/insight/collects`
+  - `DELETE /api/insight/collects`
+- 其他
+  - `GET /health`
+  - `GET /files/{filename}`
 
 ## 2. 通用响应格式
 
-除 SSE 流式接口外，其余接口统一返回 JSON：
+除文件下载接口和 SSE 接口外，普通 JSON 接口统一返回：
 
 ```json
 {
@@ -43,296 +60,322 @@
 - `message`：提示信息
 - `code`：业务状态码
 
-## 3. 认证与用户上下文
+失败示例：
 
-当前 Agent、会话、收藏接口中的 `username` 不是由前端直接传入，而是由后端通过当前请求上下文获取。
+```json
+{
+  "success": false,
+  "data": null,
+  "message": "缺少必要参数",
+  "code": 400
+}
+```
 
-前端对接时需要注意：
+## 3. Agent 分析接口
 
-- `POST /api/agent/invoke`
-- `POST /api/agent/stream`
-- `/api/insight/conversations*`
-- `/api/insight/collects*`
-
-这些接口都不要求前端显式传 `username`。
-
-## 4. Agent 分析接口
-
-### 4.1 同步分析
+### 3.1 同步分析
 
 `POST /api/agent/invoke`
 
 用途：
 
 - 发起一次同步分析请求
-- 后端会创建或恢复会话、创建轮次、加载当前上下文、调用 Agent 执行分析
+- 普通对话和分析型对话都走这一入口
 
 请求体：
 
 ```json
 {
-  "namespace_id": 1,
-  "conversation_id": 12,
-  "user_message": "帮我分析最近三个月销量趋势"
+  "namespace_id": 12,
+  "conversation_id": 71,
+  "user_message": "分析2024年Q4季度的销售趋势"
 }
 ```
 
 字段说明：
 
-- `namespace_id`：洞察空间 ID。新建会话时必传；已存在会话时以后端会话归属为准
-- `conversation_id`：会话 ID。为空、`0` 或不传时，后端会新建会话
-- `user_message`：本轮用户问题
-
-说明：
-
-- 当前轮使用的数据源范围不是由前端直接传入，而是后端根据 `conversation_id` 到会话级数据源绑定关系表中查询得到。
-- 后端会在本轮开始时自动刷新会话级 `active_datasource_snapshot`，并把本轮实际数据源范围固化到 `turn` 中。
+- `namespace_id`：洞察空间 ID。新建会话时需要传入
+- `conversation_id`：会话 ID。传空或不传时，后端可新建会话
+- `user_message`：用户输入
 
 成功响应示例：
 
 ```json
 {
   "success": true,
-  "message": "操作成功",
   "code": 200,
+  "message": "操作成功",
   "data": {
-    "username": "alice",
-    "message": "从趋势上看，三个月销量整体先升后降。",
-    "conversation_id": 12,
-    "turn_id": 35,
-    "file_id": "temp/alice_20260403_sales_trend.html",
-    "analysis_report": "最近三个月销量在 2 月达到峰值，3 月回落。"
+    "username": "anonymous",
+    "message": "Q4 销售额整体逐月上升。",
+    "conversation_id": 71,
+    "turn_id": 130,
+    "file_id": "D:/PycharmProjects/DataInsight/temp/anonymous_xxx.html",
+    "analysis_report": "本次分析显示 10 月到 12 月销售额持续增长。"
   }
 }
 ```
 
-失败响应示例：
+说明：
 
-```json
-{
-  "code": 400,
-  "message": "user_message 不能为空"
-}
-```
+- 如果本轮是普通问答，不一定会返回图表文件
+- 如果本轮是分析型请求，成功时通常会返回 `file_id` 和 `analysis_report`
 
-### 4.2 流式分析
+### 3.2 流式分析
 
 `POST /api/agent/stream`
 
 用途：
 
-- 发起一次 SSE 流式分析请求
-- 前端可以实时接收会话创建、规划说明、工具调用、代码执行进度、最终结果等事件
+- 发起一次 SSE 流式分析
+- 前端当前聊天主链路使用这个接口
 
-请求体：
+请求体与同步接口一致：
 
 ```json
 {
-  "namespace_id": 1,
-  "conversation_id": 12,
-  "user_message": "继续按区域维度拆分看一下"
+  "namespace_id": 12,
+  "conversation_id": 71,
+  "user_message": "继续分析一下上个月30号报警记录"
 }
 ```
-
-请求字段与同步分析接口一致。
 
 响应类型：
 
 - `Content-Type: text/event-stream`
 
-每条事件格式：
+SSE 事件格式：
 
 ```text
-data: {"type":"session","conversation_id":12,"turn_id":36}
+data: {"type":"session","conversation_id":71,"turn_id":130}
 
 ```
 
-### 4.3 SSE 事件类型
-
-当前稳定可用的事件类型包括：
+常见事件类型：
 
 - `session`
 - `status`
 - `assistant`
-- `result`
 - `tool_log`
+- `result`
 - `done`
 - `error`
 
-#### `session`
-
-表示本轮会话上下文已经准备好。
-
-示例：
-
-```json
-{
-  "type": "session",
-  "conversation_id": 12,
-  "turn_id": 36,
-  "namespace_id": 1,
-  "title": "最近三个月销量趋势分析"
-}
-```
-
-#### `status`
-
-表示流程阶段状态，既包括 Agent 规划阶段，也包括工具执行阶段。
-
-常见 `stage`：
-
-- `start`
-- `tool_call`
-- `tool_start`
-- `tool_running`
-- `tool_finished`
-- `tool_result`
-- `tool_retry`
-- `tool_error`
-- `tool`
-
-常见 `level`：
-
-- `info`
-- `success`
-- `warning`
-- `error`
-
-示例：
-
-```json
-{
-  "type": "status",
-  "conversation_id": 12,
-  "turn_id": 36,
-  "stage": "tool_call",
-  "level": "info",
-  "tool": "execute_python",
-  "message": "已生成分析代码，准备执行：销量趋势分析"
-}
-```
-
-#### `assistant`
-
-表示模型给前端展示的阶段性说明或规划文本。
-
-示例：
-
-```json
-{
-  "type": "assistant",
-  "conversation_id": 12,
-  "turn_id": 36,
-  "stage": "planning",
-  "message": "我会先读取销售数据，再按月份聚合并生成趋势图。"
-}
-```
-
-#### `result`
-
-表示工具已经返回结构化结果。
-
-示例：
+`result` 事件示例：
 
 ```json
 {
   "type": "result",
-  "conversation_id": 12,
-  "turn_id": 36,
-  "stage": "result",
-  "file_id": "temp/alice_20260403_sales_trend.html",
-  "analysis_report": "最近三个月销量在 2 月达到峰值，3 月回落。"
+  "conversation_id": 71,
+  "turn_id": 130,
+  "file_id": "D:/PycharmProjects/DataInsight/temp/anonymous_xxx.html",
+  "analysis_report": "分析报告正文"
 }
 ```
 
-#### `tool_log`
+## 4. 洞察空间接口
 
-表示 `execute_python` 执行过程中产出的日志摘要。
+### 4.1 获取空间列表
 
-示例：
-
-```json
-{
-  "type": "tool_log",
-  "stage": "tool_output",
-  "level": "info",
-  "tool": "execute_python",
-  "message": "已完成数据聚合，正在生成图表。"
-}
-```
-
-#### `done`
-
-表示本轮结束。
-
-示例：
-
-```json
-{
-  "type": "done",
-  "conversation_id": 12,
-  "turn_id": 36
-}
-```
-
-#### `error`
-
-表示本轮失败。
-
-示例：
-
-```json
-{
-  "type": "error",
-  "conversation_id": 12,
-  "turn_id": 36,
-  "stage": "error",
-  "level": "error",
-  "message": "执行 Python 代码工具错误，请检查后重新生成"
-}
-```
-
-## 5. 会话接口
-
-### 5.1 获取会话列表
-
-`GET /api/insight/conversations?namespace_id={namespace_id}`
+`GET /api/insight/namespaces`
 
 用途：
 
-- 查询当前用户在某个洞察空间下的全部会话
-- 用于左侧会话列表或历史页入口
-
-请求参数：
-
-- `namespace_id`：必传，空间 ID
+- 获取当前用户的空间列表
+- 前端左侧空间栏使用
 
 响应示例：
 
 ```json
 {
   "success": true,
-  "code": 200,
-  "message": "操作成功",
   "data": [
     {
       "id": 12,
-      "username": "alice",
-      "insight_namespace_id": 1,
-      "title": "最近三个月销量趋势分析",
-      "status": "active",
-      "summary_text": "第1轮 用户: 帮我分析最近三个月销量趋势；系统结论: 最近三个月销量在 2 月达到峰值，3 月回落",
-      "active_datasource_snapshot": "{\"namespace_id\":1,\"conversation_id\":12,\"selected_datasource_ids\":[3,5]}",
-      "last_turn_no": 3,
-      "last_message_at": "2026-04-03T11:20:30",
-      "created_at": "2026-04-03T10:58:10",
-      "updated_at": "2026-04-03T11:20:30"
+      "name": "会话11",
+      "username": "anonymous",
+      "created_at": "2026-04-04T15:56:13.363044"
     }
-  ]
+  ],
+  "message": "操作成功",
+  "code": 200
 }
 ```
 
-### 5.2 重命名会话
+### 4.2 新建空间
+
+`POST /api/insight/namespaces`
+
+用途：
+
+- 新建洞察空间
+- 当前实现会同时创建空间和一条默认会话
+
+请求体：
+
+```json
+{
+  "name": "报警分析空间"
+}
+```
+
+响应 `data` 中会包含：
+
+- 新空间信息
+- 默认创建的会话信息
+
+### 4.3 重命名空间
+
+`PUT /api/insight/namespaces/{namespace_id}`
+
+请求体：
+
+```json
+{
+  "name": "新的空间名称"
+}
+```
+
+### 4.4 删除空间
+
+`DELETE /api/insight/namespaces/{namespace_id}`
+
+说明：
+
+- 当前业务是空间和会话 1:1
+- 删除空间时，会话及相关上下文数据会一并删除
+
+## 5. 空间数据源接口
+
+### 5.1 获取空间数据源列表
+
+`GET /api/insight/namespaces/{namespace_id}/datasources`
+
+用途：
+
+- 获取当前空间下的全部数据源
+- 可选地按当前会话返回勾选状态
+
+查询参数：
+
+- `insight_conversation_id`：可选。传入后，后端会在返回的每条数据源上补 `checked`
+
+示例：
+
+```http
+GET /api/insight/namespaces/12/datasources?insight_conversation_id=71
+```
+
+响应示例：
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": 10,
+      "datasource_id": 10,
+      "insight_namespace_id": 12,
+      "insight_conversation_id": 71,
+      "datasource_type": "local_file",
+      "datasource_name": "ui_bind_test3",
+      "knowledge_tag": "upload_d9d12ff375ee40e5",
+      "datasource_schema": "{...}",
+      "datasource_config_json": "{...}",
+      "checked": true,
+      "created_at": "2026-04-07T17:04:15.642501",
+      "updated_at": "2026-04-07T17:04:15.642501"
+    }
+  ],
+  "message": "操作成功",
+  "code": 200
+}
+```
+
+当前前端数据源面板已经只使用这一个列表接口来展示勾选状态。
+
+### 5.2 上传空间数据源文件
+
+`POST /api/insight/namespaces/{namespace_id}/datasources/upload`
+
+用途：
+
+- 上传 `csv / xls / xlsx`
+- 文件保存到 `UPLOAD_DIR`
+- 后端自动生成空间级 `insight_datasource`
+
+请求类型：
+
+- `multipart/form-data`
+
+表单字段：
+
+- `file`：上传文件
+
+说明：
+
+- 上传只创建空间级数据源
+- 不会自动绑定到当前会话
+- 会话绑定需要单独调用绑定接口
+
+## 6. 会话数据源绑定接口
+
+### 6.1 获取会话已绑定数据源
+
+`GET /api/insight/conversation/datasource/?insight_conversation_id={conversation_id}`
+
+用途：
+
+- 获取某个会话当前已绑定的数据源关系
+- 当前前端主列表已不依赖这个接口做勾选状态计算，但接口仍保留
+
+### 6.2 绑定数据源到当前会话
+
+`POST /api/insight/conversation/datasource/`
+
+请求体：
+
+```json
+{
+  "insight_conversation_id": 71,
+  "datasource_id": 10
+}
+```
+
+说明：
+
+- 绑定的是“会话”和“空间数据源”的关系
+- 不会修改空间级数据源主表
+
+### 6.3 从当前会话解绑数据源
+
+`DELETE /api/insight/conversation/datasource/`
+
+请求体：
+
+```json
+{
+  "insight_conversation_id": 71,
+  "datasource_id": 10
+}
+```
+
+说明：
+
+- 只删除绑定关系
+- 不会删除 `insight_datasource` 主表记录
+
+## 7. 会话接口
+
+### 7.1 获取会话列表
+
+`GET /api/insight/conversations?namespace_id={namespace_id}`
+
+用途：
+
+- 获取当前空间下的会话列表
+
+### 7.2 重命名会话
 
 `PUT /api/insight/conversations/{conversation_id}`
 
@@ -340,249 +383,122 @@ data: {"type":"session","conversation_id":12,"turn_id":36}
 
 ```json
 {
-  "title": "销量趋势与区域对比分析"
+  "title": "新的会话标题"
 }
 ```
 
-说明：
-
-- `title` 为空时，后端会按第一轮问题重新生成默认标题
-
-响应示例：
-
-```json
-{
-  "success": true,
-  "code": 200,
-  "message": "会话标题已更新",
-  "data": {
-    "id": 12,
-    "title": "销量趋势与区域对比分析"
-  }
-}
-```
-
-### 5.3 获取会话历史时间线
+### 7.3 获取会话历史
 
 `GET /api/insight/conversations/{conversation_id}/history`
 
 用途：
 
-- 获取某条会话下所有轮次的历史卡片数据
-- 用于聊天区历史恢复、侧边栏回放、轮次摘要列表
+- 获取某个会话的历史轮次卡片
+- 前端聊天区历史展示使用
 
-响应结构：
+返回内容主要包括：
 
-```json
-{
-  "success": true,
-  "code": 200,
-  "message": "操作成功",
-  "data": {
-    "conversation": {},
-    "history": [
-      {
-        "turn_id": 35,
-        "turn_no": 1,
-        "question": "帮我分析最近三个月销量趋势",
-        "selected_datasource_ids": [3, 5],
-        "selected_datasource_snapshot": [
-          {
-            "datasource_id": 3,
-            "datasource_type": "table",
-            "datasource_name": "sales_order",
-            "datasource_identifier": "sales_order",
-            "metadata_schema": {}
-          }
-        ],
-        "report": "最近三个月销量在 2 月达到峰值，3 月回落。",
-        "file_id": "temp/alice_20260403_sales_trend.html",
-        "latest_execution": {
-          "id": 18,
-          "turn_id": 35,
-          "title": "销量趋势分析",
-          "description": "读取销售表并生成趋势图",
-          "execution_status": "success",
-          "result_file_id": "temp/alice_20260403_sales_trend.html",
-          "analysis_report": "最近三个月销量在 2 月达到峰值，3 月回落。",
-          "error_message": "",
-          "execution_seconds": 1620,
-          "finished_at": "2026-04-03T11:05:01"
-        },
-        "execution_count": 1,
-        "status": "success",
-        "started_at": "2026-04-03T11:04:58",
-        "finished_at": "2026-04-03T11:05:01"
-      }
-    ]
-  }
-}
-```
+- `conversation`
+- `history`
+  - `turn_id`
+  - `turn_no`
+  - `question`
+  - `report`
+  - `file_id`
+  - `selected_datasource_ids`
+  - `selected_datasource_snapshot`
+  - `latest_execution`
+  - `execution_count`
 
-说明：
-
-- `history` 接口返回的是轻量轮次列表
-- 这里只返回最近执行摘要，不返回完整代码、stdout、stderr
-- 完整执行明细请使用轮次详情接口
-
-### 5.4 获取轮次详情
+### 7.4 获取轮次详情
 
 `GET /api/insight/conversations/{conversation_id}/turns/{turn_id}`
 
 用途：
 
-- 获取某一轮的完整详情
-- 用于“查看详情”抽屉、执行记录明细、生成代码回放
+- 获取某个轮次的完整详情
+- 前端“查看详情”抽屉使用
 
-响应结构：
+返回内容主要包括：
 
-```json
-{
-  "success": true,
-  "code": 200,
-  "message": "操作成功",
-  "data": {
-    "conversation": {},
-    "turn": {
-      "id": 35,
-      "turn_no": 1,
-      "user_query": "帮我分析最近三个月销量趋势",
-      "selected_datasource_ids": [3, 5],
-      "selected_datasource_snapshot": [],
-      "final_answer": "最近三个月销量在 2 月达到峰值，3 月回落。",
-      "status": "success"
-    },
-    "messages": [
-      {
-        "id": 101,
-        "role": "user",
-        "message_kind": "prompt",
-        "content": "帮我分析最近三个月销量趋势"
-      },
-      {
-        "id": 102,
-        "role": "assistant",
-        "message_kind": "final_answer",
-        "content": "最近三个月销量在 2 月达到峰值，3 月回落。"
-      }
-    ],
-    "executions": [
-      {
-        "id": 18,
-        "conversation_id": 12,
-        "turn_id": 35,
-        "tool_call_id": "call_xxx",
-        "title": "销量趋势分析",
-        "description": "读取销售表并生成趋势图",
-        "generated_code": "import pandas as pd ...",
-        "execution_status": "success",
-        "result_file_id": "temp/alice_20260403_sales_trend.html",
-        "analysis_report": "最近三个月销量在 2 月达到峰值，3 月回落。",
-        "stdout_text": "",
-        "stderr_text": "",
-        "execution_seconds": 1620,
-        "error_message": ""
-      }
-    ],
-    "latest_execution": {},
-    "artifacts": [
-      {
-        "id": 9,
-        "artifact_type": "chart",
-        "file_id": "temp/alice_20260403_sales_trend.html",
-        "summary_text": "最近三个月销量在 2 月达到峰值，3 月回落。"
-      }
-    ]
-  }
-}
-```
+- `conversation`
+- `turn`
+- `messages`
+- `executions`
+- `latest_execution`
+- `artifacts`
+
+### 7.5 导出整轮分析结果 PDF
+
+`POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/export/pdf`
+
+用途：
+
+- 导出某个轮次的完整分析结果 PDF
+- 当前 PDF 由后端生成
+
+响应类型：
+
+- `application/pdf`
+
+前端当前通过 `blob` 方式下载。
+
+### 7.6 原轮次重新执行分析
+
+`POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/rerun/stream`
+
+用途：
+
+- 在原轮次上重新执行分析
+- 不新增新的对话轮次
+- 会覆盖原轮次的最新执行结果和产物
 
 说明：
 
-- `messages` 是当前轮持久化的核心消息
-- `executions` 是这一轮完整的代码执行记录
-- `artifacts` 是执行后派生产物，比如图表、报告
+- 响应为 SSE 流
+- 事件类型与 `/api/agent/stream` 基本一致
 
-## 6. 收藏接口
+## 8. 收藏接口
 
-### 6.1 获取收藏列表
+### 8.1 获取收藏列表
 
 `GET /api/insight/collects?namespace_id={namespace_id}`
 
 用途：
 
-- 获取当前用户的收藏列表
+- 获取当前用户收藏
 - 可按空间过滤
 
-请求参数：
-
-- `namespace_id`：可选。传入后只返回该空间下的收藏
-
-响应示例：
-
-```json
-{
-  "success": true,
-  "code": 200,
-  "message": "操作成功",
-  "data": [
-    {
-      "id": 7,
-      "username": "alice",
-      "collect_type": "turn",
-      "target_id": 35,
-      "title": "销量趋势分析",
-      "summary_text": "最近三个月销量在 2 月达到峰值，3 月回落。",
-      "insight_namespace_id": 1,
-      "insight_conversation_id": 12,
-      "insight_message_id": 0,
-      "insight_artifact_id": 9,
-      "metadata_json": "{}",
-      "created_at": "2026-04-03T11:10:00"
-    }
-  ]
-}
-```
-
-### 6.2 新增收藏
+### 8.2 新增收藏
 
 `POST /api/insight/collects`
 
-请求体：
+请求体示例：
 
 ```json
 {
-  "collect_type": "artifact",
-  "target_id": 9,
-  "title": "销量趋势图",
-  "summary_text": "最近三个月销量在 2 月达到峰值，3 月回落。",
-  "insight_namespace_id": 1,
-  "insight_conversation_id": 12,
+  "collect_type": "turn",
+  "target_id": 129,
+  "title": "帮我分析下3月30号的报警数据",
+  "summary_text": "2026年3月30日报警数据分析报告",
+  "insight_namespace_id": 12,
+  "insight_conversation_id": 71,
   "insight_message_id": 0,
-  "insight_artifact_id": 9,
+  "insight_artifact_id": 61,
   "metadata_json": {
-    "turn_id": 35
+    "turn_id": 129,
+    "file_id": "D:/PycharmProjects/DataInsight/temp/anonymous_xxx.html"
   }
 }
 ```
 
-字段说明：
+常用 `collect_type`：
 
-- `collect_type`：收藏类型，当前前端已使用的主要有 `conversation`、`turn`、`artifact`
-- `target_id`：收藏目标主键 ID
-- `title`：收藏标题
-- `summary_text`：收藏摘要
-- `insight_namespace_id`：所属空间 ID
-- `insight_conversation_id`：所属会话 ID
-- `insight_message_id`：所属消息 ID，可选
-- `insight_artifact_id`：所属产物 ID，可选
-- `metadata_json`：扩展元数据对象
+- `conversation`
+- `turn`
+- `artifact`
 
-说明：
-
-- 如果同一用户已收藏同一个 `collect_type + target_id`，后端会直接返回已有记录，不会重复创建。
-
-### 6.3 取消收藏
+### 8.3 删除收藏
 
 `DELETE /api/insight/collects`
 
@@ -591,18 +507,13 @@ data: {"type":"session","conversation_id":12,"turn_id":36}
 ```json
 {
   "collect_type": "artifact",
-  "target_id": 9
+  "target_id": 61
 }
 ```
 
-说明：
+## 9. 文件与健康检查
 
-- 删除为软删除
-- 成功时返回“取消收藏成功”
-
-## 7. 健康检查与文件访问
-
-### 7.1 健康检查
+### 9.1 健康检查
 
 `GET /health`
 
@@ -615,73 +526,75 @@ data: {"type":"session","conversation_id":12,"turn_id":36}
 }
 ```
 
-### 7.2 文件访问
+### 9.2 文件访问
 
 `GET /files/{filename}`
 
 用途：
 
-- 访问分析生成的图表文件、导出文件等
+- 打开图表 HTML
+- 打开分析产物文件
 
 示例：
 
-```text
-GET /files/temp/alice_20260403_sales_trend.html
+```http
+GET /files/D:/PycharmProjects/DataInsight/temp/anonymous_xxx.html
 ```
 
-说明：
+## 10. 前端当前实际调用链
 
-- `file_id` 一般就是传给该接口的文件路径
-- 前端可直接将 `file_id` 拼接为 `/files/{file_id}` 进行预览或打开
+当前前端 `frontend/src/api/agent.js` 已对接的主要接口如下：
 
-## 8. 前端对接建议
+- 空间
+  - `listNamespaces`
+  - `createNamespace`
+  - `renameNamespace`
+  - `deleteNamespace`
+- 会话
+  - `listConversations`
+  - `renameConversation`
+  - `getConversationHistory`
+  - `getTurnDetail`
+- Agent
+  - `invokeAgent`
+  - `streamAgent`
+  - `streamRerunTurn`
+- 数据源
+  - `listNamespaceDatasources`
+  - `uploadNamespaceDatasource`
+  - `bindConversationDatasource`
+  - `unbindConversationDatasource`
+- 收藏
+  - `listCollects`
+  - `createCollect`
+  - `removeCollect`
+- 导出
+  - `exportTurnPdf`
 
-### 8.1 会话与轮次主链路
+## 11. 当前推荐对接方式
 
-建议前端按下面顺序使用接口：
+### 11.1 聊天分析主链
 
-1. 进入页面后，用 `GET /api/insight/conversations?namespace_id=...` 拉取会话列表
-2. 选择某条会话后，用 `GET /api/insight/conversations/{conversation_id}/history` 拉取历史轮次
-3. 发起分析时，用 `POST /api/agent/stream` 或 `POST /api/agent/invoke`
-4. 收到返回中的 `conversation_id` 和 `turn_id` 后，更新当前页面状态
-5. 若用户点击“查看详情”，用 `GET /api/insight/conversations/{conversation_id}/turns/{turn_id}` 拉取完整详情
+1. 先拉空间列表
+2. 进入某个空间后拉会话列表
+3. 选中会话后拉历史
+4. 发送问题时走 `POST /api/agent/stream`
+5. 查看某轮详情时走 `GET /turns/{turn_id}`
+6. 需要重跑某轮时走 `POST /turns/{turn_id}/rerun/stream`
 
-### 8.2 数据源范围
+### 11.2 数据源主链
 
-当前设计中：
+1. 展示空间数据源：
+   - `GET /api/insight/namespaces/{namespace_id}/datasources?insight_conversation_id=...`
+2. 上传新文件数据源：
+   - `POST /api/insight/namespaces/{namespace_id}/datasources/upload`
+3. 绑定到当前会话：
+   - `POST /api/insight/conversation/datasource/`
+4. 解绑当前会话：
+   - `DELETE /api/insight/conversation/datasource/`
 
-- 前端不直接把 `selected_datasource_ids` 发给 Agent 分析接口
-- 当前轮实际使用的数据源范围，由后端根据当前 `conversation_id` 对应的数据源绑定关系查询得到
-- 数据源级唯一标识 `knowledge_tag` 存在于 `insight_datasource` 主表；知识资源级唯一标识 `knowledge_tag` 存在于 `insight_knowledge` 主表，不存在于关系表中
+关键点：
 
-因此前端需要区分两类接口：
-
-- 会话资源配置接口：负责修改会话绑定了哪些数据源
-- Agent 分析接口：只负责发起分析，不直接携带当前数据源范围
-
-### 8.3 结果展示
-
-建议前端展示时按三层理解：
-
-- `message`：用户与助手最终对话文本
-- `execution`：代码执行记录，是分析逻辑的核心
-- `artifact`：图表、报告等派生产物
-
-如果用户要“基于上一轮继续分析”，建议优先参考：
-
-- 最近一轮的 `turn_id`
-- 最近一轮的 `selected_datasource_ids`
-- 最近一轮的 `latest_execution`
-- 最近一轮的 `artifacts`
-
-## 9. 当前未纳入本文档的接口
-
-以下控制器虽然在代码仓库中存在，但当前没有注册到 Flask 应用，不属于目前前端可直接对接的接口：
-
-- `insight_namespace_controller.py`
-- `insight_knowledge_controller.py`
-- `insight_ns_message_controller.py`
-- `insight_ns_rel_datasource_controller.py`
-- `insight_ns_rel_knowledge_controller.py`
-
-如果后续这些接口接入应用，需要补充更新本文档。
+- 前端主列表展示的是空间数据源
+- 是否勾选由同一个空间数据源列表接口直接返回 `checked`
+- 前端不需要再自己拼“空间数据源列表 + 会话绑定列表”来判断勾选

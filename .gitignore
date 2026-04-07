@@ -19,3 +19,5 @@ frontend/node_modules
 frontend/dist
 frontend/.DS_Store
 *.log
+temp/
+uploads/

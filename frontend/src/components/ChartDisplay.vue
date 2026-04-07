@@ -22,7 +22,7 @@
 </template>
 
 <script setup>
-import { computed, ref, watch } from 'vue'
+import { computed, defineExpose, ref, watch } from 'vue'
 
 const props = defineProps({
   chartUrl: {
@@ -60,6 +60,50 @@ const onIframeError = () => {
   loading.value = false
   error.value = '图表加载失败，请稍后重试。'
 }
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+const getChartDataUrl = async () => {
+  if (!chartIframe.value?.contentWindow || !chartIframe.value?.contentDocument) {
+    throw new Error('图表尚未加载完成')
+  }
+
+  await wait(120)
+  const iframeWindow = chartIframe.value.contentWindow
+  const iframeDocument = chartIframe.value.contentDocument
+  const chartElement = iframeDocument.querySelector('.chart-container')
+  const echarts = iframeWindow.echarts
+
+  if (!chartElement || !echarts?.getInstanceByDom) {
+    throw new Error('当前图表暂不支持导出图片')
+  }
+
+  const chartInstance = echarts.getInstanceByDom(chartElement)
+  if (!chartInstance?.getDataURL) {
+    throw new Error('当前图表暂不支持导出图片')
+  }
+
+  return chartInstance.getDataURL({
+    type: 'png',
+    pixelRatio: 2,
+    backgroundColor: '#ffffff'
+  })
+}
+
+const downloadChartImage = async (filename = 'analysis-chart.png') => {
+  const dataUrl = await getChartDataUrl()
+  const anchor = document.createElement('a')
+  anchor.href = dataUrl
+  anchor.download = filename
+  document.body.appendChild(anchor)
+  anchor.click()
+  document.body.removeChild(anchor)
+}
+
+defineExpose({
+  getChartDataUrl,
+  downloadChartImage
+})
 </script>
 
 <style scoped>

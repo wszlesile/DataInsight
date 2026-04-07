@@ -3,12 +3,12 @@
     <div class="data-panel-content">
       <div class="search-section">
         <div class="search-box">
-          <span class="search-icon">⌕</span>
+          <span class="search-icon">🔎</span>
           <input
             v-model="searchKeyword"
             class="search-input"
             type="text"
-            placeholder="从数据资源中搜索节点、表或文件..."
+            placeholder="搜索数据源名称或类型"
           >
         </div>
       </div>
@@ -19,7 +19,7 @@
             v-for="mode in uploadModes"
             :key="mode.value"
             class="upload-box"
-            :class="{ active: activeUploadMode === mode.value, [mode.value]: true }"
+            :class="{ active: activeUploadMode === mode.value }"
             type="button"
             @click="activeUploadMode = mode.value"
           >
@@ -29,135 +29,104 @@
         </div>
       </div>
 
-      <div v-if="activeUploadMode === 'uns'" class="uns-nodes-section">
+      <div v-if="activeUploadMode === 'uns'" class="placeholder-section">
         <div class="section-header">
-          <span class="section-title">🔗 数据节点结构</span>
-          <div class="section-meta">已选 {{ selectedUnsNodes.length }} 项</div>
+          <span class="section-title">关联节点资源</span>
+          <div class="section-meta">当前保留原型结构，后续再接真实资源树</div>
         </div>
-
-        <div class="uns-tree">
-          <div v-for="group in filteredUnsGroups" :key="group.id" class="tree-node">
-            <div class="tree-node-content root">
-              <span class="tree-node-icon">{{ group.icon }}</span>
-              <span class="node-name">{{ group.name }}</span>
-            </div>
-
-            <div class="tree-children">
-              <button
-                v-for="node in group.children"
-                :key="node.id"
-                class="resource-chip"
-                :class="{ active: selectedUnsNodes.includes(node.id) }"
-                type="button"
-                @click="toggleUnsNode(node)"
-              >
-                <span class="resource-chip-icon">{{ node.icon }}</span>
-                <span>{{ node.name }}</span>
-              </button>
-            </div>
+        <div class="placeholder-card">
+          <div class="placeholder-title">UNS 节点资源入口已预留</div>
+          <div class="placeholder-text">
+            当前版本先聚焦文件数据源上传与会话绑定，节点资源树后续再按统一接口接入。
           </div>
         </div>
       </div>
 
-      <div v-else-if="activeUploadMode === 'knowledge'" class="knowledge-section">
+      <div v-else-if="activeUploadMode === 'knowledge'" class="placeholder-section">
         <div class="section-header">
-          <span class="section-title">📚 已关联知识资源</span>
-          <div class="section-meta">后续按统一知识库接口接入</div>
+          <span class="section-title">关联知识库</span>
+          <div class="section-meta">知识资源入口已预留</div>
         </div>
-
         <div class="placeholder-card">
-          <div class="placeholder-title">知识库入口已预留</div>
+          <div class="placeholder-title">知识库接入稍后统一处理</div>
           <div class="placeholder-text">
-            当前先保留原型中的知识资源区域，后续再和统一知识库项目对接。
+            当前页面先保留结构和位置，后续再与统一知识资源服务对接。
           </div>
         </div>
       </div>
 
       <div v-else class="external-section">
         <div class="section-header">
-          <span class="section-title">📎 手动指定外部数据源</span>
-          <button class="plain-action" type="button" @click="refreshDataSource">应用</button>
+          <span class="section-title">上传外部数据</span>
+          <button
+            class="plain-action"
+            type="button"
+            :disabled="!activeNamespaceId || uploading"
+            @click="triggerFileUpload"
+          >
+            {{ uploading ? '上传中...' : '上传文件' }}
+          </button>
         </div>
 
-        <div class="form-grid">
-          <label class="form-group">
-            <span class="form-label">本地文件路径</span>
-            <input v-model="localFilePath" class="form-input" placeholder="例如 D:/data/sales.csv">
-          </label>
-
-          <label class="form-group">
-            <span class="form-label">数据库表</span>
-            <select v-model="selectedTable" class="form-input">
-              <option value="">请选择数据表</option>
-              <option v-for="table in databaseTables" :key="table" :value="table">{{ table }}</option>
-            </select>
-          </label>
-
-          <label class="form-group full-width">
-            <span class="form-label">API 地址</span>
-            <input v-model="apiEndpoint" class="form-input" placeholder="https://example.com/api/data">
-          </label>
+        <div class="upload-file-card">
+          <div class="upload-file-title">上传 Excel / CSV 文件</div>
+          <div class="upload-file-text">
+            上传后的文件会保存到当前洞察空间，并转换成空间级数据源定义。当前会话可在下方勾选需要绑定的数据源。
+          </div>
+          <div class="upload-file-tip">
+            当前支持：`.csv`、`.xls`、`.xlsx`
+          </div>
         </div>
+        <input
+          ref="fileInput"
+          class="hidden-file-input"
+          type="file"
+          accept=".csv,.xls,.xlsx"
+          @change="handleFileChange"
+        >
       </div>
 
       <div class="imported-data-section">
         <div class="section-header">
-          <div class="data-tabs">
-            <button
-              class="data-tab"
-              :class="{ active: importedTab === 'imported' }"
-              type="button"
-              @click="importedTab = 'imported'"
-            >
-              📊 已导入的数据
-            </button>
-            <button
-              class="data-tab"
-              :class="{ active: importedTab === 'knowledge' }"
-              type="button"
-              @click="importedTab = 'knowledge'"
-            >
-              📚 当前会话资源
-            </button>
-          </div>
+          <span class="section-title">空间数据源</span>
+          <span class="tab-badge">{{ namespaceDatasources.length }}</span>
         </div>
 
-        <div v-if="importedTab === 'imported'" class="imported-list">
-          <template v-if="resourceCards.length">
-            <button
-              v-for="resource in resourceCards"
+        <div class="imported-list">
+          <template v-if="filteredNamespaceDatasources.length">
+            <div
+              v-for="resource in filteredNamespaceDatasources"
               :key="resource.id"
               class="data-item"
-              :class="{ active: selectedResourceId === resource.id }"
-              type="button"
-              @click="selectResource(resource)"
+              :class="{ active: resource.checked }"
             >
               <div class="data-item-icon">{{ resource.icon }}</div>
               <div class="data-item-body">
-                <div class="data-item-title">{{ resource.title }}</div>
+                <div class="data-item-title-row">
+                  <div class="data-item-title">{{ resource.title }}</div>
+                  <label class="bind-checkbox" @click.stop>
+                    <input
+                      type="checkbox"
+                      :checked="resource.checked"
+                      :disabled="!activeConversation?.id || bindingDatasourceIds.includes(resource.datasource_id)"
+                      @change="toggleDatasourceBinding(resource, $event)"
+                    >
+                    <span>{{ resource.checked ? '已绑定' : '绑定到当前会话' }}</span>
+                  </label>
+                </div>
                 <div class="data-item-subtitle">{{ resource.description }}</div>
+                <div class="data-item-meta">
+                  <span class="meta-pill">{{ resource.typeLabel }}</span>
+                  <span v-if="resource.knowledgeTag" class="meta-pill muted">{{ resource.knowledgeTag }}</span>
+                </div>
               </div>
-            </button>
+            </div>
           </template>
+
           <div v-else class="empty-state">
             <div class="empty-state-icon">☁</div>
-            <p>暂无手动指定数据源</p>
-            <span>可通过上方切换到“上传外部数据”进行补充。</span>
-          </div>
-        </div>
-
-        <div v-else class="imported-list">
-          <div class="context-card">
-            <div class="context-card-title">当前洞察空间</div>
-            <div class="context-card-value">{{ activeSpaceName || '未选择空间' }}</div>
-          </div>
-          <div class="context-card">
-            <div class="context-card-title">当前会话</div>
-            <div class="context-card-value">{{ activeConversation?.title || '会话已创建，等待提问' }}</div>
-          </div>
-          <div class="context-card">
-            <div class="context-card-title">当前前端选择</div>
-            <div class="context-card-value">{{ selectedDataSourceLabel }}</div>
+            <p>当前空间还没有可用的数据源</p>
+            <span>你可以先上传 Excel 或 CSV 文件，把它们保存为当前空间的数据源。</span>
           </div>
         </div>
       </div>
@@ -166,9 +135,18 @@
 </template>
 
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
+
+import {
+  bindConversationDatasource,
+  listNamespaceDatasources,
+  unbindConversationDatasource,
+  uploadNamespaceDatasource
+} from '../api/agent.js'
 
 const props = defineProps({
+  activeNamespaceId: { type: [String, Number], default: '' },
   activeSpaceName: { type: String, default: '' },
   activeConversation: { type: Object, default: null },
   selectedDataSource: { type: Object, default: null }
@@ -177,152 +155,211 @@ const props = defineProps({
 const emit = defineEmits(['data-source-change'])
 
 const searchKeyword = ref('')
-const activeUploadMode = ref('uns')
-const importedTab = ref('imported')
-const localFilePath = ref('')
-const selectedTable = ref('')
-const apiEndpoint = ref('')
-const selectedUnsNodes = ref([])
-const selectedResourceId = ref('')
+const activeUploadMode = ref('external')
+const uploading = ref(false)
+const fileInput = ref(null)
+const namespaceDatasources = ref([])
+const bindingDatasourceIds = ref([])
+let latestDatasourceFetchToken = 0
 
 const uploadModes = [
-  { value: 'uns', label: '关联节点资源', icon: '🔗' },
+  { value: 'uns', label: '关联节点资源', icon: '🔆' },
   { value: 'knowledge', label: '关联知识库', icon: '📚' },
-  { value: 'external', label: '上传外部数据', icon: '📎' }
+  { value: 'external', label: '上传外部数据', icon: '📤' }
 ]
 
-const databaseTables = [
-  'alarm_record',
-  'alarm_treatment',
-  'sales_order',
-  'production_daily'
-]
-
-const unsGroups = [
-  {
-    id: 'group-sales',
-    name: '经营分析',
-    icon: '📈',
-    children: [
-      { id: 'sales-q4', name: '销售记录文件', icon: '📄', type: 'local_file', value: 'sales_record_file' },
-      { id: 'sales-table', name: '销售订单表', icon: '🗂', type: 'table', value: 'sales_order' }
-    ]
-  },
-  {
-    id: 'group-alarm',
-    name: '报警中心',
-    icon: '🚨',
-    children: [
-      { id: 'alarm-record', name: '报警记录表', icon: '📋', type: 'table', value: 'alarm_record' },
-      { id: 'alarm-treatment', name: '报警处置表', icon: '🛠', type: 'table', value: 'alarm_treatment' }
-    ]
-  },
-  {
-    id: 'group-api',
-    name: '接口资源',
-    icon: '🌐',
-    children: [
-      { id: 'alarm-api', name: '报警汇总 API', icon: '🔌', type: 'api', value: 'https://example.com/api/alarm' }
-    ]
-  }
-]
-
-const filteredUnsGroups = computed(() => {
+const filteredNamespaceDatasources = computed(() => {
   const keyword = searchKeyword.value.trim().toLowerCase()
-  if (!keyword) return unsGroups
-  return unsGroups
-    .map((group) => ({
-      ...group,
-      children: group.children.filter((item) => item.name.toLowerCase().includes(keyword))
-    }))
-    .filter((group) => group.children.length)
+  return namespaceDatasources.value
+    .filter((item) => {
+      if (!keyword) return true
+      return (
+        item.datasource_name?.toLowerCase().includes(keyword) ||
+        item.datasource_type?.toLowerCase().includes(keyword)
+      )
+    })
+    .map((item) => mapDatasourceCard(item))
 })
 
-const resourceCards = computed(() => {
-  const cards = []
-  if (localFilePath.value.trim()) {
-    cards.push({
-      id: 'manual-local-file',
-      icon: '📄',
-      title: '本地文件',
-      description: localFilePath.value.trim(),
-      payload: { type: 'local_file', value: localFilePath.value.trim() }
-    })
-  }
-  if (selectedTable.value) {
-    cards.push({
-      id: 'manual-table',
-      icon: '🗂',
-      title: '数据库表',
-      description: selectedTable.value,
-      payload: { type: 'table', value: selectedTable.value }
-    })
-  }
-  if (apiEndpoint.value.trim()) {
-    cards.push({
-      id: 'manual-api',
-      icon: '🔌',
-      title: 'API 数据源',
-      description: apiEndpoint.value.trim(),
-      payload: { type: 'api', value: apiEndpoint.value.trim() }
-    })
-  }
-  selectedUnsNodes.value.forEach((nodeId) => {
-    const node = unsGroups.flatMap((group) => group.children).find((item) => item.id === nodeId)
-    if (!node) return
-    cards.push({
-      id: node.id,
-      icon: node.icon,
-      title: node.name,
-      description: node.type,
-      payload: { type: node.type, value: node.value }
-    })
-  })
-  return cards
-})
-
-const selectedDataSourceLabel = computed(() => {
-  if (!props.selectedDataSource) return '尚未指定'
-  const type = props.selectedDataSource.type || 'unknown'
-  const value = props.selectedDataSource.value || ''
-  return `${type}${value ? ` · ${value}` : ''}`
-})
-
-const refreshDataSource = () => {
-  if (localFilePath.value.trim()) {
-    selectedResourceId.value = 'manual-local-file'
-    emit('data-source-change', { type: 'local_file', value: localFilePath.value.trim() })
-    return
-  }
-  if (selectedTable.value) {
-    selectedResourceId.value = 'manual-table'
-    emit('data-source-change', { type: 'table', value: selectedTable.value })
-    return
-  }
-  if (apiEndpoint.value.trim()) {
-    selectedResourceId.value = 'manual-api'
-    emit('data-source-change', { type: 'api', value: apiEndpoint.value.trim() })
+const safeParseJson = (value) => {
+  if (!value) return {}
+  if (typeof value === 'object') return value
+  try {
+    return JSON.parse(value)
+  } catch (error) {
+    return {}
   }
 }
 
-const toggleUnsNode = (node) => {
-  if (selectedUnsNodes.value.includes(node.id)) {
-    selectedUnsNodes.value = selectedUnsNodes.value.filter((item) => item !== node.id)
-    if (selectedResourceId.value === node.id) {
-      selectedResourceId.value = ''
-      emit('data-source-change', null)
+const getDatasourceTypeLabel = (type) => {
+  switch (type) {
+    case 'local_file':
+      return '本地文件'
+    case 'minio_file':
+      return 'MinIO 文件'
+    case 'table':
+      return '数据表'
+    case 'api':
+      return '接口'
+    default:
+      return type || '未知类型'
+  }
+}
+
+const mapDatasourceCard = (item) => {
+  const config = safeParseJson(item.datasource_config_json)
+  const filePath = config.file_path || config.table_name || config.endpoint || ''
+  const icon = item.datasource_type === 'local_file' || item.datasource_type === 'minio_file' ? '📄' : '🗂'
+  return {
+    id: `datasource-${item.datasource_id}`,
+    datasource_id: Number(item.datasource_id),
+    checked: Boolean(item.checked),
+    title: item.datasource_name,
+    description: filePath || getDatasourceTypeLabel(item.datasource_type),
+    icon,
+    typeLabel: getDatasourceTypeLabel(item.datasource_type),
+    knowledgeTag: item.knowledge_tag || '',
+    payload: {
+      datasourceId: Number(item.datasource_id),
+      datasourceName: item.datasource_name,
+      type: item.datasource_type,
+      value: filePath || item.datasource_name
     }
-    return
   }
-  selectedUnsNodes.value = [...selectedUnsNodes.value, node.id]
-  selectedResourceId.value = node.id
-  emit('data-source-change', { type: node.type, value: node.value })
 }
 
-const selectResource = (resource) => {
-  selectedResourceId.value = resource.id
-  emit('data-source-change', resource.payload)
+const setDatasourceChecked = (datasourceId, checked) => {
+  namespaceDatasources.value = namespaceDatasources.value.map((item) =>
+    Number(item.datasource_id) === Number(datasourceId)
+      ? { ...item, checked }
+      : item
+  )
 }
+
+const syncNamespaceDatasourcesInBackground = async () => {
+  try {
+    await fetchNamespaceDatasources()
+  } catch (error) {
+    console.error('Sync namespace datasources error:', error)
+  }
+}
+
+const fetchNamespaceDatasources = async () => {
+  if (!props.activeNamespaceId) {
+    namespaceDatasources.value = []
+    return
+  }
+  const fetchToken = ++latestDatasourceFetchToken
+  try {
+    const response = await listNamespaceDatasources(
+      props.activeNamespaceId,
+      props.activeConversation?.id || undefined
+    )
+    if (fetchToken !== latestDatasourceFetchToken) {
+      return
+    }
+    if (response.data?.success) {
+      namespaceDatasources.value = response.data.data || []
+    }
+  } catch (error) {
+    if (fetchToken !== latestDatasourceFetchToken) {
+      return
+    }
+    console.error('List namespace datasources error:', error)
+  }
+}
+
+const triggerFileUpload = () => {
+  if (!props.activeNamespaceId) {
+    ElMessage.warning('请先创建或选择洞察空间，再上传外部数据')
+    return
+  }
+  fileInput.value?.click()
+}
+
+const handleFileChange = async (event) => {
+  const file = event.target.files?.[0]
+  event.target.value = ''
+  if (!file || !props.activeNamespaceId) return
+
+  uploading.value = true
+  try {
+    const response = await uploadNamespaceDatasource(props.activeNamespaceId, file)
+    if (!response.data?.success) {
+      ElMessage.error(response.data?.message || '上传文件失败')
+      return
+    }
+    await fetchNamespaceDatasources()
+    ElMessage.success('文件已上传到当前洞察空间，请按需勾选绑定到会话')
+  } catch (error) {
+    console.error('Upload datasource file error:', error)
+    ElMessage.error(error?.response?.data?.message || '上传文件失败')
+  } finally {
+    uploading.value = false
+  }
+}
+
+const toggleDatasourceBinding = async (resource, event) => {
+  const checked = event.target.checked
+  if (!props.activeConversation?.id) {
+    event.target.checked = false
+    ElMessage.warning('请先创建会话，再绑定数据源')
+    return
+  }
+
+  const datasourceId = Number(resource.datasource_id)
+  if (bindingDatasourceIds.value.includes(datasourceId)) return
+  bindingDatasourceIds.value = [...bindingDatasourceIds.value, datasourceId]
+
+  try {
+    if (checked) {
+      const response = await bindConversationDatasource(props.activeConversation.id, datasourceId)
+      if (!response.data?.success) {
+        throw new Error(response.data?.message || '绑定数据源失败')
+      }
+      latestDatasourceFetchToken += 1
+      setDatasourceChecked(datasourceId, true)
+      emit('data-source-change', resource.payload)
+      ElMessage.success('数据源已绑定到当前会话')
+    } else {
+      const response = await unbindConversationDatasource(props.activeConversation.id, datasourceId)
+      if (!response.data?.success) {
+        throw new Error(response.data?.message || '解绑数据源失败')
+      }
+      latestDatasourceFetchToken += 1
+      setDatasourceChecked(datasourceId, false)
+      if (props.selectedDataSource?.datasourceId === datasourceId) {
+        emit('data-source-change', null)
+      }
+      ElMessage.success('数据源已从当前会话解绑')
+    }
+    window.setTimeout(() => {
+      syncNamespaceDatasourcesInBackground()
+    }, 300)
+  } catch (error) {
+    console.error('Toggle datasource binding error:', error)
+    event.target.checked = !checked
+    ElMessage.error(error?.response?.data?.message || error.message || '操作失败')
+  } finally {
+    bindingDatasourceIds.value = bindingDatasourceIds.value.filter((item) => item !== datasourceId)
+  }
+}
+
+watch(
+  () => props.activeNamespaceId,
+  async () => {
+    await fetchNamespaceDatasources()
+  },
+  { immediate: true }
+)
+
+watch(
+  () => props.activeConversation?.id,
+  async () => {
+    await fetchNamespaceDatasources()
+  },
+  { immediate: true }
+)
 </script>
 
 <style scoped>
@@ -345,8 +382,7 @@ const selectResource = (resource) => {
 
 .search-section,
 .upload-section,
-.uns-nodes-section,
-.knowledge-section,
+.placeholder-section,
 .external-section,
 .imported-data-section {
   padding: 16px;
@@ -354,8 +390,7 @@ const selectResource = (resource) => {
 
 .search-section,
 .upload-section,
-.uns-nodes-section,
-.knowledge-section,
+.placeholder-section,
 .external-section {
   border-bottom: 1px solid #edf2f7;
 }
@@ -374,8 +409,7 @@ const selectResource = (resource) => {
   color: #64748b;
 }
 
-.search-input,
-.form-input {
+.search-input {
   width: 100%;
   border: none;
   outline: none;
@@ -448,75 +482,9 @@ const selectResource = (resource) => {
   cursor: pointer;
 }
 
-.uns-nodes-section,
-.knowledge-section,
-.external-section,
-.imported-data-section {
-  flex-shrink: 0;
-}
-
-.uns-nodes-section {
-  max-height: 300px;
-  overflow-y: auto;
-}
-
-.uns-tree {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-.tree-node-content.root {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 10px;
-}
-
-.tree-node-icon {
-  width: 30px;
-  height: 30px;
-  border-radius: 10px;
-  background: #eff6ff;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.node-name {
-  font-size: 13px;
-  font-weight: 700;
-  color: #334155;
-}
-
-.tree-children {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.resource-chip {
-  border: 1px solid #dbe3ef;
-  background: #fff;
-  border-radius: 999px;
-  padding: 8px 12px;
-  color: #475569;
-  font-size: 12px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  cursor: pointer;
-}
-
-.resource-chip.active,
-.resource-chip:hover {
-  border-color: #60a5fa;
-  background: rgba(37, 99, 235, 0.08);
-  color: #1d4ed8;
-}
-
-.resource-chip-icon {
-  font-size: 14px;
+.plain-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .placeholder-card,
@@ -542,32 +510,33 @@ const selectResource = (resource) => {
   color: #64748b;
 }
 
-.form-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+.upload-file-card {
+  border: 1px dashed #c8d8f0;
+  border-radius: 16px;
+  background: linear-gradient(180deg, #f8fbff 0%, #ffffff 100%);
+  padding: 18px 18px 16px;
 }
 
-.form-group {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+.upload-file-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #0f172a;
 }
 
-.form-group.full-width {
-  grid-column: 1 / -1;
-}
-
-.form-label {
+.upload-file-text,
+.upload-file-tip {
+  margin-top: 8px;
   font-size: 12px;
+  line-height: 1.7;
   color: #64748b;
 }
 
-.form-input {
-  border: 1px solid #dbe3ef;
-  border-radius: 12px;
-  padding: 10px 12px;
-  background: #fff;
+.upload-file-tip {
+  color: #1d4ed8;
+}
+
+.hidden-file-input {
+  display: none;
 }
 
 .imported-data-section {
@@ -578,26 +547,18 @@ const selectResource = (resource) => {
   flex-direction: column;
 }
 
-.data-tabs {
-  display: flex;
-  gap: 8px;
-}
-
-.data-tab {
-  border: none;
-  background: transparent;
+.tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 6px;
   border-radius: 999px;
-  padding: 8px 12px;
-  font-size: 12px;
-  color: #64748b;
-  cursor: pointer;
-}
-
-.data-tab.active,
-.data-tab:hover {
-  background: #edf4ff;
+  background: #dbeafe;
   color: #1d4ed8;
-  font-weight: 600;
+  font-size: 11px;
+  font-weight: 700;
 }
 
 .imported-list {
@@ -608,17 +569,28 @@ const selectResource = (resource) => {
   gap: 10px;
 }
 
+.list-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: #f8fbff;
+  border: 1px solid #e5edf7;
+  color: #64748b;
+  font-size: 12px;
+}
+
 .data-item {
   border: 1px solid #e5edf7;
   background: #fff;
   border-radius: 14px;
   padding: 12px;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 12px;
-  cursor: pointer;
-  text-align: left;
-  transition: border-color 0.2s ease, background 0.2s ease, transform 0.2s ease;
+  transition: border-color 0.2s ease, background 0.2s ease;
 }
 
 .data-item.active,
@@ -641,6 +613,14 @@ const selectResource = (resource) => {
 
 .data-item-body {
   min-width: 0;
+  flex: 1;
+}
+
+.data-item-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .data-item-title {
@@ -654,6 +634,43 @@ const selectResource = (resource) => {
   font-size: 12px;
   color: #64748b;
   word-break: break-all;
+}
+
+.data-item-meta {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.meta-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: #e2e8f0;
+  color: #334155;
+}
+
+.meta-pill.muted {
+  background: #f1f5f9;
+  color: #64748b;
+}
+
+.bind-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  color: #475569;
+  font-size: 12px;
+  user-select: none;
+}
+
+.bind-checkbox input {
+  width: 14px;
+  height: 14px;
 }
 
 .empty-state {

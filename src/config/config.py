@@ -34,7 +34,9 @@ class Config:
     SQLITE_PATH = os.environ.get('SQLITE_PATH', 'data_insight.db')
 
     # 图表文件临时保存目录
-    TEMP_DIR = os.environ.get('TEMP_DIR', 'D:/PycharmProjects/DataInsight/')
+    TEMP_DIR = os.environ.get('TEMP_DIR', 'D:/PycharmProjects/DataInsight/temp')
+    # 外部上传文件保存目录
+    UPLOAD_DIR = os.environ.get('UPLOAD_DIR', 'D:/PycharmProjects/DataInsight/uploads')
 
     # 分页配置
     DEFAULT_PAGE_SIZE = 10

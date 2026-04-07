@@ -1,9 +1,19 @@
+import re
+from io import BytesIO
 from typing import Any
+
+from PIL import Image as PILImage
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer
 
 from sqlalchemy.orm import Session
 
 from model import InsightNsArtifact, InsightNsConversation, InsightNsExecution, InsightNsMessage, InsightNsTurn
-from utils.datasource_utils import build_conversation_title, to_int
+from utils import build_conversation_title, render_chart_file_to_png, to_int
 
 
 class InsightNsConversationService:
@@ -143,6 +153,39 @@ class InsightNsConversationService:
             "artifacts": [artifact.to_dict() for artifact in artifacts],
         }
 
+    def export_turn_pdf(
+        self,
+        username: str,
+        conversation_id: Any,
+        turn_id: Any,
+    ) -> tuple[bytes, str] | None:
+        """导出指定轮次的分析结果 PDF。"""
+        detail = self.get_turn_detail(username=username, conversation_id=conversation_id, turn_id=turn_id)
+        if detail is None:
+            return None
+
+        turn = detail["turn"]
+        artifacts = detail["artifacts"]
+        latest_execution = detail.get("latest_execution") or {}
+
+        report_text = (
+            next((artifact.get("summary_text", '') for artifact in artifacts if artifact.get("artifact_type") == 'report' and artifact.get("summary_text")), '')
+            or turn.get("final_answer", '')
+            or latest_execution.get("analysis_report", '')
+        )
+        chart_file_id = next(
+            (artifact.get("file_id", '') for artifact in artifacts if artifact.get("artifact_type") == 'chart' and artifact.get("file_id")),
+            '',
+        )
+        pdf_bytes = self._build_turn_pdf_bytes(
+            title=turn.get("user_query", '') or f"第 {turn.get('turn_no', 0)} 轮分析结果",
+            turn_no=turn.get("turn_no", 0),
+            chart_file_id=chart_file_id,
+            report_text=report_text,
+        )
+        filename = self._build_pdf_filename(turn.get("user_query", '') or f"turn-{turn.get('id', 0)}")
+        return pdf_bytes, filename
+
     def _get_accessible_conversation(self, username: str, conversation_id: Any) -> InsightNsConversation | None:
         conversation_id_int = to_int(conversation_id, 0)
         if conversation_id_int <= 0:
@@ -186,3 +229,147 @@ class InsightNsConversationService:
             "execution_seconds": execution.get("execution_seconds", 0),
             "finished_at": execution.get("finished_at"),
         }
+
+    def _build_pdf_filename(self, title: str) -> str:
+        normalized = re.sub(r'[\\/:*?"<>|]+', '-', title or 'analysis-result')
+        normalized = re.sub(r'\s+', '-', normalized).strip('-')[:80] or 'analysis-result'
+        return f"{normalized}.pdf"
+
+    def _build_turn_pdf_bytes(
+        self,
+        title: str,
+        turn_no: int,
+        chart_file_id: str,
+        report_text: str,
+    ) -> bytes:
+        self._ensure_pdf_font_registered()
+
+        buffer = BytesIO()
+        document = SimpleDocTemplate(
+            buffer,
+            pagesize=A4,
+            leftMargin=18 * mm,
+            rightMargin=18 * mm,
+            topMargin=16 * mm,
+            bottomMargin=16 * mm,
+            title=title or '分析结果',
+        )
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            'InsightPdfTitle',
+            parent=styles['Title'],
+            fontName='STSong-Light',
+            fontSize=18,
+            leading=24,
+            spaceAfter=10,
+        )
+        meta_style = ParagraphStyle(
+            'InsightPdfMeta',
+            parent=styles['BodyText'],
+            fontName='STSong-Light',
+            fontSize=9,
+            leading=14,
+            textColor='#64748b',
+            spaceAfter=10,
+        )
+        section_style = ParagraphStyle(
+            'InsightPdfSection',
+            parent=styles['Heading2'],
+            fontName='STSong-Light',
+            fontSize=12,
+            leading=18,
+            spaceBefore=8,
+            spaceAfter=8,
+        )
+        body_style = ParagraphStyle(
+            'InsightPdfBody',
+            parent=styles['BodyText'],
+            fontName='STSong-Light',
+            fontSize=10.5,
+            leading=17,
+            spaceAfter=6,
+        )
+
+        story = [
+            Paragraph(self._escape_pdf_text(title or '分析结果'), title_style),
+        ]
+
+        chart_image = self._build_chart_pdf_image(chart_file_id)
+        if chart_image is not None:
+            story.append(Paragraph('分析图表', section_style))
+            story.append(chart_image)
+            story.append(Spacer(1, 8))
+        elif chart_file_id:
+            story.append(Paragraph('分析图表', section_style))
+            story.append(Paragraph(self._escape_pdf_text(f"图表文件：{chart_file_id}"), body_style))
+
+        if report_text:
+            story.append(Paragraph('分析报告', section_style))
+            for block in self._markdown_to_pdf_blocks(report_text):
+                story.append(Paragraph(self._escape_pdf_text(block).replace('\n', '<br/>'), body_style))
+        else:
+            story.append(Paragraph('分析报告', section_style))
+            story.append(Paragraph('当前轮次暂无可导出的分析报告内容。', body_style))
+
+        document.build(story)
+        return buffer.getvalue()
+
+    def _build_chart_pdf_image(self, chart_file_id: str) -> Image | None:
+        image_bytes = render_chart_file_to_png(chart_file_id)
+        if image_bytes is None:
+            return None
+        pil_image = PILImage.open(BytesIO(image_bytes))
+        width, height = pil_image.size
+        max_width = A4[0] - 36 * mm
+        draw_width = min(float(width), max_width)
+        draw_height = draw_width * float(height) / float(width)
+        return Image(BytesIO(image_bytes), width=draw_width, height=draw_height)
+
+    def _markdown_to_pdf_blocks(self, text: str) -> list[str]:
+        normalized = (text or '').replace('\r\n', '\n').strip()
+        if not normalized:
+            return []
+        normalized = re.sub(r'```[\s\S]*?```', '', normalized)
+        normalized = re.sub(r'!\[([^\]]*)\]\([^)]+\)', r'\1', normalized)
+        normalized = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1 (\2)', normalized)
+        normalized = re.sub(r'(?m)^>\s?', '', normalized)
+        normalized = re.sub(r'(?m)^#{1,6}\s*', '', normalized)
+        normalized = re.sub(r'(?m)^-{3,}\s*$', '', normalized)
+        normalized = re.sub(r'\*\*(.*?)\*\*', r'\1', normalized)
+        normalized = re.sub(r'__(.*?)__', r'\1', normalized)
+        normalized = re.sub(r'(?<!\*)\*(?!\*)(.*?)\*(?<!\*)', r'\1', normalized)
+        normalized = re.sub(r'(?<!_)_(?!_)(.*?)_(?<!_)', r'\1', normalized)
+
+        blocks = []
+        for block in re.split(r'\n\s*\n', normalized):
+            cleaned = block.strip()
+            if not cleaned:
+                continue
+            lines = []
+            for line in cleaned.split('\n'):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith('|') and stripped.endswith('|'):
+                    stripped = ' '.join(part.strip() for part in stripped.strip('|').split('|') if part.strip())
+                lines.append(stripped)
+            if lines:
+                blocks.append('\n'.join(lines))
+        return blocks
+
+    def _escape_pdf_text(self, text: str) -> str:
+        return (
+            (text or '')
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+        )
+
+    def _export_time_text(self) -> str:
+        from datetime import datetime
+
+        return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    def _ensure_pdf_font_registered(self) -> None:
+        if 'STSong-Light' not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
