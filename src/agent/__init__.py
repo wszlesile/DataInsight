@@ -87,6 +87,8 @@ def build_prompt_messages(
     namespace_id: int = 0,
     conversation_id: int = 0,
     extra_system_messages: list[str] | None = None,
+    history_turn_limit: int | None = None,
+    datasource_snapshot_override: dict[str, Any] | None = None,
 ) -> list[BaseMessage]:
     """
     为单次分析请求组装完整 Prompt 上下文。
@@ -107,14 +109,20 @@ def build_prompt_messages(
     datasource_message = get_datasource_message(
         namespace_id=namespace_id,
         conversation_id=conversation_id,
+        snapshot_override=datasource_snapshot_override,
     )
     if datasource_message is not None:
         messages.append(datasource_message)
 
     # 记忆消息是从执行记录、派生产物和历史消息中提炼出的压缩上下文，
     # 因此应该放在原始历史消息之前。
-    messages.extend(get_memory_messages(conversation_id, user_message=user_message))
-    messages.extend(get_history_messages(conversation_id))
+    messages.extend(get_memory_messages(
+        conversation_id,
+        user_message=user_message,
+        max_turn_no=history_turn_limit,
+        active_snapshot_override=datasource_snapshot_override,
+    ))
+    messages.extend(get_history_messages(conversation_id, max_turn_no=history_turn_limit))
     for extra_message in extra_system_messages or []:
         if extra_message:
             messages.append(SystemMessage(extra_message))
@@ -127,6 +135,8 @@ def get_input(
     namespace_id: int = 0,
     conversation_id: int = 0,
     extra_system_messages: list[str] | None = None,
+    history_turn_limit: int | None = None,
+    datasource_snapshot_override: dict[str, Any] | None = None,
 ) -> Any:
     """构建供 invoke/stream 调用使用的 Agent 输入载荷。"""
     return InputMessage(
@@ -135,5 +145,7 @@ def get_input(
             namespace_id=namespace_id,
             conversation_id=conversation_id,
             extra_system_messages=extra_system_messages,
+            history_turn_limit=history_turn_limit,
+            datasource_snapshot_override=datasource_snapshot_override,
         )
     )

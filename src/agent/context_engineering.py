@@ -141,7 +141,11 @@ def get_system_config_message() -> SystemMessage:
     )
 
 
-def get_datasource_message(namespace_id: int, conversation_id: int) -> SystemMessage | None:
+def get_datasource_message(
+    namespace_id: int,
+    conversation_id: int,
+    snapshot_override: dict[str, Any] | None = None,
+) -> SystemMessage | None:
     """
     注入 `sys_prompt.md` 约定的数据源上下文。
 
@@ -153,12 +157,13 @@ def get_datasource_message(namespace_id: int, conversation_id: int) -> SystemMes
     if conversation_id_int <= 0 and namespace_id_int <= 0:
         return None
 
-    snapshot: dict[str, Any] = {}
-    session = SessionLocal()
-    try:
-        snapshot = ConversationContextService(session).get_active_datasource_snapshot(conversation_id_int)
-    finally:
-        session.close()
+    snapshot: dict[str, Any] = snapshot_override or {}
+    if not snapshot:
+        session = SessionLocal()
+        try:
+            snapshot = ConversationContextService(session).get_active_datasource_snapshot(conversation_id_int)
+        finally:
+            session.close()
 
     conversation = _load_conversation(conversation_id_int)
     if conversation is not None:
@@ -166,10 +171,14 @@ def get_datasource_message(namespace_id: int, conversation_id: int) -> SystemMes
     elif namespace_id_int <= 0:
         namespace_id_int = to_int(snapshot.get('namespace_id'), 0)
 
-    datasource_items = [
-        _build_datasource_payload_item(datasource)
-        for datasource in _load_conversation_datasources(conversation_id_int)
-    ]
+    snapshot_items = snapshot.get('selected_datasource_snapshot', [])
+    if snapshot_items:
+        datasource_items = snapshot_items
+    else:
+        datasource_items = [
+            _build_datasource_payload_item(datasource)
+            for datasource in _load_conversation_datasources(conversation_id_int)
+        ]
     if not datasource_items:
         return None
 
@@ -203,7 +212,7 @@ def get_datasource_message(namespace_id: int, conversation_id: int) -> SystemMes
     )
 
 
-def get_history_messages(conversation_id: int) -> list[Any]:
+def get_history_messages(conversation_id: int, max_turn_no: int | None = None) -> list[Any]:
     """加载最近的用户问题和最终回答消息，用于历史上下文重放。"""
     if not conversation_id:
         return []
@@ -211,7 +220,11 @@ def get_history_messages(conversation_id: int) -> list[Any]:
     session = SessionLocal()
     try:
         service = ConversationContextService(session)
-        messages = service.get_recent_prompt_messages(conversation_id, limit_messages=10)
+        messages = service.get_recent_prompt_messages(
+            conversation_id,
+            limit_messages=10,
+            max_turn_no=max_turn_no,
+        )
     finally:
         session.close()
 
@@ -229,7 +242,12 @@ def get_history_messages(conversation_id: int) -> list[Any]:
     return result
 
 
-def get_memory_messages(conversation_id: int, user_message: str = '') -> list[SystemMessage]:
+def get_memory_messages(
+    conversation_id: int,
+    user_message: str = '',
+    max_turn_no: int | None = None,
+    active_snapshot_override: dict[str, Any] | None = None,
+) -> list[SystemMessage]:
     """
     构造下一轮分析使用的压缩记忆消息。
 
@@ -243,11 +261,15 @@ def get_memory_messages(conversation_id: int, user_message: str = '') -> list[Sy
         service = ConversationContextService(session)
         messages: list[SystemMessage] = []
 
-        summary_text = service.build_runtime_summary_text(conversation_id)
+        summary_text = service.build_runtime_summary_text(conversation_id, max_turn_no=max_turn_no)
         if summary_text:
             messages.append(SystemMessage(f"历史摘要：\n{summary_text}"))
 
-        analysis_state_payload = service.build_runtime_analysis_state(conversation_id)
+        analysis_state_payload = service.build_runtime_analysis_state(
+            conversation_id,
+            max_turn_no=max_turn_no,
+            active_snapshot_override=active_snapshot_override,
+        )
         if analysis_state_payload:
             messages.append(SystemMessage(
                 "当前分析状态：\n"
@@ -258,7 +280,11 @@ def get_memory_messages(conversation_id: int, user_message: str = '') -> list[Sy
         # 只有明显“继续上一轮”的追问，才把它们完整注入；
         # 如果当前问题已经是新的分析请求，则避免旧执行逻辑把模型带偏。
         if _should_inject_execution_context(user_message):
-            recent_executions = service.get_recent_executions(conversation_id, limit_items=3)
+            recent_executions = service.get_recent_executions(
+                conversation_id,
+                limit_items=3,
+                max_turn_no=max_turn_no,
+            )
             if recent_executions:
                 execution_payload = [
                     _build_execution_context_item(execution)
@@ -276,7 +302,11 @@ def get_memory_messages(conversation_id: int, user_message: str = '') -> list[Sy
                         f"{latest_execution.generated_code}"
                     ))
 
-            recent_artifacts = service.get_recent_artifacts(conversation_id, limit_items=3)
+            recent_artifacts = service.get_recent_artifacts(
+                conversation_id,
+                limit_items=3,
+                max_turn_no=max_turn_no,
+            )
             if recent_artifacts:
                 artifact_payload = [artifact.to_dict() for artifact in recent_artifacts]
                 messages.append(SystemMessage(

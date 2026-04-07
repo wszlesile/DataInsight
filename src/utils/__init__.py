@@ -13,6 +13,7 @@ from utils.datasource_utils import (
     safe_json_loads,
     to_int,
 )
+from utils.chart_export_utils import render_chart_file_to_png, resolve_local_file_path
 
 __all__ = [
     'JSONEncoder', 'to_json', 'from_json',
@@ -23,4 +24,5 @@ __all__ = [
     'build_conversation_title', 'dump_json', 'extract_datasource_identifier',
     'extract_datasource_schema', 'normalize_datasource_type',
     'safe_json_loads', 'to_int',
+    'render_chart_file_to_png', 'resolve_local_file_path',
 ]

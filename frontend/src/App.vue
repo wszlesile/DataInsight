@@ -36,6 +36,7 @@
 
       <div class="right-area">
         <DataSourcePanel
+          :active-namespace-id="activeNamespace"
           :active-space-name="activeSpaceName"
           :active-conversation="activeConversation"
           :selected-data-source="currentDataSource"
@@ -126,6 +127,22 @@
                       <div class="result-actions">
                         <button class="action-btn" type="button" @click="openTurnDetail(item.turnId)">查看详情</button>
                         <button
+                          v-if="item.chartUrl"
+                          class="action-btn"
+                          type="button"
+                          @click="onDownloadChart({ chartUrl: item.chartUrl, title: `${item.question} 图表` })"
+                        >
+                          下载图表
+                        </button>
+                        <button
+                          class="action-btn"
+                          type="button"
+                          @click="onExportAnalysisPdf({ turnId: item.turnId, title: item.question, chartUrl: item.chartUrl })"
+                        >
+                          导出 PDF
+                        </button>
+                        <button class="action-btn" type="button" @click="onRerunTurn(item)">刷新分析</button>
+                        <button
                           class="action-btn"
                           type="button"
                           @click="toggleCollect({
@@ -199,6 +216,29 @@
                       <div class="result-actions">
                         <button v-if="currentTurnId" class="action-btn" type="button" @click="openTurnDetail(currentTurnId)">
                           查看详情
+                        </button>
+                        <button
+                          v-if="currentChartUrl"
+                          class="action-btn"
+                          type="button"
+                          @click="onDownloadChart({ chartUrl: currentChartUrl, title: `${currentQuestion} 图表` })"
+                        >
+                          下载图表
+                        </button>
+                        <button
+                          class="action-btn"
+                          type="button"
+                          @click="onExportAnalysisPdf({ turnId: currentTurnId, title: currentQuestion, chartUrl: currentChartUrl })"
+                        >
+                          导出 PDF
+                        </button>
+                        <button
+                          v-if="currentTurnId"
+                          class="action-btn"
+                          type="button"
+                          @click="onRerunTurn({ turnId: currentTurnId, question: currentQuestion, chartUrl: currentChartUrl, fileId: currentResultFileId, chartArtifactId: currentChartArtifactId, report: currentReport })"
+                        >
+                          刷新分析
                         </button>
                         <button
                           v-if="currentTurnId"
@@ -450,6 +490,7 @@ import {
   createNamespace,
   createCollect,
   deleteNamespace,
+  exportTurnPdf,
   getConversationHistory,
   getTurnDetail,
   listCollects,
@@ -458,7 +499,8 @@ import {
   removeCollect,
   renameConversation,
   renameNamespace,
-  streamAgent
+  streamAgent,
+  streamRerunTurn
 } from './api/agent.js'
 
 marked.setOptions({ breaks: true, gfm: true })
@@ -480,6 +522,8 @@ const currentDataSource = ref(null)
 const currentProgressItems = ref([])
 const currentStreamController = ref(null)
 const currentTurnId = ref(0)
+const currentRunMode = ref('new')
+const rerunSourceTurnId = ref(0)
 const messagesContainer = ref(null)
 const turnDetailVisible = ref(false)
 const turnDetailLoading = ref(false)
@@ -529,6 +573,76 @@ const favoriteTypeLabel = (collect) => {
   if (collect.collect_type === 'artifact') return '图表收藏'
   if (collect.collect_type === 'conversation') return '会话收藏'
   return collect.collect_type || '收藏'
+}
+
+const buildChartDownloadFilename = (title = 'analysis-chart') =>
+  `${String(title || 'analysis-chart')
+    .replace(/[\\\\/:*?"<>|]+/g, '-')
+    .replace(/\s+/g, '-')
+    .slice(0, 80) || 'analysis-chart'}.png`
+
+const getChartImageDataUrl = (chartUrl) => new Promise((resolve, reject) => {
+  if (!chartUrl) {
+    reject(new Error('当前没有可下载的图表'))
+    return
+  }
+
+  const iframe = document.createElement('iframe')
+  iframe.style.position = 'fixed'
+  iframe.style.width = '0'
+  iframe.style.height = '0'
+  iframe.style.opacity = '0'
+  iframe.style.pointerEvents = 'none'
+  iframe.style.border = '0'
+  iframe.src = `${chartUrl}${chartUrl.includes('?') ? '&' : '?'}download_ts=${Date.now()}`
+
+  const cleanup = () => {
+    if (iframe.parentNode) {
+      iframe.parentNode.removeChild(iframe)
+    }
+  }
+
+  iframe.onload = () => {
+    window.setTimeout(() => {
+      try {
+        const iframeWindow = iframe.contentWindow
+        const iframeDocument = iframe.contentDocument
+        const chartElement = iframeDocument?.querySelector('.chart-container')
+        const chartInstance = iframeWindow?.echarts?.getInstanceByDom?.(chartElement)
+        if (!chartInstance?.getDataURL) {
+          throw new Error('当前图表暂不支持下载图片')
+        }
+
+        const dataUrl = chartInstance.getDataURL({
+          type: 'png',
+          pixelRatio: 2,
+          backgroundColor: '#ffffff'
+        })
+        cleanup()
+        resolve(dataUrl)
+      } catch (error) {
+        cleanup()
+        reject(error)
+      }
+    }, 160)
+  }
+
+  iframe.onerror = () => {
+    cleanup()
+    reject(new Error('图表加载失败，无法下载'))
+  }
+
+  document.body.appendChild(iframe)
+})
+
+const downloadChartAsImage = async (chartUrl, filename) => {
+  const dataUrl = await getChartImageDataUrl(chartUrl)
+  const anchor = document.createElement('a')
+  anchor.href = dataUrl
+  anchor.download = filename
+  document.body.appendChild(anchor)
+  anchor.click()
+  document.body.removeChild(anchor)
 }
 
 const createProgressItem = (event) => ({
@@ -588,10 +702,17 @@ const resetCurrentConversationState = () => {
   currentAssistantMessage.value = ''
   currentProgressItems.value = []
   currentTurnId.value = 0
+  currentRunMode.value = 'new'
+  rerunSourceTurnId.value = 0
 }
 
 const finalizeCurrentConversation = () => {
   if (!currentQuestion.value) return
+  if (currentRunMode.value === 'rerun') {
+    resetCurrentConversationState()
+    scrollToBottom()
+    return
+  }
   const finalReply = currentReport.value || currentAssistantMessage.value
   chatHistory.value.push({
     turnId: currentTurnId.value,
@@ -834,6 +955,80 @@ const toggleCurrentChartCollect = async () => {
   })
 }
 
+const onDownloadChart = async ({ chartUrl, title }) => {
+  try {
+    await downloadChartAsImage(chartUrl, buildChartDownloadFilename(title))
+    ElMessage.success('图表图片已开始下载')
+  } catch (error) {
+    console.error('Download chart error:', error)
+    ElMessage.error(error?.message || '下载图表失败')
+  }
+}
+
+const downloadBlobResponse = (response, fallbackName = 'analysis-result.pdf') => {
+  const blob = response?.data
+  if (!blob) {
+    throw new Error('导出结果为空')
+  }
+
+  const disposition = response.headers?.['content-disposition'] || ''
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i)
+  const plainMatch = disposition.match(/filename="?([^"]+)"?/i)
+  const filename = utf8Match
+    ? decodeURIComponent(utf8Match[1])
+    : (plainMatch?.[1] || fallbackName)
+
+  const objectUrl = window.URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = objectUrl
+  anchor.download = filename
+  document.body.appendChild(anchor)
+  anchor.click()
+  document.body.removeChild(anchor)
+  window.URL.revokeObjectURL(objectUrl)
+}
+
+const onExportAnalysisPdf = async ({ turnId, title, chartUrl }) => {
+  if (!activeConversationId.value || !turnId) return
+  try {
+    const response = await exportTurnPdf(activeConversationId.value, turnId)
+    downloadBlobResponse(response, `${title || 'analysis-result'}.pdf`)
+    ElMessage.success('分析结果 PDF 已开始导出')
+  } catch (error) {
+    console.error('Export analysis pdf error:', error)
+    ElMessage.error(error?.message || '导出 PDF 失败')
+  }
+}
+
+const onRerunTurn = (item) => {
+  if (!activeConversationId.value || !item?.turnId) return
+  stopCurrentStream()
+  resetCurrentConversationState()
+  currentRunMode.value = 'rerun'
+  rerunSourceTurnId.value = item.turnId
+  currentTurnId.value = item.turnId
+  currentQuestion.value = item.question
+  currentReport.value = ''
+  currentChartUrl.value = ''
+  currentResultFileId.value = ''
+  currentChartArtifactId.value = 0
+  loading.value = true
+  addProgressItem({
+    type: 'status',
+    level: 'info',
+    message: `正在重新执行第 ${item.turnId} 轮分析...`
+  })
+  scrollToBottom()
+
+  currentStreamController.value = streamRerunTurn(
+    activeConversationId.value,
+    item.turnId,
+    handleStreamEvent,
+    handleStreamError,
+    handleStreamDone
+  )
+}
+
 const onRenameConversation = async (conversation) => {
   if (!conversation?.id) return
   try {
@@ -1008,6 +1203,18 @@ const onDataSourceChange = (dataSource) => {
   currentDataSource.value = dataSource
 }
 
+const finalizeStreamRound = async () => {
+  const rerunConversationId = activeConversationId.value
+  const isRerun = currentRunMode.value === 'rerun'
+  loading.value = false
+  currentStreamController.value = null
+  finalizeCurrentConversation()
+  await Promise.all([fetchConversations(), fetchCollects()])
+  if (isRerun && rerunConversationId) {
+    await loadConversationHistory(rerunConversationId)
+  }
+}
+
 const handleStreamEvent = async (event) => {
   if (!event || typeof event !== 'object') return
   if (event.conversation_id) activeConversationId.value = Number(event.conversation_id)
@@ -1033,19 +1240,13 @@ const handleStreamEvent = async (event) => {
     } else if (!currentReport.value && !currentChartUrl.value) {
       currentReport.value = '本轮分析未生成可展示的图表或分析报告，请重试。'
     }
-    loading.value = false
-    currentStreamController.value = null
-    finalizeCurrentConversation()
-    await Promise.all([fetchConversations(), fetchCollects()])
+    await finalizeStreamRound()
     return
   }
   if (event.type === 'error') {
     addProgressItem(event)
     if (!currentReport.value) currentReport.value = event.message || '分析过程中发生错误。'
-    loading.value = false
-    currentStreamController.value = null
-    finalizeCurrentConversation()
-    await Promise.all([fetchConversations(), fetchCollects()])
+    await finalizeStreamRound()
     return
   }
   if (['status', 'assistant', 'tool_log', 'message'].includes(event.type)) {
@@ -1062,10 +1263,7 @@ const handleStreamError = async (error) => {
   ElMessage.error(`请求失败: ${error.message || '未知错误'}`)
   addProgressItem({ type: 'error', level: 'error', message: '请求失败，无法获取实时分析结果。' })
   if (!currentReport.value) currentReport.value = '请求失败了。'
-  loading.value = false
-  currentStreamController.value = null
-  finalizeCurrentConversation()
-  await Promise.all([fetchConversations(), fetchCollects()])
+  await finalizeStreamRound()
 }
 
 const handleStreamDone = async () => {
@@ -1075,10 +1273,7 @@ const handleStreamDone = async () => {
   } else if (!currentReport.value && !currentChartUrl.value) {
     currentReport.value = '本轮分析未生成可展示的图表或分析报告，请重试。'
   }
-  loading.value = false
-  currentStreamController.value = null
-  finalizeCurrentConversation()
-  await Promise.all([fetchConversations(), fetchCollects()])
+  await finalizeStreamRound()
 }
 
 const onSendMessage = (content) => {
@@ -1089,6 +1284,7 @@ const onSendMessage = (content) => {
   }
   stopCurrentStream()
   resetCurrentConversationState()
+  currentRunMode.value = 'new'
   currentQuestion.value = content
   loading.value = true
   addProgressItem({ type: 'status', level: 'info', message: '正在建立分析会话并加载上下文...' })

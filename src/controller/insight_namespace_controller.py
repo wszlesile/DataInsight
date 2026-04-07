@@ -1,9 +1,11 @@
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request
 
+from config.config import Config
 from config.database import SessionLocal
 from controller.base_controller import BaseController
 from dto import get_current_user_context
 from service.insight_namespace_service import InsightNamespaceService
+from service.insight_ns_rel_datasource_service import InsightNsRelDatasourceService
 from utils.response import Result
 
 
@@ -13,6 +15,8 @@ def create_insight_namespace_controller() -> Blueprint:
 
     blueprint.route('', methods=['GET'])(controller.list_namespaces)
     blueprint.route('', methods=['POST'])(controller.create_namespace)
+    blueprint.route('/<int:namespace_id>/datasources', methods=['GET'])(controller.list_datasources)
+    blueprint.route('/<int:namespace_id>/datasources/upload', methods=['POST'])(controller.upload_datasource_file)
     blueprint.route('/<int:namespace_id>', methods=['PUT'])(controller.rename_namespace)
     blueprint.route('/<int:namespace_id>', methods=['DELETE'])(controller.delete_namespace)
     return blueprint
@@ -52,6 +56,35 @@ class InsightNamespaceController(BaseController):
         except ValueError as exc:
             session.rollback()
             return jsonify(Result.error(str(exc), 400).to_dict()), 400
+        finally:
+            session.close()
+
+    def list_datasources(self, namespace_id: int):
+        insight_conversation_id = request.args.get('insight_conversation_id', type=int)
+        session = SessionLocal()
+        try:
+            service = InsightNsRelDatasourceService(session)
+            rows = service.find_by_namespace_id(namespace_id, insight_conversation_id)
+            return jsonify(Result.success(data=rows).to_dict())
+        finally:
+            session.close()
+
+    def upload_datasource_file(self, namespace_id: int):
+        upload_file = request.files.get('file')
+        if upload_file is None:
+            return self.error_response('请选择要上传的文件')
+
+        session = SessionLocal()
+        try:
+            service = InsightNsRelDatasourceService(session)
+            result = service.upload_file_datasource_to_namespace(
+                insight_namespace_id=namespace_id,
+                upload_file=upload_file,
+                upload_dir=Config.UPLOAD_DIR,
+            )
+            if result['success']:
+                return jsonify(Result.success(data=result['data'], message=result['message'], code=201).to_dict()), 201
+            return self.error_response(result['message'], 400)
         finally:
             session.close()
 
