@@ -81,6 +81,10 @@ export function uploadNamespaceDatasource(namespaceId, file) {
   })
 }
 
+export function deleteNamespaceDatasource(namespaceId, datasourceId) {
+  return api.delete(`/insight/namespaces/${namespaceId}/datasources/${datasourceId}`)
+}
+
 export function exportTurnPdf(conversationId, turnId, payload) {
   return api.post(
     `/insight/conversations/${conversationId}/turns/${turnId}/export/pdf`,

@@ -17,6 +17,7 @@ def create_insight_namespace_controller() -> Blueprint:
     blueprint.route('', methods=['POST'])(controller.create_namespace)
     blueprint.route('/<int:namespace_id>/datasources', methods=['GET'])(controller.list_datasources)
     blueprint.route('/<int:namespace_id>/datasources/upload', methods=['POST'])(controller.upload_datasource_file)
+    blueprint.route('/<int:namespace_id>/datasources/<int:datasource_id>', methods=['DELETE'])(controller.delete_datasource)
     blueprint.route('/<int:namespace_id>', methods=['PUT'])(controller.rename_namespace)
     blueprint.route('/<int:namespace_id>', methods=['DELETE'])(controller.delete_namespace)
     return blueprint
@@ -84,6 +85,17 @@ class InsightNamespaceController(BaseController):
             )
             if result['success']:
                 return jsonify(Result.success(data=result['data'], message=result['message'], code=201).to_dict()), 201
+            return self.error_response(result['message'], 400)
+        finally:
+            session.close()
+
+    def delete_datasource(self, namespace_id: int, datasource_id: int):
+        session = SessionLocal()
+        try:
+            service = InsightNsRelDatasourceService(session)
+            result = service.delete_namespace_datasource(namespace_id, datasource_id)
+            if result['success']:
+                return jsonify(Result.success(message=result['message']).to_dict())
             return self.error_response(result['message'], 400)
         finally:
             session.close()

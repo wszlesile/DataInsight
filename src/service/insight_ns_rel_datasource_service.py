@@ -118,7 +118,12 @@ class InsightNsRelDatasourceService:
             insight_namespace_id=insight_namespace_id,
             base_name=Path(original_filename).stem or f"外部数据源_{uuid4().hex[:6]}",
         )
-        datasource_schema = self._build_file_datasource_schema(stored_path, datasource_name)
+        try:
+            datasource_schema = self._build_file_datasource_schema(stored_path, datasource_name)
+        except ValueError as exc:
+            if stored_path.exists():
+                stored_path.unlink(missing_ok=True)
+            return {"success": False, "message": str(exc)}
         datasource_config_json = dump_json({
             "file_path": str(stored_path).replace('\\', '/'),
             "original_filename": original_filename,
@@ -137,6 +142,29 @@ class InsightNsRelDatasourceService:
         )
         self.session.commit()
         return {"success": True, "message": "文件上传成功", "data": self._datasource_to_dict(datasource)}
+
+    def delete_namespace_datasource(self, insight_namespace_id: int, datasource_id: int) -> dict[str, Any]:
+        datasource = self.session.query(InsightDatasource).filter(
+            InsightDatasource.id == datasource_id,
+            InsightDatasource.insight_namespace_id == insight_namespace_id,
+            InsightDatasource.is_deleted == 0,
+        ).first()
+        if datasource is None:
+            return {"success": False, "message": "数据源不存在"}
+
+        reference_count = self.session.query(InsightNsRelDatasource.id).filter(
+            InsightNsRelDatasource.datasource_id == datasource_id,
+            InsightNsRelDatasource.is_deleted == 0,
+        ).count()
+        if reference_count > 0:
+            return {
+                "success": False,
+                "message": f"当前数据源已被 {reference_count} 个会话引用，请先解绑后再删除",
+            }
+
+        datasource.is_deleted = 1
+        self.session.commit()
+        return {"success": True, "message": "数据源删除成功"}
 
     def remove_datasource(self, insight_conversation_id: int, datasource_id: int) -> dict[str, Any]:
         row = self.session.query(InsightNsRelDatasource, InsightDatasource).filter(
@@ -190,14 +218,6 @@ class InsightNsRelDatasourceService:
 
     def _build_file_datasource_schema(self, file_path: Path, datasource_name: str) -> str:
         dataframe = self._read_file_preview(file_path)
-        if dataframe is None:
-            schema = DataSourceSchema(
-                name=datasource_name,
-                description=f"用户上传的 {file_path.suffix.lstrip('.').upper()} 文件",
-                properties={},
-                required=[],
-            )
-            return dump_json(schema.model_dump())
 
         properties: dict[str, PropertySchema] = {}
         for column in dataframe.columns:
@@ -216,13 +236,21 @@ class InsightNsRelDatasourceService:
         )
         return dump_json(schema.model_dump())
 
-    def _read_file_preview(self, file_path: Path) -> pd.DataFrame | None:
+    def _read_file_preview(self, file_path: Path) -> pd.DataFrame:
         try:
             if file_path.suffix.lower() == '.csv':
                 return pd.read_csv(file_path, nrows=50)
-            return pd.read_excel(file_path, nrows=50)
-        except Exception:
-            return None
+            if file_path.suffix.lower() == '.xlsx':
+                return pd.read_excel(file_path, nrows=50, engine='openpyxl')
+            if file_path.suffix.lower() == '.xls':
+                return pd.read_excel(file_path, nrows=50, engine='xlrd')
+            raise ValueError(f'暂不支持解析 {file_path.suffix} 文件')
+        except ImportError as exc:
+            raise ValueError(f'文件解析依赖缺失：{exc}') from exc
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f'文件解析失败：{exc}') from exc
 
     def _infer_schema_type(self, series: pd.Series) -> str:
         dtype = str(series.dtype).lower()

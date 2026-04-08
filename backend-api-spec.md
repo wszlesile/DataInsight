@@ -21,6 +21,7 @@
   - `DELETE /api/insight/namespaces/{namespace_id}`
   - `GET /api/insight/namespaces/{namespace_id}/datasources`
   - `POST /api/insight/namespaces/{namespace_id}/datasources/upload`
+  - `DELETE /api/insight/namespaces/{namespace_id}/datasources/{datasource_id}`
 - 会话
   - `GET /api/insight/conversations`
   - `PUT /api/insight/conversations/{conversation_id}`
@@ -318,6 +319,41 @@ GET /api/insight/namespaces/12/datasources?insight_conversation_id=71
 - 不会自动绑定到当前会话
 - 会话绑定需要单独调用绑定接口
 
+### 5.3 删除空间数据源
+
+`DELETE /api/insight/namespaces/{namespace_id}/datasources/{datasource_id}`
+
+用途：
+
+- 删除某个空间下的数据源定义
+
+删除规则：
+
+- 如果该数据源仍被任意会话绑定引用，则删除失败
+- 需要先解除所有会话绑定关系，再删除空间级数据源
+
+成功响应示例：
+
+```json
+{
+  "success": true,
+  "data": null,
+  "message": "数据源删除成功",
+  "code": 200
+}
+```
+
+被会话引用时的失败示例：
+
+```json
+{
+  "success": false,
+  "data": null,
+  "message": "当前数据源已被 1 个会话引用，请先解绑后再删除",
+  "code": 400
+}
+```
+
 ## 6. 会话数据源绑定接口
 
 ### 6.1 获取会话已绑定数据源
@@ -588,9 +624,11 @@ GET /files/D:/PycharmProjects/DataInsight/temp/anonymous_xxx.html
    - `GET /api/insight/namespaces/{namespace_id}/datasources?insight_conversation_id=...`
 2. 上传新文件数据源：
    - `POST /api/insight/namespaces/{namespace_id}/datasources/upload`
-3. 绑定到当前会话：
+3. 删除空间级数据源：
+   - `DELETE /api/insight/namespaces/{namespace_id}/datasources/{datasource_id}`
+4. 绑定到当前会话：
    - `POST /api/insight/conversation/datasource/`
-4. 解绑当前会话：
+5. 解绑当前会话：
    - `DELETE /api/insight/conversation/datasource/`
 
 关键点：

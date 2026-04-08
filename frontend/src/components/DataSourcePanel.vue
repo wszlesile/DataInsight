@@ -77,6 +77,7 @@
             当前支持：`.csv`、`.xls`、`.xlsx`
           </div>
         </div>
+
         <input
           ref="fileInput"
           class="hidden-file-input"
@@ -104,15 +105,25 @@
               <div class="data-item-body">
                 <div class="data-item-title-row">
                   <div class="data-item-title">{{ resource.title }}</div>
-                  <label class="bind-checkbox" @click.stop>
-                    <input
-                      type="checkbox"
-                      :checked="resource.checked"
-                      :disabled="!activeConversation?.id || bindingDatasourceIds.includes(resource.datasource_id)"
-                      @change="toggleDatasourceBinding(resource, $event)"
+                  <div class="data-item-actions">
+                    <label class="bind-checkbox" @click.stop>
+                      <input
+                        type="checkbox"
+                        :checked="resource.checked"
+                        :disabled="!activeConversation?.id || bindingDatasourceIds.includes(resource.datasource_id)"
+                        @change="toggleDatasourceBinding(resource, $event)"
+                      >
+                      <span>{{ resource.checked ? '已绑定' : '绑定到当前会话' }}</span>
+                    </label>
+                    <button
+                      class="delete-btn"
+                      type="button"
+                      :disabled="bindingDatasourceIds.includes(resource.datasource_id)"
+                      @click.stop="handleDeleteDatasource(resource)"
                     >
-                    <span>{{ resource.checked ? '已绑定' : '绑定到当前会话' }}</span>
-                  </label>
+                      删除
+                    </button>
+                  </div>
                 </div>
                 <div class="data-item-subtitle">{{ resource.description }}</div>
                 <div class="data-item-meta">
@@ -136,20 +147,21 @@
 
 <script setup>
 import { computed, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 import {
   bindConversationDatasource,
+  deleteNamespaceDatasource,
   listNamespaceDatasources,
   unbindConversationDatasource,
-  uploadNamespaceDatasource
+  uploadNamespaceDatasource,
 } from '../api/agent.js'
 
 const props = defineProps({
   activeNamespaceId: { type: [String, Number], default: '' },
   activeSpaceName: { type: String, default: '' },
   activeConversation: { type: Object, default: null },
-  selectedDataSource: { type: Object, default: null }
+  selectedDataSource: { type: Object, default: null },
 })
 
 const emit = defineEmits(['data-source-change'])
@@ -165,7 +177,7 @@ let latestDatasourceFetchToken = 0
 const uploadModes = [
   { value: 'uns', label: '关联节点资源', icon: '🔆' },
   { value: 'knowledge', label: '关联知识库', icon: '📚' },
-  { value: 'external', label: '上传外部数据', icon: '📤' }
+  { value: 'external', label: '上传外部数据', icon: '📤' },
 ]
 
 const filteredNamespaceDatasources = computed(() => {
@@ -223,8 +235,8 @@ const mapDatasourceCard = (item) => {
       datasourceId: Number(item.datasource_id),
       datasourceName: item.datasource_name,
       type: item.datasource_type,
-      value: filePath || item.datasource_name
-    }
+      value: filePath || item.datasource_name,
+    },
   }
 }
 
@@ -249,6 +261,7 @@ const fetchNamespaceDatasources = async () => {
     namespaceDatasources.value = []
     return
   }
+
   const fetchToken = ++latestDatasourceFetchToken
   try {
     const response = await listNamespaceDatasources(
@@ -296,6 +309,41 @@ const handleFileChange = async (event) => {
     ElMessage.error(error?.response?.data?.message || '上传文件失败')
   } finally {
     uploading.value = false
+  }
+}
+
+const handleDeleteDatasource = async (resource) => {
+  if (!props.activeNamespaceId) return
+
+  try {
+    await ElMessageBox.confirm(
+      `确认删除数据源“${resource.title}”吗？`,
+      '删除数据源',
+      {
+        confirmButtonText: '删除',
+        cancelButtonText: '取消',
+        type: 'warning',
+      }
+    )
+  } catch (error) {
+    return
+  }
+
+  try {
+    const response = await deleteNamespaceDatasource(props.activeNamespaceId, resource.datasource_id)
+    if (!response.data?.success) {
+      throw new Error(response.data?.message || '删除数据源失败')
+    }
+    latestDatasourceFetchToken += 1
+    namespaceDatasources.value = namespaceDatasources.value.filter(
+      (item) => Number(item.datasource_id) !== Number(resource.datasource_id)
+    )
+    if (props.selectedDataSource?.datasourceId === Number(resource.datasource_id)) {
+      emit('data-source-change', null)
+    }
+    ElMessage.success('数据源已删除')
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.message || error.message || '删除数据源失败')
   }
 }
 
@@ -487,23 +535,20 @@ watch(
   opacity: 0.6;
 }
 
-.placeholder-card,
-.context-card {
+.placeholder-card {
   background: #f8fbff;
   border: 1px solid #e5edf7;
   border-radius: 16px;
   padding: 14px 16px;
 }
 
-.placeholder-title,
-.context-card-title {
+.placeholder-title {
   font-size: 13px;
   font-weight: 700;
   color: #1e293b;
 }
 
-.placeholder-text,
-.context-card-value {
+.placeholder-text {
   margin-top: 8px;
   font-size: 12px;
   line-height: 1.7;
@@ -569,19 +614,6 @@ watch(
   gap: 10px;
 }
 
-.list-summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 12px;
-  border-radius: 12px;
-  background: #f8fbff;
-  border: 1px solid #e5edf7;
-  color: #64748b;
-  font-size: 12px;
-}
-
 .data-item {
   border: 1px solid #e5edf7;
   background: #fff;
@@ -629,6 +661,13 @@ watch(
   color: #0f172a;
 }
 
+.data-item-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 .data-item-subtitle {
   margin-top: 4px;
   font-size: 12px;
@@ -671,6 +710,22 @@ watch(
 .bind-checkbox input {
   width: 14px;
   height: 14px;
+}
+
+.delete-btn {
+  border: none;
+  background: #fee2e2;
+  color: #b91c1c;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.delete-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .empty-state {
