@@ -13,7 +13,6 @@ from agent.context_engineering import (
     get_datasource_message,
     get_history_messages,
     get_memory_messages,
-    get_system_config_message,
 )
 from agent.tools import StructuredResult, execute_python
 from config import Config
@@ -101,7 +100,6 @@ def build_prompt_messages(
     """
     messages: list[BaseMessage] = [
         SystemMessage(load_system_prompt()),
-        get_system_config_message(),
     ]
 
     # 先注入数据源上下文，再注入历史消息，

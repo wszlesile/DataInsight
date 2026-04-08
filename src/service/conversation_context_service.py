@@ -218,7 +218,8 @@ class ConversationContextService:
         turn_id: int,
         assistant_message: str,
         analysis_report: str,
-        file_id: str,
+        charts: list[dict[str, Any]] | None = None,
+        tables: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """结束一次成功轮次，并刷新会话记忆。"""
         conversation = self._get_conversation_by_id(conversation_id)
@@ -246,23 +247,26 @@ class ConversationContextService:
             content_json={
                 "assistant_message": assistant_message or '',
                 "analysis_report": analysis_report or '',
-                "file_id": file_id or '',
+                "charts": charts or [],
+                "tables": tables or [],
             },
         )
 
         artifacts: list[dict[str, Any]] = []
-        if file_id:
-            # 图表和报告是执行记录的派生产物，
-            # 这里会反向关联到最近一次执行记录，而不是把它们视为主产物。
+        for index, chart in enumerate(charts or [], start=1):
             artifacts.append(self._create_artifact(
                 conversation_id=conversation.id,
                 turn_id=turn.id,
                 execution_id=latest_execution.id if latest_execution else 0,
                 artifact_type='chart',
-                title=f"{conversation.title} 图表",
-                file_id=file_id,
-                summary_text='',
-                metadata={"turn_no": turn.turn_no},
+                title=str(chart.get('title') or f"{conversation.title} 图表 {index}").strip(),
+                summary_text=str(chart.get('description') or '').strip(),
+                content=chart,
+                metadata={
+                    "turn_no": turn.turn_no,
+                    "chart_type": chart.get('chart_type') or '',
+                },
+                sort_no=index,
             ))
         if analysis_report:
             artifacts.append(self._create_artifact(
@@ -271,9 +275,22 @@ class ConversationContextService:
                 execution_id=latest_execution.id if latest_execution else 0,
                 artifact_type='report',
                 title=f"{conversation.title} 报告",
-                file_id='',
                 summary_text=analysis_report,
+                content={"report_markdown": analysis_report},
                 metadata={"turn_no": turn.turn_no},
+                sort_no=0,
+            ))
+        for index, table in enumerate(tables or [], start=1):
+            artifacts.append(self._create_artifact(
+                conversation_id=conversation.id,
+                turn_id=turn.id,
+                execution_id=latest_execution.id if latest_execution else 0,
+                artifact_type='table',
+                title=str(table.get('title') or f"{conversation.title} 表格 {index}").strip(),
+                summary_text=str(table.get('description') or '').strip(),
+                content=table,
+                metadata={"turn_no": turn.turn_no},
+                sort_no=100 + index,
             ))
 
         self._refresh_memories(conversation)
@@ -282,6 +299,8 @@ class ConversationContextService:
             "conversation": conversation,
             "turn": turn,
             "artifacts": artifacts,
+            "charts": charts or [],
+            "tables": tables or [],
         }
 
     def fail_run(self, conversation_id: int, turn_id: int, error_message: str) -> None:
@@ -780,9 +799,10 @@ class ConversationContextService:
         execution_id: int,
         artifact_type: str,
         title: str,
-        file_id: str,
         summary_text: str,
+        content: dict[str, Any],
         metadata: dict[str, Any],
+        sort_no: int = 0,
     ) -> dict[str, Any]:
         artifact = InsightNsArtifact(
             conversation_id=conversation_id,
@@ -790,9 +810,10 @@ class ConversationContextService:
             execution_id=execution_id,
             artifact_type=artifact_type,
             title=title,
-            file_id=file_id or '',
             summary_text=summary_text or '',
+            content_json=dump_json(content or {}),
             metadata_json=dump_json(metadata),
+            sort_no=sort_no,
         )
         self.session.add(artifact)
         self.session.flush()
@@ -902,8 +923,8 @@ class ConversationContextService:
             "title": execution.title,
             "description": execution.description,
             "execution_status": execution.execution_status,
-            "result_file_id": execution.result_file_id,
             "analysis_report": execution.analysis_report,
+            "result_payload_json": execution.result_payload_json,
             "error_message": execution.error_message,
             "execution_seconds": execution.execution_seconds,
             "finished_at": execution.finished_at.isoformat() if execution.finished_at else None,

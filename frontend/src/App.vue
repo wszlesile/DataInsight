@@ -118,7 +118,7 @@
                 </div>
               </div>
 
-              <div v-if="item.chartUrl || item.report" class="chat-message ai">
+              <div v-if="getDisplayCharts(item).length || item.report" class="chat-message ai">
                 <div class="message-avatar ai">AI</div>
                 <div class="message-body">
                   <div class="result-card answer-card">
@@ -127,17 +127,17 @@
                       <div class="result-actions">
                         <button class="action-btn" type="button" @click="openTurnDetail(item.turnId)">查看详情</button>
                         <button
-                          v-if="item.chartUrl"
+                          v-if="getPrimaryChart(item)"
                           class="action-btn"
                           type="button"
-                          @click="onDownloadChart({ chartUrl: item.chartUrl, title: `${item.question} 图表` })"
+                          @click="onDownloadChart({ chart: getPrimaryChart(item), title: getPrimaryChart(item)?.title || 'analysis-chart' })"
                         >
                           下载图表
                         </button>
                         <button
                           class="action-btn"
                           type="button"
-                          @click="onExportAnalysisPdf({ turnId: item.turnId, title: item.question, chartUrl: item.chartUrl })"
+                          @click="onExportAnalysisPdf({ turnId: item.turnId })"
                         >
                           导出 PDF
                         </button>
@@ -151,13 +151,17 @@
                             title: item.question,
                             summaryText: item.report,
                             conversationId: activeConversationId,
-                            metadata: { turn_id: item.turnId, file_id: item.fileId || '' }
+                            metadata: {
+                              turn_id: item.turnId,
+                              charts: item.charts || [],
+                              tables: item.tables || []
+                            }
                           })"
                         >
                           {{ isCollected('turn', item.turnId) ? '取消收藏' : '收藏本轮' }}
                         </button>
                         <button
-                          v-if="item.chartUrl"
+                          v-if="getPrimaryChart(item)"
                           class="action-btn"
                           type="button"
                           @click="toggleChartCollectForTurn(item)"
@@ -167,8 +171,14 @@
                       </div>
                     </div>
 
-                    <div v-if="item.chartUrl" class="answer-chart">
-                      <ChartDisplay :chart-url="item.chartUrl" />
+                    <div v-if="getDisplayCharts(item).length" class="answer-chart-grid">
+                      <div
+                        v-for="(chart, chartIndex) in getDisplayCharts(item)"
+                        :key="`${item.turnId}-chart-${chart.id || chartIndex}`"
+                        class="answer-chart"
+                      >
+                        <ChartDisplay :chart-spec="chart.chartSpec" />
+                      </div>
                     </div>
 
                     <div
@@ -207,7 +217,7 @@
                 </div>
               </div>
 
-              <div v-if="currentChartUrl || currentReport" class="chat-message ai">
+              <div v-if="currentCharts.length || currentReport" class="chat-message ai">
                 <div class="message-avatar ai">AI</div>
                 <div class="message-body">
                   <div class="result-card answer-card">
@@ -218,17 +228,17 @@
                           查看详情
                         </button>
                         <button
-                          v-if="currentChartUrl"
+                          v-if="getPrimaryChart({ charts: currentCharts })"
                           class="action-btn"
                           type="button"
-                          @click="onDownloadChart({ chartUrl: currentChartUrl, title: `${currentQuestion} 图表` })"
+                          @click="onDownloadChart({ chart: getPrimaryChart({ charts: currentCharts }), title: getPrimaryChart({ charts: currentCharts })?.title || 'analysis-chart' })"
                         >
                           下载图表
                         </button>
                         <button
                           class="action-btn"
                           type="button"
-                          @click="onExportAnalysisPdf({ turnId: currentTurnId, title: currentQuestion, chartUrl: currentChartUrl })"
+                          @click="onExportAnalysisPdf({ turnId: currentTurnId })"
                         >
                           导出 PDF
                         </button>
@@ -236,7 +246,7 @@
                           v-if="currentTurnId"
                           class="action-btn"
                           type="button"
-                          @click="onRerunTurn({ turnId: currentTurnId, question: currentQuestion, chartUrl: currentChartUrl, fileId: currentResultFileId, chartArtifactId: currentChartArtifactId, report: currentReport })"
+                          @click="onRerunTurn({ turnId: currentTurnId, question: currentQuestion, charts: [...currentCharts], chartArtifactId: currentChartArtifactId, report: currentReport })"
                         >
                           刷新分析
                         </button>
@@ -250,13 +260,17 @@
                             title: currentQuestion,
                             summaryText: currentReport,
                             conversationId: activeConversationId,
-                            metadata: { turn_id: currentTurnId, file_id: currentResultFileId || '' }
+                            metadata: {
+                              turn_id: currentTurnId,
+                              charts: [...currentCharts],
+                              tables: [...currentTables]
+                            }
                           })"
                         >
                           {{ isCollected('turn', currentTurnId) ? '取消收藏' : '收藏本轮' }}
                         </button>
                         <button
-                          v-if="currentTurnId && currentChartUrl"
+                          v-if="currentTurnId && getPrimaryChart({ charts: currentCharts })"
                           class="action-btn"
                           type="button"
                           @click="toggleCurrentChartCollect"
@@ -266,10 +280,15 @@
                       </div>
                     </div>
 
-                    <div v-if="currentChartUrl" class="answer-chart">
-                      <ChartDisplay :chart-url="currentChartUrl" />
+                    <div v-if="currentCharts.length" class="answer-chart-grid">
+                      <div
+                        v-for="(chart, chartIndex) in currentCharts"
+                        :key="`${currentTurnId}-chart-${chart.id || chartIndex}`"
+                        class="answer-chart"
+                      >
+                        <ChartDisplay :chart-spec="chart.chartSpec" />
+                      </div>
                     </div>
-
                     <div
                       v-if="currentReport"
                       class="message-bubble ai report-text answer-report"
@@ -311,8 +330,8 @@
                 <span class="detail-pill">{{ favoriteTypeLabel(collect) }}</span>
               </div>
 
-              <div v-if="favoriteChartUrl(collect)" class="favorite-turn-chart">
-                <ChartDisplay :chart-url="favoriteChartUrl(collect)" />
+              <div v-if="favoriteChartSpec(collect)" class="favorite-turn-chart">
+                <ChartDisplay :chart-spec="favoriteChartSpec(collect)" />
               </div>
 
               <div
@@ -337,7 +356,10 @@
               </div>
 
               <div class="favorite-preview favorite-artifact-preview">
-                <ChartDisplay v-if="favoriteChartUrl(collect)" :chart-url="favoriteChartUrl(collect)" />
+                <ChartDisplay
+                  v-if="favoriteChartSpec(collect)"
+                  :chart-spec="favoriteChartSpec(collect)"
+                />
                 <div v-else class="chart-placeholder">
                   <span class="bar" style="height: 26px;" />
                   <span class="bar" style="height: 44px;" />
@@ -400,7 +422,12 @@
               conversationId: turnDetail.conversation.id,
               metadata: {
                 turn_id: turnDetail.turn.id,
-                file_id: turnDetail.artifacts.find((artifact) => artifact.artifact_type === 'chart' && artifact.file_id)?.file_id || ''
+                charts: (turnDetail.artifacts || [])
+                  .filter((artifact) => artifact.artifact_type === 'chart')
+                  .map((artifact) => ({
+                    chart_spec: artifactChartSpec(artifact),
+                    title: artifact.title || ''
+                  }))
               }
             })"
           >
@@ -437,8 +464,14 @@
             <div v-for="artifact in turnDetail.artifacts" :key="artifact.id" class="detail-list-item">
               <div class="detail-list-actions">
                 <span class="detail-pill">{{ artifact.artifact_type }}</span>
-                <button v-if="artifact.file_id" class="action-btn" type="button" @click="previewChartArtifact(artifact)">预览</button>
-                <button v-if="artifact.file_id" class="action-btn" type="button" @click="openArtifactFile(artifact)">打开</button>
+                <button
+                  v-if="artifact.artifact_type === 'chart' && artifactChartSpec(artifact)"
+                  class="action-btn"
+                  type="button"
+                  @click="previewChartArtifact(artifact)"
+                >
+                  预览
+                </button>
                 <button
                   class="action-btn"
                   type="button"
@@ -449,7 +482,10 @@
                     summaryText: artifact.summary_text,
                     conversationId: turnDetail.conversation.id,
                     artifactId: artifact.id,
-                    metadata: { turn_id: turnDetail.turn.id, file_id: artifact.file_id }
+                    metadata: {
+                      turn_id: turnDetail.turn.id,
+                      chart_spec: artifactChartSpec(artifact)
+                    }
                   })"
                 >
                   {{ isCollected('artifact', artifact.id) ? '取消收藏' : '收藏产物' }}
@@ -458,17 +494,16 @@
               <div class="detail-card">
                 <div class="artifact-title">{{ artifact.title || '未命名产物' }}</div>
                 <div v-if="artifact.summary_text" class="artifact-summary">{{ artifact.summary_text }}</div>
-                <div v-if="artifact.file_id" class="artifact-link">文件：{{ artifact.file_id }}</div>
               </div>
             </div>
           </div>
         </div>
 
-        <div v-if="previewArtifact?.file_id" class="detail-section">
+        <div v-if="previewArtifact && artifactChartSpec(previewArtifact)" class="detail-section">
           <div class="section-title">产物预览</div>
           <div class="detail-card">
             <div class="artifact-title">{{ previewArtifact.title || '图表预览' }}</div>
-            <ChartDisplay :chart-url="normalizeFileUrl(previewArtifact.file_id)" />
+            <ChartDisplay :chart-spec="artifactChartSpec(previewArtifact)" />
           </div>
         </div>
       </div>
@@ -479,6 +514,7 @@
 
 <script setup>
 import { computed, nextTick, onMounted, ref } from 'vue'
+import * as echarts from 'echarts'
 import { marked } from 'marked'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -513,9 +549,9 @@ const activeConversationId = ref(0)
 const loading = ref(false)
 const chatHistory = ref([])
 const currentQuestion = ref('')
-const currentResultFileId = ref('')
 const currentChartArtifactId = ref(0)
-const currentChartUrl = ref('')
+const currentCharts = ref([])
+const currentTables = ref([])
 const currentReport = ref('')
 const currentAssistantMessage = ref('')
 const currentDataSource = ref(null)
@@ -548,7 +584,6 @@ const activeSpaceName = computed(() =>
 const visibleFavorites = computed(() => collects.value)
 
 const renderMarkdown = (content) => (content ? marked.parse(content) : '')
-const normalizeFileUrl = (fileId) => `/files/${encodeURIComponent(fileId)}`
 const collectKey = (collectType, targetId) => `${collectType}:${targetId}`
 const parseCollectMetadata = (collect) => {
   if (!collect?.metadata_json) return {}
@@ -563,10 +598,81 @@ const parseCollectMetadata = (collect) => {
   return collect.metadata_json || {}
 }
 
-const favoriteChartUrl = (collect) => {
+const favoriteChartSpec = (collect) => {
   const metadata = parseCollectMetadata(collect)
-  return metadata.file_id ? normalizeFileUrl(metadata.file_id) : ''
+  if (metadata.chart_spec && typeof metadata.chart_spec === 'object') {
+    return sanitizeChartSpec(metadata.chart_spec)
+  }
+  if (Array.isArray(metadata.charts) && metadata.charts.length > 0) {
+    return sanitizeChartSpec(metadata.charts[0]?.chartSpec || metadata.charts[0]?.chart_spec || null)
+  }
+  return null
 }
+
+const sanitizeChartSpec = (chartSpec) => {
+  if (!chartSpec || typeof chartSpec !== 'object') return null
+  const normalized = JSON.parse(JSON.stringify(chartSpec))
+
+  normalized.animation = false
+  normalized.animationDuration = 0
+  normalized.animationDurationUpdate = 0
+  normalized.animationDelay = 0
+  normalized.animationDelayUpdate = 0
+
+  const axisKeys = ['xAxis', 'yAxis']
+  axisKeys.forEach((axisKey) => {
+    const axes = normalized[axisKey]
+    const axisList = Array.isArray(axes) ? axes : (axes && typeof axes === 'object' ? [axes] : [])
+    axisList.forEach((axis) => {
+      if (!axis || typeof axis !== 'object') return
+      axis.animation = false
+      axis.animationDuration = 0
+      axis.animationDurationUpdate = 0
+      axis.animationDelay = 0
+      axis.animationDelayUpdate = 0
+    })
+  })
+
+  if (Array.isArray(normalized.series)) {
+    normalized.series.forEach((series) => {
+      if (!series || typeof series !== 'object') return
+      series.animation = false
+      if (series.type === 'line' && series.lineStyle && typeof series.lineStyle === 'object' && series.lineStyle.show === false) {
+        delete series.lineStyle.show
+        if (Object.keys(series.lineStyle).length === 0) {
+          delete series.lineStyle
+        }
+      }
+    })
+  }
+
+  return normalized
+}
+
+const normalizeChartItem = (chart) => {
+  if (!chart || typeof chart !== 'object') return null
+  return {
+    id: chart.id || 0,
+    title: chart.title || '',
+    chartType: chart.chart_type || '',
+    chartSpec: sanitizeChartSpec(chart.chart_spec || null),
+    summaryText: chart.summary_text || chart.description || '',
+    sortNo: chart.sort_no || 0
+  }
+}
+
+const normalizeCharts = (charts = []) => {
+  const normalized = (Array.isArray(charts) ? charts : [])
+    .map((chart) => normalizeChartItem(chart))
+    .filter(Boolean)
+    .sort((left, right) => (left.sortNo || 0) - (right.sortNo || 0))
+
+  return normalized
+}
+
+const getDisplayCharts = (item) => item?.charts || []
+const getPrimaryChart = (item) => getDisplayCharts(item)[0] || null
+const artifactChartSpec = (artifact) => sanitizeChartSpec(artifact?.content_json?.chart_spec || null)
 
 const favoriteTypeLabel = (collect) => {
   if (collect.collect_type === 'turn') return '整体结果'
@@ -581,62 +687,75 @@ const buildChartDownloadFilename = (title = 'analysis-chart') =>
     .replace(/\s+/g, '-')
     .slice(0, 80) || 'analysis-chart'}.png`
 
-const getChartImageDataUrl = (chartUrl) => new Promise((resolve, reject) => {
-  if (!chartUrl) {
+const getChartImageDataUrl = (chart) => new Promise((resolve, reject) => {
+  if (!chart) {
     reject(new Error('当前没有可下载的图表'))
     return
   }
 
-  const iframe = document.createElement('iframe')
-  iframe.style.position = 'fixed'
-  iframe.style.width = '0'
-  iframe.style.height = '0'
-  iframe.style.opacity = '0'
-  iframe.style.pointerEvents = 'none'
-  iframe.style.border = '0'
-  iframe.src = `${chartUrl}${chartUrl.includes('?') ? '&' : '?'}download_ts=${Date.now()}`
+  if (chart.chartSpec && typeof chart.chartSpec === 'object' && Object.keys(chart.chartSpec).length > 0) {
+    const container = document.createElement('div')
+    container.style.position = 'fixed'
+    container.style.left = '-99999px'
+    container.style.top = '0'
+    container.style.width = '960px'
+    container.style.height = '540px'
+    container.style.background = '#ffffff'
+    document.body.appendChild(container)
 
-  const cleanup = () => {
-    if (iframe.parentNode) {
-      iframe.parentNode.removeChild(iframe)
+    try {
+      const instance = echarts.init(container, null, { renderer: 'canvas' })
+      let settled = false
+      const cleanup = () => {
+        if (settled) return
+        settled = true
+        instance.dispose()
+        if (container.parentNode) {
+          container.parentNode.removeChild(container)
+        }
+      }
+      instance.on('finished', () => {
+        try {
+          const dataUrl = instance.getDataURL({
+            type: 'png',
+            pixelRatio: 2,
+            backgroundColor: '#ffffff'
+          })
+          cleanup()
+          resolve(dataUrl)
+        } catch (error) {
+          cleanup()
+          reject(error)
+        }
+      })
+      instance.setOption(chart.chartSpec, true)
+      window.setTimeout(() => {
+        if (settled) return
+        try {
+          const dataUrl = instance.getDataURL({
+            type: 'png',
+            pixelRatio: 2,
+            backgroundColor: '#ffffff'
+          })
+          cleanup()
+          resolve(dataUrl)
+        } catch (error) {
+          cleanup()
+          reject(error)
+        }
+      }, 600)
+      return
+    } catch (error) {
+      document.body.removeChild(container)
+      reject(error)
+      return
     }
   }
-
-  iframe.onload = () => {
-    window.setTimeout(() => {
-      try {
-        const iframeWindow = iframe.contentWindow
-        const iframeDocument = iframe.contentDocument
-        const chartElement = iframeDocument?.querySelector('.chart-container')
-        const chartInstance = iframeWindow?.echarts?.getInstanceByDom?.(chartElement)
-        if (!chartInstance?.getDataURL) {
-          throw new Error('当前图表暂不支持下载图片')
-        }
-
-        const dataUrl = chartInstance.getDataURL({
-          type: 'png',
-          pixelRatio: 2,
-          backgroundColor: '#ffffff'
-        })
-        cleanup()
-        resolve(dataUrl)
-      } catch (error) {
-        cleanup()
-        reject(error)
-      }
-    }, 160)
-  }
-
-  iframe.onerror = () => {
-    cleanup()
-    reject(new Error('图表加载失败，无法下载'))
-  }
-
-  document.body.appendChild(iframe)
+  reject(new Error('当前图表缺少可下载的结构化配置'))
 })
 
-const downloadChartAsImage = async (chartUrl, filename) => {
-  const dataUrl = await getChartImageDataUrl(chartUrl)
+const downloadChartAsImage = async (chart, filename) => {
+  const dataUrl = await getChartImageDataUrl(chart)
   const anchor = document.createElement('a')
   anchor.href = dataUrl
   anchor.download = filename
@@ -695,9 +814,9 @@ const formatDateTime = (value) => {
 
 const resetCurrentConversationState = () => {
   currentQuestion.value = ''
-  currentResultFileId.value = ''
   currentChartArtifactId.value = 0
-  currentChartUrl.value = ''
+  currentCharts.value = []
+  currentTables.value = []
   currentReport.value = ''
   currentAssistantMessage.value = ''
   currentProgressItems.value = []
@@ -717,9 +836,9 @@ const finalizeCurrentConversation = () => {
   chatHistory.value.push({
     turnId: currentTurnId.value,
     question: currentQuestion.value,
-    fileId: currentResultFileId.value,
     chartArtifactId: currentChartArtifactId.value,
-    chartUrl: currentChartUrl.value,
+    charts: [...currentCharts.value],
+    tables: [...currentTables.value],
     report: finalReply,
     progressItems: [...currentProgressItems.value]
   })
@@ -737,9 +856,9 @@ const stopCurrentStream = () => {
 const mapHistoryItem = (item) => ({
   turnId: item.turn_id,
   question: item.question,
-  fileId: item.file_id || '',
   chartArtifactId: item.chart_artifact_id || 0,
-  chartUrl: item.file_id ? normalizeFileUrl(item.file_id) : '',
+  charts: normalizeCharts(item.charts || []),
+  tables: item.tables || [],
   report: item.report,
   progressItems: []
 })
@@ -864,41 +983,41 @@ const toggleConversationCollect = async () => {
   })
 }
 
-const resolveChartArtifactForTurn = async (turnId, fallbackFileId = '') => {
+const resolveChartArtifactForTurn = async (turnId) => {
   if (!activeConversationId.value || !turnId) return null
   const response = await getTurnDetail(activeConversationId.value, turnId)
   if (!response.data?.success) return null
   const detail = response.data.data
-  const chartArtifact = (detail?.artifacts || []).find((artifact) => artifact.artifact_type === 'chart' && artifact.file_id)
+  const chartArtifact = (detail?.artifacts || []).find((artifact) => artifact.artifact_type === 'chart')
   if (!chartArtifact) return null
   return {
     artifactId: chartArtifact.id,
-    fileId: chartArtifact.file_id || fallbackFileId || '',
     title: chartArtifact.title || '',
-    summaryText: ''
+    summaryText: chartArtifact.summary_text || '',
+    chartSpec: chartArtifact.content_json?.chart_spec || null,
   }
 }
 
 const toggleChartCollectForTurn = async (item) => {
-  if (!item?.turnId || !item.chartUrl) return
+  const primaryChart = getPrimaryChart(item)
+  if (!item?.turnId || !primaryChart) return
   let artifactId = item.chartArtifactId || 0
-  let fileId = item.fileId || ''
   let title = `${item.question} 图表`
   let summaryText = ''
+  let chartSpec = primaryChart.chartSpec || null
 
   if (!artifactId) {
     try {
-      const chartArtifact = await resolveChartArtifactForTurn(item.turnId, item.fileId || '')
+      const chartArtifact = await resolveChartArtifactForTurn(item.turnId)
       if (!chartArtifact) {
         ElMessage.warning('当前轮次未找到可收藏的图表产物')
         return
       }
       artifactId = chartArtifact.artifactId
-      fileId = chartArtifact.fileId
       title = chartArtifact.title || title
       summaryText = chartArtifact.summaryText || ''
+      chartSpec = chartArtifact.chartSpec || chartSpec
       item.chartArtifactId = artifactId
-      item.fileId = fileId || item.fileId || ''
     } catch (error) {
       console.error('Resolve chart artifact error:', error)
       ElMessage.error('获取图表产物信息失败')
@@ -913,30 +1032,33 @@ const toggleChartCollectForTurn = async (item) => {
     summaryText,
     conversationId: activeConversationId.value,
     artifactId,
-    metadata: { turn_id: item.turnId, file_id: fileId }
+    metadata: {
+      turn_id: item.turnId,
+      chart_spec: chartSpec
+    }
   })
 }
 
 const toggleCurrentChartCollect = async () => {
-  if (!currentTurnId.value || !currentChartUrl.value) return
+  const primaryChart = getPrimaryChart({ charts: currentCharts.value })
+  if (!currentTurnId.value || !primaryChart) return
   let artifactId = currentChartArtifactId.value || 0
-  let fileId = currentResultFileId.value || ''
   let title = `${currentQuestion.value} 图表`
   let summaryText = ''
+  let chartSpec = primaryChart.chartSpec || null
 
   if (!artifactId) {
     try {
-      const chartArtifact = await resolveChartArtifactForTurn(currentTurnId.value, currentResultFileId.value || '')
+      const chartArtifact = await resolveChartArtifactForTurn(currentTurnId.value)
       if (!chartArtifact) {
         ElMessage.warning('当前轮次未找到可收藏的图表产物')
         return
       }
       artifactId = chartArtifact.artifactId
-      fileId = chartArtifact.fileId
       title = chartArtifact.title || title
       summaryText = chartArtifact.summaryText || ''
+      chartSpec = chartArtifact.chartSpec || chartSpec
       currentChartArtifactId.value = artifactId
-      currentResultFileId.value = fileId || currentResultFileId.value
     } catch (error) {
       console.error('Resolve current chart artifact error:', error)
       ElMessage.error('获取图表产物信息失败')
@@ -951,13 +1073,16 @@ const toggleCurrentChartCollect = async () => {
     summaryText,
     conversationId: activeConversationId.value,
     artifactId,
-    metadata: { turn_id: currentTurnId.value, file_id: fileId }
+    metadata: {
+      turn_id: currentTurnId.value,
+      chart_spec: chartSpec
+    }
   })
 }
 
-const onDownloadChart = async ({ chartUrl, title }) => {
+const onDownloadChart = async ({ chart, title }) => {
   try {
-    await downloadChartAsImage(chartUrl, buildChartDownloadFilename(title))
+    await downloadChartAsImage(chart, buildChartDownloadFilename(title))
     ElMessage.success('图表图片已开始下载')
   } catch (error) {
     console.error('Download chart error:', error)
@@ -988,11 +1113,11 @@ const downloadBlobResponse = (response, fallbackName = 'analysis-result.pdf') =>
   window.URL.revokeObjectURL(objectUrl)
 }
 
-const onExportAnalysisPdf = async ({ turnId, title, chartUrl }) => {
+const onExportAnalysisPdf = async ({ turnId }) => {
   if (!activeConversationId.value || !turnId) return
   try {
     const response = await exportTurnPdf(activeConversationId.value, turnId)
-    downloadBlobResponse(response, `${title || 'analysis-result'}.pdf`)
+    downloadBlobResponse(response, 'analysis-result.pdf')
     ElMessage.success('分析结果 PDF 已开始导出')
   } catch (error) {
     console.error('Export analysis pdf error:', error)
@@ -1009,8 +1134,6 @@ const onRerunTurn = (item) => {
   currentTurnId.value = item.turnId
   currentQuestion.value = item.question
   currentReport.value = ''
-  currentChartUrl.value = ''
-  currentResultFileId.value = ''
   currentChartArtifactId.value = 0
   loading.value = true
   addProgressItem({
@@ -1054,12 +1177,8 @@ const onRenameConversation = async (conversation) => {
 }
 
 const previewChartArtifact = (artifact) => {
-  if (artifact?.file_id) previewArtifact.value = artifact
-}
-
-const openArtifactFile = (artifact) => {
-  if (artifact?.file_id) {
-    window.open(normalizeFileUrl(artifact.file_id), '_blank', 'noopener')
+  if (artifact?.artifact_type === 'chart' && artifactChartSpec(artifact)) {
+    previewArtifact.value = artifact
   }
 }
 
@@ -1093,8 +1212,15 @@ const onSelectCollect = async (collect) => {
   if (metadata.turn_id) {
     await openTurnDetail(metadata.turn_id)
   }
-  if (metadata.file_id && turnDetail.value?.artifacts?.length) {
-    previewArtifact.value = turnDetail.value.artifacts.find((item) => item.file_id === metadata.file_id) || null
+  if (metadata.chart_spec) {
+    previewArtifact.value = {
+      title: collect.title || '图表预览',
+      artifact_type: 'chart',
+      content_json: {
+        chart_spec: metadata.chart_spec
+      }
+    }
+    return
   }
 }
 
@@ -1225,10 +1351,8 @@ const handleStreamEvent = async (event) => {
     return
   }
     if (event.type === 'result') {
-      if (event.file_id) {
-        currentResultFileId.value = event.file_id
-        currentChartUrl.value = normalizeFileUrl(event.file_id)
-      }
+      currentCharts.value = normalizeCharts(event.charts || [])
+      if (Array.isArray(event.tables)) currentTables.value = event.tables
       if (event.chart_artifact_id) currentChartArtifactId.value = Number(event.chart_artifact_id)
       if (event.analysis_report) currentReport.value = event.analysis_report
       scrollToBottom()
@@ -1237,7 +1361,7 @@ const handleStreamEvent = async (event) => {
   if (event.type === 'done') {
     if (!currentReport.value && currentAssistantMessage.value) {
       currentReport.value = currentAssistantMessage.value
-    } else if (!currentReport.value && !currentChartUrl.value) {
+    } else if (!currentReport.value && currentCharts.value.length === 0) {
       currentReport.value = '本轮分析未生成可展示的图表或分析报告，请重试。'
     }
     await finalizeStreamRound()
@@ -1270,7 +1394,7 @@ const handleStreamDone = async () => {
   if (!loading.value) return
   if (!currentReport.value && currentAssistantMessage.value) {
     currentReport.value = currentAssistantMessage.value
-  } else if (!currentReport.value && !currentChartUrl.value) {
+  } else if (!currentReport.value && currentCharts.value.length === 0) {
     currentReport.value = '本轮分析未生成可展示的图表或分析报告，请重试。'
   }
   await finalizeStreamRound()

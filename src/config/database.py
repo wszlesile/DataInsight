@@ -323,6 +323,129 @@ def _rebuild_ns_rel_knowledge_table() -> None:
         connection.execute(text("ALTER TABLE insight_ns_rel_knowledge_new RENAME TO insight_ns_rel_knowledge"))
 
 
+def _rebuild_ns_execution_table() -> None:
+    if not _has_table('insight_ns_execution'):
+        return
+
+    existing = _existing_columns('insight_ns_execution')
+    expected = {
+        'id',
+        'conversation_id',
+        'turn_id',
+        'tool_call_id',
+        'title',
+        'description',
+        'generated_code',
+        'execution_status',
+        'analysis_report',
+        'result_payload_json',
+        'stdout_text',
+        'stderr_text',
+        'execution_seconds',
+        'error_message',
+        'is_deleted',
+        'created_at',
+        'updated_at',
+        'finished_at',
+    }
+    if existing == expected:
+        return
+
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE TABLE IF NOT EXISTS insight_ns_execution_new ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "conversation_id INTEGER NOT NULL, "
+            "turn_id INTEGER NOT NULL, "
+            "tool_call_id VARCHAR(128) NOT NULL DEFAULT '', "
+            "title VARCHAR(255) NOT NULL DEFAULT '', "
+            "description TEXT NOT NULL DEFAULT '', "
+            "generated_code TEXT NOT NULL DEFAULT '', "
+            "execution_status VARCHAR(32) NOT NULL DEFAULT 'running', "
+            "analysis_report TEXT NOT NULL DEFAULT '', "
+            "result_payload_json TEXT NOT NULL DEFAULT '{}', "
+            "stdout_text TEXT NOT NULL DEFAULT '', "
+            "stderr_text TEXT NOT NULL DEFAULT '', "
+            "execution_seconds INTEGER NOT NULL DEFAULT 0, "
+            "error_message TEXT NOT NULL DEFAULT '', "
+            "is_deleted INTEGER NOT NULL DEFAULT 0, "
+            "created_at DATETIME, "
+            "updated_at DATETIME, "
+            "finished_at DATETIME"
+            ")"
+        ))
+        connection.execute(text(
+            "INSERT INTO insight_ns_execution_new ("
+            "id, conversation_id, turn_id, tool_call_id, title, description, generated_code, execution_status, "
+            "analysis_report, result_payload_json, stdout_text, stderr_text, execution_seconds, error_message, "
+            "is_deleted, created_at, updated_at, finished_at"
+            ") "
+            "SELECT "
+            "id, conversation_id, turn_id, COALESCE(tool_call_id, ''), COALESCE(title, ''), COALESCE(description, ''), "
+            "COALESCE(generated_code, ''), COALESCE(execution_status, 'running'), COALESCE(analysis_report, ''), "
+            "COALESCE(result_payload_json, '{}'), COALESCE(stdout_text, ''), COALESCE(stderr_text, ''), "
+            "COALESCE(execution_seconds, 0), COALESCE(error_message, ''), COALESCE(is_deleted, 0), "
+            "created_at, updated_at, finished_at "
+            "FROM insight_ns_execution"
+        ))
+        connection.execute(text("DROP TABLE insight_ns_execution"))
+        connection.execute(text("ALTER TABLE insight_ns_execution_new RENAME TO insight_ns_execution"))
+
+
+def _rebuild_ns_artifact_table() -> None:
+    if not _has_table('insight_ns_artifact'):
+        return
+
+    existing = _existing_columns('insight_ns_artifact')
+    expected = {
+        'id',
+        'conversation_id',
+        'turn_id',
+        'execution_id',
+        'artifact_type',
+        'title',
+        'summary_text',
+        'content_json',
+        'metadata_json',
+        'sort_no',
+        'is_deleted',
+        'created_at',
+    }
+    if existing == expected:
+        return
+
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE TABLE IF NOT EXISTS insight_ns_artifact_new ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "conversation_id INTEGER NOT NULL, "
+            "turn_id INTEGER NOT NULL, "
+            "execution_id INTEGER NOT NULL DEFAULT 0, "
+            "artifact_type VARCHAR(32) NOT NULL, "
+            "title VARCHAR(255) NOT NULL DEFAULT '', "
+            "summary_text TEXT NOT NULL DEFAULT '', "
+            "content_json TEXT NOT NULL DEFAULT '{}', "
+            "metadata_json TEXT NOT NULL DEFAULT '{}', "
+            "sort_no INTEGER NOT NULL DEFAULT 0, "
+            "is_deleted INTEGER NOT NULL DEFAULT 0, "
+            "created_at DATETIME"
+            ")"
+        ))
+        connection.execute(text(
+            "INSERT INTO insight_ns_artifact_new ("
+            "id, conversation_id, turn_id, execution_id, artifact_type, title, summary_text, content_json, "
+            "metadata_json, sort_no, is_deleted, created_at"
+            ") "
+            "SELECT "
+            "id, conversation_id, turn_id, COALESCE(execution_id, 0), COALESCE(artifact_type, ''), COALESCE(title, ''), "
+            "COALESCE(summary_text, ''), COALESCE(content_json, '{}'), COALESCE(metadata_json, '{}'), "
+            "COALESCE(sort_no, 0), COALESCE(is_deleted, 0), created_at "
+            "FROM insight_ns_artifact"
+        ))
+        connection.execute(text("DROP TABLE insight_ns_artifact"))
+        connection.execute(text("ALTER TABLE insight_ns_artifact_new RENAME TO insight_ns_artifact"))
+
+
 def _backfill_datasource_tags() -> None:
     if not _has_table('insight_ns_rel_datasource') or not _has_table('insight_datasource'):
         return
@@ -554,7 +677,6 @@ def _run_sqlite_schema_migrations() -> None:
         "description TEXT NOT NULL DEFAULT '', "
         "generated_code TEXT NOT NULL DEFAULT '', "
         "execution_status VARCHAR(32) NOT NULL DEFAULT 'running', "
-        "result_file_id VARCHAR(255) NOT NULL DEFAULT '', "
         "analysis_report TEXT NOT NULL DEFAULT '', "
         "stdout_text TEXT NOT NULL DEFAULT '', "
         "stderr_text TEXT NOT NULL DEFAULT '', "
@@ -572,8 +694,8 @@ def _run_sqlite_schema_migrations() -> None:
         "description TEXT NOT NULL DEFAULT ''",
         "generated_code TEXT NOT NULL DEFAULT ''",
         "execution_status VARCHAR(32) NOT NULL DEFAULT 'running'",
-        "result_file_id VARCHAR(255) NOT NULL DEFAULT ''",
         "analysis_report TEXT NOT NULL DEFAULT ''",
+        "result_payload_json TEXT NOT NULL DEFAULT '{}'",
         "stdout_text TEXT NOT NULL DEFAULT ''",
         "stderr_text TEXT NOT NULL DEFAULT ''",
         "execution_seconds INTEGER NOT NULL DEFAULT 0",
@@ -622,6 +744,8 @@ def _run_sqlite_schema_migrations() -> None:
     ])
     _ensure_columns('insight_ns_artifact', [
         "execution_id INTEGER NOT NULL DEFAULT 0",
+        "content_json TEXT NOT NULL DEFAULT '{}'",
+        "sort_no INTEGER NOT NULL DEFAULT 0",
         "is_deleted INTEGER NOT NULL DEFAULT 0",
     ])
     _ensure_columns('insight_knowledge', [
@@ -637,6 +761,8 @@ def _run_sqlite_schema_migrations() -> None:
     _backfill_knowledge_relations()
     _backfill_knowledge_tags()
     _rebuild_ns_rel_knowledge_table()
+    _rebuild_ns_execution_table()
+    _rebuild_ns_artifact_table()
     # 当前设计中，`insight_conversation_id = 0` 是合法且必须保留的虚拟默认会话资源绑定。
     # 这里不再把 `0` 视为“待补全的缺失值”去回填到真实会话，避免破坏默认资源关系。
 

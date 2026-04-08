@@ -270,8 +270,8 @@ class InsightNsExecution(Base):
     description = Column(Text, nullable=False, default='', comment='执行任务描述')
     generated_code = Column(Text, nullable=False, default='', comment='大模型生成的 Python 代码')
     execution_status = Column(String(32), nullable=False, default='running', comment='执行状态')
-    result_file_id = Column(String(255), nullable=False, default='', comment='结果文件 ID')
     analysis_report = Column(Text, nullable=False, default='', comment='分析报告内容')
+    result_payload_json = Column(Text, nullable=False, default='{}', comment='结构化执行结果 JSON')
     stdout_text = Column(Text, nullable=False, default='', comment='标准输出文本')
     stderr_text = Column(Text, nullable=False, default='', comment='标准错误文本')
     execution_seconds = Column(Integer, nullable=False, default=0, comment='执行耗时毫秒数')
@@ -297,8 +297,8 @@ class InsightNsExecution(Base):
             "description": self.description,
             "generated_code": self.generated_code,
             "execution_status": self.execution_status,
-            "result_file_id": self.result_file_id,
             "analysis_report": self.analysis_report,
+            "result_payload_json": self.result_payload_json,
             "stdout_text": self.stdout_text,
             "stderr_text": self.stderr_text,
             "execution_seconds": self.execution_seconds,
@@ -394,7 +394,7 @@ class InsightNsMemory(Base):
 
 
 class InsightNsArtifact(Base):
-    """代码执行派生出的用户可见产物表。"""
+    """代码执行派生出的会话级分析产物表。"""
 
     __tablename__ = 'insight_ns_artifact'
 
@@ -404,9 +404,10 @@ class InsightNsArtifact(Base):
     execution_id = Column(Integer, nullable=False, default=0, comment='所属代码执行 ID')
     artifact_type = Column(String(32), nullable=False, comment='产物类型')
     title = Column(String(255), nullable=False, default='', comment='产物标题')
-    file_id = Column(String(255), nullable=False, default='', comment='关联文件 ID')
     summary_text = Column(Text, nullable=False, default='', comment='产物摘要')
+    content_json = Column(Text, nullable=False, default='{}', comment='产物核心内容 JSON')
     metadata_json = Column(Text, nullable=False, default='{}', comment='产物元数据 JSON')
+    sort_no = Column(Integer, nullable=False, default=0, comment='产物展示顺序')
     is_deleted = Column(Integer, nullable=False, default=0, comment='软删除标记')
     created_at = Column(DateTime, default=_now, comment='创建时间')
 
@@ -423,9 +424,10 @@ class InsightNsArtifact(Base):
             "execution_id": self.execution_id,
             "artifact_type": self.artifact_type,
             "title": self.title,
-            "file_id": self.file_id,
             "summary_text": self.summary_text,
+            "content_json": self.content_json,
             "metadata_json": self.metadata_json,
+            "sort_no": self.sort_no,
             "is_deleted": self.is_deleted,
             "created_at": _format(self.created_at),
         }

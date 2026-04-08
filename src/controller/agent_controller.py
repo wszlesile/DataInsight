@@ -58,8 +58,11 @@ class AgentController(BaseController):
                 'message': response.message,
                 'conversation_id': response.conversation_id,
                 'turn_id': response.turn_id,
-                'file_id': response.file_id,
                 'analysis_report': response.analysis_report,
+                'charts': response.charts,
+                'tables': response.tables,
+                'chart_artifact_id': response.chart_artifact_id,
+                'chart_artifact_ids': response.chart_artifact_ids or [],
             }).to_dict())
         except Exception as exc:
             return self.error_response(f'Agent 执行失败: {str(exc)}')

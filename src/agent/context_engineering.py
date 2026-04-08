@@ -5,7 +5,6 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel
 
-from config.config import Config
 from config.database import SessionLocal
 from model import InsightDatasource, InsightNsConversation, InsightNsExecution, InsightNsRelDatasource
 from service.conversation_context_service import ConversationContextService
@@ -54,7 +53,6 @@ def _build_execution_context_item(execution: InsightNsExecution, include_code: b
         "description": execution.description,
         "execution_status": execution.execution_status,
         "analysis_report": execution.analysis_report,
-        "result_file_id": execution.result_file_id,
         "error_message": execution.error_message,
         "execution_seconds": execution.execution_seconds,
         "finished_at": execution.finished_at.isoformat() if execution.finished_at else None,
@@ -127,18 +125,6 @@ def _load_conversation_datasources(conversation_id: int) -> list[InsightDatasour
         ).all()
     finally:
         session.close()
-
-
-def get_system_config_message() -> SystemMessage:
-    """注入代码生成阶段需要读取的运行时系统配置。"""
-    temp_dir = Config.TEMP_DIR
-    return SystemMessage(
-        "\n".join([
-            "系统配置：",
-            f"- 图表临时目录: {temp_dir}",
-            f'- 生成代码时必须显式设置 temp_dir = "{temp_dir}"',
-        ])
-    )
 
 
 def get_datasource_message(

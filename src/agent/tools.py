@@ -1,5 +1,4 @@
 import json
-import os
 import re
 import time
 from contextlib import contextmanager
@@ -16,11 +15,10 @@ from langgraph.prebuilt import ToolRuntime
 from pydantic import BaseModel, Field
 
 from agent.context_engineering import CustomContext
-from config.config import Config
 from utils import logger
+from utils import normalize_chart_spec
 
 CURRENT_USERNAME = ContextVar('current_username', default='anonymous')
-CURRENT_TEMP_DIR = ContextVar('current_temp_dir', default=Config.TEMP_DIR)
 
 
 def load_local_file(file_path: str, sheet_name: Optional[str] = None):
@@ -30,6 +28,8 @@ def load_local_file(file_path: str, sheet_name: Optional[str] = None):
     这个辅助函数属于 `sys_prompt.md` 中约定的 Python 执行工具契约。
     """
     import pandas as pd
+
+    import os
 
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"文件不存在: {file_path}")
@@ -97,17 +97,6 @@ def load_data_with_api(
     raise ValueError(f"不支持的响应格式: {content_type}")
 
 
-def generate_temp_file_name(prefix: str = 'analysis_chart', extension: str = 'html') -> str:
-    """为图表或分析输出文件生成临时文件路径。"""
-    safe_prefix = re.sub(r'[^0-9A-Za-z_-]+', '_', prefix).strip('_') or 'analysis_chart'
-    safe_extension = extension.lstrip('.') or 'html'
-    safe_username = re.sub(r'[^0-9A-Za-z_-]+', '_', CURRENT_USERNAME.get()).strip('_') or 'anonymous'
-    timestamp = time.strftime('%Y%m%d_%H%M%S')
-    temp_dir = CURRENT_TEMP_DIR.get() or Config.TEMP_DIR
-    filename = f"{safe_username}_{timestamp}_{safe_prefix}.{safe_extension}"
-    return os.path.join(temp_dir, filename)
-
-
 def get_day_range(days_ago: int = 0, timezone_name: str = 'Asia/Shanghai') -> tuple[datetime, datetime]:
     """
     返回某个自然日的起止时间。
@@ -120,6 +109,50 @@ def get_day_range(days_ago: int = 0, timezone_name: str = 'Asia/Shanghai') -> tu
     start_at = datetime.combine(target_date, datetime_time.min, tzinfo=tz)
     end_at = datetime.combine(target_date, datetime_time.max, tzinfo=tz)
     return start_at, end_at
+
+
+def describe_time_coverage(dataframe, column_name: str) -> dict[str, Any]:
+    """
+    描述某个时间列的数据覆盖范围。
+
+    适合在“最近 / 上个月 / 近 N 天 / 根因关联”这类时间敏感分析中，
+    先判断目标时间窗口是否命中数据，再决定后续过滤、关联和空结果处理策略。
+    """
+    import pandas as pd
+
+    if dataframe is None:
+        return {
+            'column_name': column_name,
+            'row_count': 0,
+            'non_null_count': 0,
+            'min_time': None,
+            'max_time': None,
+        }
+
+    if not isinstance(dataframe, pd.DataFrame):
+        dataframe = pd.DataFrame(dataframe)
+
+    if column_name not in dataframe.columns:
+        raise KeyError(column_name)
+
+    series = pd.to_datetime(dataframe[column_name], errors='coerce')
+    valid_series = series.dropna()
+    if valid_series.empty:
+        return {
+            'column_name': column_name,
+            'row_count': int(len(dataframe)),
+            'non_null_count': 0,
+            'min_time': None,
+            'max_time': None,
+        }
+
+    return {
+        'column_name': column_name,
+        'row_count': int(len(dataframe)),
+        'non_null_count': int(valid_series.shape[0]),
+        'min_time': valid_series.min().isoformat(),
+        'max_time': valid_series.max().isoformat(),
+    }
 
 
 def build_markdown_table(dataframe, columns: Optional[list[str]] = None, max_rows: int = 10) -> str:
@@ -172,28 +205,124 @@ def build_markdown_table(dataframe, columns: Optional[list[str]] = None, max_row
 class StructuredResult(BaseModel):
     """当前 Agent 运行时消费的标准工具返回结构。"""
 
-    file_id: str = Field(description="结果文件 ID")
     analysis_report: str = Field(description="分析报告内容")
+    charts: list[dict[str, Any]] = Field(default_factory=list, description="图表产物列表")
+    tables: list[dict[str, Any]] = Field(default_factory=list, description="表格产物列表")
 
 
-class AnalysisResult(BaseModel):
-    """为兼容现有代码结构而保留的中间结果结构。"""
-
-    chart_path: str = Field(description="图表文件完整路径")
-    analysis_report: str = Field(description="分析报告内容")
-
-
-def save_analysis_result(chart_path: str, analysis_report: str) -> StructuredResult:
+def save_empty_analysis_result(
+    title: str,
+    reason: str,
+    detail_lines: Optional[list[str]] = None,
+) -> StructuredResult:
     """
-    结束一次由生成代码驱动的分析任务，并返回标准结果。
+    在目标时间范围或关联结果为空时，生成一份可直接展示的空结果分析。
 
-    `sys_prompt.md` 当前要求大模型生成的 Python 代码必须调用这个函数，
-    并把返回值赋值给 `result`。
+    这个函数的用途不是“掩盖错误”，而是在明确无数据、无命中或无关联结果时，
+    仍然稳定地产出一份合法的结果页和分析报告，避免模型在错误方向上反复重试。
+    """
+    import html
+
+    safe_title = (title or '分析结果').strip() or '分析结果'
+    safe_reason = (reason or '当前条件下未命中可分析数据。').strip() or '当前条件下未命中可分析数据。'
+    lines = [str(item).strip() for item in (detail_lines or []) if str(item).strip()]
+
+    report_sections = [
+        f"## {safe_title}",
+        "### 结果说明",
+        f"- {safe_reason}",
+    ]
+    if lines:
+        report_sections.extend([
+            "### 补充信息",
+            *[f"- {item}" for item in lines],
+        ])
+
+    analysis_report = '\n\n'.join(section for section in report_sections if section)
+    return save_analysis_result(
+        analysis_report=analysis_report,
+        charts=[],
+        tables=[],
+    )
+
+
+def _normalize_chart_items(
+    charts: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    """统一图表结果结构。"""
+    normalized_items: list[dict[str, Any]] = []
+
+    for index, chart in enumerate(charts or [], start=1):
+        if not isinstance(chart, dict):
+            raise ValueError('charts 中的每一项都必须是 dict。')
+
+        title = str(chart.get('title') or f'图表 {index}').strip()
+        chart_type = str(chart.get('chart_type') or 'echarts').strip() or 'echarts'
+        description = str(chart.get('description') or '').strip()
+        chart_spec = chart.get('chart_spec')
+
+        if not isinstance(chart_spec, dict) or not chart_spec:
+            raise ValueError('结构化图表必须提供非空 chart_spec。')
+
+        normalized_item = {
+            "title": title,
+            "chart_type": chart_type,
+            "description": description,
+            "chart_spec": normalize_chart_spec(chart_spec),
+        }
+        normalized_items.append(normalized_item)
+
+    return normalized_items
+
+
+def _normalize_table_items(tables: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
+    """统一表格结果结构。"""
+    normalized_items: list[dict[str, Any]] = []
+    for index, table in enumerate(tables or [], start=1):
+        if not isinstance(table, dict):
+            raise ValueError('tables 中的每一项都必须是 dict。')
+
+        title = str(table.get('title') or f'表格 {index}').strip()
+        description = str(table.get('description') or '').strip()
+        columns = table.get('columns') or []
+        rows = table.get('rows') or []
+        if not isinstance(columns, list) or not isinstance(rows, list):
+            raise ValueError('表格产物必须包含 columns(list) 与 rows(list)。')
+
+        normalized_items.append({
+            "title": title,
+            "description": description,
+            "columns": columns,
+            "rows": rows,
+        })
+    return normalized_items
+
+
+def save_analysis_result(
+    analysis_report: str = '',
+    charts: Optional[list[dict[str, Any]]] = None,
+    tables: Optional[list[dict[str, Any]]] = None,
+) -> StructuredResult:
+    """
+    结束一次由生成代码驱动的分析任务，并返回标准结构化结果。
+
+    当前主契约是：
+    - analysis_report: Markdown 报告
+    - charts: 图表数组
+    - tables: 表格数组
+
     """
     report_text = (analysis_report or '').strip()
     if not report_text:
         raise ValueError('analysis_report 不能为空，必须传入完整的 Markdown 分析报告。')
-    return StructuredResult(file_id=chart_path, analysis_report=report_text)
+
+    normalized_charts = _normalize_chart_items(charts=charts)
+    normalized_tables = _normalize_table_items(tables=tables)
+    return StructuredResult(
+        analysis_report=report_text,
+        charts=normalized_charts,
+        tables=normalized_tables,
+    )
 
 
 class ExePythonCodeInput(BaseModel):
@@ -253,8 +382,8 @@ def _update_execution_record(
     execution_id: int,
     *,
     execution_status: str,
-    result_file_id: str = '',
     analysis_report: str = '',
+    result_payload_json: str = '',
     stdout_text: str = '',
     stderr_text: str = '',
     execution_seconds: int = 0,
@@ -277,8 +406,8 @@ def _update_execution_record(
             return
 
         execution.execution_status = execution_status
-        execution.result_file_id = result_file_id or ''
         execution.analysis_report = analysis_report or ''
+        execution.result_payload_json = result_payload_json or '{}'
         execution.stdout_text = stdout_text or ''
         execution.stderr_text = stderr_text or ''
         execution.execution_seconds = int(execution_seconds or 0)
@@ -297,9 +426,10 @@ def _build_execution_namespace() -> dict[str, Any]:
         'load_minio_file': load_minio_file,
         'load_data_with_sql': load_data_with_sql,
         'load_data_with_api': load_data_with_api,
-        'generate_temp_file_name': generate_temp_file_name,
         'get_day_range': get_day_range,
+        'describe_time_coverage': describe_time_coverage,
         'build_markdown_table': build_markdown_table,
+        'save_empty_analysis_result': save_empty_analysis_result,
         'save_analysis_result': save_analysis_result,
     }
 
@@ -314,7 +444,6 @@ def _capture_runtime_io(username: str):
     sys_module.stdout = StringIO()
     sys_module.stderr = StringIO()
     username_token = CURRENT_USERNAME.set(username or 'anonymous')
-    temp_dir_token = CURRENT_TEMP_DIR.set(Config.TEMP_DIR)
 
     try:
         yield sys_module.stdout, sys_module.stderr
@@ -322,7 +451,6 @@ def _capture_runtime_io(username: str):
         sys_module.stdout = old_stdout
         sys_module.stderr = old_stderr
         CURRENT_USERNAME.reset(username_token)
-        CURRENT_TEMP_DIR.reset(temp_dir_token)
 
 
 def _get_stream_emitter():
@@ -353,6 +481,8 @@ def _classify_execution_error(error: Exception | None, error_message: str) -> st
         return 'undefined_name'
 
     lowered = (error_message or '').lower()
+    if 'got an unexpected keyword argument' in lowered:
+        return 'library_api_signature_mismatch'
     if 'invalid comparison' in lowered or ('datetime' in lowered and 'timestamp' in lowered):
         return 'data_type_or_time_mismatch'
     if 'not in index' in lowered or 'no such column' in lowered:
@@ -360,6 +490,112 @@ def _classify_execution_error(error: Exception | None, error_message: str) -> st
     if 'save_analysis_result' in lowered or 'analysis_report' in lowered or 'result' in lowered:
         return 'result_contract_error'
     return 'runtime_error'
+
+
+def _extract_error_signature(error_type: str, error_message: str) -> dict[str, Any]:
+    """从错误信息中提取适合下一轮修补使用的错误签名。"""
+    signature: dict[str, Any] = {
+        'error_type': error_type,
+        'message': error_message or '',
+    }
+
+    keyword_match = re.search(
+        r"(?P<owner>[A-Za-z_][\w.]*)\.__init__\(\) got an unexpected keyword argument '(?P<argument>[^']+)'",
+        error_message or '',
+    )
+    if keyword_match:
+        signature.update({
+            'signature_type': 'unexpected_keyword_argument',
+            'owner': keyword_match.group('owner'),
+            'argument': keyword_match.group('argument'),
+        })
+        return signature
+
+    module_match = re.search(r"No module named '([^']+)'", error_message or '')
+    if module_match:
+        signature.update({
+            'signature_type': 'missing_dependency',
+            'module_name': module_match.group(1),
+        })
+        return signature
+
+    key_match = re.search(r"'([^']+)'", error_message or '')
+    if error_type == 'schema_or_column_mismatch' and key_match:
+        signature.update({
+            'signature_type': 'schema_or_column_mismatch',
+            'field_name': key_match.group(1),
+        })
+        return signature
+
+    if error_type == 'data_type_or_time_mismatch':
+        signature['signature_type'] = 'data_type_or_time_mismatch'
+        return signature
+
+    signature['signature_type'] = 'generic'
+    return signature
+
+
+def _build_turn_failure_memory(turn_id: int, current_execution_id: int) -> dict[str, Any]:
+    """汇总同一轮中之前已失败的执行记录，供模型避免重复犯错。"""
+    if turn_id <= 0:
+        return {
+            'previous_failure_messages': [],
+            'previous_failure_hints': [],
+        }
+
+    from config.database import SessionLocal
+    from model import InsightNsExecution
+
+    session = SessionLocal()
+    try:
+        previous_failures = session.query(InsightNsExecution).filter(
+            InsightNsExecution.turn_id == turn_id,
+            InsightNsExecution.id != current_execution_id,
+            InsightNsExecution.is_deleted == 0,
+            InsightNsExecution.execution_status != 'success',
+        ).order_by(InsightNsExecution.created_at.asc()).all()
+
+        failure_messages: list[str] = []
+        failure_hints: list[str] = []
+        seen_hints: set[str] = set()
+
+        for execution in previous_failures:
+            error_message = (execution.error_message or '').strip()
+            if not error_message:
+                continue
+
+            failure_messages.append(error_message)
+            error_signature = _extract_error_signature(
+                _classify_execution_error(None, error_message),
+                error_message,
+            )
+            signature_type = error_signature.get('signature_type')
+
+            if signature_type == 'unexpected_keyword_argument':
+                owner = error_signature.get('owner', '当前库')
+                argument = error_signature.get('argument', '')
+                hint = f'之前已经确认 {owner} 不支持参数 `{argument}`，不要再次生成这段写法。'
+            elif signature_type == 'missing_dependency':
+                module_name = error_signature.get('module_name', '')
+                hint = f'之前已经确认当前环境缺少模块 `{module_name}`，不要再次 import 它。'
+            elif signature_type == 'schema_or_column_mismatch':
+                field_name = error_signature.get('field_name', '')
+                hint = f'之前已经出现字段或列不匹配问题（{field_name}），请先核对真实列名。'
+            elif signature_type == 'data_type_or_time_mismatch':
+                hint = '之前已经出现时间或数据类型比较不兼容问题，请先统一类型后再过滤。'
+            else:
+                hint = f'不要再次重复已出现过的错误：{error_message[:120]}'
+
+            if hint not in seen_hints:
+                seen_hints.add(hint)
+                failure_hints.append(hint)
+
+        return {
+            'previous_failure_messages': failure_messages[-5:],
+            'previous_failure_hints': failure_hints[-5:],
+        }
+    finally:
+        session.close()
 
 
 def _build_repair_instructions(error_type: str) -> list[str]:
@@ -386,6 +622,7 @@ def _build_repair_instructions(error_type: str) -> list[str]:
         'schema_or_column_mismatch': [
             '字段选择必须以 metadata_schema.properties 中提供的真实字段名为准。',
             '重新检查 DataFrame 列名后再生成过滤、聚合和展示逻辑。',
+            '如果过滤后或关联后的结果为空，不要继续修改字段名；应先判断是否为空，再生成空结果分析。',
         ],
         'undefined_name': [
             '重新检查变量名、函数名和 import 是否一致，避免引用未定义对象。',
@@ -394,10 +631,16 @@ def _build_repair_instructions(error_type: str) -> list[str]:
         'data_type_or_time_mismatch': [
             '先统一时间列或比较字段的数据类型，再进行过滤或比较。',
             '遇到相对日期或时区处理时，优先考虑使用 get_day_range() 并保证两侧都是可比较的带时区时间对象。',
+            '如果目标时间窗口没有命中数据，请优先输出空结果分析，并说明数据覆盖范围，而不是继续改字段名或图表参数。',
         ],
         'result_contract_error': [
-            '最终必须产出完整 analysis_report，并调用 save_analysis_result(chart_path, analysis_report)。',
-            '不要遗漏 result 变量，也不要返回空的 analysis_report。',
+            '最终必须产出完整 analysis_report，并调用 save_analysis_result(analysis_report=..., charts=[...])。',
+            '不要遗漏 result 变量，也不要返回空的 analysis_report 或空的结构化图表配置。',
+        ],
+        'library_api_signature_mismatch': [
+            '当前错误属于库函数签名不兼容；请只修正报错位置的非法参数，不要重写与该错误无关的数据处理和图表逻辑。',
+            '如果某个 opts 或图表参数不被当前版本支持，请删除该非法参数，或改成更基础、更稳定的默认写法。',
+            '优先保留图表结构、数据处理和报告逻辑，只对报错的 API 调用做最小修改。',
         ],
         'runtime_error': [
             '根据 error_message 直接修正导致失败的那一步，再重新生成完整代码。',
@@ -413,6 +656,10 @@ def _tool_error_message(
     error_type: str,
     error_message: str,
     repair_instructions: list[str],
+    error_signature: dict[str, Any] | None = None,
+    current_failed_code: str = '',
+    previous_failure_messages: list[str] | None = None,
+    previous_failure_hints: list[str] | None = None,
     stdout_text: str = '',
     stderr_text: str = '',
 ) -> ToolMessage:
@@ -423,6 +670,11 @@ def _tool_error_message(
         'error_type': error_type,
         'error_message': error_message,
         'repair_instructions': repair_instructions,
+        'error_signature': error_signature or {},
+        'minimal_patch_required': True,
+        'current_failed_code': current_failed_code or '',
+        'previous_failure_messages': previous_failure_messages or [],
+        'previous_failure_hints': previous_failure_hints or [],
     }
     if stdout_text:
         payload['stdout_text'] = stdout_text[:1000]
@@ -491,6 +743,11 @@ def execute_python(
             error_message = str(exc)
             error_type = _classify_execution_error(exc, error_message)
             repair_instructions = _build_repair_instructions(error_type)
+            error_signature = _extract_error_signature(error_type, error_message)
+            failure_memory = _build_turn_failure_memory(
+                turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+                current_execution_id=execution_id,
+            )
             stdout_text = _sanitize_tool_output(stdout_buffer.getvalue())
             stderr_text = _sanitize_tool_output(stderr_buffer.getvalue())
             _update_execution_record(
@@ -513,6 +770,10 @@ def execute_python(
                 error_type=error_type,
                 error_message=error_message,
                 repair_instructions=repair_instructions,
+                error_signature=error_signature,
+                current_failed_code=code,
+                previous_failure_messages=failure_memory.get('previous_failure_messages', []),
+                previous_failure_hints=failure_memory.get('previous_failure_hints', []),
                 stdout_text=stdout_text,
                 stderr_text=stderr_text,
             )
@@ -551,12 +812,12 @@ def execute_python(
         )
 
     if isinstance(exec_result, StructuredResult):
-        # 对外继续保持原有工具契约不变，同时在内部持久化更完整的执行记录。
+        # 对外继续保持 ToolMessage JSON 结构，对内持久化完整结构化执行结果。
         _update_execution_record(
             execution_id,
             execution_status='success',
-            result_file_id=exec_result.file_id,
             analysis_report=exec_result.analysis_report,
+            result_payload_json=exec_result.model_dump_json(),
             stdout_text=stdout_text,
             stderr_text=stderr_text,
             execution_seconds=execution_seconds,
@@ -595,6 +856,16 @@ def execute_python(
         error_type='result_contract_error',
         error_message='生成的代码未按模板产出 result',
         repair_instructions=_build_repair_instructions('result_contract_error'),
+        error_signature=_extract_error_signature('result_contract_error', '生成的代码未按模板产出 result'),
+        current_failed_code=code,
+        previous_failure_messages=_build_turn_failure_memory(
+            turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+            current_execution_id=execution_id,
+        ).get('previous_failure_messages', []),
+        previous_failure_hints=_build_turn_failure_memory(
+            turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+            current_execution_id=execution_id,
+        ).get('previous_failure_hints', []),
         stdout_text=stdout_text,
         stderr_text=stderr_text,
     )

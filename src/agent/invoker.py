@@ -10,12 +10,16 @@ from utils import logger
 
 THINK_BLOCK_PATTERN = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
 TOOL_CALL_BLOCK_PATTERN = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", flags=re.DOTALL)
+UNEXPECTED_KWARG_PATTERN = re.compile(
+    r"(?P<owner>[A-Za-z_][A-Za-z0-9_]*)\.__init__\(\) got an unexpected keyword argument '(?P<arg>[^']+)'"
+)
+MISSING_DEP_PATTERN = re.compile(r"No module named '(?P<module>[^']+)'")
 MAX_ANALYSIS_AGENT_ROUNDS = 3
 
 
 @dataclass
 class AgentRequest:
-    """从控制器层传给 Agent 层的标准化请求对象。"""
+    """控制器层传入 Agent 层的标准化请求对象。"""
 
     username: str
     namespace_id: str
@@ -31,19 +35,21 @@ class AgentResponse:
     message: str
     conversation_id: int
     turn_id: int
-    file_id: str = ''
+    charts: list[dict[str, Any]]
+    tables: list[dict[str, Any]]
     analysis_report: str = ''
     chart_artifact_id: int = 0
+    chart_artifact_ids: list[int] | None = None
 
 
 def _clean_message_content(content: Any) -> str:
-    """去掉模型内部思考块，仅保留对用户可见的最终消息。"""
+    """去掉模型内部思考块，只保留用户可见文本。"""
     text = content if isinstance(content, str) else str(content)
     return THINK_BLOCK_PATTERN.sub("", text).strip()
 
 
 def _extract_raw_tool_call(content: Any) -> dict[str, Any] | None:
-    """识别模型误输出的原始工具调用文本，并尽量解析其中的 JSON 载荷。"""
+    """识别模型误输出的原始工具调用文本。"""
     text = _clean_message_content(content)
     if not text or '<tool_call>' not in text:
         return None
@@ -63,27 +69,48 @@ def _extract_raw_tool_call(content: Any) -> dict[str, Any] | None:
     }
 
 
-def _parse_structured_content(content: Any) -> tuple[str, str]:
+def _is_internal_assistant_message(content: Any) -> bool:
+    """识别不应展示给前端的内部规划或代码文本。"""
+    text = _clean_message_content(content)
+    if not text:
+        return False
+
+    internal_signals = (
+        'save_analysis_result(',
+        'load_data_with_',
+        'load_local_file(',
+        'load_minio_file(',
+        'import pandas as pd',
+        'from pyecharts',
+        '```python',
+    )
+    return any(signal in text for signal in internal_signals)
+
+
+def _parse_structured_content(content: Any) -> dict[str, Any]:
     """解析工具层返回的 StructuredResult JSON。"""
     text = content if isinstance(content, str) else str(content)
     if not text.startswith('{'):
-        return '', ''
+        return {}
 
     try:
         result_data = json.loads(text)
     except Exception as exc:
         logger.info(f"[DEBUG] JSON parse error: {exc}")
-        return '', ''
+        return {}
 
-    return result_data.get('file_id', ''), result_data.get('analysis_report', '')
+    if not isinstance(result_data, dict):
+        return {}
+
+    return {
+        'analysis_report': result_data.get('analysis_report', '') or '',
+        'charts': result_data.get('charts') or [],
+        'tables': result_data.get('tables') or [],
+    }
 
 
 def _is_internal_tool_feedback(content: Any) -> bool:
-    """
-    识别只用于模型自修正的工具错误反馈 JSON。
-
-    这类内容属于内部协议，不应展示给前端，也不应作为最终助手回复保存。
-    """
+    """识别只用于模型自修复的 execute_python 错误反馈。"""
     text = content if isinstance(content, str) else str(content)
     if not text.startswith('{'):
         return False
@@ -106,12 +133,12 @@ def _is_internal_tool_feedback(content: Any) -> bool:
 
 
 def _build_progress_event(event_type: str, **payload: Any) -> dict[str, Any]:
-    """构造一条适合通过 SSE 下发的事件载荷。"""
+    """构造适合通过 SSE 下发的事件。"""
     return {'type': event_type, **payload}
 
 
 def _build_agent_context(agent_request: AgentRequest, runtime: ConversationRunContext) -> CustomContext:
-    """把运行时会话信息转换成 Agent 与工具层使用的上下文对象。"""
+    """构造 Agent 与工具层使用的运行上下文。"""
     return CustomContext(
         username=agent_request.username,
         namespace_id=runtime.conversation.insight_namespace_id,
@@ -120,23 +147,12 @@ def _build_agent_context(agent_request: AgentRequest, runtime: ConversationRunCo
     )
 
 
-def _build_agent_input(agent_request: AgentRequest, runtime: ConversationRunContext):
-    """在会话与轮次已持久化后，组装真正传给模型的输入。"""
-    return get_input(
-        agent_request.user_message,
-        namespace_id=runtime.conversation.insight_namespace_id,
-        conversation_id=runtime.conversation.id,
-        history_turn_limit=runtime.history_turn_limit,
-        datasource_snapshot_override=runtime.active_datasource_snapshot,
-    )
-
-
 def _build_agent_input_with_runtime_instruction(
     agent_request: AgentRequest,
     runtime: ConversationRunContext,
     runtime_instruction: str = '',
 ):
-    """在必要时为当前轮追加极短的运行时约束消息。"""
+    """在必要时追加一条很短的运行时修复指令。"""
     extra_system_messages = [runtime_instruction] if runtime_instruction else None
     return get_input(
         agent_request.user_message,
@@ -153,66 +169,69 @@ def _finalize_run(
     runtime: ConversationRunContext,
     assistant_message: str,
     analysis_report: str,
-    file_id: str,
+    charts: list[dict[str, Any]],
+    tables: list[dict[str, Any]],
 ) -> AgentResponse:
-    """写回本轮最终结果，并转换成控制器层可直接使用的响应对象。"""
+    """写回最终结果并转换成控制器层可直接使用的响应对象。"""
     run_result = service.complete_run(
         conversation_id=runtime.conversation.id,
         turn_id=runtime.turn.id,
         assistant_message=assistant_message,
         analysis_report=analysis_report,
-        file_id=file_id,
+        charts=charts,
+        tables=tables,
     )
-    chart_artifact_id = 0
+    chart_artifact_ids: list[int] = []
     for artifact in run_result.get('artifacts', []):
         if artifact.get('artifact_type') == 'chart':
-            chart_artifact_id = int(artifact.get('id', 0) or 0)
-            break
+            chart_artifact_ids.append(int(artifact.get('id', 0) or 0))
+
     return AgentResponse(
         username=runtime.conversation.username,
         message=assistant_message,
         conversation_id=runtime.conversation.id,
         turn_id=runtime.turn.id,
-        file_id=file_id,
+        charts=run_result.get('charts', charts),
+        tables=run_result.get('tables', tables),
         analysis_report=analysis_report,
-        chart_artifact_id=chart_artifact_id,
+        chart_artifact_id=chart_artifact_ids[0] if chart_artifact_ids else 0,
+        chart_artifact_ids=chart_artifact_ids,
     )
 
 
-def _ensure_analysis_result_ready(file_id: str, analysis_report: str) -> None:
-    """分析型请求必须真实产出图表文件和分析报告。"""
-    if file_id and analysis_report:
+def _ensure_analysis_result_ready(
+    analysis_report: str,
+    charts: list[dict[str, Any]] | None = None,
+) -> None:
+    """分析型请求必须真实产出结构化分析结果。"""
+    if analysis_report and (charts or []):
         return
-    raise ValueError('本轮未生成完整分析产物：缺少图表文件或分析报告，请重新执行分析。')
+    raise ValueError('本轮未生成完整分析产物：缺少图表结果或分析报告，请重新执行分析。')
 
 
 def _did_enter_analysis_flow(
     service: ConversationContextService,
     runtime: ConversationRunContext,
     raw_tool_call_detected: bool,
-    file_id: str,
     analysis_report: str,
+    charts: list[dict[str, Any]] | None = None,
 ) -> bool:
     """
-    判断本轮是否已经进入真实分析执行链。
+    判断当前轮次是否已经进入真实的数据分析执行链。
 
-    这里不再额外请求模型做意图分类，也不在代码里重复维护意图分流规则。
-    单次请求中：
-    - 如果模型真实调用了工具并留下执行记录，说明它已经按分析任务处理
-    - 如果模型输出了原始工具调用文本或已经产出了结构化分析结果，也视为分析链路
-    - 否则就把它解释为普通自然语言回复
+    这里不再额外请求模型做意图分流，只依据本轮是否出现过工具执行痕迹来判断。
     """
     if service.get_latest_execution(runtime.turn.id) is not None:
         return True
     if raw_tool_call_detected:
         return True
-    if file_id or analysis_report:
+    if analysis_report or (charts or []):
         return True
     return False
 
 
 def _format_tool_call_message(tool_call: dict[str, Any]) -> str:
-    """把工具调用元数据转换成前端可直接展示的执行阶段文案。"""
+    """把工具调用元数据转换成前端可展示的执行阶段文案。"""
     tool_name = tool_call.get('name', 'unknown_tool')
     args = tool_call.get('args') or {}
 
@@ -223,16 +242,60 @@ def _format_tool_call_message(tool_call: dict[str, Any]) -> str:
     return f"准备调用工具：{tool_name}"
 
 
+def _build_failed_pattern_hints(executions: list[Any]) -> list[str]:
+    """从当前轮失败记录中提取“不要重复犯错”的提示。"""
+    hints: list[str] = []
+    seen: set[str] = set()
+
+    for execution in executions:
+        error_message = (getattr(execution, 'error_message', '') or '').strip()
+        if not error_message:
+            continue
+
+        unexpected_kwarg_match = UNEXPECTED_KWARG_PATTERN.search(error_message)
+        if unexpected_kwarg_match:
+            owner = unexpected_kwarg_match.group('owner')
+            arg = unexpected_kwarg_match.group('arg')
+            hint = f'{owner} 不支持参数 `{arg}`，下次只修这个参数写法，不要重写整张图表的其他配置。'
+            if hint not in seen:
+                seen.add(hint)
+                hints.append(hint)
+            continue
+
+        missing_dep_match = MISSING_DEP_PATTERN.search(error_message)
+        if missing_dep_match:
+            module = missing_dep_match.group('module')
+            hint = f'当前环境缺少模块 `{module}`，不要再次引入它，优先使用内置辅助函数或标准库。'
+            if hint not in seen:
+                seen.add(hint)
+                hints.append(hint)
+            continue
+
+        normalized_error = error_message[:160]
+        if normalized_error not in seen:
+            seen.add(normalized_error)
+            hints.append(f'避免再次触发已出现过的错误：{normalized_error}')
+
+    return hints[:5]
+
+
+def _get_latest_failed_generated_code(executions: list[Any]) -> str:
+    """返回最近一次失败执行的完整代码，用于引导模型做最小修补。"""
+    for execution in reversed(executions):
+        if getattr(execution, 'execution_status', '') == 'success':
+            continue
+        generated_code = (getattr(execution, 'generated_code', '') or '').strip()
+        if generated_code:
+            return generated_code
+    return ''
+
+
 def _build_analysis_recovery_instruction(
     service: ConversationContextService,
     runtime: ConversationRunContext,
     round_index: int,
 ) -> str:
-    """
-    为同一轮分析的后续修正回合构造运行时控制消息。
-
-    这里只描述当前轮必须继续完成分析闭环，不复制系统业务规则。
-    """
+    """为同一轮分析构造后续修复回合的运行时指令。"""
     executions = service.get_turn_executions(runtime.turn.id)
     failed_errors = [
         execution.error_message.strip()
@@ -240,40 +303,52 @@ def _build_analysis_recovery_instruction(
         if execution.execution_status != 'success' and (execution.error_message or '').strip()
     ]
     latest_errors = failed_errors[-3:]
+    failed_pattern_hints = _build_failed_pattern_hints(executions)
+    latest_failed_code = _get_latest_failed_generated_code(executions)
 
     lines = [
         '本轮已经进入数据分析执行阶段。',
-        f'当前轮次已累计执行 {len(executions)} 次 Python 分析代码，但仍未成功生成完整分析产物。',
+        f'当前轮次累计执行了 {len(executions)} 次 Python 分析代码，但仍未成功生成完整分析产物。',
     ]
     if latest_errors:
         lines.append('最近的执行错误如下：')
         lines.extend(f'- {item}' for item in latest_errors)
 
+    if failed_pattern_hints:
+        lines.append('本轮已经确认的失败写法如下，新的修复代码中不要再次出现：')
+        lines.extend(f'- {item}' for item in failed_pattern_hints)
+
     lines.extend([
-        '请直接根据这些执行错误修正完整 Python 代码，并再次调用 execute_python。',
+        '请基于上一版失败代码做最小必要修补，不要整段重写与当前错误无关的逻辑。',
+        '请直接修正完整 Python 代码并再次调用 execute_python。',
+        '优先检查：时间过滤是否命中数据、过滤后数据集是否为空、关联结果是否为空；如果为空，应输出空结果分析，而不是继续误改字段名或图表参数。',
         '不要向用户解释工具错误，不要再次询问用户，也不要用自然语言提前结束本轮。',
-        '只有成功生成完整的 file_id 和 analysis_report，这一轮分析才算完成。',
+        '只有成功生成完整的结构化图表结果和分析报告，这一轮分析才算完成。',
     ])
 
+    if latest_failed_code:
+        lines.extend([
+            '下面是本轮最近一次失败的完整代码，请以它为基础只做最小必要修补：',
+            '```python',
+            latest_failed_code,
+            '```',
+        ])
+
     if round_index >= MAX_ANALYSIS_AGENT_ROUNDS - 1:
-        lines.append('这已经是本轮最后一次修正机会；如果仍无法完成，请让本轮以失败结束，而不是伪装成成功。')
+        lines.append('这已经是本轮最后一次修复机会；如果仍无法完成，请让本轮以失败结束，而不是伪装成成功。')
 
     return '\n'.join(lines)
 
 
-def _extract_invoke_result(messages: list[Any]) -> tuple[str, str, str, bool]:
-    """
-    从 invoke 返回结果中提取最终助手消息和结构化工具结果。
-
-    当前工具契约仍然是 StructuredResult(file_id, analysis_report)，
-    所以这里仅解析现有约定，不改变既有主流程。
-    """
+def _extract_invoke_result(messages: list[Any]) -> tuple[str, str, list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """从 invoke 结果中提取最终助手消息和结构化工具结果。"""
     if not messages:
-        return '', '', '', False
+        return '', '', [], [], False
 
     assistant_message = ''
     analysis_report = ''
-    file_id = ''
+    charts: list[dict[str, Any]] = []
+    tables: list[dict[str, Any]] = []
     raw_tool_call_detected = False
 
     for message in reversed(messages):
@@ -286,23 +361,26 @@ def _extract_invoke_result(messages: list[Any]) -> tuple[str, str, str, bool]:
             raw_tool_call_detected = True
             continue
 
-        parsed_file_id, parsed_analysis_report = _parse_structured_content(cleaned)
-        if parsed_file_id or parsed_analysis_report:
-            file_id = parsed_file_id or file_id
-            analysis_report = parsed_analysis_report or analysis_report
+        parsed_result = _parse_structured_content(cleaned)
+        if parsed_result:
+            analysis_report = parsed_result.get('analysis_report', '') or analysis_report
+            charts = parsed_result.get('charts') or charts
+            tables = parsed_result.get('tables') or tables
             continue
 
         if _is_internal_tool_feedback(cleaned):
+            continue
+        if _is_internal_assistant_message(cleaned):
             continue
 
         if not assistant_message:
             assistant_message = cleaned
 
-    return assistant_message, analysis_report, file_id, raw_tool_call_detected
+    return assistant_message, analysis_report, charts, tables, raw_tool_call_detected
 
 
 def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
-    """端到端执行一次非流式分析请求。"""
+    """执行一次非流式分析请求。"""
     session = SessionLocal()
     service = ConversationContextService(session)
     runtime = service.start_run(
@@ -313,11 +391,10 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
     )
 
     try:
-        # 先把本轮 turn 落库，再执行 Agent。
-        # 这样工具层从一开始就能拿到最新的 conversation_id 与 turn_id。
         assistant_message = ''
         analysis_report = ''
-        file_id = ''
+        charts: list[dict[str, Any]] = []
+        tables: list[dict[str, Any]] = []
         analysis_flow_started = False
 
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
@@ -337,7 +414,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 ),
                 context=_build_agent_context(agent_request, runtime),
             )
-            assistant_message, analysis_report, file_id, raw_tool_call_detected = _extract_invoke_result(
+            assistant_message, analysis_report, charts, tables, raw_tool_call_detected = _extract_invoke_result(
                 agent_response.get('messages', [])
             )
 
@@ -345,22 +422,22 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 service=service,
                 runtime=runtime,
                 raw_tool_call_detected=raw_tool_call_detected,
-                file_id=file_id,
                 analysis_report=analysis_report,
+                charts=charts,
             )
             analysis_flow_started = analysis_flow_started or entered_analysis_flow
 
-            if raw_tool_call_detected and not (file_id or analysis_report):
+            if raw_tool_call_detected and not (analysis_report or charts):
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
                 raise ValueError('模型返回了未执行的工具调用内容，未生成最终分析结果，请重试。')
 
             if analysis_flow_started:
-                if file_id and analysis_report:
+                if analysis_report and charts:
                     break
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
-                _ensure_analysis_result_ready(file_id=file_id, analysis_report=analysis_report)
+                _ensure_analysis_result_ready(analysis_report=analysis_report, charts=charts)
                 break
 
             break
@@ -370,7 +447,8 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
             runtime=runtime,
             assistant_message=assistant_message,
             analysis_report=analysis_report,
-            file_id=file_id,
+            charts=charts,
+            tables=tables,
         )
     except Exception as exc:
         service.fail_run(runtime.conversation.id, runtime.turn.id, str(exc))
@@ -384,10 +462,11 @@ def _stream_with_runtime(
     runtime: ConversationRunContext,
     agent_request: AgentRequest,
 ) -> Iterator[dict[str, Any]]:
-    """在给定运行上下文下执行流式分析或重跑，并持续产出 SSE 事件。"""
+    """在给定上下文中执行流式分析或重跑，并持续产出 SSE 事件。"""
     assistant_message = ''
-    file_id = ''
     analysis_report = ''
+    charts: list[dict[str, Any]] = []
+    tables: list[dict[str, Any]] = []
     analysis_flow_started = runtime.is_rerun
 
     yield _build_progress_event(
@@ -435,8 +514,6 @@ def _stream_with_runtime(
                 stream_mode=["updates", "custom"],
             ):
                 if stream_mode == "updates":
-                    # `updates` 承载模型与工具节点的增量消息。
-                    # 这里会把内部消息转换成前端可直接消费的进度事件。
                     for _, payload in chunk.items():
                         messages = payload.get("messages", [])
                         for message in messages:
@@ -445,7 +522,7 @@ def _stream_with_runtime(
                             cleaned = _clean_message_content(getattr(message, 'content', ''))
 
                             if tool_calls:
-                                if cleaned:
+                                if cleaned and not _is_internal_assistant_message(cleaned):
                                     assistant_message = cleaned
                                     yield _build_progress_event(
                                         'assistant',
@@ -482,22 +559,16 @@ def _stream_with_runtime(
                             if not cleaned:
                                 continue
 
-                            # 工具返回值仍然遵循 StructuredResult(file_id, analysis_report)。
-                            parsed_file_id, parsed_analysis_report = _parse_structured_content(cleaned)
-                            if parsed_file_id or parsed_analysis_report:
-                                file_id = parsed_file_id or file_id
-                                analysis_report = parsed_analysis_report or analysis_report
-                                yield _build_progress_event(
-                                    'result',
-                                    conversation_id=runtime.conversation.id,
-                                    turn_id=runtime.turn.id,
-                                    stage='result',
-                                    file_id=file_id,
-                                    analysis_report=analysis_report,
-                                )
+                            parsed_result = _parse_structured_content(cleaned)
+                            if parsed_result:
+                                analysis_report = parsed_result.get('analysis_report', '') or analysis_report
+                                charts = parsed_result.get('charts') or charts
+                                tables = parsed_result.get('tables') or tables
                                 continue
 
                             if _is_internal_tool_feedback(cleaned):
+                                continue
+                            if _is_internal_assistant_message(cleaned):
                                 continue
 
                             assistant_message = cleaned
@@ -510,8 +581,6 @@ def _stream_with_runtime(
                             )
 
                 elif stream_mode == "custom":
-                    # `custom` 承载工具侧主动发出的事件，
-                    # 比如 execute_python 的执行进度。
                     if isinstance(chunk, dict):
                         chunk.setdefault('conversation_id', runtime.conversation.id)
                         chunk.setdefault('turn_id', runtime.turn.id)
@@ -530,22 +599,22 @@ def _stream_with_runtime(
                 service=service,
                 runtime=runtime,
                 raw_tool_call_detected=raw_tool_call_detected,
-                file_id=file_id,
                 analysis_report=analysis_report,
+                charts=charts,
             )
             analysis_flow_started = analysis_flow_started or entered_analysis_flow
 
-            if raw_tool_call_detected and not (file_id or analysis_report):
+            if raw_tool_call_detected and not (analysis_report or charts):
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
                 raise ValueError('模型返回了未执行的工具调用内容，未生成最终分析结果，请重试。')
 
             if analysis_flow_started:
-                if file_id and analysis_report:
+                if analysis_report and charts:
                     break
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
-                _ensure_analysis_result_ready(file_id=file_id, analysis_report=analysis_report)
+                _ensure_analysis_result_ready(analysis_report=analysis_report, charts=charts)
                 break
 
             break
@@ -555,17 +624,20 @@ def _stream_with_runtime(
             runtime=runtime,
             assistant_message=assistant_message,
             analysis_report=analysis_report,
-            file_id=file_id,
+            charts=charts,
+            tables=tables,
         )
-        if response.chart_artifact_id:
+        if response.chart_artifact_ids:
             yield _build_progress_event(
                 'result',
                 conversation_id=runtime.conversation.id,
                 turn_id=runtime.turn.id,
                 stage='result',
-                file_id=file_id,
                 analysis_report=analysis_report,
+                charts=response.charts,
+                tables=response.tables,
                 chart_artifact_id=response.chart_artifact_id,
+                chart_artifact_ids=response.chart_artifact_ids,
             )
         yield _build_progress_event(
             'done',
@@ -585,7 +657,7 @@ def _stream_with_runtime(
 
 
 def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]:
-    """执行一次流式分析请求，并持续产出适合 SSE 下发的进度事件。"""
+    """执行一次流式分析请求，并持续产出适合 SSE 的事件。"""
     session = SessionLocal()
     service = ConversationContextService(session)
     runtime = service.start_run(

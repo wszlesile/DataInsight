@@ -111,16 +111,23 @@
     "message": "Q4 销售额整体逐月上升。",
     "conversation_id": 71,
     "turn_id": 130,
-    "file_id": "D:/PycharmProjects/DataInsight/temp/anonymous_xxx.html",
-    "analysis_report": "本次分析显示 10 月到 12 月销售额持续增长。"
+    "analysis_report": "本次分析显示 10 月到 12 月销售额持续增长。",
+    "charts": [
+      {
+        "title": "Q4 销售趋势",
+        "chart_type": "echarts",
+        "chart_spec": {}
+      }
+    ],
+    "tables": []
   }
 }
 ```
 
 说明：
 
-- 如果本轮是普通问答，不一定会返回图表文件
-- 如果本轮是分析型请求，成功时通常会返回 `file_id` 和 `analysis_report`
+- 如果本轮是普通问答，不一定会返回结构化图表结果
+- 如果本轮是分析型请求，成功时通常会返回 `analysis_report` 和 `charts`
 
 ### 3.2 流式分析
 
@@ -169,8 +176,15 @@ data: {"type":"session","conversation_id":71,"turn_id":130}
   "type": "result",
   "conversation_id": 71,
   "turn_id": 130,
-  "file_id": "D:/PycharmProjects/DataInsight/temp/anonymous_xxx.html",
-  "analysis_report": "分析报告正文"
+  "analysis_report": "分析报告正文",
+  "charts": [
+    {
+      "title": "报警趋势图",
+      "chart_type": "echarts",
+      "chart_spec": {}
+    }
+  ],
+  "tables": []
 }
 ```
 
@@ -440,7 +454,7 @@ GET /api/insight/namespaces/12/datasources?insight_conversation_id=71
   - `turn_no`
   - `question`
   - `report`
-  - `file_id`
+  - `charts`
   - `selected_datasource_ids`
   - `selected_datasource_snapshot`
   - `latest_execution`
@@ -523,7 +537,7 @@ GET /api/insight/namespaces/12/datasources?insight_conversation_id=71
   "insight_artifact_id": 61,
   "metadata_json": {
     "turn_id": 129,
-    "file_id": "D:/PycharmProjects/DataInsight/temp/anonymous_xxx.html"
+    "chart_spec": {}
   }
 }
 ```
