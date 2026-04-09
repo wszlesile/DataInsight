@@ -591,8 +591,8 @@ def _build_turn_failure_memory(turn_id: int, current_execution_id: int) -> dict[
                 failure_hints.append(hint)
 
         return {
-            'previous_failure_messages': failure_messages[-5:],
-            'previous_failure_hints': failure_hints[-5:],
+            'previous_failure_messages': failure_messages[-3:],
+            'previous_failure_hints': failure_hints[-3:],
         }
     finally:
         session.close()
@@ -673,14 +673,53 @@ def _tool_error_message(
         'error_signature': error_signature or {},
         'minimal_patch_required': True,
         'current_failed_code': current_failed_code or '',
-        'previous_failure_messages': previous_failure_messages or [],
-        'previous_failure_hints': previous_failure_hints or [],
+        'previous_failure_messages': (previous_failure_messages or [])[-3:],
+        'previous_failure_hints': (previous_failure_hints or [])[-3:],
+        'previous_failure_count': len(previous_failure_messages or []),
     }
     if stdout_text:
         payload['stdout_text'] = stdout_text[:1000]
     if stderr_text:
         payload['stderr_text'] = stderr_text[:1000]
 
+    return ToolMessage(
+        content=json.dumps(payload, ensure_ascii=False),
+        tool_call_id=tool_call_id,
+    )
+
+
+def _tool_success_message(
+    *,
+    tool_call_id: str,
+    analysis_report: str,
+    charts: list[dict[str, Any]] | None = None,
+    tables: list[dict[str, Any]] | None = None,
+) -> ToolMessage:
+    """
+    构造成功的工具结果反馈。
+
+    这里不再把完整 charts/tables 配置原样塞回模型上下文，
+    避免结构化图表配置把后续一轮模型请求撑爆。
+    完整结果已经持久化到 execution.result_payload_json 中，
+    后续由 invoker 基于最新成功执行记录回填真正结果。
+    """
+    payload = {
+        'tool': 'execute_python',
+        'status': 'success',
+        'analysis_report': (analysis_report or '').strip(),
+        'chart_count': len(charts or []),
+        'table_count': len(tables or []),
+        'chart_titles': [
+            str(item.get('title') or '').strip()
+            for item in (charts or [])
+            if isinstance(item, dict) and str(item.get('title') or '').strip()
+        ][:5],
+        'table_titles': [
+            str(item.get('title') or '').strip()
+            for item in (tables or [])
+            if isinstance(item, dict) and str(item.get('title') or '').strip()
+        ][:5],
+    }
     return ToolMessage(
         content=json.dumps(payload, ensure_ascii=False),
         tool_call_id=tool_call_id,
@@ -829,9 +868,11 @@ def execute_python(
             tool='execute_python',
             message='分析结果已生成，正在整理最终报告。',
         )
-        return ToolMessage(
-            content=exec_result.model_dump_json(),
+        return _tool_success_message(
             tool_call_id=runtime.tool_call_id,
+            analysis_report=exec_result.analysis_report,
+            charts=exec_result.charts,
+            tables=exec_result.tables,
         )
 
     _update_execution_record(

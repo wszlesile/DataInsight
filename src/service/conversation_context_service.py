@@ -440,6 +440,33 @@ class ConversationContextService:
             InsightNsExecution.id.desc(),
         ).first()
 
+    def get_latest_successful_analysis_turn(
+        self,
+        conversation_id: Any,
+        max_turn_no: int | None = None,
+    ) -> InsightNsTurn | None:
+        """返回当前会话最近一条真正成功完成过分析执行的轮次。"""
+        conversation_id_int = to_int(conversation_id, 0)
+        if conversation_id_int <= 0:
+            return None
+
+        successful_turn_ids = self._get_successful_execution_turn_ids(conversation_id_int)
+        if not successful_turn_ids:
+            return None
+
+        query = self.session.query(InsightNsTurn).filter(
+            InsightNsTurn.conversation_id == conversation_id_int,
+            InsightNsTurn.id.in_(successful_turn_ids),
+            InsightNsTurn.is_deleted == 0,
+        )
+        if max_turn_no is not None and max_turn_no >= 0:
+            query = query.filter(InsightNsTurn.turn_no <= max_turn_no)
+
+        return query.order_by(
+            InsightNsTurn.turn_no.desc(),
+            InsightNsTurn.id.desc(),
+        ).first()
+
     def get_turn_executions(self, turn_id: Any) -> list[InsightNsExecution]:
         """返回某一轮内全部代码执行记录，按发生顺序排列。"""
         turn_id_int = to_int(turn_id, 0)
@@ -500,7 +527,7 @@ class ConversationContextService:
                 max_turn_no=max_turn_no,
             ),
             "latest_artifacts": [
-                artifact.to_dict()
+                self._build_artifact_summary_item(artifact)
                 for artifact in self.get_recent_artifacts(
                     conversation_id_int,
                     limit_items=3,
@@ -916,6 +943,9 @@ class ConversationContextService:
         include_code: bool = False,
     ) -> dict[str, Any]:
         """把一条执行记录转换成适合写入记忆的摘要结构。"""
+        result_payload = safe_json_loads(execution.result_payload_json, {})
+        chart_count = len(result_payload.get('charts') or []) if isinstance(result_payload, dict) else 0
+        table_count = len(result_payload.get('tables') or []) if isinstance(result_payload, dict) else 0
         payload = {
             "execution_id": execution.id,
             "turn_id": execution.turn_id,
@@ -923,17 +953,42 @@ class ConversationContextService:
             "title": execution.title,
             "description": execution.description,
             "execution_status": execution.execution_status,
-            "analysis_report": execution.analysis_report,
-            "result_payload_json": execution.result_payload_json,
+            "analysis_report_preview": (execution.analysis_report or '')[:800],
+            "chart_count": chart_count,
+            "table_count": table_count,
             "error_message": execution.error_message,
             "execution_seconds": execution.execution_seconds,
             "finished_at": execution.finished_at.isoformat() if execution.finished_at else None,
         }
         if include_code:
-            payload["generated_code"] = execution.generated_code or ''
+            payload["generated_code"] = (execution.generated_code or '')[:3000]
         else:
             payload["generated_code_preview"] = (execution.generated_code or '')[:1200]
         return payload
+
+    def _build_artifact_summary_item(self, artifact: InsightNsArtifact) -> dict[str, Any]:
+        """把产物压缩成适合会话记忆的轻量摘要。"""
+        content = safe_json_loads(artifact.content_json, {})
+        summary = {
+            "id": artifact.id,
+            "turn_id": artifact.turn_id,
+            "execution_id": artifact.execution_id,
+            "artifact_type": artifact.artifact_type,
+            "title": artifact.title,
+            "summary_text": (artifact.summary_text or '')[:500],
+            "sort_no": artifact.sort_no,
+            "created_at": artifact.created_at.isoformat() if artifact.created_at else None,
+        }
+
+        if artifact.artifact_type == 'chart':
+            chart_spec = content.get('chart_spec', {}) if isinstance(content, dict) else {}
+            summary["chart_type"] = content.get('chart_type', '')
+            summary["chart_series_count"] = len(chart_spec.get('series', [])) if isinstance(chart_spec, dict) else 0
+        elif artifact.artifact_type == 'table':
+            summary["row_count"] = len(content.get('rows', [])) if isinstance(content, dict) else 0
+            summary["column_count"] = len(content.get('columns', [])) if isinstance(content, dict) else 0
+
+        return summary
 
     def _upsert_memory(self, conversation_id: int, memory_type: str, payload: dict[str, Any]) -> None:
         """插入或更新一条记忆记录，并同步提升版本号。"""

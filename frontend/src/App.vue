@@ -27,9 +27,11 @@
         :collects="collects"
         :active-conversation-id="activeConversationId"
         @select-space="onSelectSpace"
+        @select-conversation="onSelectConversation"
         @delete-space="onDeleteSpace"
         @rename-space="onRenameSpace"
         @new-space="onNewSpace"
+        @new-conversation="onNewConversation"
         @open-favorites="favoritesPanelVisible = true"
         @open-knowledge="showKnowledgePlaceholder"
       />
@@ -523,6 +525,7 @@ import DataSourcePanel from './components/DataSourcePanel.vue'
 import ChatInput from './components/ChatInput.vue'
 import ChartDisplay from './components/ChartDisplay.vue'
 import {
+  createConversation,
   createNamespace,
   createCollect,
   deleteNamespace,
@@ -1195,6 +1198,47 @@ const onSelectSpace = async (space) => {
   await Promise.all([fetchConversations(), fetchCollects()])
   if (conversations.value.length > 0) {
     await loadConversationHistory(conversations.value[0].id)
+  }
+}
+
+const onSelectConversation = async (conversation) => {
+  if (!conversation?.id) return
+  stopCurrentStream()
+  loading.value = false
+  chatHistory.value = []
+  resetCurrentConversationState()
+  turnDetailVisible.value = false
+  turnDetail.value = null
+  previewArtifact.value = null
+  await loadConversationHistory(conversation.id)
+}
+
+const onNewConversation = async () => {
+  if (!activeNamespace.value) {
+    ElMessage.warning('请先选择一个洞察空间')
+    return
+  }
+  stopCurrentStream()
+  try {
+    const response = await createConversation(activeNamespace.value)
+    if (!response.data?.success) {
+      ElMessage.error(response.data?.message || '新增会话失败')
+      return
+    }
+    const conversation = response.data?.data
+    await Promise.all([fetchConversations(), fetchCollects()])
+    if (conversation?.id) {
+      chatHistory.value = []
+      resetCurrentConversationState()
+      turnDetailVisible.value = false
+      turnDetail.value = null
+      previewArtifact.value = null
+      await loadConversationHistory(conversation.id)
+    }
+    ElMessage.success('会话已创建')
+  } catch (error) {
+    console.error('Create conversation error:', error)
+    ElMessage.error('新增会话失败')
   }
 }
 

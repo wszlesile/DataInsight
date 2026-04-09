@@ -33,6 +33,13 @@ export function listConversations(namespaceId) {
   })
 }
 
+export function createConversation(namespaceId, title = '') {
+  return api.post('/insight/conversations', {
+    namespace_id: namespaceId,
+    title
+  })
+}
+
 export function renameConversation(conversationId, title) {
   return api.put(`/insight/conversations/${conversationId}`, { title })
 }

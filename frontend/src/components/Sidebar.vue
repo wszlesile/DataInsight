@@ -57,6 +57,45 @@
             删除
           </button>
         </div>
+
+        <div v-if="!collapsed && activeSpace && conversations.length" class="conversation-section">
+          <div class="conversation-header">
+            <span class="conversation-title">会话</span>
+            <button
+              class="conversation-create-btn"
+              type="button"
+              @click="$emit('new-conversation')"
+            >
+              新增会话
+            </button>
+          </div>
+
+          <div class="conversation-list">
+            <button
+              v-for="conversation in conversations"
+              :key="conversation.id"
+              class="conversation-item"
+              :class="{ active: activeConversationId === conversation.id }"
+              type="button"
+              @click="$emit('select-conversation', conversation)"
+            >
+              <span class="conversation-item-title">{{ conversation.title || `会话 #${conversation.id}` }}</span>
+            </button>
+          </div>
+        </div>
+
+        <div v-else-if="!collapsed && activeSpace" class="conversation-section">
+          <div class="conversation-header">
+            <span class="conversation-title">会话</span>
+            <button
+              class="conversation-create-btn"
+              type="button"
+              @click="$emit('new-conversation')"
+            >
+              新增会话
+            </button>
+          </div>
+        </div>
       </div>
 
       <div class="panel-footer-links">
@@ -94,9 +133,11 @@ const props = defineProps({
 
 defineEmits([
   'select-space',
+  'select-conversation',
   'delete-space',
   'rename-space',
   'new-space',
+  'new-conversation',
   'open-favorites',
   'open-knowledge'
 ])
@@ -201,6 +242,74 @@ const notebookAbbr = (name) => {
   flex-direction: column;
   gap: 8px;
   padding-right: 2px;
+}
+
+.conversation-section {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #e5edf7;
+}
+
+.conversation-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.conversation-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #64748b;
+}
+
+.conversation-create-btn {
+  border: 1px solid #dbe3ef;
+  background: #fff;
+  color: #475569;
+  border-radius: 10px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.conversation-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.conversation-item {
+  width: 100%;
+  text-align: left;
+  border: 1px solid #e5edf7;
+  background: #f8fbff;
+  color: #334155;
+  border-radius: 12px;
+  padding: 9px 12px;
+  cursor: pointer;
+}
+
+.conversation-item:hover {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+}
+
+.conversation-item.active {
+  border-color: #60a5fa;
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.conversation-item-title {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .notebook-item {

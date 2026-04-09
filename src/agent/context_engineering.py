@@ -294,7 +294,10 @@ def get_memory_messages(
                 max_turn_no=max_turn_no,
             )
             if recent_artifacts:
-                artifact_payload = [artifact.to_dict() for artifact in recent_artifacts]
+                artifact_payload = [
+                    service._build_artifact_summary_item(artifact)
+                    for artifact in recent_artifacts
+                ]
                 messages.append(SystemMessage(
                     "最近派生产物摘要：\n"
                     f"{json.dumps(artifact_payload, ensure_ascii=False, indent=2)}"

@@ -14,6 +14,7 @@ def create_insight_ns_conversation_controller() -> Blueprint:
     blueprint = Blueprint('insight_ns_conversation', __name__, url_prefix='/api/insight/conversations')
     controller = InsightNsConversationController(blueprint)
 
+    blueprint.route('', methods=['POST'])(controller.create_conversation)
     blueprint.route('', methods=['GET'])(controller.list_conversations)
     blueprint.route('/<int:conversation_id>', methods=['PUT'])(controller.rename_conversation)
     blueprint.route('/<int:conversation_id>/history', methods=['GET'])(controller.get_history)
@@ -29,6 +30,24 @@ class InsightNsConversationController(BaseController):
     def _get_username(self) -> str:
         user_context = get_current_user_context()
         return user_context.username if user_context else 'anonymous'
+
+    def create_conversation(self):
+        data = self.get_json_data()
+        namespace_id = data.get('namespace_id', 0)
+        title = data.get('title', '')
+        session = SessionLocal()
+        try:
+            service = InsightNsConversationService(session)
+            conversation = service.create_conversation(
+                username=self._get_username(),
+                namespace_id=namespace_id,
+                title=title,
+            )
+            if conversation is None:
+                return self.error_response('洞察空间不存在', 404)
+            return jsonify(Result.success(data=conversation, message='会话已创建', code=201).to_dict()), 201
+        finally:
+            session.close()
 
     def list_conversations(self):
         namespace_id = request.args.get('namespace_id', '0')

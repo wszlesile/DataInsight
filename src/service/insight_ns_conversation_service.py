@@ -1,5 +1,6 @@
 import json
 import re
+from datetime import datetime
 from io import BytesIO
 from typing import Any
 
@@ -17,6 +18,7 @@ from model import (
     InsightNsConversation,
     InsightNsExecution,
     InsightNsMessage,
+    InsightNamespace,
     InsightNsTurn,
 )
 from utils import (
@@ -44,6 +46,47 @@ class InsightNsConversationService:
             InsightNsConversation.id.desc(),
         ).all()
         return [conversation.to_dict() for conversation in conversations]
+
+    def create_conversation(
+        self,
+        username: str,
+        namespace_id: Any,
+        title: str = '',
+    ) -> dict[str, Any] | None:
+        """在指定洞察空间下创建一条新的空会话。"""
+        namespace_id_int = to_int(namespace_id, 0)
+        if namespace_id_int <= 0:
+            return None
+
+        namespace = self.session.query(InsightNamespace).filter(
+            InsightNamespace.id == namespace_id_int,
+            InsightNamespace.username == username,
+            InsightNamespace.is_deleted == 0,
+        ).first()
+        if namespace is None:
+            return None
+
+        normalized_title = (title or '').strip()[:255] or '新建会话'
+
+        conversation = InsightNsConversation(
+            username=username,
+            insight_namespace_id=namespace_id_int,
+            title=normalized_title,
+            status='active',
+            summary_text='',
+            active_datasource_snapshot='{}',
+            last_turn_no=0,
+            last_message_at=datetime.now(),
+            user_message='',
+            insight_result='',
+            is_deleted=0,
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+        self.session.add(conversation)
+        self.session.commit()
+        self.session.refresh(conversation)
+        return conversation.to_dict()
 
     def rename_conversation(self, username: str, conversation_id: Any, title: str) -> dict[str, Any] | None:
         conversation = self._get_accessible_conversation(username, conversation_id)

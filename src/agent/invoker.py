@@ -15,6 +15,7 @@ UNEXPECTED_KWARG_PATTERN = re.compile(
 )
 MISSING_DEP_PATTERN = re.compile(r"No module named '(?P<module>[^']+)'")
 MAX_ANALYSIS_AGENT_ROUNDS = 3
+REGENERATE_REQUEST_PATTERN = re.compile(r'^(重新生成|重试|重新执行|重新跑一次|再生成一次|再来一次)$')
 
 
 @dataclass
@@ -109,6 +110,55 @@ def _parse_structured_content(content: Any) -> dict[str, Any]:
     }
 
 
+def _load_latest_execution_result(
+    service: ConversationContextService,
+    runtime: ConversationRunContext,
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    从当前轮最近一次成功执行记录中读取完整结构化结果。
+
+    execute_python 成功后只向模型返回轻量摘要，
+    真正完整的 charts/tables 结果以 execution.result_payload_json 为准。
+    """
+    latest_execution = service.get_latest_execution(runtime.turn.id)
+    if latest_execution is None or latest_execution.execution_status != 'success':
+        return '', [], []
+
+    try:
+        payload = json.loads(latest_execution.result_payload_json or '{}')
+    except Exception:
+        return '', [], []
+
+    if not isinstance(payload, dict):
+        return '', [], []
+
+    return (
+        payload.get('analysis_report', '') or '',
+        payload.get('charts') or [],
+        payload.get('tables') or [],
+    )
+
+
+def _resolve_analysis_outputs(
+    service: ConversationContextService,
+    runtime: ConversationRunContext,
+    analysis_report: str,
+    charts: list[dict[str, Any]] | None = None,
+    tables: list[dict[str, Any]] | None = None,
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    统一收口本轮完整分析结果。
+
+    优先使用最新成功执行记录里的完整 payload，
+    再回退到当前回合直接解析到的结构化结果。
+    """
+    execution_report, execution_charts, execution_tables = _load_latest_execution_result(service, runtime)
+    final_report = execution_report or analysis_report or ''
+    final_charts = execution_charts or (charts or [])
+    final_tables = execution_tables or (tables or [])
+    return final_report, final_charts, final_tables
+
+
 def _is_internal_tool_feedback(content: Any) -> bool:
     """识别只用于模型自修复的 execute_python 错误反馈。"""
     text = content if isinstance(content, str) else str(content)
@@ -161,6 +211,44 @@ def _build_agent_input_with_runtime_instruction(
         extra_system_messages=extra_system_messages,
         history_turn_limit=runtime.history_turn_limit,
         datasource_snapshot_override=runtime.active_datasource_snapshot,
+    )
+
+
+def _is_regenerate_request(user_message: str) -> bool:
+    """识别明显指向“重跑上一轮分析”的简短省略指令。"""
+    normalized = re.sub(r'\s+', '', (user_message or '').strip())
+    return bool(REGENERATE_REQUEST_PATTERN.fullmatch(normalized))
+
+
+def _build_regenerate_instruction(
+    service: ConversationContextService,
+    runtime: ConversationRunContext,
+    user_message: str,
+) -> str:
+    """
+    把“重新生成/重试”这类省略指代还原成最近一次成功分析任务。
+
+    这里只补充最短的运行时约束，不复制 sys_prompt 里的通用业务规则。
+    """
+    if not _is_regenerate_request(user_message):
+        return ''
+
+    latest_turn = service.get_latest_successful_analysis_turn(
+        runtime.conversation.id,
+        max_turn_no=runtime.history_turn_limit,
+    )
+    if latest_turn is None:
+        return ''
+
+    latest_question = (latest_turn.user_query or '').strip()
+    if not latest_question:
+        return ''
+
+    return (
+        '当前用户输入“重新生成/重试”明确指向最近一次成功分析任务。'
+        f'请把本轮目标理解为：重新执行第 {latest_turn.turn_no} 轮的分析请求：'
+        f'「{latest_question}」。'
+        '不要复述历史结论，必须重新调用 execute_python 基于当前会话数据源重新完成分析。'
     )
 
 
@@ -405,6 +493,12 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                     runtime=runtime,
                     round_index=round_index,
                 )
+            elif round_index == 0:
+                runtime_instruction = _build_regenerate_instruction(
+                    service=service,
+                    runtime=runtime,
+                    user_message=agent_request.user_message,
+                )
 
             agent_response = insight_agent.invoke(
                 _build_agent_input_with_runtime_instruction(
@@ -426,6 +520,13 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 charts=charts,
             )
             analysis_flow_started = analysis_flow_started or entered_analysis_flow
+            analysis_report, charts, tables = _resolve_analysis_outputs(
+                service=service,
+                runtime=runtime,
+                analysis_report=analysis_report,
+                charts=charts,
+                tables=tables,
+            )
 
             if raw_tool_call_detected and not (analysis_report or charts):
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
@@ -502,6 +603,12 @@ def _stream_with_runtime(
                     stage='retry',
                     level='warning',
                     message='本轮分析尚未完成，正在根据最近执行错误继续修正代码。',
+                )
+            elif round_index == 0:
+                runtime_instruction = _build_regenerate_instruction(
+                    service=service,
+                    runtime=runtime,
+                    user_message=agent_request.user_message,
                 )
 
             for stream_mode, chunk in insight_agent.stream(
@@ -603,6 +710,13 @@ def _stream_with_runtime(
                 charts=charts,
             )
             analysis_flow_started = analysis_flow_started or entered_analysis_flow
+            analysis_report, charts, tables = _resolve_analysis_outputs(
+                service=service,
+                runtime=runtime,
+                analysis_report=analysis_report,
+                charts=charts,
+                tables=tables,
+            )
 
             if raw_tool_call_detected and not (analysis_report or charts):
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
