@@ -6,7 +6,7 @@ from utils import logger
 
 
 # 允许匿名访问的路径
-ANONYMOUS_PATHS = ['/health', '/files/','/api/']
+ANONYMOUS_PATHS = ['/health', '/files/', '/api/']
 
 
 def init_auth_middleware(app):
@@ -15,12 +15,23 @@ def init_auth_middleware(app):
     @app.before_request
     def authenticate():
         """请求前置认证"""
+        auth_header = request.headers.get('Authorization', '')
+
+        def _try_bind_user_context() -> None:
+            if not auth_header.startswith('Bearer '):
+                return
+            try:
+                user_context: UserContext = user_auth_service.get_user_context(auth_header)
+                g.user_context = user_context
+            except Exception as exc:
+                logger.warn(f"可选认证初始化失败: {exc}")
+
         # 跳过匿名路径
         if any(request.path.startswith(path) for path in ANONYMOUS_PATHS):
+            _try_bind_user_context()
             return None
 
         # 获取Authorization头
-        auth_header = request.headers.get('Authorization', '')
         if not auth_header.startswith('Bearer '):
             return jsonify({
                 'code': 401,

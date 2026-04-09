@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from uuid import uuid4
 from typing import Any
@@ -5,11 +6,12 @@ from typing import Any
 import pandas as pd
 from werkzeug.datastructures import FileStorage
 
+from api import supos_kernel_api
 from sqlalchemy.orm import Session
 
 from dto import DataSourceSchema, PropertySchema
 from model import InsightDatasource, InsightNsConversation, InsightNsRelDatasource
-from utils import dump_json, normalize_datasource_type
+from utils import dump_json, normalize_datasource_type, safe_json_loads
 
 
 class InsightNsRelDatasourceService:
@@ -155,6 +157,66 @@ class InsightNsRelDatasourceService:
         self.session.commit()
         return {"success": True, "message": "文件上传成功", "data": self._datasource_to_dict(datasource)}
 
+    def import_uns_nodes_to_namespace(
+        self,
+        insight_namespace_id: int,
+        aliases: list[str],
+        authorization: str,
+        lake_rds_database_name: str,
+    ) -> dict[str, Any]:
+        """
+        将选中的 UNS 文件节点转换为当前空间下的 table 类型数据源。
+        这里仅负责空间级数据源落库，不自动绑定到会话。
+        """
+        if insight_namespace_id <= 0:
+            return {"success": False, "message": "空间不存在"}
+
+        normalized_aliases = self._normalize_uns_aliases(aliases)
+        if not normalized_aliases:
+            return {"success": False, "message": "请选择至少一个 UNS 文件节点"}
+        if not authorization:
+            return {"success": False, "message": "缺少 SUPOS 认证信息，无法导入 UNS 节点"}
+        if not lake_rds_database_name:
+            return {"success": False, "message": "当前用户上下文未初始化 LakeRDS 数据库名"}
+
+        detail_results = self._fetch_uns_details_in_parallel(normalized_aliases, authorization)
+        imported_rows: list[dict[str, Any]] = []
+        failed_rows: list[dict[str, Any]] = []
+
+        for result in detail_results:
+            if not result.get("success"):
+                failed_rows.append({
+                    "alias": result.get("alias", ""),
+                    "message": result.get("message", "导入失败"),
+                })
+                continue
+
+            try:
+                datasource = self._upsert_uns_table_datasource(
+                    insight_namespace_id=insight_namespace_id,
+                    detail=result["detail"],
+                    lake_rds_database_name=lake_rds_database_name,
+                )
+                imported_rows.append(self._datasource_to_dict(datasource))
+            except Exception as exc:
+                failed_rows.append({
+                    "alias": result.get("alias", ""),
+                    "message": str(exc),
+                })
+
+        self.session.commit()
+        message = f"已导入 {len(imported_rows)} 个 UNS 节点"
+        if failed_rows:
+            message = f"{message}，{len(failed_rows)} 个节点失败"
+        return {
+            "success": True,
+            "message": message,
+            "data": {
+                "imported": imported_rows,
+                "failed": failed_rows,
+            },
+        }
+
     def delete_namespace_datasource(self, insight_namespace_id: int, datasource_id: int) -> dict[str, Any]:
         """删除空间级数据源；若仍被会话引用，则阻止删除。"""
         datasource = self.session.query(InsightDatasource).filter(
@@ -202,6 +264,106 @@ class InsightNsRelDatasourceService:
             InsightNsConversation.id == insight_conversation_id,
             InsightNsConversation.is_deleted == 0,
         ).first()
+
+    def _normalize_uns_aliases(self, aliases: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for alias in aliases or []:
+            value = str(alias or '').strip()
+            if not value or value in seen:
+                continue
+            normalized.append(value)
+            seen.add(value)
+        return normalized
+
+    def _fetch_uns_details_in_parallel(
+        self,
+        aliases: list[str],
+        authorization: str,
+    ) -> list[dict[str, Any]]:
+        if not aliases:
+            return []
+
+        results: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(aliases)))) as executor:
+            future_to_alias = {
+                executor.submit(supos_kernel_api.fetch_uns_file_detail, alias, authorization): alias
+                for alias in aliases
+            }
+            for future in as_completed(future_to_alias):
+                alias = future_to_alias[future]
+                try:
+                    results.append({
+                        "success": True,
+                        "alias": alias,
+                        "detail": future.result(),
+                    })
+                except Exception as exc:
+                    results.append({
+                        "success": False,
+                        "alias": alias,
+                        "message": str(exc),
+                    })
+        results.sort(key=lambda item: aliases.index(item["alias"]))
+        return results
+
+    def _upsert_uns_table_datasource(
+        self,
+        insight_namespace_id: int,
+        detail: dict[str, Any],
+        lake_rds_database_name: str,
+    ) -> InsightDatasource:
+        alias = str(detail.get('alias') or '').strip()
+        if not alias:
+            raise ValueError('UNS 节点缺少 alias，无法导入')
+
+        datasource = self._find_namespace_table_datasource_by_table_name(
+            insight_namespace_id=insight_namespace_id,
+            table_name=alias,
+        )
+        datasource_name = str(detail.get('name') or alias).strip()[:128] or alias
+
+        if datasource is None:
+            datasource_name = self._build_unique_datasource_name(insight_namespace_id, datasource_name)
+            datasource = InsightDatasource(
+                insight_namespace_id=insight_namespace_id,
+                datasource_type='table',
+                datasource_name=datasource_name,
+                knowledge_tag=alias,
+                datasource_schema='',
+                datasource_config_json='{}',
+            )
+            self.session.add(datasource)
+            self.session.flush()
+        else:
+            datasource.datasource_name = datasource_name
+            datasource.knowledge_tag = alias
+
+        datasource.datasource_schema = self._build_uns_datasource_schema(detail, datasource.datasource_name)
+        datasource.datasource_config_json = dump_json({
+            "database_name": lake_rds_database_name,
+            "table_name": alias,
+            "uns_alias": alias,
+            "uns_path": detail.get('path') or '',
+            "uns_path_name": detail.get('pathName') or detail.get('name') or '',
+        })
+        return datasource
+
+    def _find_namespace_table_datasource_by_table_name(
+        self,
+        insight_namespace_id: int,
+        table_name: str,
+    ) -> InsightDatasource | None:
+        rows = self.session.query(InsightDatasource).filter(
+            InsightDatasource.insight_namespace_id == insight_namespace_id,
+            InsightDatasource.datasource_type == 'table',
+            InsightDatasource.is_deleted == 0,
+        ).all()
+        for datasource in rows:
+            config = safe_json_loads(datasource.datasource_config_json, {})
+            if str(config.get('table_name') or '').strip() == table_name:
+                return datasource
+        return None
 
     def _namespace_has_same_named_datasource(self, insight_namespace_id: int, datasource_name: str) -> bool:
         existing = self.session.query(InsightDatasource.id).filter(
@@ -251,6 +413,36 @@ class InsightNsRelDatasourceService:
         )
         return dump_json(schema.model_dump())
 
+    def _build_uns_datasource_schema(self, detail: dict[str, Any], datasource_name: str) -> str:
+        definition = detail.get('definition') or []
+        properties: dict[str, PropertySchema] = {}
+        required: list[str] = []
+
+        for field in definition:
+            field_name = str(field.get('name') or '').strip()
+            if not field_name:
+                continue
+
+            description_parts = [
+                str(field.get('displayName') or '').strip(),
+                str(field.get('remark') or '').strip(),
+            ]
+            properties[field_name] = PropertySchema(
+                type=self._map_uns_field_type(field.get('type')),
+                description='；'.join(part for part in description_parts if part) or field_name,
+                example=None,
+            )
+            if not bool(field.get('systemField')):
+                required.append(field_name)
+
+        schema = DataSourceSchema(
+            name=datasource_name,
+            description=f"UNS 节点“{detail.get('name') or datasource_name}”转换得到的表结构",
+            properties=properties,
+            required=required,
+        )
+        return dump_json(schema.model_dump())
+
     def _read_file_preview(self, file_path: Path) -> pd.DataFrame:
         """按文件类型读取预览数据；异常会转换成可直接返回给前端的错误。"""
         try:
@@ -278,6 +470,16 @@ class InsightNsRelDatasourceService:
             return 'boolean'
         if 'date' in dtype or 'time' in dtype:
             return 'string'
+        return 'string'
+
+    def _map_uns_field_type(self, source_type: Any) -> str:
+        normalized = str(source_type or '').strip().upper()
+        if normalized in {'INTEGER', 'LONG', 'INT', 'SHORT'}:
+            return 'integer'
+        if normalized in {'DOUBLE', 'FLOAT', 'DECIMAL', 'NUMBER'}:
+            return 'number'
+        if normalized in {'BOOLEAN', 'BOOL'}:
+            return 'boolean'
         return 'string'
 
     def _extract_example_value(self, series: pd.Series) -> Any | None:

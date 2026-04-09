@@ -15,11 +15,26 @@ from langgraph.prebuilt import ToolRuntime
 from pydantic import BaseModel, Field
 
 from agent.context_engineering import CustomContext
+from api.SuposkernelApi import databaseInfo
 from utils import logger
 from utils import normalize_chart_spec
 
 CURRENT_USERNAME = ContextVar('current_username', default='anonymous')
+def load_data_with_fed_query(sql: str,params: Optional[list[Any]] = None):
+    import psycopg2
+    import pandas as pd
 
+    # 连接数据库
+    db = psycopg2.connect(
+        host=databaseInfo.host,
+        user=databaseInfo.user,
+        password=databaseInfo.password,
+        database=databaseInfo.database,
+        port=int(databaseInfo.port),
+    )
+
+    with db as connection:
+        return pd.read_sql(sql, connection, params=params if params else None)
 
 def load_local_file(file_path: str, sheet_name: Optional[str] = None):
     """

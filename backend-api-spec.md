@@ -535,6 +535,104 @@ data: {"type":"status","message":"已收到请求，正在理解分析需求。"
 - 主列表只展示**空间级数据源**
 - 勾选框表示“是否绑定到当前会话”
 - 不再单独展示“当前会话资源列表”
+- UNS 资源树通过**本项目后端代理接口**获取，前端不直接跨域请求第三方平台
+
+### 4.0 获取 UNS 树节点
+
+`POST /api/insight/namespaces/{namespace_id}/uns/tree`
+
+用途：
+
+- 前端加载 UNS 资源树
+- 由本项目后端代请求第三方平台接口，解决浏览器跨域问题
+- 前端只需要关心树节点展示和多选，不需要直接对接第三方域名
+
+请求体：
+
+```json
+{
+  "parentId": "0",
+  "pageNo": 1,
+  "pageSize": 100,
+  "keyword": "",
+  "searchType": 1
+}
+```
+
+请求字段说明：
+- `parentId`
+  - 当前要查询的父节点 ID
+  - 根节点固定传 `"0"`
+- `pageNo`
+  - 页码
+  - 当前前端固定传 `1`
+- `pageSize`
+  - 每页条数
+  - 当前前端固定传 `100`
+- `keyword`
+  - 关键字搜索
+  - 当前前端默认为空字符串
+- `searchType`
+  - 搜索类型
+  - 当前前端固定传 `1`
+
+响应结构：
+
+```json
+{
+  "success": true,
+  "data": {
+    "pageNo": 1,
+    "pageSize": 100,
+    "total": 55,
+    "code": 200,
+    "msg": "Simple DB Search",
+    "data": [
+      {
+        "id": "101",
+        "alias": "_uns_iiot",
+        "name": "IIoT采集设备节点",
+        "pathName": "IIoT采集设备节点",
+        "hasChildren": true,
+        "countChildren": 436,
+        "type": 0
+      }
+    ]
+  },
+  "message": "操作成功",
+  "code": 200
+}
+```
+
+响应字段说明：
+- 顶层 `success / message / code`
+  - 本项目统一响应包裹
+- 顶层 `data`
+  - 第三方 UNS 树接口的原始响应对象
+- `data.data`
+  - 当前节点列表数组
+
+单个节点字段说明：
+- `id`
+  - 节点 ID
+- `alias`
+  - 节点别名
+- `name`
+  - 节点名称
+- `pathName`
+  - 节点路径名称
+- `hasChildren`
+  - 是否有子节点
+- `countChildren`
+  - 子节点数量
+- `type`
+  - 节点类型
+  - 当前前端会结合 `hasChildren / countChildren / type` 判断它是文件夹还是文件
+
+前端当前用法说明：
+- 根节点加载时传 `parentId = "0"`
+- 点击文件夹继续展开时，传当前节点的 `id` 作为新的 `parentId`
+- 只把已勾选的文件节点 `alias` 数组传给“导入 UNS 节点到空间数据源”接口
 
 ### 4.1 获取空间数据源列表
 
@@ -657,7 +755,67 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 - 返回值就是新建后的数据源对象
 - 字段结构与“获取空间数据源列表”中的单条数据源一致
 
-### 4.3 删除空间数据源
+### 4.3 导入 UNS 节点到空间数据源
+
+`POST /api/insight/namespaces/{namespace_id}/datasources/import-uns`
+
+用途：
+
+- 把前端已选中的 UNS 文件节点批量导入为当前空间下的 `table` 类型数据源
+- 这里不会自动绑定到当前会话
+
+请求体：
+
+```json
+{
+  "aliases": [
+    "_baojingjilubiao_5d3feea65c1942bdbb7a",
+    "_baojingchuzhigongdan_53b31f4fe6c24fd3b8a1"
+  ]
+}
+```
+
+请求字段说明：
+- `aliases`
+  - UNS 文件节点 alias 数组
+  - 只传文件节点，不传文件夹
+
+响应 `data` 结构：
+
+```json
+{
+  "imported": [
+    {
+      "datasource_id": 16,
+      "datasource_type": "table",
+      "datasource_name": "报警记录表",
+      "knowledge_tag": "_baojingjilubiao_5d3feea65c1942bdbb7a",
+      "datasource_schema": "{...}",
+      "datasource_config_json": "{...}",
+      "checked": false
+    }
+  ],
+  "failed": [
+    {
+      "alias": "_xxx",
+      "message": "未查询到 UNS 节点详情"
+    }
+  ]
+}
+```
+
+响应字段说明：
+- `imported`
+  - 成功导入的数据源列表
+- `failed`
+  - 失败的 alias 列表及错误原因
+
+说明：
+- 后端会使用当前用户 `UserContext` 中的 token 调第三方详情接口
+- 后端会使用当前用户 `UserContext` 中初始化好的 `LakeRDS` 数据库名
+- 导入后的数据源类型仍然是 `table`
+
+### 4.4 删除空间数据源
 
 `DELETE /api/insight/namespaces/{namespace_id}/datasources/{datasource_id}`
 
@@ -681,7 +839,7 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 }
 ```
 
-### 4.4 绑定数据源到会话
+### 4.5 绑定数据源到会话
 
 `POST /api/insight/conversation/datasource/`
 
@@ -710,7 +868,7 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 
 - 空间数据源列表勾选时调用
 
-### 4.5 从会话解绑数据源
+### 4.6 从会话解绑数据源
 
 `DELETE /api/insight/conversation/datasource/`
 
@@ -1205,6 +1363,8 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 - `unbindConversationDatasource`
 - `listNamespaceDatasources`
 - `uploadNamespaceDatasource`
+- `fetchUnsTreeNodes`
+- `importNamespaceUnsDatasources`
 - `deleteNamespaceDatasource`
 - `exportTurnPdf`
 - `listCollects`
@@ -1234,7 +1394,11 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
    - `DELETE /api/insight/conversation/datasource/`
 5. 上传文件时：
    - `POST /api/insight/namespaces/{namespace_id}/datasources/upload`
-6. 删除数据源时：
+6. 加载 UNS 树时：
+   - `POST /api/insight/namespaces/{namespace_id}/uns/tree`
+7. 从 UNS 节点导入时：
+   - `POST /api/insight/namespaces/{namespace_id}/datasources/import-uns`
+8. 删除数据源时：
    - `DELETE /api/insight/namespaces/{namespace_id}/datasources/{datasource_id}`
 
 ### 10.3 聊天分析

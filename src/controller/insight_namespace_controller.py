@@ -1,5 +1,6 @@
 from flask import Blueprint, jsonify, request
 
+from api import supos_kernel_api
 from config.config import Config
 from config.database import SessionLocal
 from controller.base_controller import BaseController
@@ -15,8 +16,10 @@ def create_insight_namespace_controller() -> Blueprint:
 
     blueprint.route('', methods=['GET'])(controller.list_namespaces)
     blueprint.route('', methods=['POST'])(controller.create_namespace)
+    blueprint.route('/<int:namespace_id>/uns/tree', methods=['POST'])(controller.fetch_uns_tree)
     blueprint.route('/<int:namespace_id>/datasources', methods=['GET'])(controller.list_datasources)
     blueprint.route('/<int:namespace_id>/datasources/upload', methods=['POST'])(controller.upload_datasource_file)
+    blueprint.route('/<int:namespace_id>/datasources/import-uns', methods=['POST'])(controller.import_uns_datasources)
     blueprint.route('/<int:namespace_id>/datasources/<int:datasource_id>', methods=['DELETE'])(controller.delete_datasource)
     blueprint.route('/<int:namespace_id>', methods=['PUT'])(controller.rename_namespace)
     blueprint.route('/<int:namespace_id>', methods=['DELETE'])(controller.delete_namespace)
@@ -78,6 +81,25 @@ class InsightNamespaceController(BaseController):
         finally:
             session.close()
 
+    def fetch_uns_tree(self, namespace_id: int):
+        """代理查询第三方 UNS 树，供前端同源访问。"""
+        _ = namespace_id
+        user_context = get_current_user_context()
+        data = self.get_json_data()
+
+        try:
+            result = supos_kernel_api.fetch_uns_tree_nodes(
+                authorization=user_context.token if user_context else '',
+                parent_id=data.get('parentId', '0'),
+                page_no=data.get('pageNo', 1),
+                page_size=data.get('pageSize', 100),
+                keyword=data.get('keyword', ''),
+                search_type=data.get('searchType', 1),
+            )
+            return jsonify(Result.success(data=result).to_dict())
+        except Exception as exc:
+            return self.error_response(str(exc), 400)
+
     def upload_datasource_file(self, namespace_id: int):
         """上传文件到空间，并转换成一条空间级数据源。"""
         upload_file = request.files.get('file')
@@ -94,6 +116,26 @@ class InsightNamespaceController(BaseController):
             )
             if result['success']:
                 return jsonify(Result.success(data=result['data'], message=result['message'], code=201).to_dict()), 201
+            return self.error_response(result['message'], 400)
+        finally:
+            session.close()
+
+    def import_uns_datasources(self, namespace_id: int):
+        """把选中的 UNS 文件节点批量导入为空间级 table 数据源。"""
+        user_context = get_current_user_context()
+        aliases = self.get_json_data().get('aliases') or []
+
+        session = SessionLocal()
+        try:
+            service = InsightNsRelDatasourceService(session)
+            result = service.import_uns_nodes_to_namespace(
+                insight_namespace_id=namespace_id,
+                aliases=aliases,
+                authorization=user_context.token if user_context else '',
+                lake_rds_database_name=user_context.lake_rds_database_name if user_context else '',
+            )
+            if result['success']:
+                return jsonify(Result.success(data=result['data'], message=result['message']).to_dict())
             return self.error_response(result['message'], 400)
         finally:
             session.close()

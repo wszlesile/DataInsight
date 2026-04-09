@@ -15,8 +15,9 @@ class UserAuthService:
     """用户认证服务"""
 
     def __init__(self):
-        self.base_url = Config.USER_SERVICE_URL
+        self.base_url = Config.SUPOS_WEB
         self.auth_endpoint = Config.USER_AUTH_ENDPOINT
+        self.request_timeout = Config.SUPOS_REQUEST_TIMEOUT
 
     def verify_token(self, token: str) -> Optional[UserContext]:
         """
@@ -37,12 +38,16 @@ class UserAuthService:
         }
 
         try:
-            response = requests.get(url, headers=headers, timeout=10)
+            response = requests.get(url, headers=headers, timeout=self.request_timeout)
             if response.status_code == 200:
                 result = response.json()
                 if result.get('code') == 100000000:
                     data = result.get('data', {})
-                    return UserContext.from_auth_response(data, token)
+                    return UserContext.from_auth_response(
+                        data,
+                        token,
+                        lake_rds_database_name=self._fetch_lake_rds_database_name(token),
+                    )
                 else:
                     logger.warn(f"认证失败: {result.get('message', '未知错误')}")
                     return None
@@ -70,6 +75,32 @@ class UserAuthService:
         if not user_context:
             raise AuthError("无效的认证凭证")
         return user_context
+
+    def _fetch_lake_rds_database_name(self, token: str) -> str:
+        """
+        初始化用户上下文时补充 LakeRDS 数据库名。
+        这一步仅用于增强 UNS 导入能力；若第三方接口暂时不可用，不阻断认证主流程。
+        """
+        url = f"{self.base_url}/os/inter-api/fedquery/v1/databases"
+        headers = {
+            'Authorization': token,
+        }
+        params = {
+            'pageSize': 100000,
+        }
+
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=self.request_timeout)
+            response.raise_for_status()
+            payload = response.json()
+            for item in payload.get('list') or []:
+                if item.get('description') == 'LakeRDS' and item.get('name'):
+                    return str(item.get('name'))
+        except requests.RequestException as exc:
+            logger.warn(f"获取 LakeRDS 数据库名失败: {exc}")
+        except ValueError as exc:
+            logger.warn(f"解析 LakeRDS 数据库响应失败: {exc}")
+        return ''
 
 
 # 全局单例

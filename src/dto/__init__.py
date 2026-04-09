@@ -44,9 +44,16 @@ class UserContext:
     user_code: str
     # 当前认证 token。
     token: str
+    # 当前用户可访问的 LakeRDS 数据库名称。
+    lake_rds_database_name: str = ''
 
     @classmethod
-    def from_auth_response(cls, data: dict, token: str) -> 'UserContext':
+    def from_auth_response(
+        cls,
+        data: dict,
+        token: str,
+        lake_rds_database_name: str = '',
+    ) -> 'UserContext':
         """从认证接口响应中构造用户上下文。"""
         user_session = data.get('userSessionInfo', {})
         return cls(
@@ -56,6 +63,7 @@ class UserContext:
             staff_name=user_session.get('staffName', ''),
             user_code=data.get('userCode', ''),
             token=token,
+            lake_rds_database_name=lake_rds_database_name,
         )
 
 

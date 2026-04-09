@@ -3,7 +3,7 @@
     <div class="data-panel-content">
       <div class="search-section">
         <div class="search-box">
-          <span class="search-icon">🔎</span>
+          <span class="search-icon">🔍</span>
           <input
             v-model="searchKeyword"
             class="search-input"
@@ -31,14 +31,57 @@
 
       <div v-if="activeUploadMode === 'uns'" class="placeholder-section">
         <div class="section-header">
-          <span class="section-title">关联节点资源</span>
-          <div class="section-meta">当前保留原型结构，后续再接真实资源树</div>
+          <span class="section-title">关联 UNS 节点</span>
+          <div class="section-meta">按树浏览节点，勾选文件后批量导入为空间数据源</div>
         </div>
-        <div class="placeholder-card">
-          <div class="placeholder-title">UNS 节点资源入口已预留</div>
-          <div class="placeholder-text">
-            当前版本先聚焦文件数据源上传与会话绑定，节点资源树后续再按统一接口接入。
+
+        <div class="uns-toolbar">
+          <span class="uns-selected-text">已选择 {{ selectedUnsAliases.length }} 个文件节点</span>
+          <div class="uns-toolbar-actions">
+            <button class="plain-action" type="button" @click="reloadUnsTree">
+              刷新
+            </button>
+            <button
+              class="plain-action"
+              type="button"
+              :disabled="!activeNamespaceId || unsImporting || selectedUnsAliases.length === 0"
+              @click="importSelectedUnsNodes"
+            >
+              {{ unsImporting ? '导入中...' : '导入到当前空间' }}
+            </button>
           </div>
+        </div>
+
+        <div class="uns-tree-card">
+          <el-tree
+            ref="unsTreeRef"
+            class="uns-tree"
+            node-key="id"
+            lazy
+            show-checkbox
+            :data="unsRootNodes"
+            :props="unsTreeProps"
+            :indent="18"
+            :expand-on-click-node="false"
+            :load="loadUnsTreeNode"
+            @check="handleUnsCheck"
+          >
+            <template #default="{ data }">
+              <div class="uns-tree-node">
+                <span class="uns-tree-icon">{{ data.isFolder ? '📁' : '📄' }}</span>
+                <div class="uns-tree-body">
+                  <div class="uns-tree-title-row">
+                    <div class="uns-tree-title">{{ data.label }}</div>
+                    <span class="uns-tree-kind">{{ data.isFolder ? '文件夹' : '文件' }}</span>
+                  </div>
+                  <div class="uns-tree-meta">
+                    <span class="meta-line">别名：{{ data.alias || '-' }}</span>
+                    <span v-if="data.pathName" class="meta-line">路径：{{ data.pathName }}</span>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </el-tree>
         </div>
       </div>
 
@@ -50,7 +93,7 @@
         <div class="placeholder-card">
           <div class="placeholder-title">知识库接入稍后统一处理</div>
           <div class="placeholder-text">
-            当前页面先保留结构和位置，后续再与统一知识资源服务对接。
+            当前页面先保留结构和入口，后续再与统一知识资源服务对接。
           </div>
         </div>
       </div>
@@ -71,7 +114,7 @@
         <div class="upload-file-card">
           <div class="upload-file-title">上传 Excel / CSV 文件</div>
           <div class="upload-file-text">
-            上传后的文件会保存到当前洞察空间，并转换成空间级数据源定义。当前会话可在下方勾选需要绑定的数据源。
+            上传后的文件会保存到当前洞察空间，并转换成空间级数据源定义。当前会话可在下方按需勾选绑定。
           </div>
           <div class="upload-file-tip">
             当前支持：`.csv`、`.xls`、`.xlsx`
@@ -137,7 +180,7 @@
           <div v-else class="empty-state">
             <div class="empty-state-icon">☁</div>
             <p>当前空间还没有可用的数据源</p>
-            <span>你可以先上传 Excel 或 CSV 文件，把它们保存为当前空间的数据源。</span>
+            <span>你可以先上传 Excel / CSV 文件，或者从 UNS 节点导入数据源。</span>
           </div>
         </div>
       </div>
@@ -151,7 +194,9 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 
 import {
   bindConversationDatasource,
+  fetchUnsTreeNodes,
   deleteNamespaceDatasource,
+  importNamespaceUnsDatasources,
   listNamespaceDatasources,
   unbindConversationDatasource,
   uploadNamespaceDatasource,
@@ -169,16 +214,48 @@ const emit = defineEmits(['data-source-change'])
 const searchKeyword = ref('')
 const activeUploadMode = ref('external')
 const uploading = ref(false)
+const unsImporting = ref(false)
 const fileInput = ref(null)
+const unsTreeRef = ref(null)
+const unsRootNodes = ref([])
+const selectedUnsAliases = ref([])
 const namespaceDatasources = ref([])
 const bindingDatasourceIds = ref([])
+
 let latestDatasourceFetchToken = 0
+let latestUnsTreeToken = 0
 
 const uploadModes = [
-  { value: 'uns', label: '关联节点资源', icon: '🔆' },
-  { value: 'knowledge', label: '关联知识库', icon: '📚' },
-  { value: 'external', label: '上传外部数据', icon: '📤' },
+  { value: 'uns', label: '关联节点资源', icon: '🌉' },
+  { value: 'knowledge', label: '关联知识库', icon: '📎' },
+  { value: 'external', label: '上传外部数据', icon: '📛' },
 ]
+
+const unsTreeProps = {
+  label: 'label',
+  children: 'children',
+  isLeaf: 'isLeaf',
+  disabled: 'disabled',
+}
+
+const isUnsFolderNode = (node) => {
+  return Boolean(node?.hasChildren) || Number(node?.countChildren || 0) > 0 || Number(node?.type) === 0
+}
+
+const mapUnsNode = (node) => {
+  const isFolder = isUnsFolderNode(node)
+  return {
+    id: String(node.id || node.alias || ''),
+    alias: node.alias || '',
+    label: node.name || node.pathName || node.alias || '未命名节点',
+    pathName: node.pathName || node.path || '',
+    raw: node,
+    isFolder,
+    disabled: isFolder,
+    isLeaf: !isFolder,
+    children: [],
+  }
+}
 
 const filteredNamespaceDatasources = computed(() => {
   const keyword = searchKeyword.value.trim().toLowerCase()
@@ -198,7 +275,7 @@ const safeParseJson = (value) => {
   if (typeof value === 'object') return value
   try {
     return JSON.parse(value)
-  } catch (error) {
+  } catch {
     return {}
   }
 }
@@ -268,17 +345,93 @@ const fetchNamespaceDatasources = async () => {
       props.activeNamespaceId,
       props.activeConversation?.id || undefined
     )
-    if (fetchToken !== latestDatasourceFetchToken) {
-      return
-    }
+    if (fetchToken !== latestDatasourceFetchToken) return
     if (response.data?.success) {
       namespaceDatasources.value = response.data.data || []
     }
   } catch (error) {
-    if (fetchToken !== latestDatasourceFetchToken) {
-      return
-    }
+    if (fetchToken !== latestDatasourceFetchToken) return
     console.error('List namespace datasources error:', error)
+  }
+}
+
+const fetchUnsRootNodes = async () => {
+  if (!props.activeNamespaceId) {
+    unsRootNodes.value = []
+    return
+  }
+
+  const fetchToken = ++latestUnsTreeToken
+  try {
+    const response = await fetchUnsTreeNodes(props.activeNamespaceId, '0')
+    if (fetchToken !== latestUnsTreeToken) return
+    const rows = response.data?.data?.data || []
+    unsRootNodes.value = rows.map(mapUnsNode)
+  } catch (error) {
+    if (fetchToken !== latestUnsTreeToken) return
+    console.error('Fetch UNS root nodes error:', error)
+    ElMessage.error(error?.response?.data?.message || '加载 UNS 节点失败')
+  }
+}
+
+const loadUnsTreeNode = async (node, resolve) => {
+  if (node.level === 0) {
+    resolve(unsRootNodes.value)
+    return
+  }
+
+  try {
+    const response = await fetchUnsTreeNodes(props.activeNamespaceId, node.data.id)
+    const rows = response.data?.data?.data || []
+    resolve(rows.map(mapUnsNode))
+  } catch (error) {
+    console.error('Load UNS child nodes error:', error)
+    ElMessage.error(error?.response?.data?.message || '加载 UNS 子节点失败')
+    resolve([])
+  }
+}
+
+const handleUnsCheck = () => {
+  const checkedNodes = unsTreeRef.value?.getCheckedNodes(false, true) || []
+  selectedUnsAliases.value = checkedNodes
+    .filter((item) => !item.isFolder && item.alias)
+    .map((item) => item.alias)
+}
+
+const reloadUnsTree = async () => {
+  selectedUnsAliases.value = []
+  unsRootNodes.value = []
+  await fetchUnsRootNodes()
+}
+
+const importSelectedUnsNodes = async () => {
+  if (!props.activeNamespaceId) {
+    ElMessage.warning('请先创建或选择洞察空间')
+    return
+  }
+  if (selectedUnsAliases.value.length === 0) {
+    ElMessage.warning('请先勾选至少一个 UNS 文件节点')
+    return
+  }
+
+  unsImporting.value = true
+  try {
+    const response = await importNamespaceUnsDatasources(props.activeNamespaceId, selectedUnsAliases.value)
+    if (!response.data?.success) {
+      throw new Error(response.data?.message || '导入 UNS 节点失败')
+    }
+    await fetchNamespaceDatasources()
+    const failed = response.data?.data?.failed || []
+    if (failed.length) {
+      ElMessage.warning(`${response.data.message}，请查看失败节点后重试`)
+    } else {
+      ElMessage.success(response.data.message || 'UNS 节点导入成功')
+    }
+  } catch (error) {
+    console.error('Import UNS nodes error:', error)
+    ElMessage.error(error?.response?.data?.message || error.message || '导入 UNS 节点失败')
+  } finally {
+    unsImporting.value = false
   }
 }
 
@@ -325,7 +478,7 @@ const handleDeleteDatasource = async (resource) => {
         type: 'warning',
       }
     )
-  } catch (error) {
+  } catch {
     return
   }
 
@@ -396,7 +549,12 @@ const toggleDatasourceBinding = async (resource, event) => {
 watch(
   () => props.activeNamespaceId,
   async () => {
+    selectedUnsAliases.value = []
+    unsRootNodes.value = []
     await fetchNamespaceDatasources()
+    if (activeUploadMode.value === 'uns') {
+      await fetchUnsRootNodes()
+    }
   },
   { immediate: true }
 )
@@ -407,6 +565,15 @@ watch(
     await fetchNamespaceDatasources()
   },
   { immediate: true }
+)
+
+watch(
+  () => activeUploadMode.value,
+  async (mode) => {
+    if (mode === 'uns' && props.activeNamespaceId && unsRootNodes.value.length === 0) {
+      await fetchUnsRootNodes()
+    }
+  }
 )
 </script>
 
@@ -517,6 +684,7 @@ watch(
 .section-meta {
   font-size: 12px;
   color: #64748b;
+  text-align: right;
 }
 
 .plain-action {
@@ -540,6 +708,100 @@ watch(
   border: 1px solid #e5edf7;
   border-radius: 16px;
   padding: 14px 16px;
+}
+
+.uns-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.uns-selected-text {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.uns-toolbar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.uns-tree-card {
+  border: 1px solid #e5edf7;
+  border-radius: 16px;
+  background: #f8fbff;
+  padding: 10px 12px;
+  max-height: 380px;
+  overflow: auto;
+}
+
+.uns-tree {
+  background: transparent;
+  color: #0f172a;
+}
+
+.uns-tree-node {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+  width: 100%;
+  padding: 6px 0;
+}
+
+.uns-tree-icon {
+  width: 20px;
+  text-align: center;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.uns-tree-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.uns-tree-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.uns-tree-title {
+  font-size: 13px;
+  color: #0f172a;
+  font-weight: 700;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.uns-tree-kind {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: #e2e8f0;
+  color: #475569;
+}
+
+.uns-tree-meta {
+  margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11px;
+  color: #64748b;
+}
+
+.meta-line {
+  line-height: 1.5;
+  word-break: break-all;
 }
 
 .placeholder-title {
@@ -754,5 +1016,24 @@ watch(
   justify-content: center;
   font-size: 20px;
   margin-bottom: 12px;
+}
+
+:deep(.uns-tree .el-tree-node__content) {
+  min-height: 52px;
+  border-radius: 10px;
+  margin: 2px 0;
+  padding-right: 8px;
+}
+
+:deep(.uns-tree .el-tree-node__content:hover) {
+  background: rgba(37, 99, 235, 0.08);
+}
+
+:deep(.uns-tree .el-checkbox) {
+  margin-right: 10px;
+}
+
+:deep(.uns-tree .el-tree-node__expand-icon) {
+  color: #64748b;
 }
 </style>

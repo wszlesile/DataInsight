@@ -1,8 +1,24 @@
 import axios from 'axios'
 
+const SUPOS_AUTHORIZATION =
+  import.meta.env.VITE_SUPOS_AUTHORIZATION || 'Bearer cnTsOfcmJInlgXgaWXFMi'
+
+function getAuthorizationHeader() {
+  return SUPOS_AUTHORIZATION
+}
+
 const api = axios.create({
   baseURL: '/api',
   timeout: 120000
+})
+
+api.interceptors.request.use((config) => {
+  const authorization = getAuthorizationHeader()
+  if (authorization) {
+    config.headers = config.headers || {}
+    config.headers.Authorization = authorization
+  }
+  return config
 })
 
 export function invokeAgent(params) {
@@ -88,8 +104,27 @@ export function uploadNamespaceDatasource(namespaceId, file) {
   })
 }
 
+export function importNamespaceUnsDatasources(namespaceId, aliases) {
+  return api.post(`/insight/namespaces/${namespaceId}/datasources/import-uns`, {
+    aliases
+  })
+}
+
 export function deleteNamespaceDatasource(namespaceId, datasourceId) {
   return api.delete(`/insight/namespaces/${namespaceId}/datasources/${datasourceId}`)
+}
+
+export function fetchUnsTreeNodes(namespaceId, parentId = '0', options = {}) {
+  return api.post(
+    `/insight/namespaces/${namespaceId}/uns/tree`,
+    {
+      parentId,
+      pageNo: 1,
+      pageSize: 100,
+      keyword: options.keyword || '',
+      searchType: 1
+    }
+  )
 }
 
 export function exportTurnPdf(conversationId, turnId, payload) {
