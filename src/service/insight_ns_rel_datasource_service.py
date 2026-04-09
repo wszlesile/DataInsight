@@ -13,12 +13,13 @@ from utils import dump_json, normalize_datasource_type
 
 
 class InsightNsRelDatasourceService:
-    """负责管理会话级数据源绑定关系。"""
+    """管理空间级数据源以及会话级绑定关系。"""
 
     def __init__(self, session: Session):
         self.session = session
 
     def find_by_conversation_id(self, insight_conversation_id: int) -> list[dict[str, Any]]:
+        """查询某个会话已绑定的数据源。"""
         rows = self.session.query(InsightNsRelDatasource, InsightDatasource).filter(
             InsightNsRelDatasource.insight_conversation_id == insight_conversation_id,
             InsightNsRelDatasource.datasource_id == InsightDatasource.id,
@@ -35,6 +36,11 @@ class InsightNsRelDatasourceService:
         insight_namespace_id: int,
         insight_conversation_id: int | None = None,
     ) -> list[dict[str, Any]]:
+        """
+        查询空间级数据源列表。
+
+        如果传入会话 ID，返回结果会直接附带 `checked`，供前端勾选框展示。
+        """
         rows = self.session.query(InsightDatasource).filter(
             InsightDatasource.insight_namespace_id == insight_namespace_id,
             InsightDatasource.is_deleted == 0,
@@ -61,6 +67,7 @@ class InsightNsRelDatasourceService:
         ]
 
     def bind_existing_datasource(self, insight_conversation_id: int, datasource_id: int) -> dict[str, Any]:
+        """把一条空间级数据源绑定到会话。"""
         conversation = self._get_conversation(insight_conversation_id)
         if conversation is None:
             return {"success": False, "message": "会话不存在"}
@@ -98,6 +105,11 @@ class InsightNsRelDatasourceService:
         upload_file: FileStorage,
         upload_dir: str,
     ) -> dict[str, Any]:
+        """
+        上传文件并在空间下创建数据源。
+
+        该方法只负责空间级资源创建，不会自动把数据源绑定到任何会话。
+        """
         if insight_namespace_id <= 0:
             return {"success": False, "message": "空间不存在"}
         if upload_file is None or not upload_file.filename:
@@ -144,6 +156,7 @@ class InsightNsRelDatasourceService:
         return {"success": True, "message": "文件上传成功", "data": self._datasource_to_dict(datasource)}
 
     def delete_namespace_datasource(self, insight_namespace_id: int, datasource_id: int) -> dict[str, Any]:
+        """删除空间级数据源；若仍被会话引用，则阻止删除。"""
         datasource = self.session.query(InsightDatasource).filter(
             InsightDatasource.id == datasource_id,
             InsightDatasource.insight_namespace_id == insight_namespace_id,
@@ -167,6 +180,7 @@ class InsightNsRelDatasourceService:
         return {"success": True, "message": "数据源删除成功"}
 
     def remove_datasource(self, insight_conversation_id: int, datasource_id: int) -> dict[str, Any]:
+        """从会话解绑数据源，不删除空间级数据源本体。"""
         row = self.session.query(InsightNsRelDatasource, InsightDatasource).filter(
             InsightNsRelDatasource.insight_conversation_id == insight_conversation_id,
             InsightNsRelDatasource.datasource_id == InsightDatasource.id,
@@ -217,6 +231,7 @@ class InsightNsRelDatasourceService:
         return count + 1
 
     def _build_file_datasource_schema(self, file_path: Path, datasource_name: str) -> str:
+        """读取上传文件前几行数据，并推断元数据 Schema。"""
         dataframe = self._read_file_preview(file_path)
 
         properties: dict[str, PropertySchema] = {}
@@ -237,6 +252,7 @@ class InsightNsRelDatasourceService:
         return dump_json(schema.model_dump())
 
     def _read_file_preview(self, file_path: Path) -> pd.DataFrame:
+        """按文件类型读取预览数据；异常会转换成可直接返回给前端的错误。"""
         try:
             if file_path.suffix.lower() == '.csv':
                 return pd.read_csv(file_path, nrows=50)
@@ -287,6 +303,7 @@ class InsightNsRelDatasourceService:
         datasource_schema: str,
         datasource_config_json: str,
     ) -> InsightDatasource:
+        """按空间、名称和类型幂等创建数据源定义。"""
         normalized_type = normalize_datasource_type(datasource_type)
         if normalized_type == 'unknown':
             raise ValueError(f'不支持的数据源类型: {datasource_type}')

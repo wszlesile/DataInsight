@@ -25,6 +25,7 @@ class InsightUserCollectController(BaseController):
         return user_context.username if user_context else 'anonymous'
 
     def list_collects(self):
+        """按空间查询当前用户收藏。"""
         namespace_id = request.args.get('namespace_id')
         session = SessionLocal()
         try:
@@ -38,6 +39,7 @@ class InsightUserCollectController(BaseController):
             session.close()
 
     def create_collect(self):
+        """创建一条收藏记录。"""
         data = self.get_json_data()
         collect_type = data.get('collect_type', '')
         target_id = data.get('target_id', 0)
@@ -64,6 +66,7 @@ class InsightUserCollectController(BaseController):
             session.close()
 
     def remove_collect(self):
+        """取消收藏。"""
         data = self.get_json_data()
         collect_type = data.get('collect_type', '')
         target_id = data.get('target_id', 0)

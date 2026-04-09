@@ -569,7 +569,9 @@ def _stream_with_runtime(
     analysis_report = ''
     charts: list[dict[str, Any]] = []
     tables: list[dict[str, Any]] = []
-    analysis_flow_started = runtime.is_rerun
+    # “原轮次重跑”并不等于“已经进入失败后的修复回合”。
+    # 只有当前这次重跑真的执行过分析、且尚未成功收口时，才进入 retry 分支。
+    analysis_flow_started = False
 
     yield _build_progress_event(
         'session',
@@ -586,6 +588,15 @@ def _stream_with_runtime(
         level='info',
         message='已收到请求，正在理解分析需求。',
     )
+    if runtime.is_rerun:
+        yield _build_progress_event(
+            'status',
+            conversation_id=runtime.conversation.id,
+            turn_id=runtime.turn.id,
+            stage='rerun',
+            level='info',
+            message='正在重新执行本轮分析。',
+        )
 
     try:
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):

@@ -31,6 +31,7 @@ class InsightNamespaceController(BaseController):
         return user_context.username if user_context else 'anonymous'
 
     def list_namespaces(self):
+        """查询当前用户的空间列表。"""
         session = SessionLocal()
         try:
             service = InsightNamespaceService(session)
@@ -40,6 +41,7 @@ class InsightNamespaceController(BaseController):
             session.close()
 
     def create_namespace(self):
+        """创建空间，并同步创建一条默认会话。"""
         data = self.get_json_data()
         name = data.get('name', '')
         session = SessionLocal()
@@ -61,6 +63,12 @@ class InsightNamespaceController(BaseController):
             session.close()
 
     def list_datasources(self, namespace_id: int):
+        """
+        查询空间级数据源列表。
+
+        如果传入 `insight_conversation_id`，后端会直接在结果中标记当前会话的
+        绑定状态，前端无需再拼接第二份绑定列表。
+        """
         insight_conversation_id = request.args.get('insight_conversation_id', type=int)
         session = SessionLocal()
         try:
@@ -71,6 +79,7 @@ class InsightNamespaceController(BaseController):
             session.close()
 
     def upload_datasource_file(self, namespace_id: int):
+        """上传文件到空间，并转换成一条空间级数据源。"""
         upload_file = request.files.get('file')
         if upload_file is None:
             return self.error_response('请选择要上传的文件')
@@ -90,6 +99,7 @@ class InsightNamespaceController(BaseController):
             session.close()
 
     def delete_datasource(self, namespace_id: int, datasource_id: int):
+        """删除空间级数据源；若被会话引用则要求先解绑。"""
         session = SessionLocal()
         try:
             service = InsightNsRelDatasourceService(session)
@@ -101,6 +111,7 @@ class InsightNamespaceController(BaseController):
             session.close()
 
     def delete_namespace(self, namespace_id: int):
+        """删除空间，并一并软删除其下会话和上下文数据。"""
         session = SessionLocal()
         try:
             service = InsightNamespaceService(session)
@@ -115,6 +126,7 @@ class InsightNamespaceController(BaseController):
             session.close()
 
     def rename_namespace(self, namespace_id: int):
+        """更新空间名称。"""
         data = self.get_json_data()
         name = data.get('name', '')
         session = SessionLocal()

@@ -1,96 +1,84 @@
-# DataInsight Agent 上下文管理设计
+# DataInsight 上下文工程设计
 
-## 1. 文档目标
+本文档描述当前 DataInsight 项目中，多轮数据洞察 Agent 的上下文管理设计。重点说明：
 
-本文档用于说明 DataInsight 项目中数据洞察 Agent 的上下文管理设计，重点回答以下问题：
+- 为什么会话是主上下文边界
+- 一轮分析的历史事实如何保存
+- 下一轮对话时，历史上下文如何重新组装给模型
+- 数据源、执行记录、图表和报告分别承担什么职责
 
-- 系统如何支持多轮、持续的即席数据洞察对话
-- 对话记录、执行记录和派生产物如何持久化保存
-- 下一轮对话时，历史上下文如何重新组织并注入大模型
-- 数据源、会话、轮次、执行记录之间的职责边界如何划分
+## 1. 设计目标
 
-## 2. 设计原则
+当前上下文工程要同时满足四件事：
 
-### 2.1 上下文边界
+1. 支持会话内连续追问和持续分析
+2. 支持分析结果回放、重跑和溯源
+3. 避免把完整历史无脑塞进 Prompt 导致上下文膨胀
+4. 在不改变主架构的前提下，为后续扩展更多会话和资源类型预留空间
 
-当前系统采用以下边界定义：
+## 2. 上下文边界
 
-- `namespace_id`：资源归属边界
-- `conversation_id`：上下文边界
-- `turn`：单轮分析事实边界
+### 2.1 空间边界
 
-这意味着：
+`namespace_id` 表示资源归属边界。
 
-- 空间负责承载资源归属
-- 会话负责承载多轮上下文
-- 轮次负责记录每一轮分析的历史事实
+空间负责承载：
 
-### 2.2 产物边界
+- 空间级数据源
+- 空间级默认资源关系
+- 空间下的会话集合
 
-本项目不是普通聊天机器人，而是“代码生成与执行型”数据分析 Agent。  
-因此产物边界定义如下：
+### 2.2 会话边界
 
-- 主产物：本轮由大模型生成并执行的 Python 代码
-- 派生产物：代码执行后生成的图表、报告和结果文件
+`conversation_id` 是真正的上下文主边界。
 
-这也是上下文管理与普通聊天场景最大的区别。下一轮追问时，真正重要的不只是“上轮说了什么”，还包括：
+会话负责承载：
 
-- 上轮选了哪些数据源
-- 上轮生成了什么 Python 代码
-- 上轮执行结果是什么
+- 当前分析主线
+- 活动数据源快照
+- 滚动摘要
+- 当前分析状态
+- 多轮历史问答与执行轨迹
 
-## 3. 业务边界
+### 2.3 轮次边界
 
-### 3.1 空间与会话
+`turn` 是历史事实边界。
 
-当前业务阶段中，一个洞察空间下通常只有一个活跃会话，实际使用关系近似为：
+每一轮保存的是“这一轮当时真实发生了什么”，包括：
 
-- `namespace : conversation = 1 : 1`
+- 用户问题
+- 本轮使用的数据源范围
+- 本轮最终回答
+- 本轮执行记录
+- 本轮派生产物
 
-但系统建模已经按未来可扩展到：
+## 3. 关键数据模型职责
 
-- `namespace : conversation = 1 : N`
-
-因此当前实现中，会话仍然被设计为独立实体，作为真正的上下文边界。
-
-### 3.2 数据源与知识资源
-
-当前业务约束如下：
-
-- 知识资源是全局资源，可以被任意空间引用
-- 数据源是空间隔离资源，只归属于某个空间
-
-因此当前建模方式为：
-
-- 全局知识资源实体
-- 空间隔离的数据源实体
-- 会话级资源绑定关系
-
-## 4. 核心数据模型
-
-### 4.1 会话相关
+### 3.1 会话与轮次
 
 #### `insight_ns_conversation`
 
-用于表示一条持续分析会话。关键字段包括：
+会话主表，保存当前状态和会话级快照。
 
-- `id`
-- `username`
-- `insight_namespace_id`
+当前与上下文最相关的字段：
+
 - `title`
 - `status`
 - `summary_text`
 - `active_datasource_snapshot`
 - `last_turn_no`
+- `last_message_at`
 
 其中：
 
-- `summary_text` 保存会话级滚动摘要
-- `active_datasource_snapshot` 保存当前会话最新的数据源选择快照
+- `summary_text` 保存滚动摘要文本
+- `active_datasource_snapshot` 保存当前会话最新的数据源快照
 
 #### `insight_ns_turn`
 
-用于表示会话中的一轮完整分析。关键字段包括：
+轮次表，保存单轮分析事实。
+
+关键字段：
 
 - `conversation_id`
 - `turn_no`
@@ -99,334 +87,207 @@
 - `selected_datasource_snapshot_json`
 - `final_answer`
 - `status`
+- `error_message`
 
-其中：
+这两个数据源字段的职责分别是：
 
-- `selected_datasource_ids_json` 保存本轮选中的数据源 ID 列表
-- `selected_datasource_snapshot_json` 保存本轮分析开始时的数据源快照
+- `selected_datasource_ids_json`
+  - 本轮实际使用的数据源 ID 列表
+- `selected_datasource_snapshot_json`
+  - 本轮分析开始时冻结的数据源快照
+
+### 3.2 消息
 
 #### `insight_ns_message`
 
-用于保存真正参与上下文组装的消息明细。典型消息包括：
+消息表负责保存后续上下文回放真正需要的用户/助手消息。
+
+当前主要保存：
 
 - 用户问题
 - assistant 最终回答
-- 错误消息
+- assistant 错误消息
 
-### 4.2 执行与产物相关
+它不承担完整工具执行日志存储职责。
+
+### 3.3 执行记录
 
 #### `insight_ns_execution`
 
-这是上下文工程中的关键实体。  
-它保存每一轮分析中大模型生成并执行的 Python 代码，以及执行结果。
+执行表是“代码生成与执行型分析”场景里最关键的表之一。
 
-关键字段包括：
+它保存：
 
-- `conversation_id`
-- `turn_id`
-- `tool_call_id`
-- `title`
-- `description`
-- `generated_code`
-- `execution_status`
-- `result_file_id`
-- `analysis_report`
-- `stdout_text`
-- `stderr_text`
-- `execution_seconds`
-- `error_message`
+- 生成的 Python 代码
+- 执行状态
+- 错误信息
+- 标准输出和错误输出
+- 结构化执行结果 `result_payload_json`
+- 分析报告 `analysis_report`
 
-它的职责是：
+它承担的是“分析主逻辑留痕”，而不是纯展示结果。
 
-- 保存分析主逻辑
-- 支撑后续多轮分析延续
-- 支撑执行回放、问题排查和结果溯源
+### 3.4 派生产物
 
 #### `insight_ns_artifact`
 
-用于保存代码执行后生成的派生产物，例如：
+产物表负责保存面向用户展示和后续引用的分析产物。
 
-- 图表
-- 报告
-- 结果文件
+当前主要产物类型：
 
-它不是分析主产物，而是用户展示层和历史回看的补充结果。
+- `chart`
+- `report`
+- `table`
 
-### 4.3 记忆相关
+典型内容：
+
+- `chart`
+  - 保存在 `content_json.chart_spec`
+- `report`
+  - 保存在 `content_json.report_markdown`
+- `table`
+  - 保存在 `content_json.columns / rows`
+
+### 3.5 会话记忆
 
 #### `insight_ns_memory`
 
-用于保存压缩后的会话级记忆。当前主要包含两类：
+记忆表负责保存会话级压缩记忆，而不是逐条消息历史。
+
+当前有两类记忆：
 
 - `rolling_summary`
 - `analysis_state`
 
 其中：
 
-- `rolling_summary` 用于压缩自然语言历史
-- `analysis_state` 用于保存结构化分析状态
+- `rolling_summary`
+  - 用于压缩自然语言历史
+- `analysis_state`
+  - 用于保存结构化分析状态
 
-### 4.4 数据源相关
+## 4. 数据源上下文设计
 
-#### `insight_datasource`
+### 4.1 数据源归属
 
-用于定义空间内的数据源实体。当前 `datasource_type` 已收敛为：
+当前数据源是空间级资源：
 
-- `local_file`
-- `minio_file`
-- `table`
-- `api`
+- 上传文件数据源 -> 保存到 `insight_datasource`
+- 归属某个 `namespace`
 
-同时，`knowledge_tag` 已经收敛为数据源主表字段，用于承载数据源级稳定标识，便于后续做向量索引、召回过滤和结果归属。
+会话是否使用某个数据源，通过 `insight_ns_rel_datasource` 决定。
 
-#### `insight_ns_rel_datasource`
+### 4.2 为什么既要会话级快照，又要轮次级快照
 
-用于定义“当前会话可引用哪些空间内数据源”的关系，不承载历史轮次事实，也不再保存数据源级标识信息。
+当前设计同时保留：
 
-## 5. 为什么数据源状态要分层保存
+- `conversation.active_datasource_snapshot`
+- `turn.selected_datasource_snapshot_json`
 
-用户在每一轮对话前都可能重新选择数据源范围。  
-因此系统必须同时保存两类状态：
+原因是这两个状态语义不同：
 
-### 5.1 会话级当前状态
+#### 会话级快照
 
-保存位置：
+表示：
 
-- `insight_ns_conversation.active_datasource_snapshot`
-
-含义：
-
-- 当前会话最新激活的数据源范围
+- 当前会话“最新”的数据源使用范围
 
 用途：
 
-- 作为下一轮默认延续的数据源范围
-- 作为当前会话状态的快速入口
+- 下一轮默认续用
+- 当前状态展示
+- Prompt 组装时构建数据源上下文
 
-### 5.2 轮次级历史事实
+#### 轮次级快照
 
-保存位置：
+表示：
 
-- `insight_ns_turn.selected_datasource_ids_json`
-- `insight_ns_turn.selected_datasource_snapshot_json`
-
-含义：
-
-- 本轮分析开始时，实际选中了哪些数据源
+- 本轮分析开始时“真实使用”的数据源范围
 
 用途：
 
-- 保证历史轮次可追溯
-- 避免后续轮次覆盖历史事实
-- 支持“继续上一轮那个范围”这类追问
+- 历史回放
+- 结果溯源
+- 原轮重跑
 
-## 6. 多轮即席数据洞察的运行链路
+如果只保留会话级快照，后面切换数据源后，历史轮次就会失真。
 
-### 6.1 请求进入
+## 5. 一轮分析的运行链路
 
-前端通过以下接口发起请求：
+### 5.1 启动新一轮分析
 
-- `POST /api/agent/invoke`
-- `POST /api/agent/stream`
+入口在：
 
-请求核心字段包括：
+- `ConversationContextService.start_run()`
 
-- `namespace_id`
-- `conversation_id`
-- `user_message`
+主要步骤：
 
-规则如下：
+1. 查找或创建会话
+2. 确保会话级资源绑定存在
+3. 计算下一轮 `turn_no`
+4. 刷新会话级数据源快照
+5. 冻结本轮数据源快照
+6. 创建 `insight_ns_turn`
+7. 写入用户消息到 `insight_ns_message`
 
-- `conversation_id` 为空时，表示新建会话
-- 当前轮实际使用的数据源范围，不由 Agent 分析接口直接传入，而是由后端根据 `conversation_id` 查询会话级绑定关系得到
+### 5.2 重跑原轮次
 
-### 6.2 创建或恢复会话
+入口在：
 
-入口：
+- `ConversationContextService.start_rerun()`
 
-- `src/agent/invoker.py`
-- `src/service/conversation_context_service.py`
+语义是：
 
-`ConversationContextService.start_run()` 的主要流程：
+- 在同一个 `turn_id` 上重新执行分析
+- 不新增新轮次
 
-1. 根据 `conversation_id` 查询会话
-2. 若不存在则创建新会话
-3. 确保当前会话已经具备资源绑定关系
-4. 计算下一轮 `turn_no`
-5. 合并当前会话数据源快照
-6. 冻结本轮数据源快照
-7. 创建一条新的 `insight_ns_turn`
-8. 写入一条用户消息到 `insight_ns_message`
+重跑前会清理该轮旧的：
 
-### 6.3 处理本轮数据源范围
+- assistant 消息
+- execution
+- artifact
 
-`start_run()` 内部会调用 `_merge_datasource_snapshot()`：
+然后复用：
 
-1. 读取会话级 `active_datasource_snapshot`
-2. 如果本轮传入了 `datasource_ids`，先按会话绑定关系校验这些数据源是否可用
-3. 校验通过后更新会话级最新快照
-4. 同时生成本轮 `selected_datasource_snapshot_json`
+- 原问题
+- 原数据源快照
 
-结果是：
+## 6. Prompt 组装设计
 
-- 会话级记录“当前最新选择”
-- 轮次级记录“本轮历史事实”
+Prompt 组装入口在：
 
-### 6.4 调用 Agent 分析
-
-在会话和轮次落库后，`invoker` 会调用：
-
-- `get_input()`
-- `insight_agent.invoke()` 或 `insight_agent.stream()`
-
-送入模型的上下文主要包括：
-
-- 系统提示词
-- 运行时系统配置
-- 数据源上下文
-- 历史问答消息
-- 会话记忆
-- 最近代码执行记录
-- 最近派生产物摘要
-
-### 6.5 执行 Python 代码
-
-大模型按照 `sys_prompt.md` 的约束生成 Python 分析代码，并通过 `execute_python` 执行。
-
-`execute_python` 的关键行为如下：
-
-1. 在执行前创建一条 `insight_ns_execution`
-2. 保存 `generated_code`、`title`、`description`
-3. 执行代码
-4. 成功时回写：
-   - `execution_status`
-   - `result_file_id`
-   - `analysis_report`
-   - `stdout_text`
-   - `stderr_text`
-   - `execution_seconds`
-5. 失败时回写：
-   - `execution_status = failed`
-   - `error_message`
-   - `stdout_text`
-   - `stderr_text`
-
-当前为了兼容现有 Agent 契约，`execute_python` 对外仍返回：
-
-- `StructuredResult(file_id, analysis_report)`
-
-也就是说：
-
-- 外部工具契约不变
-- 内部增加了完整执行留痕
-
-### 6.6 分析完成后的持久化
-
-分析成功时会调用 `complete_run()`：
-
-1. 更新 `turn.final_answer`
-2. 写入 assistant 最终回答消息
-3. 查询本轮最近一次 `execution`
-4. 生成派生产物记录
-5. 刷新 `rolling_summary`
-6. 刷新 `analysis_state`
-
-分析失败时会调用 `fail_run()`：
-
-1. 标记轮次失败
-2. 写入错误消息
-3. 刷新摘要与记忆
-
-## 7. 对话记录是怎么保存的
-
-系统不是只保存聊天文本，而是分层持久化：
-
-- 会话层：会话元信息、当前快照、滚动摘要
-- 轮次层：本轮问题、最终回答、本轮数据源范围
-- 消息层：用户消息、assistant 回答、错误消息
-- 执行层：生成代码、执行状态、执行输出、执行结果
-- 产物层：图表、报告、结果文件
-- 记忆层：摘要和分析状态
-
-这种分层方式的好处是：
-
-- 页面展示时可以按“会话 -> 轮次 -> 消息/执行/产物”组织数据
-- 组装下一轮上下文时只提取必要内容
-- 历史轮次的数据源范围和执行代码都可追溯
-- 后续做收藏、审计、回放都更稳定
-
-## 8. 下一轮对话时，历史上下文如何组装
-
-上下文组装入口位于：
-
+- `src/agent/__init__.py`
 - `src/agent/context_engineering.py`
 
-当前会构造四类上下文：
+当前发送给模型的上下文顺序是：
 
-- 数据源上下文
-- 历史问答上下文
-- 记忆上下文
-- 执行与产物上下文
+1. 系统提示词
+2. 数据源上下文
+3. 会话记忆上下文
+4. 历史问答消息
+5. 当前用户问题
 
-### 8.1 数据源上下文
+当前已经针对 MiniMax 做了一个额外约束：
 
-`get_datasource_message(namespace_id, conversation_id)` 的逻辑是：
+- 所有系统级上下文会先合并成一条 `SystemMessage`
+- 历史对话仍按 `HumanMessage / AIMessage` 传入
 
-1. 读取会话级 `active_datasource_snapshot`
-2. 按 `conversation_id` 查询当前会话绑定的数据源
-3. 关联到真实数据源定义
-4. 组装成统一的运行时 JSON
+这样可以避免因为多条 `SystemMessage` 导致模型侧参数校验失败。
 
-当前注入模型的数据源上下文格式：
+## 7. 会话记忆设计
 
-```json
-{
-  "datasources": [
-    {
-      "datasource_id": 1,
-      "datasource_type": "table",
-      "datasource_name": "sales_detail",
-      "datasource_identifier": "sales_detail",
-      "metadata_schema": {
-        "name": "sales_detail",
-        "description": "销售明细表",
-        "properties": {},
-        "required": []
-      }
-    }
-  ],
-  "selected_datasource_ids": [1]
-}
-```
+### 7.1 `rolling_summary`
 
-含义：
+滚动摘要由最近若干轮构建而成，用于在长会话里保留主要历史脉络。
 
-- `datasources` 是当前会话可用于洞察的完整数据源集合
-- `selected_datasource_ids` 是当前会话最近一次选中的分析范围
+当前策略是：
 
-### 8.2 历史问答上下文
+- 优先保留真实成功执行过的轮次结论
+- 避免把仅靠自然语言复述、没有真实执行支撑的结果继续污染后续上下文
 
-`get_history_messages(conversation_id)` 会提取最近的：
+### 7.2 `analysis_state`
 
-- 用户问题
-- assistant 最终回答
-
-默认只取最近 10 条，并转换为模型可消费的：
-
-- `HumanMessage`
-- `AIMessage`
-
-### 8.3 记忆上下文
-
-`get_memory_messages(conversation_id)` 会补充两类系统消息：
-
-#### `rolling_summary`
-
-保存最近若干轮对话的压缩摘要，用于降低 prompt 长度，同时保留主线。
-
-#### `analysis_state`
-
-保存当前分析状态，主要包括：
+结构化分析状态通常包含：
 
 - `active_datasource_snapshot`
 - `recent_turn_datasource_usage`
@@ -435,101 +296,93 @@
 - `latest_artifacts`
 - `last_turn_no`
 
-它不是简单聊天历史，而是“当前分析已经推进到哪里”的结构化状态。
+这部分不是给用户看的，而是给下一轮分析继续读取的状态摘要。
 
-### 8.4 执行上下文
+## 8. 执行与产物如何参与下一轮上下文
 
-这是当前方案相对普通对话系统最关键的升级点。
+### 8.1 执行记录的作用
 
-`get_memory_messages(conversation_id)` 还会额外注入：
+最近执行摘要会被写入记忆，帮助模型理解：
 
-- 最近几次代码执行记录摘要
-- 最近一次执行的 Python 分析代码
+- 最近分析做了什么
+- 最近代码执行状态如何
+- 最近失败在哪里
 
-这样用户说：
+当前不会把完整 `result_payload_json` 直接回灌给模型，以避免图表配置和表格结果把上下文撑爆。
 
-- “继续用刚才的分析逻辑”
-- “把上一轮代码改成按区域聚合”
-- “还是用刚才那段逻辑，只把时间过滤改成 Q4”
+### 8.2 派生产物的作用
 
-模型都能直接参考最近代码和执行结果，而不是只依赖图表或报告去猜测。
+最近产物也会参与会话记忆，但只保留轻量摘要：
 
-### 8.5 派生产物上下文
+- 产物类型
+- 标题
+- 摘要
+- 图表系列数量 / 表格行列数等概览信息
 
-最近图表和报告也会以系统消息形式补充到上下文中，但它们的定位是：
+不会把完整 `chart_spec` 直接塞回会话上下文。
 
-- 展示层产物
-- 历史追溯资源
-- 对执行结果的补充摘要
-
-而不是主分析产物。
-
-## 9. 页面如何回放历史会话
-
-页面查询展示走标准 Web 查询链路，而不走 Agent 运行链路。
-
-主要服务：
-
-- `src/service/insight_ns_conversation_service.py`
-
-其中：
-
-- `get_conversation_history()`：返回整个会话的轮次时间线
-- `get_turn_detail()`：返回单轮完整详情
+## 9. 历史回放与前端展示
 
 ### 9.1 会话历史
 
-会话历史按 `turn_no` 顺序返回，每轮包括：
+前端主聊天区通过：
 
-- 问题
-- 本轮选中的数据源 ID
-- 本轮数据源快照
-- 报告内容
-- 图表文件 ID
-- 最新执行摘要
+- `GET /api/insight/conversations/{conversation_id}/history`
+
+拿到按轮次聚合后的历史结果。
+
+每个轮次结果卡主要由以下内容组成：
+
+- 用户问题
+- 报告
+- 图表列表
+- 表格列表
+- 最近执行摘要
 - 执行次数
-- 状态
-- 开始和结束时间
 
-### 9.2 轮次详情
+### 9.2 单轮详情
 
-轮次详情会进一步返回：
+前端详情抽屉通过：
 
-- 本轮消息列表
-- 本轮执行记录列表
-- 本轮最新执行记录
-- 本轮派生产物列表
+- `GET /api/insight/conversations/{conversation_id}/turns/{turn_id}`
 
-## 10. 为什么这套方案能支持多轮即席数据洞察
+读取完整轮次信息，包括：
 
-因为系统同时保存了四类关键事实：
+- messages
+- executions
+- latest_execution
+- artifacts
 
-### 10.1 历史问答事实
+### 9.3 PDF 导出
 
-通过 `insight_ns_message` 保存真实用户问题和助手回答。
+PDF 导出走：
 
-### 10.2 历史分析状态
+- `POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/export/pdf`
 
-通过 `insight_ns_memory` 保存摘要和分析状态，避免每轮都依赖全量原始历史。
+后端会从该轮产物中读取：
 
-### 10.3 历史数据源事实
+- chart artifact
+- report artifact
 
-通过 `insight_ns_turn.selected_datasource_ids_json` 和 `selected_datasource_snapshot_json` 保存每轮分析时的数据源范围，确保：
+动态生成 PDF，不依赖会话记忆。
 
-- 当前轮切换数据源不会污染历史轮次
-- 回看历史时知道当时基于哪些数据源得出结论
-- 后续追问“继续上一轮那个范围”时有据可依
+## 10. 当前设计能解决什么问题
 
-### 10.4 历史执行事实
+这套设计当前解决的是：
 
-通过 `insight_ns_execution` 保存每轮真正执行过的 Python 代码及其结果，确保：
-
-- 后续问题可以延续上一轮分析逻辑
-- 图表和报告都能追溯到对应执行
-- 调试时能定位“结论是怎么计算出来的”
+- 多轮分析不是纯聊天历史堆叠，而是“会话状态 + 轮次事实 + 执行记录 + 派生产物”的组合
+- 历史轮次的数据源范围不会被后续轮次覆盖
+- 原轮重跑不会新增新轮次，便于用户在同一结果卡上刷新分析
+- 前端历史展示、收藏、导出都能基于同一套轮次产物结构工作
 
 ## 11. 一句话总结
 
-当前上下文管理方案的核心思路是：
+当前 DataInsight 的上下文工程，以 `conversation` 作为持续分析的主边界，以 `turn` 作为历史事实边界，用 `message + memory + execution + artifact` 共同支撑多轮数据洞察。
 
-以 `conversation` 作为上下文主边界，以 `turn` 作为历史事实单元，以 `message + memory + execution + artifact` 共同组织多轮分析上下文；其中 `execution` 承载真正的分析主逻辑，`artifact` 承载用户可见的派生产物，再通过“会话级当前快照 + 轮次级历史快照”同时兼顾连续分析体验、历史可追溯性和未来从 `1:1` 平滑升级到 `1:N` 的演进能力。
+其中：
+
+- `execution` 负责保存真正的分析主逻辑
+- `artifact` 负责保存面向展示和复用的结果产物
+- `memory` 负责控制后续 Prompt 长度并保留分析主线
+
+这样既能支持连续分析，也能保证结果可回放、可重跑、可溯源。

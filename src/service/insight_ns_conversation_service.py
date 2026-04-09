@@ -30,12 +30,13 @@ from utils import (
 
 
 class InsightNsConversationService:
-    """提供会话历史、轮次详情与导出能力的 Web 查询服务。"""
+    """会话历史、轮次详情与导出相关的查询服务。"""
 
     def __init__(self, session: Session):
         self.session = session
 
     def list_conversations(self, username: str, namespace_id: Any) -> list[dict[str, Any]]:
+        """按空间查询当前用户的会话列表。"""
         namespace_id_int = to_int(namespace_id, 0)
         conversations = self.session.query(InsightNsConversation).filter(
             InsightNsConversation.username == username,
@@ -89,6 +90,7 @@ class InsightNsConversationService:
         return conversation.to_dict()
 
     def rename_conversation(self, username: str, conversation_id: Any, title: str) -> dict[str, Any] | None:
+        """更新会话标题；空标题时回退到默认标题生成逻辑。"""
         conversation = self._get_accessible_conversation(username, conversation_id)
         if conversation is None:
             return None
@@ -103,6 +105,11 @@ class InsightNsConversationService:
         return conversation.to_dict()
 
     def get_conversation_history(self, username: str, conversation_id: Any) -> dict[str, Any] | None:
+        """
+        返回主聊天区使用的轮次历史。
+
+        这里会把 turn、latest execution 和 artifacts 聚合成前端直接消费的结果卡结构。
+        """
         conversation = self._get_accessible_conversation(username, conversation_id)
         if conversation is None:
             return None
@@ -161,6 +168,7 @@ class InsightNsConversationService:
         }
 
     def get_turn_detail(self, username: str, conversation_id: Any, turn_id: Any) -> dict[str, Any] | None:
+        """返回单轮完整详情，用于详情抽屉和调试场景。"""
         conversation = self._get_accessible_conversation(username, conversation_id)
         if conversation is None:
             return None
@@ -215,6 +223,7 @@ class InsightNsConversationService:
         conversation_id: Any,
         turn_id: Any,
     ) -> tuple[bytes, str] | None:
+        """把单轮分析结果导出为 PDF。"""
         detail = self.get_turn_detail(username=username, conversation_id=conversation_id, turn_id=turn_id)
         if detail is None:
             return None
@@ -269,6 +278,7 @@ class InsightNsConversationService:
         }
 
     def _group_artifacts_by_turn(self, artifacts: list[InsightNsArtifact]) -> dict[int, dict[str, Any]]:
+        """按轮次聚合产物，便于历史列表直接渲染结果卡。"""
         artifact_map: dict[int, dict[str, Any]] = {}
         for artifact in artifacts:
             turn_artifacts = artifact_map.setdefault(artifact.turn_id, self._empty_turn_artifacts())
@@ -303,6 +313,11 @@ class InsightNsConversationService:
         return artifact_map
 
     def _artifact_to_view(self, artifact: InsightNsArtifact) -> dict[str, Any]:
+        """
+        统一解析产物中的 JSON 字段。
+
+        chart_spec 会在这里做一次轻量规范化，保证前端展示和导出链看到的是同一份图表定义。
+        """
         payload = artifact.to_dict()
         content_json = payload.get('content_json')
         if isinstance(content_json, str):
@@ -350,6 +365,7 @@ class InsightNsConversationService:
         chart_artifacts: list[dict[str, Any]],
         report_text: str,
     ) -> bytes:
+        """把图表与分析报告排版成 PDF 字节流。"""
         self._ensure_pdf_font_registered()
 
         buffer = BytesIO()

@@ -21,6 +21,7 @@ class InsightNsRelDatasourceController(BaseController):
     """提供会话数据源绑定的查询与变更接口。"""
 
     def get_by_conversation(self):
+        """查询某个会话当前已绑定的数据源。"""
         insight_conversation_id = request.args.get('insight_conversation_id', type=int)
         if not insight_conversation_id:
             return self.error_response("缺少 insight_conversation_id 参数")
@@ -34,6 +35,7 @@ class InsightNsRelDatasourceController(BaseController):
             session.close()
 
     def bind_datasource(self):
+        """把空间级数据源绑定到当前会话。"""
         data = self.get_json_data()
         insight_conversation_id = data.get('insight_conversation_id')
         datasource_id = data.get('datasource_id')
@@ -54,6 +56,7 @@ class InsightNsRelDatasourceController(BaseController):
             session.close()
 
     def remove(self):
+        """从当前会话解绑某个数据源，不删除空间级数据源本体。"""
         data = self.get_json_data()
         insight_conversation_id = data.get('insight_conversation_id')
         datasource_id = data.get('datasource_id')

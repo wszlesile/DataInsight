@@ -29,6 +29,7 @@ class InsightNamespaceService:
         self.session = session
 
     def list_namespaces(self, username: str) -> list[dict[str, Any]]:
+        """返回当前用户可见的空间列表。"""
         namespaces = self.session.query(InsightNamespace).filter(
             InsightNamespace.username == username,
             InsightNamespace.is_deleted == 0,
@@ -39,6 +40,12 @@ class InsightNamespaceService:
         return [self._to_dict(item) for item in namespaces]
 
     def create_namespace(self, username: str, name: str) -> dict[str, Any]:
+        """
+        创建空间，并同步创建一条默认会话。
+
+        当前产品进入空间后就允许直接开始对话，因此把空间初始化和默认会话
+        初始化放在同一事务里完成。
+        """
         normalized_name = (name or '').strip()[:128]
         if not normalized_name:
             raise ValueError('洞察空间名称不能为空')
@@ -87,6 +94,7 @@ class InsightNamespaceService:
         }
 
     def rename_namespace(self, username: str, namespace_id: Any, name: str) -> dict[str, Any] | None:
+        """更新空间名称，并做同用户下的唯一性校验。"""
         normalized_name = (name or '').strip()[:128]
         if not normalized_name:
             raise ValueError('洞察空间名称不能为空')
@@ -114,6 +122,12 @@ class InsightNamespaceService:
         return self._to_dict(namespace)
 
     def delete_namespace(self, username: str, namespace_id: Any) -> bool:
+        """
+        软删除空间及其下所有会话级上下文数据。
+
+        不改变当前架构设计，只在一个地方集中收口空间删除时需要级联清理的
+        会话、轮次、消息、执行、产物、记忆、绑定关系和收藏。
+        """
         namespace = self.session.query(InsightNamespace).filter(
             InsightNamespace.id == int(namespace_id),
             InsightNamespace.username == username,

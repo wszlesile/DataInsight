@@ -25,13 +25,14 @@ def create_insight_ns_conversation_controller() -> Blueprint:
 
 
 class InsightNsConversationController(BaseController):
-    """会话历史、详情和重命名相关的查询控制器。"""
+    """会话列表、历史、详情、导出与原轮重跑接口。"""
 
     def _get_username(self) -> str:
         user_context = get_current_user_context()
         return user_context.username if user_context else 'anonymous'
 
     def create_conversation(self):
+        """在指定空间下创建一条新的空会话。"""
         data = self.get_json_data()
         namespace_id = data.get('namespace_id', 0)
         title = data.get('title', '')
@@ -50,6 +51,7 @@ class InsightNsConversationController(BaseController):
             session.close()
 
     def list_conversations(self):
+        """按空间查询会话列表。"""
         namespace_id = request.args.get('namespace_id', '0')
         session = SessionLocal()
         try:
@@ -63,6 +65,7 @@ class InsightNsConversationController(BaseController):
             session.close()
 
     def rename_conversation(self, conversation_id: int):
+        """重命名会话。"""
         data = self.get_json_data()
         title = data.get('title', '')
         session = SessionLocal()
@@ -80,6 +83,7 @@ class InsightNsConversationController(BaseController):
             session.close()
 
     def get_history(self, conversation_id: int):
+        """返回主聊天区使用的轮次历史。"""
         session = SessionLocal()
         try:
             service = InsightNsConversationService(session)
@@ -94,6 +98,7 @@ class InsightNsConversationController(BaseController):
             session.close()
 
     def get_turn_detail(self, conversation_id: int, turn_id: int):
+        """返回单轮详情，包含消息、执行与产物。"""
         session = SessionLocal()
         try:
             service = InsightNsConversationService(session)
@@ -109,6 +114,7 @@ class InsightNsConversationController(BaseController):
             session.close()
 
     def export_turn_pdf(self, conversation_id: int, turn_id: int):
+        """导出单轮分析结果 PDF。"""
         session = SessionLocal()
         try:
             service = InsightNsConversationService(session)
@@ -130,6 +136,7 @@ class InsightNsConversationController(BaseController):
             session.close()
 
     def rerun_turn_stream(self, conversation_id: int, turn_id: int):
+        """在同一轮次内流式重跑分析，不新增新轮次。"""
         from agent.invoker import stream_rerun_turn
         username = self._get_username()
 
