@@ -81,6 +81,29 @@ def create_data_insight_agent():
 insight_agent = create_data_insight_agent()
 
 
+def _merge_system_messages(*parts: BaseMessage | list[BaseMessage] | None) -> str:
+    """Merge all system-level context into a single system prompt string."""
+    merged_parts: list[str] = []
+
+    def append_message(message: BaseMessage | None) -> None:
+        if message is None or not isinstance(message, SystemMessage):
+            return
+        content = (message.content or '').strip()
+        if content:
+            merged_parts.append(content)
+
+    for part in parts:
+        if part is None:
+            continue
+        if isinstance(part, list):
+            for item in part:
+                append_message(item)
+        else:
+            append_message(part)
+
+    return '\n\n'.join(item for item in merged_parts if item)
+
+
 def build_prompt_messages(
     user_message: str,
     namespace_id: int = 0,
@@ -98,32 +121,35 @@ def build_prompt_messages(
     3. 记忆与历史上下文
     4. 当前用户问题
     """
-    messages: list[BaseMessage] = [
-        SystemMessage(load_system_prompt()),
-    ]
-
-    # 先注入数据源上下文，再注入历史消息，
-    # 这样模型会先知道当前可分析的数据范围。
     datasource_message = get_datasource_message(
         namespace_id=namespace_id,
         conversation_id=conversation_id,
         snapshot_override=datasource_snapshot_override,
     )
-    if datasource_message is not None:
-        messages.append(datasource_message)
-
-    # 记忆消息是从执行记录、派生产物和历史消息中提炼出的压缩上下文，
-    # 因此应该放在原始历史消息之前。
-    messages.extend(get_memory_messages(
+    memory_messages = get_memory_messages(
         conversation_id,
         user_message=user_message,
         max_turn_no=history_turn_limit,
         active_snapshot_override=datasource_snapshot_override,
-    ))
+    )
+    runtime_messages = [
+        SystemMessage(extra_message)
+        for extra_message in (extra_system_messages or [])
+        if extra_message
+    ]
+
+    merged_system_content = _merge_system_messages(
+        SystemMessage(load_system_prompt()),
+        datasource_message,
+        memory_messages,
+        runtime_messages,
+    )
+
+    messages: list[BaseMessage] = []
+    if merged_system_content:
+        messages.append(SystemMessage(merged_system_content))
+
     messages.extend(get_history_messages(conversation_id, max_turn_no=history_turn_limit))
-    for extra_message in extra_system_messages or []:
-        if extra_message:
-            messages.append(SystemMessage(extra_message))
     messages.append(HumanMessage(user_message))
     return messages
 

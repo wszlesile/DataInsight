@@ -552,6 +552,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
             tables=tables,
         )
     except Exception as exc:
+        session.rollback()
         service.fail_run(runtime.conversation.id, runtime.turn.id, str(exc))
         raise
     finally:
@@ -759,6 +760,7 @@ def _stream_with_runtime(
             turn_id=runtime.turn.id,
         )
     except Exception as exc:
+        service.session.rollback()
         service.fail_run(runtime.conversation.id, runtime.turn.id, str(exc))
         yield _build_progress_event(
             'error',

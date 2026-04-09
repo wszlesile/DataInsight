@@ -623,7 +623,6 @@ class ConversationContextService:
         last_seq = self.session.query(func.max(InsightNsMessage.seq_no)).filter(
             InsightNsMessage.insight_conversation_id == conversation_id,
             InsightNsMessage.turn_no == turn_no,
-            InsightNsMessage.is_deleted == 0,
         ).scalar()
         return int(last_seq or 0) + 1
 
