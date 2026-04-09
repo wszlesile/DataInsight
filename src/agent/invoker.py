@@ -252,6 +252,23 @@ def _build_regenerate_instruction(
     )
 
 
+def _build_rerun_instruction(runtime: ConversationRunContext) -> str:
+    """
+    为“分析刷新/原轮次重跑”补一条首轮运行时指令。
+
+    这里不改变原问题文本，只明确告诉模型：
+    当前不是普通续问，也不是让它复述历史答案，而是要基于同一轮问题重新执行分析。
+    """
+    if not runtime.is_rerun:
+        return ''
+
+    return (
+        '当前操作是“刷新分析”，需要在同一轮内重新执行这条分析请求。'
+        '请基于本轮原始问题、当前会话数据源和已有历史上下文重新完成分析，'
+        '不要直接复述之前的结论，必须重新调用 execute_python 生成新的分析结果。'
+    )
+
+
 def _finalize_run(
     service: ConversationContextService,
     runtime: ConversationRunContext,
@@ -493,6 +510,8 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                     runtime=runtime,
                     round_index=round_index,
                 )
+            elif runtime.is_rerun and round_index == 0:
+                runtime_instruction = _build_rerun_instruction(runtime)
             elif round_index == 0:
                 runtime_instruction = _build_regenerate_instruction(
                     service=service,
@@ -616,6 +635,8 @@ def _stream_with_runtime(
                     level='warning',
                     message='本轮分析尚未完成，正在根据最近执行错误继续修正代码。',
                 )
+            elif runtime.is_rerun and round_index == 0:
+                runtime_instruction = _build_rerun_instruction(runtime)
             elif round_index == 0:
                 runtime_instruction = _build_regenerate_instruction(
                     service=service,
