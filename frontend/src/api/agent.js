@@ -1,7 +1,7 @@
 import axios from 'axios'
 
 const SUPOS_AUTHORIZATION =
-  import.meta.env.VITE_SUPOS_AUTHORIZATION || 'Bearer KTAlgyHWSJAgtIfXprgHu'
+  import.meta.env.VITE_SUPOS_AUTHORIZATION || 'Bearer JSXozLjgzZuYcDAoFCNvT'
 
 function getAuthorizationHeader() {
   return SUPOS_AUTHORIZATION
@@ -108,9 +108,27 @@ export function uploadNamespaceDatasource(namespaceId, file) {
   })
 }
 
-export function importNamespaceUnsDatasources(namespaceId, ids) {
+export function importNamespaceUnsDatasources(namespaceId, conversationId, nodes) {
   return api.post(`/insight/namespaces/${namespaceId}/datasources/import-uns`, {
-    ids
+    insight_conversation_id: conversationId,
+    nodes
+  })
+}
+
+export function listNamespaceUnsSelections(namespaceId, conversationId) {
+  return api.get(`/insight/namespaces/${namespaceId}/uns/selections`, {
+    params: {
+      insight_conversation_id: conversationId
+    }
+  })
+}
+
+export function removeNamespaceUnsSelection(namespaceId, conversationId, unsNodeId) {
+  return api.delete(`/insight/namespaces/${namespaceId}/uns/selections`, {
+    data: {
+      insight_conversation_id: conversationId,
+      uns_node_id: unsNodeId
+    }
   })
 }
 

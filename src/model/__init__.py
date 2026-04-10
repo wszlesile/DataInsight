@@ -112,6 +112,7 @@ class InsightDatasource(Base):
     datasource_type = Column(String(32), nullable=False, comment='数据源类型')
     datasource_name = Column(String(128), nullable=False, comment='数据源名称')
     knowledge_tag = Column(String(128), nullable=False, default='', comment='数据源唯一标识标签')
+    uns_node_id = Column(String(128), nullable=False, default='', comment='UNS 节点唯一 ID')
     datasource_schema = Column(Text, nullable=False, default='', comment='数据源元数据 Schema')
     datasource_config_json = Column(Text, nullable=False, default='{}', comment='数据源配置 JSON')
     is_deleted = Column(Integer, nullable=False, default=0, comment='软删除标记')
@@ -121,6 +122,7 @@ class InsightDatasource(Base):
     __table_args__ = (
         Index('idx_insight_datasource_namespace_name', 'insight_namespace_id', 'datasource_name'),
         Index('idx_insight_datasource_namespace_type', 'insight_namespace_id', 'datasource_type'),
+        Index('idx_insight_datasource_uns_node', 'uns_node_id'),
         {'comment': '空间隔离的数据源定义表'},
     )
 
@@ -131,6 +133,7 @@ class InsightDatasource(Base):
             "datasource_type": self.datasource_type,
             "datasource_name": self.datasource_name,
             "knowledge_tag": self.knowledge_tag,
+            "uns_node_id": self.uns_node_id,
             "datasource_schema": self.datasource_schema,
             "datasource_config_json": self.datasource_config_json,
             "is_deleted": self.is_deleted,
@@ -148,6 +151,7 @@ class InsightNsRelDatasource(Base):
     datasource_id = Column(Integer, nullable=False, default=0, comment='关联空间数据源 ID')
     is_active = Column(Integer, nullable=False, default=1, comment='保留字段，不参与当前业务判断')
     sort_no = Column(Integer, nullable=False, default=0, comment='排序号')
+    bind_source = Column(String(32), nullable=False, default='user_selected', comment='绑定来源')
     is_deleted = Column(Integer, nullable=False, default=0, comment='软删除标记')
     created_at = Column(DateTime, default=_now, comment='创建时间')
     updated_at = Column(DateTime, default=_now, onupdate=_now, comment='更新时间')
@@ -164,6 +168,45 @@ class InsightNsRelDatasource(Base):
             "insight_conversation_id": self.insight_conversation_id,
             "datasource_id": self.datasource_id,
             "sort_no": self.sort_no,
+            "bind_source": self.bind_source,
+            "is_deleted": self.is_deleted,
+            "created_at": _format(self.created_at),
+            "updated_at": _format(self.updated_at),
+        }
+
+
+class InsightNsUnsSelection(Base):
+    """UNS 树选择回显记录；实际分析绑定仍以数据源关系表为准。"""
+
+    __tablename__ = 'insight_ns_uns_selection'
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment='UNS 选择记录主键')
+    insight_namespace_id = Column(Integer, nullable=False, comment='所属洞察空间 ID')
+    insight_conversation_id = Column(Integer, nullable=False, default=0, comment='所属会话 ID')
+    uns_node_id = Column(String(128), nullable=False, default='', comment='UNS 节点 ID')
+    uns_node_name = Column(String(255), nullable=False, default='', comment='UNS 节点名称')
+    uns_node_path = Column(String(1024), nullable=False, default='', comment='UNS 节点路径')
+    is_folder = Column(Integer, nullable=False, default=0, comment='是否文件夹节点')
+    expanded_uns_node_ids_json = Column(Text, nullable=False, default='[]', comment='文件夹展开后的文件节点 ID JSON')
+    is_deleted = Column(Integer, nullable=False, default=0, comment='软删除标记')
+    created_at = Column(DateTime, default=_now, comment='创建时间')
+    updated_at = Column(DateTime, default=_now, onupdate=_now, comment='更新时间')
+
+    __table_args__ = (
+        Index('idx_uns_selection_conversation_node', 'insight_conversation_id', 'uns_node_id'),
+        {'comment': '会话 UNS 树选择回显表'},
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "insight_namespace_id": self.insight_namespace_id,
+            "insight_conversation_id": self.insight_conversation_id,
+            "uns_node_id": self.uns_node_id,
+            "uns_node_name": self.uns_node_name,
+            "uns_node_path": self.uns_node_path,
+            "is_folder": bool(self.is_folder),
+            "expanded_uns_node_ids": _safe_json_loads(self.expanded_uns_node_ids_json, []),
             "is_deleted": self.is_deleted,
             "created_at": _format(self.created_at),
             "updated_at": _format(self.updated_at),

@@ -180,6 +180,7 @@ def _rebuild_insight_datasource_table() -> None:
         'datasource_type',
         'datasource_name',
         'knowledge_tag',
+        'uns_node_id',
         'datasource_schema',
         'datasource_config_json',
         'is_deleted',
@@ -197,6 +198,7 @@ def _rebuild_insight_datasource_table() -> None:
             "datasource_type VARCHAR(32) NOT NULL DEFAULT 'unknown', "
             "datasource_name VARCHAR(128) NOT NULL DEFAULT '', "
             "knowledge_tag VARCHAR(128) NOT NULL DEFAULT '', "
+            "uns_node_id VARCHAR(128) NOT NULL DEFAULT '', "
             "datasource_schema TEXT NOT NULL DEFAULT '', "
             "datasource_config_json TEXT NOT NULL DEFAULT '{}', "
             "is_deleted INTEGER NOT NULL DEFAULT 0, "
@@ -206,16 +208,17 @@ def _rebuild_insight_datasource_table() -> None:
         ))
         rows = connection.execute(text(
             "SELECT id, datasource_type, datasource_name, knowledge_tag, datasource_schema, datasource_config_json, "
-            "insight_namespace_id, is_deleted, created_at, updated_at "
+            "insight_namespace_id, is_deleted, created_at, updated_at, "
+            "COALESCE(uns_node_id, '') AS uns_node_id "
             "FROM insight_datasource"
         )).mappings().all()
         for row in rows:
             connection.execute(text(
                 "INSERT INTO insight_datasource_new ("
-                "id, insight_namespace_id, datasource_type, datasource_name, knowledge_tag, datasource_schema, datasource_config_json, "
+                "id, insight_namespace_id, datasource_type, datasource_name, knowledge_tag, uns_node_id, datasource_schema, datasource_config_json, "
                 "is_deleted, created_at, updated_at"
                 ") VALUES ("
-                ":id, :insight_namespace_id, :datasource_type, :datasource_name, :knowledge_tag, :datasource_schema, :datasource_config_json, "
+                ":id, :insight_namespace_id, :datasource_type, :datasource_name, :knowledge_tag, :uns_node_id, :datasource_schema, :datasource_config_json, "
                 ":is_deleted, :created_at, :updated_at"
                 ")"
             ), {
@@ -224,6 +227,7 @@ def _rebuild_insight_datasource_table() -> None:
                 'datasource_type': _normalize_datasource_type(row.get('datasource_type')),
                 'datasource_name': row.get('datasource_name') or '',
                 'knowledge_tag': row.get('knowledge_tag') or '',
+                'uns_node_id': row.get('uns_node_id') or '',
                 'datasource_schema': row.get('datasource_schema') or '',
                 'datasource_config_json': row.get('datasource_config_json') or '{}',
                 'is_deleted': row.get('is_deleted') or 0,
@@ -246,6 +250,7 @@ def _rebuild_ns_rel_datasource_table() -> None:
         'datasource_id',
         'is_active',
         'sort_no',
+        'bind_source',
         'is_deleted',
         'created_at',
         'updated_at',
@@ -262,6 +267,7 @@ def _rebuild_ns_rel_datasource_table() -> None:
             "datasource_id INTEGER NOT NULL DEFAULT 0, "
             "is_active INTEGER NOT NULL DEFAULT 1, "
             "sort_no INTEGER NOT NULL DEFAULT 0, "
+            "bind_source VARCHAR(32) NOT NULL DEFAULT 'user_selected', "
             "is_deleted INTEGER NOT NULL DEFAULT 0, "
             "created_at DATETIME, "
             "updated_at DATETIME"
@@ -270,6 +276,7 @@ def _rebuild_ns_rel_datasource_table() -> None:
         connection.execute(text(
             "INSERT INTO insight_ns_rel_datasource_new ("
             "id, insight_namespace_id, insight_conversation_id, datasource_id, is_active, sort_no, is_deleted, created_at, updated_at"
+            ", bind_source"
             ") "
             "SELECT "
             "id, "
@@ -280,7 +287,8 @@ def _rebuild_ns_rel_datasource_table() -> None:
             "COALESCE(sort_no, 0), "
             "COALESCE(is_deleted, 0), "
             "created_at, "
-            "updated_at "
+            "updated_at, "
+            "COALESCE(bind_source, 'user_selected') "
             "FROM insight_ns_rel_datasource"
         ))
         connection.execute(text("DROP TABLE insight_ns_rel_datasource"))
@@ -637,6 +645,7 @@ def _run_sqlite_schema_migrations() -> None:
         "datasource_type VARCHAR(32) NOT NULL DEFAULT 'unknown', "
         "datasource_name VARCHAR(128) NOT NULL DEFAULT '', "
         "knowledge_tag VARCHAR(128) NOT NULL DEFAULT '', "
+        "uns_node_id VARCHAR(128) NOT NULL DEFAULT '', "
         "datasource_schema TEXT NOT NULL DEFAULT '', "
         "datasource_config_json TEXT NOT NULL DEFAULT '{}', "
         "is_deleted INTEGER NOT NULL DEFAULT 0, "
@@ -649,6 +658,7 @@ def _run_sqlite_schema_migrations() -> None:
         "insight_conversation_id INTEGER NOT NULL DEFAULT 0",
         "datasource_id INTEGER NOT NULL DEFAULT 0",
         "sort_no INTEGER NOT NULL DEFAULT 0",
+        "bind_source VARCHAR(32) NOT NULL DEFAULT 'user_selected'",
         "datasource_schema TEXT NOT NULL DEFAULT ''",
         "datasource_config_json TEXT NOT NULL DEFAULT '{}'",
         "is_active INTEGER NOT NULL DEFAULT 1",
@@ -659,7 +669,32 @@ def _run_sqlite_schema_migrations() -> None:
     _ensure_columns('insight_datasource', [
         "insight_namespace_id INTEGER NOT NULL DEFAULT 0",
         "knowledge_tag VARCHAR(128) NOT NULL DEFAULT ''",
+        "uns_node_id VARCHAR(128) NOT NULL DEFAULT ''",
         "is_deleted INTEGER NOT NULL DEFAULT 0",
+    ])
+
+    _create_table_if_not_exists(
+        "CREATE TABLE IF NOT EXISTS insight_ns_uns_selection ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "insight_namespace_id INTEGER NOT NULL, "
+        "insight_conversation_id INTEGER NOT NULL DEFAULT 0, "
+        "uns_node_id VARCHAR(128) NOT NULL DEFAULT '', "
+        "uns_node_name VARCHAR(255) NOT NULL DEFAULT '', "
+        "uns_node_path VARCHAR(1024) NOT NULL DEFAULT '', "
+        "is_folder INTEGER NOT NULL DEFAULT 0, "
+        "expanded_uns_node_ids_json TEXT NOT NULL DEFAULT '[]', "
+        "is_deleted INTEGER NOT NULL DEFAULT 0, "
+        "created_at DATETIME, "
+        "updated_at DATETIME"
+        ")"
+    )
+    _ensure_columns('insight_ns_uns_selection', [
+        "uns_node_name VARCHAR(255) NOT NULL DEFAULT ''",
+        "uns_node_path VARCHAR(1024) NOT NULL DEFAULT ''",
+        "is_folder INTEGER NOT NULL DEFAULT 0",
+        "expanded_uns_node_ids_json TEXT NOT NULL DEFAULT '[]'",
+        "is_deleted INTEGER NOT NULL DEFAULT 0",
+        "updated_at DATETIME",
     ])
 
     _ensure_columns('insight_ns_conversation', [
@@ -803,8 +838,16 @@ def _run_sqlite_schema_migrations() -> None:
             "ON insight_datasource (insight_namespace_id, datasource_type)"
         ))
         connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_insight_datasource_uns_node "
+            "ON insight_datasource (uns_node_id)"
+        ))
+        connection.execute(text(
             "CREATE INDEX IF NOT EXISTS idx_ns_rel_datasource_conversation_datasource "
             "ON insight_ns_rel_datasource (insight_conversation_id, datasource_id)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_uns_selection_conversation_node "
+            "ON insight_ns_uns_selection (insight_conversation_id, uns_node_id)"
         ))
         connection.execute(text(
             "CREATE INDEX IF NOT EXISTS idx_rel_knowledge_conversation_knowledge "

@@ -768,7 +768,6 @@ class ConversationContextService:
         ).filter(
             InsightNsRelDatasource.insight_conversation_id == conversation_id,
             InsightNsRelDatasource.is_deleted == 0,
-            InsightDatasource.insight_namespace_id == self._get_conversation_namespace_id_subquery(conversation_id),
             InsightDatasource.is_deleted == 0,
         ).order_by(
             InsightNsRelDatasource.sort_no.asc(),
@@ -802,7 +801,6 @@ class ConversationContextService:
             InsightNsRelDatasource.insight_conversation_id == conversation_id,
             InsightNsRelDatasource.datasource_id.in_(normalized_ids),
             InsightNsRelDatasource.is_deleted == 0,
-            InsightDatasource.insight_namespace_id == self._get_conversation_namespace_id_subquery(conversation_id),
             InsightDatasource.is_deleted == 0,
         ).all()
         valid_ids = {int(row[0]) for row in rows}
@@ -833,7 +831,6 @@ class ConversationContextService:
             InsightNsRelDatasource.insight_conversation_id == conversation_id_int,
             InsightDatasource.id.in_(normalized_ids),
             InsightNsRelDatasource.is_deleted == 0,
-            InsightDatasource.insight_namespace_id == self._get_conversation_namespace_id_subquery(conversation_id_int),
             InsightDatasource.is_deleted == 0,
         ).all()
 
@@ -869,6 +866,7 @@ class ConversationContextService:
                     datasource_id=row.datasource_id,
                     is_active=row.is_active,
                     sort_no=row.sort_no,
+                    bind_source=getattr(row, 'bind_source', 'system_default') or 'system_default',
                     is_deleted=0,
                 ))
 

@@ -32,22 +32,16 @@
       <div v-if="activeUploadMode === 'uns'" class="placeholder-section">
         <div class="section-header">
           <span class="section-title">关联 UNS 节点</span>
-          <div class="section-meta">按树浏览节点，勾选文件后批量导入为空间数据源</div>
+          <div class="section-meta">按树浏览节点，支持勾选文件或文件夹后批量导入</div>
         </div>
 
         <div class="uns-toolbar">
-          <span class="uns-selected-text">已选择 {{ selectedUnsNodeIds.length }} 个文件节点</span>
+          <span class="uns-selected-text">
+            {{ unsSyncing ? 'UNS 选择同步中...' : `已选择 ${selectedUnsNodeIds.length} 个 UNS 节点，勾选后自动生效` }}
+          </span>
           <div class="uns-toolbar-actions">
             <button class="plain-action" type="button" @click="reloadUnsTree">
               刷新
-            </button>
-            <button
-              class="plain-action"
-              type="button"
-              :disabled="!activeNamespaceId || unsImporting || selectedUnsNodeIds.length === 0"
-              @click="importSelectedUnsNodes"
-            >
-              {{ unsImporting ? '导入中...' : '导入到当前空间' }}
             </button>
           </div>
         </div>
@@ -189,7 +183,7 @@
 </template>
 
 <script setup>
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 import {
@@ -197,7 +191,9 @@ import {
   fetchUnsTreeNodes,
   deleteNamespaceDatasource,
   importNamespaceUnsDatasources,
+  listNamespaceUnsSelections,
   listNamespaceDatasources,
+  removeNamespaceUnsSelection,
   unbindConversationDatasource,
   uploadNamespaceDatasource,
 } from '../api/agent.js'
@@ -214,16 +210,18 @@ const emit = defineEmits(['data-source-change'])
 const searchKeyword = ref('')
 const activeUploadMode = ref('external')
 const uploading = ref(false)
-const unsImporting = ref(false)
+const unsSyncing = ref(false)
 const fileInput = ref(null)
 const unsTreeRef = ref(null)
 const unsRootNodes = ref([])
-const selectedUnsNodeIds = ref([])
+const selectedUnsNodes = ref([])
+const backendSelectedUnsNodeIds = ref([])
 const namespaceDatasources = ref([])
 const bindingDatasourceIds = ref([])
 
 let latestDatasourceFetchToken = 0
 let latestUnsTreeToken = 0
+let unsOperationQueue = Promise.resolve()
 
 const uploadModes = [
   { value: 'uns', label: '关联节点资源', icon: '🌉' },
@@ -238,21 +236,32 @@ const unsTreeProps = {
   disabled: 'disabled',
 }
 
+const selectedUnsNodeIds = computed(() => selectedUnsNodes.value.map((item) => item.id))
+
 const isUnsFolderNode = (node) => {
   return Boolean(node?.hasChildren) || Number(node?.countChildren || 0) > 0 || Number(node?.type) === 0
 }
 
 const mapUnsNode = (node) => {
   const isFolder = isUnsFolderNode(node)
+  const countChildren = Number(node.countChildren || 0)
+  const hasChildren = Boolean(node.hasChildren)
+  const canExpand = isFolder && (hasChildren || countChildren > 0)
   return {
     id: String(node.id || node.alias || ''),
     alias: node.alias || '',
     label: node.name || node.pathName || node.alias || '未命名节点',
     pathName: node.pathName || node.path || '',
+    name: node.name || node.pathName || node.alias || '未命名节点',
+    path: node.path || node.pathName || '',
+    hasChildren,
+    countChildren,
+    type: Number(node.type ?? -1),
+    pathType: Number(node.pathType ?? -1),
     raw: node,
     isFolder,
-    disabled: isFolder,
-    isLeaf: !isFolder,
+    disabled: isFolder && !canExpand,
+    isLeaf: !canExpand,
     children: [],
   }
 }
@@ -367,6 +376,7 @@ const fetchUnsRootNodes = async () => {
     if (fetchToken !== latestUnsTreeToken) return
     const rows = response.data?.data?.data || []
     unsRootNodes.value = rows.map(mapUnsNode)
+    await applyUnsCheckedKeys()
   } catch (error) {
     if (fetchToken !== latestUnsTreeToken) return
     console.error('Fetch UNS root nodes error:', error)
@@ -384,6 +394,7 @@ const loadUnsTreeNode = async (node, resolve) => {
     const response = await fetchUnsTreeNodes(props.activeNamespaceId, node.data.id)
     const rows = response.data?.data?.data || []
     resolve(rows.map(mapUnsNode))
+    await applyUnsCheckedKeys()
   } catch (error) {
     console.error('Load UNS child nodes error:', error)
     ElMessage.error(error?.response?.data?.message || '加载 UNS 子节点失败')
@@ -391,47 +402,115 @@ const loadUnsTreeNode = async (node, resolve) => {
   }
 }
 
-const handleUnsCheck = () => {
-  const checkedNodes = unsTreeRef.value?.getCheckedNodes(false, true) || []
-  selectedUnsNodeIds.value = checkedNodes
-    .filter((item) => !item.isFolder && item.id)
-    .map((item) => item.id)
+const toUnsNodePayload = (node) => ({
+  id: String(node?.id || ''),
+  alias: node?.alias || '',
+  name: node?.name || node?.label || '',
+  path: node?.path || node?.pathName || '',
+  pathName: node?.pathName || node?.path || '',
+  hasChildren: Boolean(node?.hasChildren),
+  countChildren: Number(node?.countChildren || 0),
+  type: Number(node?.type ?? -1),
+  pathType: Number(node?.pathType ?? -1),
+  isFolder: Boolean(node?.isFolder),
+})
+
+const handleUnsCheck = (data, checkedState) => {
+  const checkedNodes = unsTreeRef.value?.getCheckedNodes(false, false) || []
+  selectedUnsNodes.value = checkedNodes
+    .filter((item) => item.id)
+    .map((item) => toUnsNodePayload(item))
+
+  const checkedKeys = (checkedState?.checkedKeys || []).map((item) => String(item))
+  const isChecked = checkedKeys.includes(String(data?.id || ''))
+  enqueueUnsSelectionOperation(toUnsNodePayload(data), isChecked)
+}
+
+const enqueueUnsSelectionOperation = (node, checked) => {
+  if (!node.id) return
+  unsOperationQueue = unsOperationQueue
+    .catch(() => undefined)
+    .then(() => syncUnsSelection(node, checked))
+  return unsOperationQueue
+}
+
+const syncUnsSelection = async (node, checked) => {
+  if (!props.activeNamespaceId) {
+    ElMessage.warning('请先创建或选择洞察空间')
+    await fetchUnsSelections()
+    return
+  }
+  if (!props.activeConversation?.id) {
+    ElMessage.warning('请先创建或选择会话，再选择 UNS 节点')
+    await fetchUnsSelections()
+    return
+  }
+
+  unsSyncing.value = true
+  try {
+    const response = checked
+      ? await importNamespaceUnsDatasources(props.activeNamespaceId, props.activeConversation.id, [node])
+      : await removeNamespaceUnsSelection(props.activeNamespaceId, props.activeConversation.id, node.id)
+    if (!response.data?.success) {
+      throw new Error(response.data?.message || '同步 UNS 节点选择失败')
+    }
+
+    await fetchNamespaceDatasources()
+    await fetchUnsSelections()
+    const failed = response.data?.data?.failed || []
+    if (failed.length) {
+      ElMessage.warning(`${response.data.message}，部分节点未同步成功`)
+    } else {
+      ElMessage.success(response.data.message || 'UNS 节点选择已同步')
+    }
+  } catch (error) {
+    console.error('Sync UNS selection error:', error)
+    ElMessage.error(error?.response?.data?.message || error.message || '同步 UNS 节点选择失败')
+    await fetchUnsSelections()
+  } finally {
+    unsSyncing.value = false
+  }
 }
 
 const reloadUnsTree = async () => {
-  selectedUnsNodeIds.value = []
+  selectedUnsNodes.value = []
+  backendSelectedUnsNodeIds.value = []
   unsRootNodes.value = []
+  await fetchUnsSelections()
   await fetchUnsRootNodes()
 }
 
-const importSelectedUnsNodes = async () => {
-  if (!props.activeNamespaceId) {
-    ElMessage.warning('请先创建或选择洞察空间')
-    return
-  }
-  if (selectedUnsNodeIds.value.length === 0) {
-    ElMessage.warning('请先勾选至少一个 UNS 文件节点')
+const applyUnsCheckedKeys = async () => {
+  await nextTick()
+  await new Promise((resolve) => window.setTimeout(resolve, 0))
+  if (!unsTreeRef.value) return
+  const keys = Array.from(new Set([
+    ...backendSelectedUnsNodeIds.value,
+    ...selectedUnsNodeIds.value,
+  ]))
+  unsTreeRef.value.setCheckedKeys(keys, false)
+}
+
+const fetchUnsSelections = async () => {
+  if (!props.activeNamespaceId || !props.activeConversation?.id) {
+    backendSelectedUnsNodeIds.value = []
     return
   }
 
-  unsImporting.value = true
   try {
-    const response = await importNamespaceUnsDatasources(props.activeNamespaceId, selectedUnsNodeIds.value)
-    if (!response.data?.success) {
-      throw new Error(response.data?.message || '导入 UNS 节点失败')
-    }
-    await fetchNamespaceDatasources()
-    const failed = response.data?.data?.failed || []
-    if (failed.length) {
-      ElMessage.warning(`${response.data.message}，请查看失败节点后重试`)
-    } else {
-      ElMessage.success(response.data.message || 'UNS 节点导入成功')
+    const response = await listNamespaceUnsSelections(props.activeNamespaceId, props.activeConversation.id)
+    if (response.data?.success) {
+      const rows = response.data.data || []
+      const checkedNodeIds = rows
+        .map((item) => item.uns_node_id)
+        .map((item) => String(item || ''))
+        .filter(Boolean)
+      backendSelectedUnsNodeIds.value = checkedNodeIds
+      selectedUnsNodes.value = checkedNodeIds.map((id) => ({ id }))
+      await applyUnsCheckedKeys()
     }
   } catch (error) {
-    console.error('Import UNS nodes error:', error)
-    ElMessage.error(error?.response?.data?.message || error.message || '导入 UNS 节点失败')
-  } finally {
-    unsImporting.value = false
+    console.error('Fetch UNS selections error:', error)
   }
 }
 
@@ -549,10 +628,12 @@ const toggleDatasourceBinding = async (resource, event) => {
 watch(
   () => props.activeNamespaceId,
   async () => {
-    selectedUnsNodeIds.value = []
+    selectedUnsNodes.value = []
+    backendSelectedUnsNodeIds.value = []
     unsRootNodes.value = []
     await fetchNamespaceDatasources()
     if (activeUploadMode.value === 'uns') {
+      await fetchUnsSelections()
       await fetchUnsRootNodes()
     }
   },
@@ -563,6 +644,10 @@ watch(
   () => props.activeConversation?.id,
   async () => {
     await fetchNamespaceDatasources()
+    if (activeUploadMode.value === 'uns') {
+      await fetchUnsSelections()
+      await applyUnsCheckedKeys()
+    }
   },
   { immediate: true }
 )
@@ -570,8 +655,12 @@ watch(
 watch(
   () => activeUploadMode.value,
   async (mode) => {
-    if (mode === 'uns' && props.activeNamespaceId && unsRootNodes.value.length === 0) {
+    if (mode !== 'uns' || !props.activeNamespaceId) return
+    await fetchUnsSelections()
+    if (unsRootNodes.value.length === 0) {
       await fetchUnsRootNodes()
+    } else {
+      await applyUnsCheckedKeys()
     }
   }
 )
