@@ -120,7 +120,10 @@ def _load_latest_execution_result(
     execute_python 成功后只向模型返回轻量摘要，
     真正完整的 charts/tables 结果以 execution.result_payload_json 为准。
     """
-    latest_execution = service.get_latest_execution(runtime.turn.id)
+    latest_execution = service.get_latest_execution(
+        runtime.turn.id,
+        started_at=runtime.turn.started_at,
+    )
     if latest_execution is None or latest_execution.execution_status != 'success':
         return '', [], []
 
@@ -190,7 +193,7 @@ def _build_progress_event(event_type: str, **payload: Any) -> dict[str, Any]:
 def _build_agent_context(agent_request: AgentRequest, runtime: ConversationRunContext) -> CustomContext:
     """构造 Agent 与工具层使用的运行上下文。"""
     return CustomContext(
-        username=runtime.conversation.username,
+        username=agent_request.username,
         namespace_id=runtime.conversation.insight_namespace_id,
         conversation_id=runtime.conversation.id,
         turn_id=runtime.turn.id,
@@ -272,12 +275,16 @@ def _build_rerun_instruction(runtime: ConversationRunContext) -> str:
 def _finalize_run(
     service: ConversationContextService,
     runtime: ConversationRunContext,
+    username: str,
     assistant_message: str,
     analysis_report: str,
     charts: list[dict[str, Any]],
     tables: list[dict[str, Any]],
 ) -> AgentResponse:
     """写回最终结果并转换成控制器层可直接使用的响应对象。"""
+    if not ((assistant_message or '').strip() or (analysis_report or '').strip() or charts or tables):
+        raise ValueError('模型本轮未返回可展示内容，也未生成分析产物，请重试。')
+
     run_result = service.complete_run(
         conversation_id=runtime.conversation.id,
         turn_id=runtime.turn.id,
@@ -285,6 +292,7 @@ def _finalize_run(
         analysis_report=analysis_report,
         charts=charts,
         tables=tables,
+        replace_existing_results=runtime.is_rerun,
     )
     chart_artifact_ids: list[int] = []
     for artifact in run_result.get('artifacts', []):
@@ -292,7 +300,7 @@ def _finalize_run(
             chart_artifact_ids.append(int(artifact.get('id', 0) or 0))
 
     return AgentResponse(
-        username=runtime.conversation.username,
+        username=username,
         message=assistant_message,
         conversation_id=runtime.conversation.id,
         turn_id=runtime.turn.id,
@@ -326,10 +334,12 @@ def _did_enter_analysis_flow(
 
     这里不再额外请求模型做意图分流，只依据本轮是否出现过工具执行痕迹来判断。
     """
-    if service.get_latest_execution(runtime.turn.id) is not None:
+    if service.get_latest_execution(runtime.turn.id, started_at=runtime.turn.started_at) is not None:
         return True
     if raw_tool_call_detected:
         return True
+    if runtime.is_rerun:
+        return False
     if analysis_report or (charts or []):
         return True
     return False
@@ -401,7 +411,10 @@ def _build_analysis_recovery_instruction(
     round_index: int,
 ) -> str:
     """为同一轮分析构造后续修复回合的运行时指令。"""
-    executions = service.get_turn_executions(runtime.turn.id)
+    executions = service.get_turn_executions(
+        runtime.turn.id,
+        started_at=runtime.turn.started_at,
+    )
     failed_errors = [
         execution.error_message.strip()
         for execution in executions
@@ -510,7 +523,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                     runtime=runtime,
                     round_index=round_index,
                 )
-            elif runtime.is_rerun and round_index == 0:
+            elif runtime.is_rerun:
                 runtime_instruction = _build_rerun_instruction(runtime)
             elif round_index == 0:
                 runtime_instruction = _build_regenerate_instruction(
@@ -560,11 +573,17 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 _ensure_analysis_result_ready(analysis_report=analysis_report, charts=charts)
                 break
 
+            if runtime.is_rerun:
+                if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
+                    continue
+                raise ValueError('刷新分析未重新执行代码，已保留本轮原有分析结果，请重试。')
+
             break
 
         return _finalize_run(
             service=service,
             runtime=runtime,
+            username=agent_request.username,
             assistant_message=assistant_message,
             analysis_report=analysis_report,
             charts=charts,
@@ -572,7 +591,12 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
         )
     except Exception as exc:
         session.rollback()
-        service.fail_run(runtime.conversation.id, runtime.turn.id, str(exc))
+        service.fail_run(
+            runtime.conversation.id,
+            runtime.turn.id,
+            str(exc),
+            preserve_existing_results=runtime.is_rerun,
+        )
         raise
     finally:
         session.close()
@@ -621,6 +645,7 @@ def _stream_with_runtime(
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
             raw_tool_call_detected = False
             runtime_instruction = ''
+            tool_result_ready = False
             if analysis_flow_started:
                 runtime_instruction = _build_analysis_recovery_instruction(
                     service=service,
@@ -635,7 +660,7 @@ def _stream_with_runtime(
                     level='warning',
                     message='本轮分析尚未完成，正在根据最近执行错误继续修正代码。',
                 )
-            elif runtime.is_rerun and round_index == 0:
+            elif runtime.is_rerun:
                 runtime_instruction = _build_rerun_instruction(runtime)
             elif round_index == 0:
                 runtime_instruction = _build_regenerate_instruction(
@@ -725,6 +750,17 @@ def _stream_with_runtime(
                         chunk.setdefault('conversation_id', runtime.conversation.id)
                         chunk.setdefault('turn_id', runtime.turn.id)
                         yield chunk
+                        if chunk.get('stage') == 'tool_result':
+                            execution_report, execution_charts, execution_tables = _load_latest_execution_result(
+                                service=service,
+                                runtime=runtime,
+                            )
+                            if execution_report and execution_charts:
+                                analysis_report = execution_report
+                                charts = execution_charts
+                                tables = execution_tables
+                                tool_result_ready = True
+                                break
                     elif chunk:
                         yield _build_progress_event(
                             'status',
@@ -734,6 +770,10 @@ def _stream_with_runtime(
                             level='info',
                             message=str(chunk),
                         )
+
+            if tool_result_ready:
+                analysis_flow_started = True
+                break
 
             entered_analysis_flow = _did_enter_analysis_flow(
                 service=service,
@@ -764,11 +804,17 @@ def _stream_with_runtime(
                 _ensure_analysis_result_ready(analysis_report=analysis_report, charts=charts)
                 break
 
+            if runtime.is_rerun:
+                if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
+                    continue
+                raise ValueError('刷新分析未重新执行代码，已保留本轮原有分析结果，请重试。')
+
             break
 
         response = _finalize_run(
             service=service,
             runtime=runtime,
+            username=agent_request.username,
             assistant_message=assistant_message,
             analysis_report=analysis_report,
             charts=charts,
@@ -793,7 +839,12 @@ def _stream_with_runtime(
         )
     except Exception as exc:
         service.session.rollback()
-        service.fail_run(runtime.conversation.id, runtime.turn.id, str(exc))
+        service.fail_run(
+            runtime.conversation.id,
+            runtime.turn.id,
+            str(exc),
+            preserve_existing_results=runtime.is_rerun,
+        )
         yield _build_progress_event(
             'error',
             conversation_id=runtime.conversation.id,

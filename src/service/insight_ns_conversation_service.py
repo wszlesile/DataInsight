@@ -44,7 +44,6 @@ class InsightNsConversationService:
         """按空间查询当前用户的会话列表。"""
         namespace_id_int = to_int(namespace_id, 0)
         conversations = self.session.query(InsightNsConversation).filter(
-            InsightNsConversation.username == username,
             InsightNsConversation.insight_namespace_id == namespace_id_int,
             InsightNsConversation.is_deleted == 0,
         ).order_by(
@@ -75,7 +74,6 @@ class InsightNsConversationService:
         normalized_title = (title or '').strip()[:255] or '新建会话'
 
         conversation = InsightNsConversation(
-            username=username,
             insight_namespace_id=namespace_id_int,
             title=normalized_title,
             status='active',
@@ -369,7 +367,6 @@ class InsightNsConversationService:
             return None
         return self.session.query(InsightNsConversation).filter(
             InsightNsConversation.id == conversation_id_int,
-            InsightNsConversation.username == username,
             InsightNsConversation.is_deleted == 0,
         ).first()
 

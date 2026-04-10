@@ -196,7 +196,6 @@ class ConversationContextService:
     ) -> InsightNsMessage:
         """持久化一条用于多轮上下文重放的消息记录。"""
         message = InsightNsMessage(
-            username=conversation.username,
             insight_namespace_id=conversation.insight_namespace_id,
             insight_conversation_id=conversation.id,
             turn_id=turn.id,
@@ -223,12 +222,24 @@ class ConversationContextService:
         analysis_report: str,
         charts: list[dict[str, Any]] | None = None,
         tables: list[dict[str, Any]] | None = None,
+        replace_existing_results: bool = False,
     ) -> dict[str, Any]:
         """结束一次成功轮次，并刷新会话记忆。"""
         conversation = self._get_conversation_by_id(conversation_id)
         turn = self._get_turn_by_id(turn_id)
         if not conversation or not turn:
             return {}
+
+        latest_execution = self.get_latest_execution(
+            turn.id,
+            started_at=turn.started_at if replace_existing_results else None,
+        )
+        if replace_existing_results:
+            self._archive_previous_turn_results(
+                conversation=conversation,
+                turn=turn,
+                started_at=turn.started_at,
+            )
 
         final_answer = (analysis_report or assistant_message or '').strip()
         turn.final_answer = final_answer
@@ -240,7 +251,6 @@ class ConversationContextService:
         conversation.last_message_at = _now()
         conversation.updated_at = _now()
 
-        latest_execution = self.get_latest_execution(turn.id)
         self.add_message(
             conversation=conversation,
             turn=turn,
@@ -306,11 +316,28 @@ class ConversationContextService:
             "tables": tables or [],
         }
 
-    def fail_run(self, conversation_id: int, turn_id: int, error_message: str) -> None:
+    def fail_run(
+        self,
+        conversation_id: int,
+        turn_id: int,
+        error_message: str,
+        preserve_existing_results: bool = False,
+    ) -> None:
         """结束一次失败轮次，同时保持整体上下文流程不变。"""
         conversation = self._get_conversation_by_id(conversation_id)
         turn = self._get_turn_by_id(turn_id)
         if not conversation or not turn:
+            return
+
+        if preserve_existing_results and self._turn_has_active_result(conversation, turn):
+            self._archive_current_rerun_executions(conversation, turn)
+            turn.status = 'success'
+            turn.error_message = ''
+            turn.finished_at = _now()
+            conversation.status = 'active'
+            conversation.last_message_at = _now()
+            conversation.updated_at = _now()
+            self.session.commit()
             return
 
         turn.status = 'failed'
@@ -330,6 +357,36 @@ class ConversationContextService:
         )
         self._refresh_memories(conversation)
         self.session.commit()
+
+    def _turn_has_active_result(self, conversation: InsightNsConversation, turn: InsightNsTurn) -> bool:
+        if (turn.final_answer or '').strip():
+            return True
+        return self.session.query(InsightNsArtifact.id).filter(
+            InsightNsArtifact.conversation_id == conversation.id,
+            InsightNsArtifact.turn_id == turn.id,
+            InsightNsArtifact.is_deleted == 0,
+        ).first() is not None
+
+    def _archive_current_rerun_executions(
+        self,
+        conversation: InsightNsConversation,
+        turn: InsightNsTurn,
+    ) -> None:
+        started_at = turn.started_at
+        if started_at is None:
+            return
+        self.session.query(InsightNsExecution).filter(
+            InsightNsExecution.conversation_id == conversation.id,
+            InsightNsExecution.turn_id == turn.id,
+            InsightNsExecution.created_at >= started_at,
+            InsightNsExecution.is_deleted == 0,
+        ).update(
+            {
+                InsightNsExecution.is_deleted: 1,
+                InsightNsExecution.updated_at: _now(),
+            },
+            synchronize_session=False,
+        )
 
     def get_recent_prompt_messages(
         self,
@@ -430,15 +487,23 @@ class ConversationContextService:
         ).limit(limit_items).all()
         return list(reversed(rows))
 
-    def get_latest_execution(self, turn_id: Any) -> InsightNsExecution | None:
+    def get_latest_execution(
+        self,
+        turn_id: Any,
+        started_at: datetime | None = None,
+    ) -> InsightNsExecution | None:
         turn_id_int = to_int(turn_id, 0)
         if turn_id_int <= 0:
             return None
 
-        return self.session.query(InsightNsExecution).filter(
+        query = self.session.query(InsightNsExecution).filter(
             InsightNsExecution.turn_id == turn_id_int,
             InsightNsExecution.is_deleted == 0,
-        ).order_by(
+        )
+        if started_at is not None:
+            query = query.filter(InsightNsExecution.created_at >= started_at)
+
+        return query.order_by(
             InsightNsExecution.created_at.desc(),
             InsightNsExecution.id.desc(),
         ).first()
@@ -470,16 +535,24 @@ class ConversationContextService:
             InsightNsTurn.id.desc(),
         ).first()
 
-    def get_turn_executions(self, turn_id: Any) -> list[InsightNsExecution]:
+    def get_turn_executions(
+        self,
+        turn_id: Any,
+        started_at: datetime | None = None,
+    ) -> list[InsightNsExecution]:
         """返回某一轮内全部代码执行记录，按发生顺序排列。"""
         turn_id_int = to_int(turn_id, 0)
         if turn_id_int <= 0:
             return []
 
-        return self.session.query(InsightNsExecution).filter(
+        query = self.session.query(InsightNsExecution).filter(
             InsightNsExecution.turn_id == turn_id_int,
             InsightNsExecution.is_deleted == 0,
-        ).order_by(
+        )
+        if started_at is not None:
+            query = query.filter(InsightNsExecution.created_at >= started_at)
+
+        return query.order_by(
             InsightNsExecution.created_at.asc(),
             InsightNsExecution.id.asc(),
         ).all()
@@ -548,7 +621,6 @@ class ConversationContextService:
 
     def _create_conversation(self, username: str, namespace_id: Any, user_message: str) -> InsightNsConversation:
         conversation = InsightNsConversation(
-            username=username,
             insight_namespace_id=to_int(namespace_id, 0),
             title=build_conversation_title(user_message),
             status='active',
@@ -584,9 +656,21 @@ class ConversationContextService:
         conversation: InsightNsConversation,
         turn: InsightNsTurn,
     ) -> None:
-        """重跑前清空该轮旧结果，仅保留原始问题与数据源快照。"""
+        """重跑开始时只标记运行态，旧结果等新结果成功后再替换。"""
         now = _now()
+        turn.status = 'running'
+        turn.error_message = ''
+        turn.started_at = now
+        turn.finished_at = None
 
+    def _archive_previous_turn_results(
+        self,
+        conversation: InsightNsConversation,
+        turn: InsightNsTurn,
+        started_at: datetime | None,
+    ) -> None:
+        """刷新成功后归档旧结果，避免刷新失败时把用户已看到的结果清空。"""
+        now = _now()
         self.session.query(InsightNsMessage).filter(
             InsightNsMessage.insight_conversation_id == conversation.id,
             InsightNsMessage.turn_id == turn.id,
@@ -594,17 +678,6 @@ class ConversationContextService:
             InsightNsMessage.is_deleted == 0,
         ).update(
             {InsightNsMessage.is_deleted: 1},
-            synchronize_session=False,
-        )
-        self.session.query(InsightNsExecution).filter(
-            InsightNsExecution.conversation_id == conversation.id,
-            InsightNsExecution.turn_id == turn.id,
-            InsightNsExecution.is_deleted == 0,
-        ).update(
-            {
-                InsightNsExecution.is_deleted: 1,
-                InsightNsExecution.updated_at: now,
-            },
             synchronize_session=False,
         )
         self.session.query(InsightNsArtifact).filter(
@@ -615,12 +688,20 @@ class ConversationContextService:
             {InsightNsArtifact.is_deleted: 1},
             synchronize_session=False,
         )
-
-        turn.final_answer = ''
-        turn.status = 'running'
-        turn.error_message = ''
-        turn.started_at = now
-        turn.finished_at = None
+        execution_query = self.session.query(InsightNsExecution).filter(
+            InsightNsExecution.conversation_id == conversation.id,
+            InsightNsExecution.turn_id == turn.id,
+            InsightNsExecution.is_deleted == 0,
+        )
+        if started_at is not None:
+            execution_query = execution_query.filter(InsightNsExecution.created_at < started_at)
+        execution_query.update(
+            {
+                InsightNsExecution.is_deleted: 1,
+                InsightNsExecution.updated_at: now,
+            },
+            synchronize_session=False,
+        )
 
     def _next_seq_no(self, conversation_id: int, turn_no: int) -> int:
         last_seq = self.session.query(func.max(InsightNsMessage.seq_no)).filter(

@@ -21,7 +21,7 @@ from utils import logger
 from utils import normalize_chart_spec
 
 CURRENT_USERNAME = ContextVar('current_username', default='anonymous')
-def load_data_with_fed_query(sql: str,params: Optional[list[Any]] = None):
+def _load_data_with_fed_query(sql: str,params: Optional[list[Any]] = None):
     import psycopg2
     import pandas as pd
 

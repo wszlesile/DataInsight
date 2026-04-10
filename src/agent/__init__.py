@@ -1,6 +1,8 @@
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Generic, TypeVar
+from zoneinfo import ZoneInfo
 
 from langchain.agents import AgentState, create_agent
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
@@ -14,7 +16,7 @@ from agent.context_engineering import (
     get_history_messages,
     get_memory_messages,
 )
-from agent.tools import StructuredResult, execute_python
+from agent.tools import execute_python
 from config import Config
 
 MessageT = TypeVar("MessageT", bound=BaseMessage, covariant=True)
@@ -74,7 +76,6 @@ def create_data_insight_agent():
         state_schema=CustomAgentState,
         context_schema=CustomContext,
         tools=[execute_python],
-        response_format=StructuredResult,
     )
 
 
@@ -102,6 +103,17 @@ def _merge_system_messages(*parts: BaseMessage | list[BaseMessage] | None) -> st
             append_message(part)
 
     return '\n\n'.join(item for item in merged_parts if item)
+
+
+def _build_runtime_environment_message() -> SystemMessage:
+    """Provide stable temporal context for relative-date analysis requests."""
+    now = datetime.now(ZoneInfo('Asia/Shanghai'))
+    return SystemMessage(
+        "运行时环境信息：\n"
+        f"- 当前日期：{now:%Y-%m-%d}\n"
+        f"- 当前时间：{now:%Y-%m-%d %H:%M:%S} Asia/Shanghai\n"
+        "- 用户提到“今天 / 昨天 / 前天 / 本月 / 上月 / 今年 / 去年”等相对日期时，必须以上述当前日期和 Asia/Shanghai 业务时区为准。"
+    )
 
 
 def build_prompt_messages(
@@ -140,6 +152,7 @@ def build_prompt_messages(
 
     merged_system_content = _merge_system_messages(
         SystemMessage(load_system_prompt()),
+        _build_runtime_environment_message(),
         datasource_message,
         memory_messages,
         runtime_messages,

@@ -33,18 +33,16 @@ class InsightNsMessageController(BaseController):
 
     def create(self):
         data = self.get_json_data()
-        username = data.get('username')
         insight_namespace_id = data.get('insight_namespace_id')
         insight_conversation_id = data.get('insight_conversation_id')
         message_type = data.get('type')
         content = data.get('content')
         insight_result = data.get('insight_result', '')
 
-        if not all([username, insight_namespace_id, insight_conversation_id, message_type is not None, content]):
+        if not all([insight_namespace_id, insight_conversation_id, message_type is not None, content]):
             return self.error_response("缺少必要参数")
 
         result = self._service.create_message(
-            username,
             insight_namespace_id,
             insight_conversation_id,
             message_type,
@@ -67,7 +65,6 @@ class InsightNsMessageController(BaseController):
     def _to_dict(self, message) -> dict:
         return {
             "id": message.id,
-            "username": message.username,
             "insight_namespace_id": message.insight_namespace_id,
             "insight_conversation_id": message.insight_conversation_id,
             "type": message.type,

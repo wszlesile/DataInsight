@@ -85,6 +85,14 @@ def _rename_column(table_name: str, old_name: str, new_name: str) -> None:
         connection.execute(text(f"ALTER TABLE {table_name} RENAME COLUMN {old_name} TO {new_name}"))
 
 
+def _drop_column_if_exists(table_name: str, column_name: str) -> None:
+    existing = _existing_columns(table_name)
+    if not existing or column_name not in existing:
+        return
+    with engine.begin() as connection:
+        connection.execute(text(f"ALTER TABLE {table_name} DROP COLUMN {column_name}"))
+
+
 def _create_table_if_not_exists(create_sql: str) -> None:
     with engine.begin() as connection:
         connection.execute(text(create_sql))
@@ -617,6 +625,10 @@ def _run_sqlite_schema_migrations() -> None:
         return
 
     _rename_table('insight_ns_context', 'insight_ns_message')
+    with engine.begin() as connection:
+        connection.execute(text("DROP INDEX IF EXISTS idx_conversation_user_namespace"))
+    _drop_column_if_exists('insight_ns_conversation', 'username')
+    _drop_column_if_exists('insight_ns_message', 'username')
 
     _create_table_if_not_exists(
         "CREATE TABLE IF NOT EXISTS insight_datasource ("
@@ -772,8 +784,7 @@ def _run_sqlite_schema_migrations() -> None:
             "ON insight_ns_conversation (insight_namespace_id, status)"
         ))
         connection.execute(text(
-            "CREATE INDEX IF NOT EXISTS idx_conversation_user_namespace "
-            "ON insight_ns_conversation (username, insight_namespace_id)"
+            "DROP INDEX IF EXISTS idx_conversation_user_namespace"
         ))
         connection.execute(text(
             "CREATE INDEX IF NOT EXISTS idx_message_conversation_turn_seq "

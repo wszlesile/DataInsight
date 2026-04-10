@@ -25,7 +25,6 @@ class InsightNsMessageService(BaseService[InsightNsMessageDAO]):
 
     def create_message(
         self,
-        username: str,
         insight_namespace_id: int,
         insight_conversation_id: int,
         message_type: int,
@@ -33,7 +32,6 @@ class InsightNsMessageService(BaseService[InsightNsMessageDAO]):
         insight_result: str = "",
     ) -> dict[str, Any]:
         message = InsightNsMessage(
-            username=username,
             insight_namespace_id=insight_namespace_id,
             insight_conversation_id=insight_conversation_id,
             type=message_type,
@@ -50,7 +48,6 @@ class InsightNsMessageService(BaseService[InsightNsMessageDAO]):
     def _to_dict(self, message: InsightNsMessage) -> dict[str, Any]:
         return {
             "id": message.id,
-            "username": message.username,
             "insight_namespace_id": message.insight_namespace_id,
             "insight_conversation_id": message.insight_conversation_id,
             "type": message.type,

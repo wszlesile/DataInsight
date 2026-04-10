@@ -176,7 +176,6 @@ class InsightNsConversation(Base):
     __tablename__ = 'insight_ns_conversation'
 
     id = Column(Integer, primary_key=True, autoincrement=True, comment='会话主键')
-    username = Column(String(64), nullable=False, comment='会话所属用户名')
     insight_namespace_id = Column(Integer, nullable=False, comment='所属洞察空间 ID')
     title = Column(String(255), nullable=False, default='新建洞察', comment='会话标题')
     status = Column(String(32), nullable=False, default='active', comment='会话状态')
@@ -192,14 +191,12 @@ class InsightNsConversation(Base):
 
     __table_args__ = (
         Index('idx_conversation_namespace_status', 'insight_namespace_id', 'status'),
-        Index('idx_conversation_user_namespace', 'username', 'insight_namespace_id'),
         {'comment': '洞察分析会话表'},
     )
 
     def to_dict(self):
         return {
             "id": self.id,
-            "username": self.username,
             "insight_namespace_id": self.insight_namespace_id,
             "title": self.title,
             "status": self.status,
@@ -316,7 +313,6 @@ class InsightNsMessage(Base):
     __tablename__ = 'insight_ns_message'
 
     id = Column(Integer, primary_key=True, autoincrement=True, comment='消息主键')
-    username = Column(String(64), nullable=False, comment='消息所属用户名')
     insight_namespace_id = Column(Integer, nullable=False, comment='所属洞察空间 ID')
     insight_conversation_id = Column(Integer, nullable=False, comment='所属会话 ID')
     turn_id = Column(Integer, nullable=False, default=0, comment='所属轮次 ID')
@@ -342,7 +338,6 @@ class InsightNsMessage(Base):
     def to_dict(self):
         return {
             "id": self.id,
-            "username": self.username,
             "insight_namespace_id": self.insight_namespace_id,
             "insight_conversation_id": self.insight_conversation_id,
             "turn_id": self.turn_id,

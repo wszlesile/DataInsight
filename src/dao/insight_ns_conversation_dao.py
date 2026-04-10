@@ -21,13 +21,6 @@ class InsightNsConversationDAO(BaseDAO[InsightNsConversation]):
             InsightNsConversation.is_deleted == 0,
         ).all()
 
-    def find_by_username(self, username: str) -> List[InsightNsConversation]:
-        """根据用户名查询会话列表"""
-        return self._session.query(InsightNsConversation).filter(
-            InsightNsConversation.username == username,
-            InsightNsConversation.is_deleted == 0,
-        ).all()
-
     def find_by_namespace_id_and_created_at_desc(self, insight_namespace_id: int) -> List[InsightNsConversation]:
         """根据洞察空间ID查询会话列表（按创建时间倒序）"""
         return self._session.query(InsightNsConversation).filter(

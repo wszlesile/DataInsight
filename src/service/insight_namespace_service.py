@@ -69,7 +69,6 @@ class InsightNamespaceService:
 
         # 当前业务下空间与会话是 1:1，因此创建空间时同步创建一条真实会话。
         conversation = InsightNsConversation(
-            username=username,
             insight_namespace_id=namespace.id,
             title=normalized_name,
             status='active',
