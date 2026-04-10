@@ -160,7 +160,7 @@ class InsightNsRelDatasourceService:
     def import_uns_nodes_to_namespace(
         self,
         insight_namespace_id: int,
-        aliases: list[str],
+        ids: list[str],
         authorization: str,
         lake_rds_database_name: str,
     ) -> dict[str, Any]:
@@ -171,22 +171,22 @@ class InsightNsRelDatasourceService:
         if insight_namespace_id <= 0:
             return {"success": False, "message": "空间不存在"}
 
-        normalized_aliases = self._normalize_uns_aliases(aliases)
-        if not normalized_aliases:
+        normalized_ids = self._normalize_uns_node_ids(ids)
+        if not normalized_ids:
             return {"success": False, "message": "请选择至少一个 UNS 文件节点"}
         if not authorization:
             return {"success": False, "message": "缺少 SUPOS 认证信息，无法导入 UNS 节点"}
         if not lake_rds_database_name:
             return {"success": False, "message": "当前用户上下文未初始化 LakeRDS 数据库名"}
 
-        detail_results = self._fetch_uns_details_in_parallel(normalized_aliases, authorization)
+        detail_results = self._fetch_uns_details_in_parallel(normalized_ids, authorization)
         imported_rows: list[dict[str, Any]] = []
         failed_rows: list[dict[str, Any]] = []
 
         for result in detail_results:
             if not result.get("success"):
                 failed_rows.append({
-                    "alias": result.get("alias", ""),
+                    "id": result.get("id", ""),
                     "message": result.get("message", "导入失败"),
                 })
                 continue
@@ -200,7 +200,8 @@ class InsightNsRelDatasourceService:
                 imported_rows.append(self._datasource_to_dict(datasource))
             except Exception as exc:
                 failed_rows.append({
-                    "alias": result.get("alias", ""),
+                    "id": result.get("id", ""),
+                    "alias": result.get("detail", {}).get("alias", ""),
                     "message": str(exc),
                 })
 
@@ -265,11 +266,11 @@ class InsightNsRelDatasourceService:
             InsightNsConversation.is_deleted == 0,
         ).first()
 
-    def _normalize_uns_aliases(self, aliases: list[str]) -> list[str]:
+    def _normalize_uns_node_ids(self, ids: list[str]) -> list[str]:
         normalized: list[str] = []
         seen: set[str] = set()
-        for alias in aliases or []:
-            value = str(alias or '').strip()
+        for node_id in ids or []:
+            value = str(node_id or '').strip()
             if not value or value in seen:
                 continue
             normalized.append(value)
@@ -278,33 +279,33 @@ class InsightNsRelDatasourceService:
 
     def _fetch_uns_details_in_parallel(
         self,
-        aliases: list[str],
+        ids: list[str],
         authorization: str,
     ) -> list[dict[str, Any]]:
-        if not aliases:
+        if not ids:
             return []
 
         results: list[dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=min(8, max(1, len(aliases)))) as executor:
-            future_to_alias = {
-                executor.submit(supos_kernel_api.fetch_uns_file_detail, alias, authorization): alias
-                for alias in aliases
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(ids)))) as executor:
+            future_to_id = {
+                executor.submit(supos_kernel_api.fetch_uns_instance_detail, node_id, authorization): node_id
+                for node_id in ids
             }
-            for future in as_completed(future_to_alias):
-                alias = future_to_alias[future]
+            for future in as_completed(future_to_id):
+                node_id = future_to_id[future]
                 try:
                     results.append({
                         "success": True,
-                        "alias": alias,
+                        "id": node_id,
                         "detail": future.result(),
                     })
                 except Exception as exc:
                     results.append({
                         "success": False,
-                        "alias": alias,
+                        "id": node_id,
                         "message": str(exc),
                     })
-        results.sort(key=lambda item: aliases.index(item["alias"]))
+        results.sort(key=lambda item: ids.index(item["id"]))
         return results
 
     def _upsert_uns_table_datasource(
@@ -414,7 +415,7 @@ class InsightNsRelDatasourceService:
         return dump_json(schema.model_dump())
 
     def _build_uns_datasource_schema(self, detail: dict[str, Any], datasource_name: str) -> str:
-        definition = detail.get('definition') or []
+        definition = detail.get('fields') or []
         properties: dict[str, PropertySchema] = {}
         required: list[str] = []
 
@@ -437,7 +438,8 @@ class InsightNsRelDatasourceService:
 
         schema = DataSourceSchema(
             name=datasource_name,
-            description=f"UNS 节点“{detail.get('name') or datasource_name}”转换得到的表结构",
+            description=str(detail.get('description') or '').strip()
+            or f"UNS 节点“{detail.get('name') or datasource_name}”转换得到的表结构",
             properties=properties,
             required=required,
         )

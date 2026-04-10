@@ -72,7 +72,10 @@ class ConversationContextService:
         conversation_id: Any = None,
     ) -> ConversationRunContext:
         """创建或恢复会话，并开启新一轮分析。"""
-        conversation = self._get_accessible_conversation(username, conversation_id)
+        requested_conversation_id = to_int(conversation_id, 0)
+        conversation = self._get_conversation_for_run(conversation_id)
+        if requested_conversation_id > 0 and conversation is None:
+            raise ValueError('当前会话不存在，请重新选择会话后再分析')
         if conversation is None:
             conversation = self._create_conversation(
                 username=username,
@@ -138,7 +141,7 @@ class ConversationContextService:
         turn_id: Any,
     ) -> ConversationRunContext | None:
         """在同一轮次内重新执行分析，并复用该轮原始问题与数据源快照。"""
-        conversation = self._get_accessible_conversation(username, conversation_id)
+        conversation = self._get_conversation_for_run(conversation_id)
         if conversation is None:
             return None
 
@@ -633,13 +636,13 @@ class ConversationContextService:
         ).scalar()
         return max(int(current_turn_no or 0), int(max_turn_no or 0)) + 1
 
-    def _get_accessible_conversation(self, username: str, conversation_id: Any) -> InsightNsConversation | None:
+    def _get_conversation_for_run(self, conversation_id: Any) -> InsightNsConversation | None:
+        """Agent 执行链按会话 ID 恢复会话，避免请求态用户名波动导致误建新会话。"""
         conversation_id_int = to_int(conversation_id, 0)
         if conversation_id_int <= 0:
             return None
         return self.session.query(InsightNsConversation).filter(
             InsightNsConversation.id == conversation_id_int,
-            InsightNsConversation.username == username,
             InsightNsConversation.is_deleted == 0,
         ).first()
 

@@ -123,14 +123,14 @@ class InsightNamespaceController(BaseController):
     def import_uns_datasources(self, namespace_id: int):
         """把选中的 UNS 文件节点批量导入为空间级 table 数据源。"""
         user_context = get_current_user_context()
-        aliases = self.get_json_data().get('aliases') or []
+        ids = self.get_json_data().get('ids') or []
 
         session = SessionLocal()
         try:
             service = InsightNsRelDatasourceService(session)
             result = service.import_uns_nodes_to_namespace(
                 insight_namespace_id=namespace_id,
-                aliases=aliases,
+                ids=ids,
                 authorization=user_context.token if user_context else '',
                 lake_rds_database_name=user_context.lake_rds_database_name if user_context else '',
             )

@@ -36,7 +36,7 @@
         </div>
 
         <div class="uns-toolbar">
-          <span class="uns-selected-text">已选择 {{ selectedUnsAliases.length }} 个文件节点</span>
+          <span class="uns-selected-text">已选择 {{ selectedUnsNodeIds.length }} 个文件节点</span>
           <div class="uns-toolbar-actions">
             <button class="plain-action" type="button" @click="reloadUnsTree">
               刷新
@@ -44,7 +44,7 @@
             <button
               class="plain-action"
               type="button"
-              :disabled="!activeNamespaceId || unsImporting || selectedUnsAliases.length === 0"
+              :disabled="!activeNamespaceId || unsImporting || selectedUnsNodeIds.length === 0"
               @click="importSelectedUnsNodes"
             >
               {{ unsImporting ? '导入中...' : '导入到当前空间' }}
@@ -218,7 +218,7 @@ const unsImporting = ref(false)
 const fileInput = ref(null)
 const unsTreeRef = ref(null)
 const unsRootNodes = ref([])
-const selectedUnsAliases = ref([])
+const selectedUnsNodeIds = ref([])
 const namespaceDatasources = ref([])
 const bindingDatasourceIds = ref([])
 
@@ -393,13 +393,13 @@ const loadUnsTreeNode = async (node, resolve) => {
 
 const handleUnsCheck = () => {
   const checkedNodes = unsTreeRef.value?.getCheckedNodes(false, true) || []
-  selectedUnsAliases.value = checkedNodes
-    .filter((item) => !item.isFolder && item.alias)
-    .map((item) => item.alias)
+  selectedUnsNodeIds.value = checkedNodes
+    .filter((item) => !item.isFolder && item.id)
+    .map((item) => item.id)
 }
 
 const reloadUnsTree = async () => {
-  selectedUnsAliases.value = []
+  selectedUnsNodeIds.value = []
   unsRootNodes.value = []
   await fetchUnsRootNodes()
 }
@@ -409,14 +409,14 @@ const importSelectedUnsNodes = async () => {
     ElMessage.warning('请先创建或选择洞察空间')
     return
   }
-  if (selectedUnsAliases.value.length === 0) {
+  if (selectedUnsNodeIds.value.length === 0) {
     ElMessage.warning('请先勾选至少一个 UNS 文件节点')
     return
   }
 
   unsImporting.value = true
   try {
-    const response = await importNamespaceUnsDatasources(props.activeNamespaceId, selectedUnsAliases.value)
+    const response = await importNamespaceUnsDatasources(props.activeNamespaceId, selectedUnsNodeIds.value)
     if (!response.data?.success) {
       throw new Error(response.data?.message || '导入 UNS 节点失败')
     }
@@ -549,7 +549,7 @@ const toggleDatasourceBinding = async (resource, event) => {
 watch(
   () => props.activeNamespaceId,
   async () => {
-    selectedUnsAliases.value = []
+    selectedUnsNodeIds.value = []
     unsRootNodes.value = []
     await fetchNamespaceDatasources()
     if (activeUploadMode.value === 'uns') {

@@ -190,7 +190,7 @@ def _build_progress_event(event_type: str, **payload: Any) -> dict[str, Any]:
 def _build_agent_context(agent_request: AgentRequest, runtime: ConversationRunContext) -> CustomContext:
     """构造 Agent 与工具层使用的运行上下文。"""
     return CustomContext(
-        username=agent_request.username,
+        username=runtime.conversation.username,
         namespace_id=runtime.conversation.insight_namespace_id,
         conversation_id=runtime.conversation.id,
         turn_id=runtime.turn.id,

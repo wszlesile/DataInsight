@@ -309,7 +309,33 @@ data: {"type":"status","message":"已收到请求，正在理解分析需求。"
   - 新的会话标题
   - 必填
 
-### 3.4 获取会话历史
+### 3.4 删除会话
+
+`DELETE /api/insight/conversations/{conversation_id}`
+
+用途：
+
+- 删除当前用户下的指定会话
+- 后端会同步软删除该会话下的历史轮次、消息、执行记录、分析产物、会话记忆、会话数据源绑定、会话知识绑定和关联收藏
+- 不会删除洞察空间本身，也不会删除空间级数据源定义
+
+请求字段说明：
+
+- `conversation_id`
+  - 路径参数
+  - 要删除的会话 ID
+
+响应示例：
+
+```json
+{
+  "success": true,
+  "message": "会话已删除",
+  "data": null
+}
+```
+
+### 3.5 获取会话历史
 
 `GET /api/insight/conversations/{conversation_id}/history`
 
@@ -632,7 +658,7 @@ data: {"type":"status","message":"已收到请求，正在理解分析需求。"
 前端当前用法说明：
 - 根节点加载时传 `parentId = "0"`
 - 点击文件夹继续展开时，传当前节点的 `id` 作为新的 `parentId`
-- 只把已勾选的文件节点 `alias` 数组传给“导入 UNS 节点到空间数据源”接口
+- 只把已勾选的文件节点 `id` 数组传给“导入 UNS 节点到空间数据源”接口
 
 ### 4.1 获取空间数据源列表
 
@@ -768,16 +794,16 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 
 ```json
 {
-  "aliases": [
-    "_baojingjilubiao_5d3feea65c1942bdbb7a",
-    "_baojingchuzhigongdan_53b31f4fe6c24fd3b8a1"
+  "ids": [
+    "2035975648114712576",
+    "2035976562024194048"
   ]
 }
 ```
 
 请求字段说明：
-- `aliases`
-  - UNS 文件节点 alias 数组
+- `ids`
+  - UNS 文件节点 ID 数组
   - 只传文件节点，不传文件夹
 
 响应 `data` 结构：
@@ -797,7 +823,7 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
   ],
   "failed": [
     {
-      "alias": "_xxx",
+      "id": "2035976562024194048",
       "message": "未查询到 UNS 节点详情"
     }
   ]
@@ -808,12 +834,17 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 - `imported`
   - 成功导入的数据源列表
 - `failed`
-  - 失败的 alias 列表及错误原因
+  - 失败的节点 ID 列表及错误原因
 
 说明：
-- 后端会使用当前用户 `UserContext` 中的 token 调第三方详情接口
+- 后端会使用当前用户 `UserContext` 中的 token 调第三方 UNS 实例详情接口：
+  - `GET {SUPOS_WEB}/inter-api/supos/uns/instance?id={id}`
 - 后端会使用当前用户 `UserContext` 中初始化好的 `LakeRDS` 数据库名
 - 导入后的数据源类型仍然是 `table`
+- 导入时表名取详情接口返回的 `data.alias`
+- 字段定义从详情接口返回的 `data.fields` 转换
+- `datasource_schema.description` 取详情接口返回的 `data.description`
+- `datasource_config_json` 结构保持不变，仍包含 `database_name`、`table_name`、`uns_alias`、`uns_path`、`uns_path_name`
 
 ### 4.4 删除空间数据源
 
@@ -1357,6 +1388,7 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 - `listConversations`
 - `createConversation`
 - `renameConversation`
+- `deleteConversation`
 - `getConversationHistory`
 - `getTurnDetail`
 - `bindConversationDatasource`
@@ -1409,7 +1441,9 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
    - `GET /api/insight/conversations/{conversation_id}/history`
 3. 查看详情：
    - `GET /api/insight/conversations/{conversation_id}/turns/{turn_id}`
-4. 刷新分析：
+4. 删除会话：
+   - `DELETE /api/insight/conversations/{conversation_id}`
+5. 刷新分析：
    - `POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/rerun/stream`
-5. 导出 PDF：
+6. 导出 PDF：
    - `POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/export/pdf`

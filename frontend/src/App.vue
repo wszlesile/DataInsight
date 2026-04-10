@@ -28,6 +28,7 @@
         :active-conversation-id="activeConversationId"
         @select-space="onSelectSpace"
         @select-conversation="onSelectConversation"
+        @delete-conversation="onDeleteConversation"
         @delete-space="onDeleteSpace"
         @rename-space="onRenameSpace"
         @new-space="onNewSpace"
@@ -528,6 +529,7 @@ import {
   createConversation,
   createNamespace,
   createCollect,
+  deleteConversation,
   deleteNamespace,
   exportTurnPdf,
   getConversationHistory,
@@ -1175,6 +1177,46 @@ const onRenameConversation = async (conversation) => {
     if (error !== 'cancel' && error !== 'close') {
       console.error('Rename conversation error:', error)
       ElMessage.error('重命名失败')
+    }
+  }
+}
+
+const clearActiveConversationView = () => {
+  activeConversationId.value = 0
+  chatHistory.value = []
+  loading.value = false
+  resetCurrentConversationState()
+  turnDetailVisible.value = false
+  turnDetail.value = null
+  previewArtifact.value = null
+}
+
+const onDeleteConversation = async (conversation) => {
+  if (!conversation?.id) return
+  try {
+    await ElMessageBox.confirm(
+      `确认删除会话“${conversation.title || `会话 #${conversation.id}`}”吗？删除后会同步清理该会话的历史、分析结果、绑定关系和收藏。`,
+      '删除会话',
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' }
+    )
+    const deletingCurrent = activeConversationId.value === conversation.id
+    if (deletingCurrent) stopCurrentStream()
+    await deleteConversation(conversation.id)
+    await Promise.all([fetchConversations(), fetchCollects()])
+
+    if (deletingCurrent) {
+      const nextConversation = conversations.value[0]
+      if (nextConversation?.id) {
+        await loadConversationHistory(nextConversation.id)
+      } else {
+        clearActiveConversationView()
+      }
+    }
+    ElMessage.success('会话已删除')
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') {
+      console.error('Delete conversation error:', error)
+      ElMessage.error(error?.response?.data?.message || '删除会话失败')
     }
   }
 }

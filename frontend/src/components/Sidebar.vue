@@ -2,7 +2,7 @@
   <aside class="left-panel" :class="{ collapsed }">
     <div class="panel-section">
       <div class="panel-header">
-        <span v-if="!collapsed" class="panel-title">📚 洞察空间</span>
+        <span v-if="!collapsed" class="panel-title">洞察空间</span>
         <div class="panel-actions">
           <button class="panel-icon-btn" type="button" title="新建洞察" @click="$emit('new-space')">
             +
@@ -13,7 +13,7 @@
             :title="collapsed ? '展开侧边栏' : '折叠侧边栏'"
             @click="collapsed = !collapsed"
           >
-            {{ collapsed ? '›' : '‹' }}
+            {{ collapsed ? '>' : '<' }}
           </button>
         </div>
       </div>
@@ -58,7 +58,7 @@
           </button>
         </div>
 
-        <div v-if="!collapsed && activeSpace && conversations.length" class="conversation-section">
+        <div v-if="!collapsed && activeSpace" class="conversation-section">
           <div class="conversation-header">
             <span class="conversation-title">会话</span>
             <button
@@ -70,30 +70,24 @@
             </button>
           </div>
 
-          <div class="conversation-list">
-            <button
+          <div v-if="conversations.length" class="conversation-list">
+            <div
               v-for="conversation in conversations"
               :key="conversation.id"
               class="conversation-item"
               :class="{ active: activeConversationId === conversation.id }"
-              type="button"
               @click="$emit('select-conversation', conversation)"
             >
               <span class="conversation-item-title">{{ conversation.title || `会话 #${conversation.id}` }}</span>
-            </button>
-          </div>
-        </div>
-
-        <div v-else-if="!collapsed && activeSpace" class="conversation-section">
-          <div class="conversation-header">
-            <span class="conversation-title">会话</span>
-            <button
-              class="conversation-create-btn"
-              type="button"
-              @click="$emit('new-conversation')"
-            >
-              新增会话
-            </button>
+              <button
+                class="conversation-delete-btn"
+                type="button"
+                title="删除会话"
+                @click.stop="$emit('delete-conversation', conversation)"
+              >
+                删除
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -108,7 +102,7 @@
         </div>
 
         <div class="notebook-item footer-item" @click="$emit('open-favorites')">
-          <div class="notebook-icon footer-icon favorite">★</div>
+          <div class="notebook-icon footer-icon favorite">*</div>
           <div v-if="!collapsed" class="notebook-info">
             <div class="notebook-name">我的收藏</div>
             <div class="notebook-count">{{ collects.length }} 个收藏</div>
@@ -134,6 +128,7 @@ const props = defineProps({
 defineEmits([
   'select-space',
   'select-conversation',
+  'delete-conversation',
   'delete-space',
   'rename-space',
   'new-space',
@@ -208,7 +203,6 @@ const notebookAbbr = (name) => {
   font-weight: 700;
   color: #4b5563;
   letter-spacing: 0.08em;
-  text-transform: uppercase;
 }
 
 .panel-actions {
@@ -242,74 +236,6 @@ const notebookAbbr = (name) => {
   flex-direction: column;
   gap: 8px;
   padding-right: 2px;
-}
-
-.conversation-section {
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid #e5edf7;
-}
-
-.conversation-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 10px;
-}
-
-.conversation-title {
-  font-size: 12px;
-  font-weight: 700;
-  color: #64748b;
-}
-
-.conversation-create-btn {
-  border: 1px solid #dbe3ef;
-  background: #fff;
-  color: #475569;
-  border-radius: 10px;
-  padding: 6px 10px;
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.conversation-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.conversation-item {
-  width: 100%;
-  text-align: left;
-  border: 1px solid #e5edf7;
-  background: #f8fbff;
-  color: #334155;
-  border-radius: 12px;
-  padding: 9px 12px;
-  cursor: pointer;
-}
-
-.conversation-item:hover {
-  border-color: #bfdbfe;
-  background: #eff6ff;
-}
-
-.conversation-item.active {
-  border-color: #60a5fa;
-  background: #dbeafe;
-  color: #1d4ed8;
-}
-
-.conversation-item-title {
-  display: block;
-  font-size: 12px;
-  font-weight: 600;
-  line-height: 1.5;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .notebook-item {
@@ -362,89 +288,157 @@ const notebookAbbr = (name) => {
   margin-top: 4px;
   font-size: 12px;
   color: #64748b;
-  line-height: 1.45;
+  line-height: 1.4;
 }
 
 .notebook-more {
   border: none;
   background: transparent;
-  color: #94a3b8;
+  color: #64748b;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 4px 0;
+}
+
+.notebook-more:hover {
+  color: #1d4ed8;
+}
+
+.notebook-more.danger {
+  color: #ef4444;
+}
+
+.notebook-more.danger:hover {
+  color: #b91c1c;
+}
+
+.conversation-section {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #e5edf7;
+}
+
+.conversation-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.conversation-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #64748b;
+}
+
+.conversation-create-btn {
+  border: 1px solid #dbe3ef;
+  background: #fff;
+  color: #475569;
+  border-radius: 10px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.conversation-create-btn:hover {
+  border-color: #60a5fa;
+  color: #1d4ed8;
+}
+
+.conversation-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.conversation-item {
+  width: 100%;
+  text-align: left;
+  border: 1px solid #e5edf7;
+  background: #f8fbff;
+  color: #334155;
+  border-radius: 12px;
+  padding: 9px 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.conversation-item:hover {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+}
+
+.conversation-item.active {
+  border-color: #60a5fa;
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.conversation-item-title {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.conversation-delete-btn {
+  border: none;
+  background: transparent;
+  color: #ef4444;
   cursor: pointer;
   font-size: 12px;
   opacity: 0;
   transition: opacity 0.2s ease, color 0.2s ease;
 }
 
-.danger {
-  color: #c2410c;
-}
-
-.notebook-item:hover .notebook-more,
-.notebook-item.active .notebook-more {
+.conversation-item:hover .conversation-delete-btn {
   opacity: 1;
 }
 
-.notebook-more:hover {
-  color: #dc2626;
+.conversation-delete-btn:hover {
+  color: #b91c1c;
 }
 
 .panel-footer-links {
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding-top: 12px;
-  margin-top: 12px;
   border-top: 1px solid #e5edf7;
 }
 
 .footer-item {
-  background: #f8fbff;
+  background: rgba(248, 250, 252, 0.9);
 }
 
 .footer-icon.knowledge {
-  background: linear-gradient(135deg, #06b6d4, #0891b2);
+  background: linear-gradient(135deg, #0ea5e9, #2563eb);
 }
 
 .footer-icon.favorite {
-  background: linear-gradient(135deg, #ec4899, #db2777);
+  background: linear-gradient(135deg, #f97316, #ea580c);
 }
 
 .favorites-badge {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  min-width: 18px;
-  height: 18px;
-  padding: 0 6px;
+  min-width: 20px;
+  height: 20px;
   border-radius: 999px;
   background: #ef4444;
   color: #fff;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 700;
-}
-
-.left-panel.collapsed .panel-section {
-  padding: 18px 10px 12px;
-}
-
-.left-panel.collapsed .panel-header {
-  flex-direction: column;
-  align-items: center;
-}
-
-.left-panel.collapsed .panel-actions {
-  flex-direction: column;
-}
-
-.left-panel.collapsed .notebook-item {
-  justify-content: center;
-  padding: 10px 8px;
-}
-
-.left-panel.collapsed .panel-footer-links {
-  margin-top: auto;
 }
 </style>

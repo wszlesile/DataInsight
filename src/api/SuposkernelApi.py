@@ -20,8 +20,6 @@ class DatabaseInfo:
     port: str = ''
     user: str = ''
     password: str = ''
-    database: str = ''
-
 
 class SuposKernelApi:
     """
@@ -239,24 +237,24 @@ class SuposKernelApi:
         payload = response.json()
         return payload.get("list") or []
 
-    def fetch_uns_file_detail(self, alias: str, authorization: str) -> dict[str, Any]:
-        """查询单个 UNS 文件节点详情。"""
-        if not alias:
-            raise ValueError("UNS alias 不能为空")
+    def fetch_uns_instance_detail(self, node_id: str, authorization: str) -> dict[str, Any]:
+        """查询单个 UNS 实例详情。"""
+        if not node_id:
+            raise ValueError("UNS node id 不能为空")
         if not authorization:
             raise ValueError("SUPOS authorization 不能为空")
-        url = f"{self.supos_web}/os/open-api/uns/file/{alias}"
+        url = f"{self.supos_web}/inter-api/supos/uns/instance"
         headers = {
             "Authorization": authorization,
         }
-        response = requests.get(url, headers=headers, timeout=self.timeout)
+        response = requests.get(url, headers=headers, params={"id": node_id}, timeout=self.timeout)
         response.raise_for_status()
         payload = response.json()
-        if payload.get("code") != 200:
-            raise ValueError(payload.get("msg") or f"查询 UNS 节点详情失败: {alias}")
+        if payload.get("code") not in (0, 200):
+            raise ValueError(payload.get("msg") or f"查询 UNS 实例详情失败: {node_id}")
         data = payload.get("data") or {}
         if not data:
-            raise ValueError(f"未查询到 UNS 节点详情: {alias}")
+            raise ValueError(f"未查询到 UNS 实例详情: {node_id}")
         return data
 
     def fetch_uns_tree_nodes(
@@ -291,3 +289,4 @@ class SuposKernelApi:
 
 
 supos_kernel_api = SuposKernelApi()
+databaseInfo = supos_kernel_api.get_database_info()

@@ -48,6 +48,7 @@ class Config:
 
     # 用户系统配置
     USER_AUTH_ENDPOINT = '/os/inter-api/auth/v1/current-user/sessionInfo'
+    USER_CONTEXT_CACHE_TTL_SECONDS = int(os.environ.get('USER_CONTEXT_CACHE_TTL_SECONDS', 600))
 
     # SUPOS / Kernel 配置
     SUPOS_WEB = os.environ.get('SUPOS_WEB', 'http://localhost:8080')

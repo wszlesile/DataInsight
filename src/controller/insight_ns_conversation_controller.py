@@ -17,6 +17,7 @@ def create_insight_ns_conversation_controller() -> Blueprint:
     blueprint.route('', methods=['POST'])(controller.create_conversation)
     blueprint.route('', methods=['GET'])(controller.list_conversations)
     blueprint.route('/<int:conversation_id>', methods=['PUT'])(controller.rename_conversation)
+    blueprint.route('/<int:conversation_id>', methods=['DELETE'])(controller.delete_conversation)
     blueprint.route('/<int:conversation_id>/history', methods=['GET'])(controller.get_history)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>', methods=['GET'])(controller.get_turn_detail)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/export/pdf', methods=['POST'])(controller.export_turn_pdf)
@@ -79,6 +80,21 @@ class InsightNsConversationController(BaseController):
             if conversation is None:
                 return self.error_response('会话不存在', 404)
             return jsonify(Result.success(data=conversation, message='会话标题已更新').to_dict())
+        finally:
+            session.close()
+
+    def delete_conversation(self, conversation_id: int):
+        """软删除会话及其会话级上下文数据。"""
+        session = SessionLocal()
+        try:
+            service = InsightNsConversationService(session)
+            deleted = service.delete_conversation(
+                username=self._get_username(),
+                conversation_id=conversation_id,
+            )
+            if not deleted:
+                return self.error_response('会话不存在', 404)
+            return jsonify(Result.success(message='会话已删除').to_dict())
         finally:
             session.close()
 

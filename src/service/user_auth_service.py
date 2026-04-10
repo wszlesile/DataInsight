@@ -1,4 +1,5 @@
 import requests
+import time
 from typing import Optional
 
 from config.config import Config
@@ -18,6 +19,8 @@ class UserAuthService:
         self.base_url = Config.SUPOS_WEB
         self.auth_endpoint = Config.USER_AUTH_ENDPOINT
         self.request_timeout = Config.SUPOS_REQUEST_TIMEOUT
+        self.cache_ttl_seconds = Config.USER_CONTEXT_CACHE_TTL_SECONDS
+        self._context_cache: dict[str, tuple[float, UserContext]] = {}
 
     def verify_token(self, token: str) -> Optional[UserContext]:
         """
@@ -71,10 +74,35 @@ class UserAuthService:
         Raises:
             AuthError: 认证失败
         """
+        user_context = self._get_cached_user_context(auth_header)
+        if user_context:
+            return user_context
+
         user_context = self.verify_token(auth_header)
         if not user_context:
             raise AuthError("无效的认证凭证")
+        self._set_cached_user_context(auth_header, user_context)
         return user_context
+
+    def _get_cached_user_context(self, auth_header: str) -> UserContext | None:
+        """按 Authorization 头缓存用户上下文，避免每次请求都访问 SUPOS 用户接口。"""
+        if not auth_header or self.cache_ttl_seconds <= 0:
+            return None
+
+        cached = self._context_cache.get(auth_header)
+        if not cached:
+            return None
+
+        expires_at, user_context = cached
+        if expires_at <= time.time():
+            self._context_cache.pop(auth_header, None)
+            return None
+        return user_context
+
+    def _set_cached_user_context(self, auth_header: str, user_context: UserContext) -> None:
+        if not auth_header or self.cache_ttl_seconds <= 0:
+            return
+        self._context_cache[auth_header] = (time.time() + self.cache_ttl_seconds, user_context)
 
     def _fetch_lake_rds_database_name(self, token: str) -> str:
         """

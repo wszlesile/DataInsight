@@ -11,15 +11,20 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from model import (
     InsightNsArtifact,
     InsightNsConversation,
     InsightNsExecution,
+    InsightNsMemory,
     InsightNsMessage,
+    InsightNsRelDatasource,
+    InsightNsRelKnowledge,
     InsightNamespace,
     InsightNsTurn,
+    InsightUserCollect,
 )
 from utils import (
     build_conversation_title,
@@ -103,6 +108,110 @@ class InsightNsConversationService:
         self.session.commit()
         self.session.refresh(conversation)
         return conversation.to_dict()
+
+    def delete_conversation(self, username: str, conversation_id: Any) -> bool:
+        """软删除单个会话及其会话级上下文数据，不删除空间和空间级数据源。"""
+        conversation = self._get_accessible_conversation(username, conversation_id)
+        if conversation is None:
+            return False
+
+        now = datetime.now()
+        turn_ids = [
+            row[0]
+            for row in self.session.query(InsightNsTurn.id).filter(
+                InsightNsTurn.conversation_id == conversation.id,
+                InsightNsTurn.is_deleted == 0,
+            ).all()
+        ]
+        artifact_ids = [
+            row[0]
+            for row in self.session.query(InsightNsArtifact.id).filter(
+                InsightNsArtifact.conversation_id == conversation.id,
+                InsightNsArtifact.is_deleted == 0,
+            ).all()
+        ]
+
+        self.session.query(InsightNsTurn).filter(
+            InsightNsTurn.conversation_id == conversation.id,
+            InsightNsTurn.is_deleted == 0,
+        ).update(
+            {
+                InsightNsTurn.is_deleted: 1,
+                InsightNsTurn.finished_at: now,
+            },
+            synchronize_session=False,
+        )
+        self.session.query(InsightNsMessage).filter(
+            InsightNsMessage.insight_conversation_id == conversation.id,
+            InsightNsMessage.is_deleted == 0,
+        ).update(
+            {InsightNsMessage.is_deleted: 1},
+            synchronize_session=False,
+        )
+        self.session.query(InsightNsExecution).filter(
+            InsightNsExecution.conversation_id == conversation.id,
+            InsightNsExecution.is_deleted == 0,
+        ).update(
+            {InsightNsExecution.is_deleted: 1},
+            synchronize_session=False,
+        )
+        self.session.query(InsightNsArtifact).filter(
+            InsightNsArtifact.conversation_id == conversation.id,
+            InsightNsArtifact.is_deleted == 0,
+        ).update(
+            {InsightNsArtifact.is_deleted: 1},
+            synchronize_session=False,
+        )
+        self.session.query(InsightNsMemory).filter(
+            InsightNsMemory.conversation_id == conversation.id,
+            InsightNsMemory.is_deleted == 0,
+        ).update(
+            {InsightNsMemory.is_deleted: 1},
+            synchronize_session=False,
+        )
+        self.session.query(InsightNsRelDatasource).filter(
+            InsightNsRelDatasource.insight_conversation_id == conversation.id,
+            InsightNsRelDatasource.is_deleted == 0,
+        ).update(
+            {
+                InsightNsRelDatasource.is_deleted: 1,
+                InsightNsRelDatasource.updated_at: now,
+            },
+            synchronize_session=False,
+        )
+        self.session.query(InsightNsRelKnowledge).filter(
+            InsightNsRelKnowledge.insight_conversation_id == conversation.id,
+            InsightNsRelKnowledge.is_deleted == 0,
+        ).update(
+            {InsightNsRelKnowledge.is_deleted: 1},
+            synchronize_session=False,
+        )
+
+        collect_filters = [
+            InsightUserCollect.insight_conversation_id == conversation.id,
+        ]
+        if turn_ids:
+            collect_filters.append(
+                (InsightUserCollect.collect_type == 'turn') & (InsightUserCollect.target_id.in_(turn_ids))
+            )
+        if artifact_ids:
+            collect_filters.append(
+                (InsightUserCollect.collect_type == 'artifact') & (InsightUserCollect.target_id.in_(artifact_ids))
+            )
+        self.session.query(InsightUserCollect).filter(
+            InsightUserCollect.username == username,
+            InsightUserCollect.is_deleted == 0,
+            or_(*collect_filters),
+        ).update(
+            {InsightUserCollect.is_deleted: 1},
+            synchronize_session=False,
+        )
+
+        conversation.is_deleted = 1
+        conversation.status = 'archived'
+        conversation.updated_at = now
+        self.session.commit()
+        return True
 
     def get_conversation_history(self, username: str, conversation_id: Any) -> dict[str, Any] | None:
         """

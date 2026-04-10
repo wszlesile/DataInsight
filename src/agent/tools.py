@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from agent.context_engineering import CustomContext
 from api.SuposkernelApi import databaseInfo
+from dto import UserContext
 from utils import logger
 from utils import normalize_chart_spec
 
@@ -29,7 +30,7 @@ def load_data_with_fed_query(sql: str,params: Optional[list[Any]] = None):
         host=databaseInfo.host,
         user=databaseInfo.user,
         password=databaseInfo.password,
-        database=databaseInfo.database,
+        database=UserContext.lake_rds_database_name,
         port=int(databaseInfo.port),
     )
 

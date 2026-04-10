@@ -17,7 +17,8 @@ def init_auth_middleware(app):
         """请求前置认证"""
         auth_header = request.headers.get('Authorization', '')
 
-        def _try_bind_user_context() -> None:
+        def _bind_optional_user_context() -> None:
+            """匿名接口允许无 token；如果前端带了 token，则顺手绑定 UserContext。"""
             if not auth_header.startswith('Bearer '):
                 return
             try:
@@ -26,34 +27,35 @@ def init_auth_middleware(app):
             except Exception as exc:
                 logger.warn(f"可选认证初始化失败: {exc}")
 
-        # 跳过匿名路径
+        def _bind_required_user_context():
+            """非匿名接口必须有合法 token。"""
+            if not auth_header.startswith('Bearer '):
+                return jsonify({
+                    'code': 401,
+                    'message': '缺少有效的认证凭证'
+                }), 401
+
+            try:
+                user_context: UserContext = user_auth_service.get_user_context(auth_header)
+                g.user_context = user_context
+                logger.info(f"用户认证成功: {user_context.username}")
+                return None
+            except AuthError as e:
+                logger.warn(f"用户认证失败: {e}")
+                return jsonify({
+                    'code': 401,
+                    'message': str(e)
+                }), 401
+            except Exception as e:
+                logger.error(f"认证异常: {e}")
+                return jsonify({
+                    'code': 500,
+                    'message': '认证服务异常'
+                }), 500
+
+        # 匿名路径走可选认证，避免破坏现有 anonymous 访问链路。
         if any(request.path.startswith(path) for path in ANONYMOUS_PATHS):
-            _try_bind_user_context()
+            _bind_optional_user_context()
             return None
 
-        # 获取Authorization头
-        if not auth_header.startswith('Bearer '):
-            return jsonify({
-                'code': 401,
-                'message': '缺少有效的认证凭证'
-            }), 401
-
-        # 验证token并获取用户上下文
-        try:
-            user_context: UserContext = user_auth_service.get_user_context(auth_header)
-            g.user_context = user_context
-            logger.info(f"用户认证成功: {user_context.username}")
-        except AuthError as e:
-            logger.warn(f"用户认证失败: {e}")
-            return jsonify({
-                'code': 401,
-                'message': str(e)
-            }), 401
-        except Exception as e:
-            logger.error(f"认证异常: {e}")
-            return jsonify({
-                'code': 500,
-                'message': '认证服务异常'
-            }), 500
-
-        return None
+        return _bind_required_user_context()

@@ -1,7 +1,7 @@
 import axios from 'axios'
 
 const SUPOS_AUTHORIZATION =
-  import.meta.env.VITE_SUPOS_AUTHORIZATION || 'Bearer cnTsOfcmJInlgXgaWXFMi'
+  import.meta.env.VITE_SUPOS_AUTHORIZATION || 'Bearer KTAlgyHWSJAgtIfXprgHu'
 
 function getAuthorizationHeader() {
   return SUPOS_AUTHORIZATION
@@ -60,6 +60,10 @@ export function renameConversation(conversationId, title) {
   return api.put(`/insight/conversations/${conversationId}`, { title })
 }
 
+export function deleteConversation(conversationId) {
+  return api.delete(`/insight/conversations/${conversationId}`)
+}
+
 export function getConversationHistory(conversationId) {
   return api.get(`/insight/conversations/${conversationId}/history`)
 }
@@ -104,9 +108,9 @@ export function uploadNamespaceDatasource(namespaceId, file) {
   })
 }
 
-export function importNamespaceUnsDatasources(namespaceId, aliases) {
+export function importNamespaceUnsDatasources(namespaceId, ids) {
   return api.post(`/insight/namespaces/${namespaceId}/datasources/import-uns`, {
-    aliases
+    ids
   })
 }
 
@@ -167,12 +171,17 @@ export function streamRerunTurn(conversationId, turnId, onMessage, onError, onDo
 
 function streamRequest(url, params, onMessage, onError, onDone) {
   const controller = new AbortController()
+  const headers = {
+    'Content-Type': 'application/json'
+  }
+  const authorization = getAuthorizationHeader()
+  if (authorization) {
+    headers.Authorization = authorization
+  }
 
   fetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
+    headers,
     body: JSON.stringify(params || {}),
     signal: controller.signal
   })
