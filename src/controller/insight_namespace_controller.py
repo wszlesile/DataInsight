@@ -175,7 +175,7 @@ class InsightNamespaceController(BaseController):
                 insight_conversation_id=insight_conversation_id,
                 nodes=nodes,
                 authorization=user_context.token if user_context else '',
-                lake_rds_database_name=user_context.lake_rds_database_name if user_context else '',
+                lake_rds_database_name=user_context.database_context.lake_rds_database_name if user_context else '',
                 ids=ids,
             )
             if result['success']:

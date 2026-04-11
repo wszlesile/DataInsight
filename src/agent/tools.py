@@ -15,27 +15,13 @@ from langgraph.prebuilt import ToolRuntime
 from pydantic import BaseModel, Field
 
 from agent.context_engineering import CustomContext
-from api.SuposkernelApi import databaseInfo
-from dto import UserContext
+from api import supos_kernel_api
 from utils import logger
 from utils import normalize_chart_spec
 
 CURRENT_USERNAME = ContextVar('current_username', default='anonymous')
 def _load_data_with_fed_query(sql: str,params: Optional[list[Any]] = None):
-    import psycopg2
-    import pandas as pd
-
-    # 连接数据库
-    db = psycopg2.connect(
-        host=databaseInfo.host,
-        user=databaseInfo.user,
-        password=databaseInfo.password,
-        database=UserContext.lake_rds_database_name,
-        port=int(databaseInfo.port),
-    )
-
-    with db as connection:
-        return pd.read_sql(sql, connection, params=params if params else None)
+    return supos_kernel_api.query_dataframe(sql=sql, params=params)
 
 def load_local_file(file_path: str, sheet_name: Optional[str] = None):
     """
@@ -64,6 +50,9 @@ def load_minio_file(bucket: str, object_name: str, sheet_name: Optional[str] = N
 
 
 def load_data_with_sql(sql: str, params: Optional[list[Any]] = None):
+   return _load_data_with_fed_query(sql=sql,params=params)
+
+def load_local_data_with_sql(sql: str, params: Optional[list[Any]] = None):
     """通过 SQL 从当前配置的数据源中加载表格数据。"""
     import pandas as pd
 
@@ -71,7 +60,6 @@ def load_data_with_sql(sql: str, params: Optional[list[Any]] = None):
 
     with engine.connect() as connection:
         return pd.read_sql(sql, connection, params=params if params else None)
-
 
 def load_data_with_api(
     endpoint: str,

@@ -1,7 +1,7 @@
-from api.SuposkernelApi import DatabaseInfo, SuposKernelApi, supos_kernel_api
+from api.SuposkernelApi import DatabaseContext, SuposKernelApi, supos_kernel_api
 
 __all__ = [
-    "DatabaseInfo",
+    "DatabaseContext",
     "SuposKernelApi",
     "supos_kernel_api",
 ]

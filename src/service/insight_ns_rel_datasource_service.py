@@ -673,7 +673,7 @@ class InsightNsRelDatasourceService:
         datasource.datasource_schema = self._build_uns_datasource_schema(detail, datasource.datasource_name)
         datasource.datasource_config_json = dump_json({
             "database_name": lake_rds_database_name,
-            "table_name": alias,
+            "table_name": f"public.{alias}",
             "uns_alias": alias,
             "uns_path": detail.get('path') or '',
             "uns_path_name": detail.get('pathName') or detail.get('name') or '',

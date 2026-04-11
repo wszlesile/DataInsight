@@ -8,7 +8,7 @@ load_dotenv()
 
 class Config:
     """应用配置类"""
-
+    PROFILE = os.environ.get('PROFILE', 'local')
     # Flask配置
     SECRET_KEY = os.environ.get('SECRET_KEY', 'dev-secret-key')
     DEBUG = os.environ.get('DEBUG', 'True').lower() == 'true'
@@ -52,9 +52,6 @@ class Config:
 
     # SUPOS / Kernel 配置
     SUPOS_WEB = os.environ.get('SUPOS_WEB', 'http://localhost:8080')
-    SUPOS_KERNEL_HOST = os.environ.get('SUPOS_KERNEL_HOST', 'platform-base-kernel')
-    SUPOS_KERNEL_PORT = os.environ.get('SUPOS_KERNEL_PORT', '6443')
-    SUPOS_KERNEL_TOKEN = os.environ.get('SUPOS_KERNEL_TOKEN', '')
     SUPOS_REQUEST_TIMEOUT = int(os.environ.get('SUPOS_REQUEST_TIMEOUT', 15))
 
     # LLM配置

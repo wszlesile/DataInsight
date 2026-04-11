@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -29,6 +29,23 @@ class DataSourceSchema(BaseModel):
 
 
 @dataclass
+class DatabaseContext:
+    """Table/UNS 查询共用的数据库连接上下文。"""
+
+    host: str = ''
+    port: str = ''
+    user: str = ''
+    password: str = ''
+    lake_rds_database_name: str = ''
+
+    def is_ready(self) -> bool:
+        """是否已经拿到完整可用的数据库连接信息。"""
+        return bool(
+            self.host and self.port and self.user and self.password and self.lake_rds_database_name
+        )
+
+
+@dataclass
 class UserContext:
     """当前请求对应的用户上下文。"""
 
@@ -44,15 +61,15 @@ class UserContext:
     user_code: str
     # 当前认证 token。
     token: str
-    # 当前用户可访问的 LakeRDS 数据库名称。
-    lake_rds_database_name: str = ''
+    # 系统级数据库连接上下文单例引用。
+    database_context: DatabaseContext = field(default_factory=DatabaseContext)
 
     @classmethod
     def from_auth_response(
         cls,
         data: dict,
         token: str,
-        lake_rds_database_name: str = '',
+        database_context: DatabaseContext | None = None,
     ) -> 'UserContext':
         """从认证接口响应中构造用户上下文。"""
         user_session = data.get('userSessionInfo', {})
@@ -63,7 +80,7 @@ class UserContext:
             staff_name=user_session.get('staffName', ''),
             user_code=data.get('userCode', ''),
             token=token,
-            lake_rds_database_name=lake_rds_database_name,
+            database_context=database_context or DatabaseContext(),
         )
 
 
@@ -75,6 +92,7 @@ def get_current_user_context():
 
 
 __all__ = [
+    'DatabaseContext',
     'UserContext',
     'get_current_user_context',
     'PropertySchema',
