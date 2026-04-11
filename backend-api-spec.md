@@ -846,7 +846,41 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 - `datasource_schema.description` 取详情接口返回的 `data.description`
 - `datasource_config_json` 结构保持不变，仍包含 `database_name`、`table_name`、`uns_alias`、`uns_path`、`uns_path_name`
 
-### 4.4 删除空间数据源
+### 4.4 修改空间数据源描述
+
+`PUT /api/insight/namespaces/{namespace_id}/datasources/{datasource_id}/description`
+
+用途：
+
+- 修改空间数据源的描述信息
+- 实际更新字段为 `insight_datasource.datasource_schema.description`
+- 只修改描述，不会覆盖 `properties`、`required` 等其他 schema 信息
+
+请求体：
+
+```json
+{
+  "description": "2026年报警记录明细表，包含报警时间、位号、报警等级等字段"
+}
+```
+
+请求字段说明：
+
+- `description`
+  - 数据源描述文本
+  - 可为空字符串；传空时表示清空描述
+
+响应 `data` 字段说明：
+
+- 返回更新后的数据源对象
+- 字段结构与“获取空间数据源列表”中的单条数据源一致
+- 前端通常会直接用返回值更新当前列表项，无需再等下一次刷新
+
+适用场景：
+
+- 空间数据源列表中，点击“编辑描述”后保存
+
+### 4.5 删除空间数据源
 
 `DELETE /api/insight/namespaces/{namespace_id}/datasources/{datasource_id}`
 
@@ -870,7 +904,7 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 }
 ```
 
-### 4.5 绑定数据源到会话
+### 4.6 绑定数据源到会话
 
 `POST /api/insight/conversation/datasource/`
 
@@ -899,7 +933,7 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 
 - 空间数据源列表勾选时调用
 
-### 4.6 从会话解绑数据源
+### 4.7 从会话解绑数据源
 
 `DELETE /api/insight/conversation/datasource/`
 
@@ -1424,13 +1458,15 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
    - `POST /api/insight/conversation/datasource/`
 4. 取消勾选时：
    - `DELETE /api/insight/conversation/datasource/`
-5. 上传文件时：
+5. 编辑数据源描述时：
+   - `PUT /api/insight/namespaces/{namespace_id}/datasources/{datasource_id}/description`
+6. 上传文件时：
    - `POST /api/insight/namespaces/{namespace_id}/datasources/upload`
-6. 加载 UNS 树时：
+7. 加载 UNS 树时：
    - `POST /api/insight/namespaces/{namespace_id}/uns/tree`
-7. 从 UNS 节点导入时：
+8. 从 UNS 节点导入时：
    - `POST /api/insight/namespaces/{namespace_id}/datasources/import-uns`
-8. 删除数据源时：
+9. 删除数据源时：
    - `DELETE /api/insight/namespaces/{namespace_id}/datasources/{datasource_id}`
 
 ### 10.3 聊天分析

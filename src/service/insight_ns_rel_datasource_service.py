@@ -196,6 +196,40 @@ class InsightNsRelDatasourceService:
         self.session.commit()
         return {"success": True, "message": "文件上传成功", "data": self._datasource_to_dict(datasource)}
 
+    def update_namespace_datasource_description(
+        self,
+        insight_namespace_id: int,
+        datasource_id: int,
+        description: str,
+    ) -> dict[str, Any]:
+        """
+        更新空间数据源描述。
+
+        描述存放在 datasource_schema.description，因此这里只改这一项，
+        避免编辑描述时覆盖其他 schema 元信息。
+        """
+        datasource = self.session.query(InsightDatasource).filter(
+            InsightDatasource.id == datasource_id,
+            InsightDatasource.insight_namespace_id.in_([SHARED_UNS_NAMESPACE_ID, insight_namespace_id]),
+            InsightDatasource.is_deleted == 0,
+        ).first()
+        if datasource is None:
+            return {"success": False, "message": "数据源不存在"}
+
+        schema_payload = safe_json_loads(datasource.datasource_schema, {})
+        if not isinstance(schema_payload, dict):
+            schema_payload = {}
+        schema_payload['description'] = str(description or '').strip()
+
+        datasource.datasource_schema = dump_json(schema_payload)
+        self.session.commit()
+        self.session.refresh(datasource)
+        return {
+            "success": True,
+            "message": "数据源描述已更新",
+            "data": self._datasource_to_dict(datasource),
+        }
+
     def import_uns_nodes_to_namespace(
         self,
         insight_namespace_id: int,

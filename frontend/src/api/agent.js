@@ -136,6 +136,12 @@ export function deleteNamespaceDatasource(namespaceId, datasourceId) {
   return api.delete(`/insight/namespaces/${namespaceId}/datasources/${datasourceId}`)
 }
 
+export function updateNamespaceDatasourceDescription(namespaceId, datasourceId, description) {
+  return api.put(`/insight/namespaces/${namespaceId}/datasources/${datasourceId}/description`, {
+    description
+  })
+}
+
 export function fetchUnsTreeNodes(namespaceId, parentId = '0', options = {}) {
   return api.post(
     `/insight/namespaces/${namespaceId}/uns/tree`,

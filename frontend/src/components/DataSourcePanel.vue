@@ -153,9 +153,17 @@
                       <span>{{ resource.checked ? '已绑定' : '绑定到当前会话' }}</span>
                     </label>
                     <button
+                      class="edit-btn"
+                      type="button"
+                      :disabled="editingDatasourceIds.includes(resource.datasource_id)"
+                      @click.stop="handleEditDatasourceDescription(resource)"
+                    >
+                      编辑描述
+                    </button>
+                    <button
                       class="delete-btn"
                       type="button"
-                      :disabled="bindingDatasourceIds.includes(resource.datasource_id)"
+                      :disabled="bindingDatasourceIds.includes(resource.datasource_id) || editingDatasourceIds.includes(resource.datasource_id)"
                       @click.stop="handleDeleteDatasource(resource)"
                     >
                       删除
@@ -166,6 +174,9 @@
                 <div class="data-item-meta">
                   <span class="meta-pill">{{ resource.typeLabel }}</span>
                   <span v-if="resource.knowledgeTag" class="meta-pill muted">{{ resource.knowledgeTag }}</span>
+                  <span v-if="resource.sourceValue && resource.sourceValue !== resource.description" class="meta-pill muted source-pill">
+                    {{ resource.sourceValue }}
+                  </span>
                 </div>
               </div>
             </div>
@@ -195,6 +206,7 @@ import {
   listNamespaceDatasources,
   removeNamespaceUnsSelection,
   unbindConversationDatasource,
+  updateNamespaceDatasourceDescription,
   uploadNamespaceDatasource,
 } from '../api/agent.js'
 
@@ -218,6 +230,7 @@ const selectedUnsNodes = ref([])
 const backendSelectedUnsNodeIds = ref([])
 const namespaceDatasources = ref([])
 const bindingDatasourceIds = ref([])
+const editingDatasourceIds = ref([])
 
 let latestDatasourceFetchToken = 0
 let latestUnsTreeToken = 0
@@ -306,17 +319,21 @@ const getDatasourceTypeLabel = (type) => {
 
 const mapDatasourceCard = (item) => {
   const config = safeParseJson(item.datasource_config_json)
+  const schema = safeParseJson(item.datasource_schema)
   const filePath = config.file_path || config.table_name || config.endpoint || ''
+  const schemaDescription = typeof schema.description === 'string' ? schema.description.trim() : ''
   const icon = item.datasource_type === 'local_file' || item.datasource_type === 'minio_file' ? '📄' : '🗂'
   return {
     id: `datasource-${item.datasource_id}`,
     datasource_id: Number(item.datasource_id),
     checked: Boolean(item.checked),
     title: item.datasource_name,
-    description: filePath || getDatasourceTypeLabel(item.datasource_type),
+    description: schemaDescription || filePath || getDatasourceTypeLabel(item.datasource_type),
+    sourceValue: filePath,
     icon,
     typeLabel: getDatasourceTypeLabel(item.datasource_type),
     knowledgeTag: item.knowledge_tag || '',
+    raw: item,
     payload: {
       datasourceId: Number(item.datasource_id),
       datasourceName: item.datasource_name,
@@ -332,6 +349,33 @@ const setDatasourceChecked = (datasourceId, checked) => {
       ? { ...item, checked }
       : item
   )
+}
+
+const upsertNamespaceDatasource = (datasource) => {
+  if (!datasource) return
+
+  const datasourceId = Number(datasource.datasource_id || datasource.id)
+  let replaced = false
+  namespaceDatasources.value = namespaceDatasources.value.map((item) => {
+    if (Number(item.datasource_id || item.id) !== datasourceId) {
+      return item
+    }
+    replaced = true
+    return {
+      ...item,
+      ...datasource,
+      datasource_id: datasourceId,
+      id: datasourceId,
+      checked: datasource.checked ?? item.checked,
+    }
+  })
+
+  if (!replaced) {
+    namespaceDatasources.value = [
+      ...namespaceDatasources.value,
+      { ...datasource, datasource_id: datasourceId, id: datasourceId },
+    ]
+  }
 }
 
 const syncNamespaceDatasourcesInBackground = async () => {
@@ -576,6 +620,51 @@ const handleDeleteDatasource = async (resource) => {
     ElMessage.success('数据源已删除')
   } catch (error) {
     ElMessage.error(error?.response?.data?.message || error.message || '删除数据源失败')
+  }
+}
+
+const handleEditDatasourceDescription = async (resource) => {
+  if (!props.activeNamespaceId) return
+
+  const datasourceId = Number(resource.datasource_id)
+  if (editingDatasourceIds.value.includes(datasourceId)) return
+
+  try {
+    const { value } = await ElMessageBox.prompt(
+      `请输入“${resource.title}”的数据源描述`,
+      '编辑数据源描述',
+      {
+        inputType: 'textarea',
+        inputValue: safeParseJson(resource.raw?.datasource_schema).description || '',
+        inputPlaceholder: '例如：2026年报警记录明细表，包含报警时间、位号、报警等级等字段',
+        confirmButtonText: '保存',
+        cancelButtonText: '取消',
+      }
+    )
+
+    editingDatasourceIds.value = [...editingDatasourceIds.value, datasourceId]
+    const response = await updateNamespaceDatasourceDescription(
+      props.activeNamespaceId,
+      datasourceId,
+      value ?? ''
+    )
+    if (!response.data?.success) {
+      throw new Error(response.data?.message || '更新数据源描述失败')
+    }
+
+    upsertNamespaceDatasource(response.data.data)
+    ElMessage.success(response.data.message || '数据源描述已更新')
+    window.setTimeout(() => {
+      syncNamespaceDatasourcesInBackground()
+    }, 300)
+  } catch (error) {
+    if (error === 'cancel' || error === 'close' || error?.action === 'cancel' || error?.action === 'close') {
+      return
+    }
+    console.error('Update datasource description error:', error)
+    ElMessage.error(error?.response?.data?.message || error.message || '更新数据源描述失败')
+  } finally {
+    editingDatasourceIds.value = editingDatasourceIds.value.filter((item) => item !== datasourceId)
   }
 }
 
@@ -1074,9 +1163,26 @@ watch(
   cursor: pointer;
 }
 
+.edit-btn {
+  border: none;
+  background: #e0edff;
+  color: #1d4ed8;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.edit-btn:disabled,
 .delete-btn:disabled {
   cursor: not-allowed;
   opacity: 0.6;
+}
+
+.source-pill {
+  max-width: 100%;
+  word-break: break-all;
 }
 
 .empty-state {
