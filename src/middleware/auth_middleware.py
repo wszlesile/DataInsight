@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 from flask import request, g, jsonify
 
 from dto import UserContext
@@ -15,6 +17,7 @@ def init_auth_middleware(app):
     @app.before_request
     def authenticate():
         """请求前置认证"""
+        g.request_id = request.headers.get('X-Request-ID', '').strip() or uuid4().hex
         auth_header = request.headers.get('Authorization', '')
 
         def _bind_optional_user_context() -> None:
@@ -59,3 +62,8 @@ def init_auth_middleware(app):
             return None
 
         return _bind_required_user_context()
+
+    @app.after_request
+    def attach_request_id(response):
+        response.headers['X-Request-ID'] = getattr(g, 'request_id', '')
+        return response

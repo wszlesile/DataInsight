@@ -20,7 +20,7 @@ from agent.tools import execute_python
 from config import Config
 
 MessageT = TypeVar("MessageT", bound=BaseMessage, covariant=True)
-SYS_PROMPT_PATH = Path(__file__).resolve().parents[2] / 'sys_prompt.md'
+SYS_PROMPT_PATH = Path(__file__).resolve().with_name('sys_prompt.md')
 
 
 class CustomAgentState(AgentState):

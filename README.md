@@ -148,7 +148,7 @@ DataInsight/
 │  ├─ service/
 │  └─ utils/
 ├─ frontend/
-├─ sys_prompt.md
+├─ src/agent/sys_prompt.md
 ├─ context-engineering-design.md
 ├─ backend-api-spec.md
 └─ pyproject.toml
@@ -210,4 +210,4 @@ npm run build
 - 后端接口说明：
   - [backend-api-spec.md](D:/PycharmProjects/DataInsight/backend-api-spec.md)
 - Agent 系统提示词：
-  - [sys_prompt.md](D:/PycharmProjects/DataInsight/sys_prompt.md)
+  - [src/agent/sys_prompt.md](D:/PycharmProjects/DataInsight/src/agent/sys_prompt.md)

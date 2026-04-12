@@ -754,6 +754,13 @@ def execute_python(
         title=title,
         description=description,
     )
+    execution_log_context = {
+        'username': getattr(runtime.context, 'username', 'anonymous'),
+        'namespace_id': int(getattr(runtime.context, 'namespace_id', 0) or 0),
+        'conversation_id': int(getattr(runtime.context, 'conversation_id', 0) or 0),
+        'turn_id': int(getattr(runtime.context, 'turn_id', 0) or 0),
+        'execution_id': execution_id,
+    }
 
     task_title = title or '数据分析任务'
     emit(
@@ -763,9 +770,10 @@ def execute_python(
         tool='execute_python',
         message=f"正在执行分析代码：{task_title}",
     )
-    logger.info(f"开始执行：{task_title}")
-    logger.info(f"代码：\n```python\n{code}\n```")
-    logger.info("代码已提交到本地执行器。")
+    with logger.context(**execution_log_context):
+        logger.info(f"开始执行：{task_title}")
+        logger.info(f"代码：\n```python\n{code}\n```")
+        logger.info("代码已提交到本地执行器。")
     emit(
         'status',
         stage='tool_running',
@@ -801,6 +809,8 @@ def execute_python(
                 execution_seconds=int((time.time() - start_time) * 1000),
                 error_message=error_message,
             )
+            with logger.context(**execution_log_context):
+                logger.error(f"代码执行失败（{error_type}）：{error_message}")
             emit(
                 'status',
                 stage='tool_error',
@@ -825,7 +835,8 @@ def execute_python(
             stderr_text = _sanitize_tool_output(stderr_buffer.getvalue())
 
     execution_seconds = int((time.time() - start_time) * 1000)
-    logger.info(f"执行完成，耗时 {execution_seconds / 1000:.2f} 秒")
+    with logger.context(**execution_log_context):
+        logger.info(f"执行完成，耗时 {execution_seconds / 1000:.2f} 秒")
     emit(
         'status',
         stage='tool_finished',
@@ -836,7 +847,8 @@ def execute_python(
 
     if stdout_text:
         # stdout/stderr 既用于调试，也用于后续回看执行历史。
-        logger.info(stdout_text)
+        with logger.context(**execution_log_context):
+            logger.info(stdout_text)
         emit(
             'tool_log',
             stage='tool_output',
@@ -845,7 +857,8 @@ def execute_python(
             message=stdout_text[:1000],
         )
     if stderr_text:
-        logger.info(f"标准错误：\n{stderr_text}")
+        with logger.context(**execution_log_context):
+            logger.info(f"标准错误：\n{stderr_text}")
         emit(
             'tool_log',
             stage='tool_output',

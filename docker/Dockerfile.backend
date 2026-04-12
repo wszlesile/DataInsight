@@ -1,0 +1,88 @@
+# ======================
+# 第一阶段：构建依赖
+# 目标：
+# 1. 安装编译期依赖
+# 2. 安装 Python 运行依赖和 gunicorn
+# 3. 尽量把依赖层提前，便于后续复用缓存
+# ======================
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+# 编译某些 Python 包时需要的系统依赖。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    g++ \
+    libpq-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# 先复制依赖声明和后端源码，供 pip 构建安装。
+COPY pyproject.toml README.md ./
+COPY src ./src
+
+# 安装项目依赖，并额外安装生产启动所需的 gunicorn。
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    python -m pip install --user --ignore-installed packaging . gunicorn
+
+
+# ======================
+# 第二阶段：运行环境
+# 目标：
+# 1. 只保留运行所需的系统库
+# 2. 拷贝 builder 阶段已安装好的 Python 依赖
+# 3. 启动 Flask 应用的 Gunicorn 服务
+# ======================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# 运行时依赖：
+# - libpq5：PostgreSQL 客户端库
+# - tzdata：容器时区
+# - fontconfig / 字体：PDF、图表、中文输出所需
+# - libgomp1：数值计算相关依赖常用运行库
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    libpq5 \
+    tzdata \
+    fontconfig \
+    fonts-liberation \
+    fonts-wqy-zenhei \
+    && rm -rf /var/lib/apt/lists/*
+
+# 统一容器时区为上海，避免日志和导出文件时间混乱。
+RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    dpkg-reconfigure -f noninteractive tzdata
+
+# 复用 builder 阶段已安装完成的 Python 包。
+COPY --from=builder /root/.local /root/.local
+
+# 容器内默认运行参数：
+# - PYTHONPATH 指向 src，方便按现有代码结构导入
+# - TEMP_DIR / UPLOAD_DIR / LOG_DIR 为容器内默认目录
+ENV PATH=/root/.local/bin:$PATH \
+    PYTHONPATH=/app/src \
+    HOST=0.0.0.0 \
+    PORT=5000 \
+    TEMP_DIR=/app/temp \
+    UPLOAD_DIR=/app/uploads \
+    LOG_DIR=/app/logs \
+    PYTHONUNBUFFERED=1
+
+# 拷贝运行时需要的源码和配置文件。
+COPY src ./src
+COPY docker/gunicorn.conf.py ./docker/gunicorn.conf.py
+COPY wsgi.py ./wsgi.py
+
+# 提前创建运行目录，避免首次写文件时报目录不存在。
+RUN mkdir -p /app/temp /app/uploads /app/logs
+
+EXPOSE 5000
+
+# 使用健康检查接口探测服务是否已正常启动。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=3)" || exit 1
+
+# 生产环境使用 gunicorn 启动，不走 Flask 内置开发服务器。
+CMD ["gunicorn", "-c", "docker/gunicorn.conf.py", "wsgi:app"]

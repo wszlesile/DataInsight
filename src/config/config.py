@@ -38,6 +38,11 @@ class Config:
     # 外部上传文件保存目录
     UPLOAD_DIR = os.environ.get('UPLOAD_DIR', 'D:/PycharmProjects/DataInsight/uploads')
 
+    # 日志配置
+    LOG_DIR = os.environ.get('LOG_DIR', 'logs')
+    LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+    LOG_ENABLE_FILE = os.environ.get('LOG_ENABLE_FILE', 'true').lower() == 'true'
+    LOG_RETENTION_DAYS = int(os.environ.get('LOG_RETENTION_DAYS', 15))
     # 分页配置
     DEFAULT_PAGE_SIZE = 10
     MAX_PAGE_SIZE = 100

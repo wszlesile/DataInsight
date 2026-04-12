@@ -612,6 +612,12 @@ def _stream_with_runtime(
     analysis_report = ''
     charts: list[dict[str, Any]] = []
     tables: list[dict[str, Any]] = []
+    log_context_token = logger.bind_context(
+        username=agent_request.username,
+        namespace_id=runtime.conversation.insight_namespace_id,
+        conversation_id=runtime.conversation.id,
+        turn_id=runtime.turn.id,
+    )
     # “原轮次重跑”并不等于“已经进入失败后的修复回合”。
     # 只有当前这次重跑真的执行过分析、且尚未成功收口时，才进入 retry 分支。
     analysis_flow_started = False
@@ -853,6 +859,8 @@ def _stream_with_runtime(
             level='error',
             message=str(exc),
         )
+    finally:
+        logger.reset_context(log_context_token)
 
 
 def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]:
