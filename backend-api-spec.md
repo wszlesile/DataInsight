@@ -736,6 +736,14 @@ data: {"type":"status","message":"已收到请求，正在理解分析需求。"
 
 - `insight_conversation_id`
 
+说明：
+
+- 该接口只返回“当前空间自有数据源”
+- 通过 UNS 选择树导入并落在共享空间的 table 数据源，不在这里展示
+- UNS 资源的选择、回显与绑定状态，请使用：
+  - `GET /api/insight/namespaces/{namespace_id}/uns/selections`
+  - `POST /api/insight/namespaces/{namespace_id}/datasources/import-uns`
+
 示例：
 
 ```http

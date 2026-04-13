@@ -70,7 +70,6 @@ class InsightNsRelDatasourceService:
         如果传入会话 ID，返回结果会直接附带 `checked`，供前端勾选框展示。
         """
         bound_datasource_ids: set[int] = set()
-        visible_shared_datasource_ids: set[int] = set()
         if insight_conversation_id:
             bound_rows = self.session.query(
                 InsightNsRelDatasource.datasource_id,
@@ -84,15 +83,10 @@ class InsightNsRelDatasourceService:
                 for row in bound_rows
                 if (row[1] or BIND_SOURCE_USER_SELECTED) != BIND_SOURCE_SYSTEM_DEFAULT
             }
-            visible_shared_datasource_ids = bound_datasource_ids
 
         rows = self.session.query(InsightDatasource).filter(
             InsightDatasource.is_deleted == 0,
-            (
-                InsightDatasource.insight_namespace_id == insight_namespace_id
-            ) | (
-                InsightDatasource.id.in_(visible_shared_datasource_ids)
-            ),
+            InsightDatasource.insight_namespace_id == insight_namespace_id,
         ).order_by(
             InsightDatasource.created_at.desc(),
             InsightDatasource.id.desc(),
