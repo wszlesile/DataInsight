@@ -198,13 +198,16 @@ class InsightNsUnsSelection(Base):
     )
 
     def to_dict(self):
+        uns_node_path = _safe_json_loads(self.uns_node_path, [])
+        if not isinstance(uns_node_path, list):
+            uns_node_path = []
         return {
             "id": self.id,
             "insight_namespace_id": self.insight_namespace_id,
             "insight_conversation_id": self.insight_conversation_id,
             "uns_node_id": self.uns_node_id,
             "uns_node_name": self.uns_node_name,
-            "uns_node_path": self.uns_node_path,
+            "uns_node_path": uns_node_path,
             "is_folder": bool(self.is_folder),
             "expanded_uns_node_ids": _safe_json_loads(self.expanded_uns_node_ids_json, []),
             "is_deleted": self.is_deleted,

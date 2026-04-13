@@ -18,7 +18,6 @@ def create_insight_namespace_controller() -> Blueprint:
     blueprint.route('', methods=['POST'])(controller.create_namespace)
     blueprint.route('/<int:namespace_id>/uns/tree', methods=['POST'])(controller.fetch_uns_tree)
     blueprint.route('/<int:namespace_id>/uns/selections', methods=['GET'])(controller.list_uns_selections)
-    blueprint.route('/<int:namespace_id>/uns/selections', methods=['DELETE'])(controller.remove_uns_selection)
     blueprint.route('/<int:namespace_id>/datasources', methods=['GET'])(controller.list_datasources)
     blueprint.route('/<int:namespace_id>/datasources/upload', methods=['POST'])(controller.upload_datasource_file)
     blueprint.route('/<int:namespace_id>/datasources/import-uns', methods=['POST'])(controller.import_uns_datasources)
@@ -118,28 +117,6 @@ class InsightNamespaceController(BaseController):
         finally:
             session.close()
 
-    def remove_uns_selection(self, namespace_id: int):
-        """取消当前会话的 UNS 树节点选择，并同步解绑对应数据源。"""
-        data = self.get_json_data()
-        insight_conversation_id = int(data.get('insight_conversation_id') or 0)
-        uns_node_id = str(data.get('uns_node_id') or '').strip()
-        if not insight_conversation_id or not uns_node_id:
-            return self.error_response('缺少必要参数')
-
-        session = SessionLocal()
-        try:
-            service = InsightNsRelDatasourceService(session)
-            result = service.remove_uns_selection_from_conversation(
-                insight_namespace_id=namespace_id,
-                insight_conversation_id=insight_conversation_id,
-                uns_node_id=uns_node_id,
-            )
-            if result['success']:
-                return jsonify(Result.success(data=result.get('data'), message=result['message']).to_dict())
-            return self.error_response(result['message'], 400)
-        finally:
-            session.close()
-
     def upload_datasource_file(self, namespace_id: int):
         """上传文件到空间，并转换成一条空间级数据源。"""
         upload_file = request.files.get('file')
@@ -165,7 +142,6 @@ class InsightNamespaceController(BaseController):
         user_context = get_current_user_context()
         data = self.get_json_data()
         nodes = data.get('nodes') or []
-        ids = data.get('ids') or []
         insight_conversation_id = int(data.get('insight_conversation_id') or 0)
 
         session = SessionLocal()
@@ -177,7 +153,6 @@ class InsightNamespaceController(BaseController):
                 nodes=nodes,
                 authorization=user_context.token if user_context else '',
                 lake_rds_database_name=user_context.database_context.lake_rds_database_name if user_context else '',
-                ids=ids,
             )
             if result['success']:
                 return jsonify(Result.success(data=result['data'], message=result['message']).to_dict())

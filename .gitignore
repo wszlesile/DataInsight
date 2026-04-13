@@ -21,3 +21,4 @@ frontend/.DS_Store
 *.log
 temp/
 uploads/
+/logs/

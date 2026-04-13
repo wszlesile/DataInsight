@@ -9,6 +9,7 @@ import pandas as pd
 from werkzeug.datastructures import FileStorage
 
 from api import supos_kernel_api
+from config.config import Config
 from sqlalchemy.orm import Session
 
 from dto import DataSourceSchema, PropertySchema
@@ -20,11 +21,11 @@ DEFAULT_CONVERSATION_ID = 0
 BIND_SOURCE_USER_SELECTED = 'user_selected'
 BIND_SOURCE_IMPORT_SELECTED = 'import_selected'
 BIND_SOURCE_SYSTEM_DEFAULT = 'system_default'
-UNS_MAX_EXPANDED_FILES = 200
-UNS_MAX_EXPAND_DEPTH = 5
-UNS_TREE_PAGE_SIZE = 100
-UNS_DETAIL_WORKERS = 5
-UNS_IMPORT_MAX_CONCURRENT = 2
+UNS_MAX_EXPANDED_FILES = Config.UNS_MAX_EXPANDED_FILES
+UNS_MAX_EXPAND_DEPTH = Config.UNS_MAX_EXPAND_DEPTH
+UNS_TREE_PAGE_SIZE = Config.UNS_TREE_PAGE_SIZE
+UNS_DETAIL_WORKERS = Config.UNS_DETAIL_WORKERS
+UNS_IMPORT_MAX_CONCURRENT = Config.UNS_IMPORT_MAX_CONCURRENT
 UNS_IMPORT_SEMAPHORE = BoundedSemaphore(UNS_IMPORT_MAX_CONCURRENT)
 
 
@@ -237,7 +238,6 @@ class InsightNsRelDatasourceService:
         nodes: list[dict[str, Any]] | None = None,
         authorization: str = '',
         lake_rds_database_name: str = '',
-        ids: list[str] | None = None,
     ) -> dict[str, Any]:
         """
         将选中的 UNS 节点转换为共享 table 数据源，并绑定到当前会话。
@@ -251,176 +251,132 @@ class InsightNsRelDatasourceService:
         if conversation is None or conversation.insight_namespace_id != insight_namespace_id:
             return {"success": False, "message": "当前会话不存在或不属于该空间"}
 
-        normalized_nodes = self._normalize_uns_nodes(nodes, ids)
-        if not normalized_nodes:
-            return {"success": False, "message": "请选择至少一个 UNS 节点"}
-        if not authorization:
-            return {"success": False, "message": "缺少 SUPOS 认证信息，无法导入 UNS 节点"}
-        if not lake_rds_database_name:
-            return {"success": False, "message": "当前用户上下文未初始化 LakeRDS 数据库名"}
+        normalized_nodes = self._normalize_uns_nodes(nodes)
 
         try:
             with _uns_import_slot():
-                expand_result = self._expand_uns_file_nodes(normalized_nodes, authorization)
-                if not expand_result["file_nodes"]:
-                    has_expand_failure = bool(expand_result["failed"])
-                    message = "UNS 节点展开失败，未找到可导入的文件节点" if has_expand_failure else "该节点下暂无可导入的 UNS 文件节点"
-                    return {
-                        "success": not has_expand_failure,
-                        "message": message,
-                        "data": {
-                            "imported": [],
-                            "failed": expand_result["failed"],
-                            "selections": self.list_uns_selections(insight_conversation_id),
-                        },
-                    }
-
-                detail_results = self._fetch_uns_details_in_parallel(
-                    [node["id"] for node in expand_result["file_nodes"]],
-                    authorization,
-                )
                 imported_rows: list[dict[str, Any]] = []
                 failed_rows: list[dict[str, Any]] = []
+                desired_selections: list[dict[str, Any]] = []
+                desired_file_node_ids: list[str] = []
+                desired_datasource_ids: list[int] = []
 
-                failed_rows.extend(expand_result["failed"])
-                for result in detail_results:
-                    if not result.get("success"):
-                        failed_rows.append({
-                            "id": result.get("id", ""),
-                            "message": result.get("message", "导入失败"),
-                        })
-                        continue
+                if normalized_nodes:
+                    if not authorization:
+                        return {"success": False, "message": "缺少 SUPOS 认证信息，无法导入 UNS 节点"}
+                    if not lake_rds_database_name:
+                        return {"success": False, "message": "当前用户上下文未初始化 LakeRDS 数据库名"}
 
-                    try:
-                        datasource = self._upsert_uns_table_datasource(
-                            detail=result["detail"],
-                            lake_rds_database_name=lake_rds_database_name,
-                        )
-                        self._bind_datasource(
+                    expand_result = self._expand_uns_file_nodes(normalized_nodes, authorization)
+                    if expand_result["failed"]:
+                        return {
+                            "success": False,
+                            "message": "UNS 节点同步失败，请稍后重试",
+                            "data": {
+                                "imported": [],
+                                "failed": expand_result["failed"],
+                                "selections": self.list_uns_selections(insight_conversation_id),
+                            },
+                        }
+
+                    desired_selections = self._canonicalize_uns_selections(expand_result["selections"])
+                    desired_file_node_ids = self._normalize_uns_node_id_list([
+                        node.get("id")
+                        for selection in desired_selections
+                        for node in [{"id": item} for item in (selection.get("expanded_uns_node_ids") or [])]
+                    ])
+                    if not desired_file_node_ids:
+                        self._replace_uns_selections(
                             insight_namespace_id=insight_namespace_id,
                             insight_conversation_id=insight_conversation_id,
-                            datasource_id=datasource.id,
-                            bind_source=BIND_SOURCE_IMPORT_SELECTED,
+                            selections=[],
                         )
-                        self._bind_datasource(
-                            insight_namespace_id=SHARED_UNS_NAMESPACE_ID,
-                            insight_conversation_id=DEFAULT_CONVERSATION_ID,
-                            datasource_id=datasource.id,
-                            bind_source=BIND_SOURCE_SYSTEM_DEFAULT,
+                        removed_datasource_ids = self._sync_uns_conversation_bindings(
+                            insight_namespace_id=insight_namespace_id,
+                            insight_conversation_id=insight_conversation_id,
+                            desired_datasource_ids=[],
                         )
-                        imported_rows.append(self._datasource_to_dict(datasource))
-                    except Exception as exc:
-                        failed_rows.append({
-                            "id": result.get("id", ""),
-                            "alias": result.get("detail", {}).get("alias", ""),
-                            "message": str(exc),
-                        })
+                        self.session.commit()
+                        return {
+                            "success": True,
+                            "message": "已清空 UNS 节点选择",
+                            "data": {
+                                "imported": [],
+                                "failed": [],
+                                "removed_datasource_ids": removed_datasource_ids,
+                                "selections": self.list_uns_selections(insight_conversation_id),
+                            },
+                        }
 
-                for selection in expand_result["selections"]:
-                    self._upsert_uns_selection(
-                        insight_namespace_id=insight_namespace_id,
-                        insight_conversation_id=insight_conversation_id,
-                        selection=selection,
-                    )
+                    existing_datasources = self._find_uns_datasources_by_node_ids(desired_file_node_ids)
+                    missing_node_ids = [
+                        node_id
+                        for node_id in desired_file_node_ids
+                        if node_id not in existing_datasources
+                    ]
+                    if missing_node_ids:
+                        detail_results = self._fetch_uns_details_in_parallel(
+                            missing_node_ids,
+                            authorization,
+                        )
+                        failed_rows.extend([
+                            {
+                                "id": result.get("id", ""),
+                                "message": result.get("message", "导入失败"),
+                            }
+                            for result in detail_results
+                            if not result.get("success")
+                        ])
+                        if failed_rows:
+                            return {
+                                "success": False,
+                                "message": "UNS 节点导入失败，请稍后重试",
+                                "data": {
+                                    "imported": [],
+                                    "failed": failed_rows,
+                                    "selections": self.list_uns_selections(insight_conversation_id),
+                                },
+                            }
+
+                        for result in detail_results:
+                            datasource = self._upsert_uns_table_datasource(
+                                detail=result["detail"],
+                                lake_rds_database_name=lake_rds_database_name,
+                            )
+                            self._bind_datasource(
+                                insight_namespace_id=SHARED_UNS_NAMESPACE_ID,
+                                insight_conversation_id=DEFAULT_CONVERSATION_ID,
+                                datasource_id=datasource.id,
+                                bind_source=BIND_SOURCE_SYSTEM_DEFAULT,
+                            )
+                            imported_rows.append(self._datasource_to_dict(datasource))
+
+                    desired_datasource_ids = self._find_datasource_ids_by_uns_node_ids(desired_file_node_ids)
+
+                self._replace_uns_selections(
+                    insight_namespace_id=insight_namespace_id,
+                    insight_conversation_id=insight_conversation_id,
+                    selections=desired_selections,
+                )
+                removed_datasource_ids = self._sync_uns_conversation_bindings(
+                    insight_namespace_id=insight_namespace_id,
+                    insight_conversation_id=insight_conversation_id,
+                    desired_datasource_ids=desired_datasource_ids,
+                )
         except RuntimeError as exc:
             return {"success": False, "message": str(exc)}
 
         self.session.commit()
-        message = f"已绑定 {len(imported_rows)} 个 UNS 节点"
-        if failed_rows:
-            message = f"{message}，{len(failed_rows)} 个节点失败"
+        message = "UNS 节点选择已同步"
+        if imported_rows:
+            message = f"UNS 节点选择已同步，新增导入 {len(imported_rows)} 个数据源"
         return {
             "success": True,
             "message": message,
             "data": {
                 "imported": imported_rows,
                 "failed": failed_rows,
-                "selections": self.list_uns_selections(insight_conversation_id),
-            },
-        }
-
-    def remove_uns_selection_from_conversation(
-        self,
-        insight_namespace_id: int,
-        insight_conversation_id: int,
-        uns_node_id: str,
-    ) -> dict[str, Any]:
-        """取消一个 UNS 树选择，并解绑仅由该选择引入的当前会话数据源。"""
-        if insight_namespace_id <= 0:
-            return {"success": False, "message": "空间不存在"}
-        conversation = self._get_conversation(insight_conversation_id)
-        if conversation is None or conversation.insight_namespace_id != insight_namespace_id:
-            return {"success": False, "message": "当前会话不存在或不属于该空间"}
-
-        normalized_node_id = str(uns_node_id or '').strip()
-        if not normalized_node_id:
-            return {"success": False, "message": "缺少 UNS 节点 ID"}
-
-        try:
-            with _uns_import_slot():
-                active_selections = self.session.query(InsightNsUnsSelection).filter(
-                    InsightNsUnsSelection.insight_conversation_id == insight_conversation_id,
-                    InsightNsUnsSelection.is_deleted == 0,
-                ).all()
-
-                candidate_uns_node_ids: set[str] = set()
-                changed = False
-                for selection in active_selections:
-                    expanded_uns_node_ids = self._selection_expanded_uns_node_ids(selection)
-                    if selection.uns_node_id == normalized_node_id:
-                        selection.is_deleted = 1
-                        candidate_uns_node_ids.update(expanded_uns_node_ids)
-                        changed = True
-                        continue
-
-                    if normalized_node_id not in expanded_uns_node_ids:
-                        continue
-
-                    updated_expanded_ids = [
-                        node_id
-                        for node_id in expanded_uns_node_ids
-                        if node_id != normalized_node_id
-                    ]
-                    selection.is_deleted = 1
-                    for remaining_node_id in updated_expanded_ids:
-                        self._upsert_uns_file_selection_by_node_id(
-                            insight_namespace_id=insight_namespace_id,
-                            insight_conversation_id=insight_conversation_id,
-                            uns_node_id=remaining_node_id,
-                        )
-                    candidate_uns_node_ids.add(normalized_node_id)
-                    changed = True
-
-                if not changed:
-                    return {
-                        "success": True,
-                        "message": "UNS 节点已取消选择",
-                        "data": {
-                            "removed_datasource_ids": [],
-                            "selections": self.list_uns_selections(insight_conversation_id),
-                        },
-                    }
-
-                self.session.flush()
-                candidate_datasource_ids = self._find_datasource_ids_by_uns_node_ids(list(candidate_uns_node_ids))
-                keep_uns_node_ids = self._active_selection_expanded_uns_node_ids(insight_conversation_id)
-                removable_datasource_ids = self._filter_datasource_ids_not_kept(
-                    candidate_datasource_ids,
-                    keep_uns_node_ids,
-                )
-                self._soft_delete_conversation_datasource_relations(
-                    insight_conversation_id=insight_conversation_id,
-                    datasource_ids=removable_datasource_ids,
-                )
-        except RuntimeError as exc:
-            return {"success": False, "message": str(exc)}
-
-        self.session.commit()
-        return {
-            "success": True,
-            "message": "UNS 节点已取消选择",
-            "data": {
-                "removed_datasource_ids": removable_datasource_ids,
+                "removed_datasource_ids": removed_datasource_ids,
                 "selections": self.list_uns_selections(insight_conversation_id),
             },
         }
@@ -432,7 +388,39 @@ class InsightNsRelDatasourceService:
         ).order_by(
             InsightNsUnsSelection.id.asc(),
         ).all()
-        return [row.to_dict() for row in rows]
+        selected_rows: list[dict[str, Any]] = []
+        selected_node_ids: set[str] = set()
+        derived_partial_ids: set[str] = set()
+
+        for row in rows:
+            payload = row.to_dict()
+            payload["selection_state"] = "selected"
+            payload["derived"] = False
+            selected_rows.append(payload)
+            selected_node_ids.add(str(payload.get("uns_node_id") or "").strip())
+
+        partial_rows: list[dict[str, Any]] = []
+        for payload in selected_rows:
+            for ancestor_id in self._normalize_uns_node_id_list(payload.get("uns_node_path") or []):
+                if ancestor_id in selected_node_ids or ancestor_id in derived_partial_ids:
+                    continue
+                partial_rows.append({
+                    "id": f"partial:{ancestor_id}",
+                    "insight_namespace_id": payload.get("insight_namespace_id"),
+                    "insight_conversation_id": payload.get("insight_conversation_id"),
+                    "uns_node_id": ancestor_id,
+                    "uns_node_name": "",
+                    "uns_node_path": [],
+                    "is_folder": True,
+                    "expanded_uns_node_ids": [],
+                    "selection_state": "partial",
+                    "derived": True,
+                    "is_deleted": 0,
+                    "created_at": payload.get("created_at"),
+                    "updated_at": payload.get("updated_at"),
+                })
+                derived_partial_ids.add(ancestor_id)
+        return selected_rows + partial_rows
 
     def delete_namespace_datasource(self, insight_namespace_id: int, datasource_id: int) -> dict[str, Any]:
         """删除空间级数据源；若仍被会话引用，则阻止删除。"""
@@ -482,21 +470,9 @@ class InsightNsRelDatasourceService:
             InsightNsConversation.is_deleted == 0,
         ).first()
 
-    def _normalize_uns_node_ids(self, ids: list[str]) -> list[str]:
-        normalized: list[str] = []
-        seen: set[str] = set()
-        for node_id in ids or []:
-            value = str(node_id or '').strip()
-            if not value or value in seen:
-                continue
-            normalized.append(value)
-            seen.add(value)
-        return normalized
-
     def _normalize_uns_nodes(
         self,
         nodes: list[dict[str, Any]] | None,
-        fallback_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -507,28 +483,23 @@ class InsightNsRelDatasourceService:
             node_id = str(node.get('id') or node.get('uns_node_id') or '').strip()
             if not node_id or node_id in seen:
                 continue
+            count_children = int(node.get('countChildren') or node.get('count_children') or 0)
             is_folder = bool(node.get('isFolder') or node.get('is_folder'))
             if not is_folder:
-                is_folder = bool(node.get('hasChildren')) or int(node.get('countChildren') or 0) > 0
+                is_folder = bool(node.get('hasChildren')) or count_children > 0
             normalized.append({
                 "id": node_id,
                 "alias": str(node.get('alias') or '').strip(),
                 "name": str(node.get('name') or node.get('label') or node.get('pathName') or node_id).strip(),
-                "path": str(node.get('path') or node.get('pathName') or '').strip(),
+                "uns_node_path": self._normalize_uns_node_id_list(
+                    node.get('unsNodePath')
+                    or node.get('uns_node_path')
+                    or node.get('ancestorNodeIds')
+                    or node.get('ancestor_node_ids')
+                    or []
+                ),
+                "count_children": count_children,
                 "is_folder": is_folder,
-            })
-            seen.add(node_id)
-
-        # 兼容旧前端：只传 ids 时默认都按文件节点处理。
-        for node_id in self._normalize_uns_node_ids(fallback_ids or []):
-            if node_id in seen:
-                continue
-            normalized.append({
-                "id": node_id,
-                "alias": '',
-                "name": node_id,
-                "path": '',
-                "is_folder": False,
             })
             seen.add(node_id)
         return normalized
@@ -556,6 +527,11 @@ class InsightNsRelDatasourceService:
                 continue
 
             try:
+                if int(node.get("count_children") or 0) > UNS_MAX_EXPANDED_FILES:
+                    raise ValueError(
+                        f"UNS 文件夹“{node.get('name') or node_id}”子节点过多（{node.get('count_children')}），"
+                        f"请继续展开后选择更小范围（当前上限 {UNS_MAX_EXPANDED_FILES}）"
+                    )
                 expanded = self._expand_uns_folder_files(node, authorization)
                 for file_node in expanded:
                     file_id = file_node["id"]
@@ -740,50 +716,6 @@ class InsightNsRelDatasourceService:
         ).all()
         return [int(row[0]) for row in rows]
 
-    def _active_selection_expanded_uns_node_ids(self, insight_conversation_id: int) -> set[str]:
-        rows = self.session.query(InsightNsUnsSelection).filter(
-            InsightNsUnsSelection.insight_conversation_id == insight_conversation_id,
-            InsightNsUnsSelection.is_deleted == 0,
-        ).all()
-
-        kept_ids: set[str] = set()
-        for row in rows:
-            kept_ids.update(self._selection_expanded_uns_node_ids(row))
-        return kept_ids
-
-    def _selection_expanded_uns_node_ids(self, selection: InsightNsUnsSelection) -> list[str]:
-        expanded_ids = safe_json_loads(selection.expanded_uns_node_ids_json, [])
-        if not expanded_ids:
-            expanded_ids = [selection.uns_node_id]
-
-        normalized_ids: list[str] = []
-        seen: set[str] = set()
-        for item in expanded_ids:
-            node_id = str(item or '').strip()
-            if not node_id or node_id in seen:
-                continue
-            normalized_ids.append(node_id)
-            seen.add(node_id)
-        return normalized_ids
-
-    def _filter_datasource_ids_not_kept(
-        self,
-        datasource_ids: list[int],
-        keep_uns_node_ids: set[str],
-    ) -> list[int]:
-        if not datasource_ids:
-            return []
-
-        rows = self.session.query(InsightDatasource.id, InsightDatasource.uns_node_id).filter(
-            InsightDatasource.id.in_(datasource_ids),
-            InsightDatasource.is_deleted == 0,
-        ).all()
-        return [
-            int(row[0])
-            for row in rows
-            if str(row[1] or '').strip() not in keep_uns_node_ids
-        ]
-
     def _soft_delete_conversation_datasource_relations(
         self,
         insight_conversation_id: int,
@@ -872,12 +804,64 @@ class InsightNsRelDatasourceService:
 
         row.insight_namespace_id = insight_namespace_id
         row.uns_node_name = selection.get("name", "")[:255]
-        row.uns_node_path = selection.get("path", "")[:1024]
+        row.uns_node_path = self._build_uns_selection_path_payload(selection.get("uns_node_path") or [])
         row.is_folder = 1 if selection.get("is_folder") else 0
         row.expanded_uns_node_ids_json = dump_json(selection.get("expanded_uns_node_ids") or [])
         row.is_deleted = 0
         self.session.flush()
         return row
+
+    def _canonicalize_uns_selections(
+        self,
+        selections: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        normalized_selections: list[dict[str, Any]] = []
+        for selection in selections or []:
+            selection_id = str(selection.get("id") or "").strip()
+            if not selection_id:
+                continue
+            normalized_selections.append({
+                **selection,
+                "id": selection_id,
+                "expanded_uns_node_ids": self._normalize_uns_node_id_list(selection.get("expanded_uns_node_ids") or [selection_id]),
+            })
+
+        sorted_selections = sorted(
+            normalized_selections,
+            key=lambda item: (
+                0 if item.get("is_folder") else 1,
+                -len(item.get("expanded_uns_node_ids") or []),
+                item["id"],
+            ),
+        )
+        kept: list[dict[str, Any]] = []
+        covered_node_ids: set[str] = set()
+        for selection in sorted_selections:
+            selection_id = selection["id"]
+            expanded_ids = selection.get("expanded_uns_node_ids") or [selection_id]
+            if selection_id in covered_node_ids or set(expanded_ids).issubset(covered_node_ids):
+                continue
+            kept.append(selection)
+            covered_node_ids.update(expanded_ids)
+            covered_node_ids.add(selection_id)
+        return kept
+
+    def _normalize_uns_node_id_list(self, values: list[Any]) -> list[str]:
+        normalized_ids: list[str] = []
+        seen: set[str] = set()
+        for item in values:
+            node_id = str(item or '').strip()
+            if not node_id or node_id in seen:
+                continue
+            normalized_ids.append(node_id)
+            seen.add(node_id)
+        return normalized_ids
+
+    def _build_uns_selection_path_payload(
+        self,
+        uns_node_path: list[Any],
+    ) -> str:
+        return dump_json(self._normalize_uns_node_id_list(uns_node_path or []))
 
     def _upsert_uns_file_selection_by_node_id(
         self,
@@ -893,11 +877,86 @@ class InsightNsRelDatasourceService:
             selection={
                 "id": uns_node_id,
                 "name": datasource.datasource_name if datasource else uns_node_id,
-                "path": datasource_config.get("uns_path") or datasource_config.get("uns_path_name") or "",
+                "uns_node_path": [],
                 "is_folder": False,
                 "expanded_uns_node_ids": [uns_node_id],
             },
         )
+
+    def _replace_uns_selections(
+        self,
+        insight_namespace_id: int,
+        insight_conversation_id: int,
+        selections: list[dict[str, Any]],
+    ) -> None:
+        self.session.query(InsightNsUnsSelection).filter(
+            InsightNsUnsSelection.insight_conversation_id == insight_conversation_id,
+            InsightNsUnsSelection.is_deleted == 0,
+        ).update(
+            {InsightNsUnsSelection.is_deleted: 1},
+            synchronize_session=False,
+        )
+        self.session.flush()
+
+        for selection in selections:
+            self._upsert_uns_selection(
+                insight_namespace_id=insight_namespace_id,
+                insight_conversation_id=insight_conversation_id,
+                selection=selection,
+            )
+
+    def _find_uns_datasources_by_node_ids(
+        self,
+        uns_node_ids: list[str],
+    ) -> dict[str, InsightDatasource]:
+        normalized_ids = self._normalize_uns_node_id_list(uns_node_ids)
+        if not normalized_ids:
+            return {}
+
+        rows = self.session.query(InsightDatasource).filter(
+            InsightDatasource.uns_node_id.in_(normalized_ids),
+            InsightDatasource.datasource_type == 'table',
+            InsightDatasource.is_deleted == 0,
+        ).all()
+        return {
+            str(row.uns_node_id or '').strip(): row
+            for row in rows
+            if str(row.uns_node_id or '').strip()
+        }
+
+    def _sync_uns_conversation_bindings(
+        self,
+        insight_namespace_id: int,
+        insight_conversation_id: int,
+        desired_datasource_ids: list[int],
+    ) -> list[int]:
+        desired_ids = sorted(set(int(item) for item in desired_datasource_ids or [] if int(item) > 0))
+        active_rows = self.session.query(InsightNsRelDatasource.id, InsightNsRelDatasource.datasource_id).join(
+            InsightDatasource,
+            InsightDatasource.id == InsightNsRelDatasource.datasource_id,
+        ).filter(
+            InsightNsRelDatasource.insight_conversation_id == insight_conversation_id,
+            InsightNsRelDatasource.bind_source == BIND_SOURCE_IMPORT_SELECTED,
+            InsightNsRelDatasource.is_deleted == 0,
+            InsightDatasource.is_deleted == 0,
+            InsightDatasource.uns_node_id != '',
+        ).all()
+
+        active_ids = {int(row[1]) for row in active_rows}
+        removable_ids = [datasource_id for datasource_id in active_ids if datasource_id not in desired_ids]
+        self._soft_delete_conversation_datasource_relations(
+            insight_conversation_id=insight_conversation_id,
+            datasource_ids=removable_ids,
+        )
+
+        for datasource_id in desired_ids:
+            self._bind_datasource(
+                insight_namespace_id=insight_namespace_id,
+                insight_conversation_id=insight_conversation_id,
+                datasource_id=datasource_id,
+                bind_source=BIND_SOURCE_IMPORT_SELECTED,
+            )
+        return removable_ids
 
     def _next_sort_no(self, insight_conversation_id: int) -> int:
         count = self.session.query(InsightNsRelDatasource.id).filter(

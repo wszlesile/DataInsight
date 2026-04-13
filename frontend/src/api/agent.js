@@ -123,15 +123,6 @@ export function listNamespaceUnsSelections(namespaceId, conversationId) {
   })
 }
 
-export function removeNamespaceUnsSelection(namespaceId, conversationId, unsNodeId) {
-  return api.delete(`/insight/namespaces/${namespaceId}/uns/selections`, {
-    data: {
-      insight_conversation_id: conversationId,
-      uns_node_id: unsNodeId
-    }
-  })
-}
-
 export function deleteNamespaceDatasource(namespaceId, datasourceId) {
   return api.delete(`/insight/namespaces/${namespaceId}/datasources/${datasourceId}`)
 }

@@ -58,6 +58,11 @@ class Config:
     # SUPOS / Kernel 配置
     SUPOS_WEB = os.environ.get('SUPOS_WEB', 'http://localhost:8080')
     SUPOS_REQUEST_TIMEOUT = int(os.environ.get('SUPOS_REQUEST_TIMEOUT', 15))
+    UNS_MAX_EXPANDED_FILES = int(os.environ.get('UNS_MAX_EXPANDED_FILES', 200))
+    UNS_MAX_EXPAND_DEPTH = int(os.environ.get('UNS_MAX_EXPAND_DEPTH', 5))
+    UNS_TREE_PAGE_SIZE = int(os.environ.get('UNS_TREE_PAGE_SIZE', 100))
+    UNS_DETAIL_WORKERS = int(os.environ.get('UNS_DETAIL_WORKERS', 5))
+    UNS_IMPORT_MAX_CONCURRENT = int(os.environ.get('UNS_IMPORT_MAX_CONCURRENT', 2))
 
     # LLM配置
     LLM_MODEL_ACTIVE=os.environ.get('LLM_MODEL_ACTIVE', 'MiniMax-M2.5')

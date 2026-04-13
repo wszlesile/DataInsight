@@ -658,7 +658,75 @@ data: {"type":"status","message":"已收到请求，正在理解分析需求。"
 前端当前用法说明：
 - 根节点加载时传 `parentId = "0"`
 - 点击文件夹继续展开时，传当前节点的 `id` 作为新的 `parentId`
-- 只把已勾选的文件节点 `id` 数组传给“导入 UNS 节点到空间数据源”接口
+- 前端勾选状态变化后，直接提交“当前整棵树的已选节点集合”给后端统一同步
+
+### 4.0.1 获取当前会话的 UNS 已选节点
+
+`GET /api/insight/namespaces/{namespace_id}/uns/selections?insight_conversation_id={conversation_id}`
+
+用途：
+
+- 获取当前会话已经选择的 UNS 树节点
+- 用于前端 UNS 树勾选状态与半选状态回显
+
+查询参数说明：
+- `insight_conversation_id`
+  - 当前会话 ID
+  - 必填
+
+响应 `data` 示例：
+
+```json
+[
+  {
+    "id": 12,
+    "insight_namespace_id": 7,
+    "insight_conversation_id": 19,
+    "uns_node_id": "2035975648114712576",
+    "uns_node_name": "报警记录表",
+    "uns_node_path": ["101"],
+    "is_folder": false,
+    "expanded_uns_node_ids": ["2035975648114712576"],
+    "selection_state": "selected",
+    "derived": false,
+    "created_at": "2026-04-12T10:20:00",
+    "updated_at": "2026-04-12T10:20:00"
+  },
+  {
+    "id": "partial:101",
+    "insight_namespace_id": 7,
+    "insight_conversation_id": 19,
+    "uns_node_id": "101",
+    "uns_node_name": "",
+    "uns_node_path": [],
+    "is_folder": true,
+    "expanded_uns_node_ids": [],
+    "selection_state": "partial",
+    "derived": true,
+    "created_at": "2026-04-12T10:20:00",
+    "updated_at": "2026-04-12T10:20:00"
+  }
+]
+```
+
+响应字段说明：
+- `uns_node_id`
+  - 当前回显节点 ID
+- `uns_node_name`
+  - 节点名称
+- `uns_node_path`
+  - 当前节点的祖先节点 ID 数组
+  - 字段名历史保留，不再表示路径字符串
+- `is_folder`
+  - `true` 表示文件夹节点，`false` 表示文件节点
+- `expanded_uns_node_ids`
+  - 如果当时勾选的是文件夹，这里记录该文件夹展开后命中的文件节点 ID 列表
+- `selection_state`
+  - `selected` 表示真实选中节点
+  - `partial` 表示由子节点带出的半选父节点，仅用于前端展示
+- `derived`
+  - `true` 表示后端推导出的半选节点
+  - `false` 表示用户真实选中的节点
 
 ### 4.1 获取空间数据源列表
 
@@ -787,24 +855,64 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 
 用途：
 
-- 把前端已选中的 UNS 文件节点批量导入为当前空间下的 `table` 类型数据源
-- 这里不会自动绑定到当前会话
+- 把前端当前“全量已选”的 UNS 节点集合统一同步为可分析的数据源
+- 导入后的 UNS 数据源本体会落到共享空间，避免不同空间重复导入同一份 UNS 定义
+- 本次请求会同时完成：
+  - 导入/复用共享数据源
+  - 同步当前会话的数据源绑定
+  - 覆盖更新当前会话的 UNS 选择状态
 
 请求体：
 
 ```json
 {
-  "ids": [
-    "2035975648114712576",
-    "2035976562024194048"
+  "insight_conversation_id": 19,
+  "nodes": [
+    {
+      "id": "101",
+      "name": "abi测试",
+      "pathName": "abi测试",
+      "hasChildren": true,
+      "countChildren": 2,
+      "type": 0
+    },
+    {
+      "id": "2035975648114712576",
+      "name": "报警记录表",
+      "pathName": "abi测试/报警记录表",
+      "hasChildren": false,
+      "countChildren": 0,
+      "type": 1
+    }
   ]
 }
 ```
 
 请求字段说明：
-- `ids`
-  - UNS 文件节点 ID 数组
-  - 只传文件节点，不传文件夹
+- `insight_conversation_id`
+  - 当前会话 ID
+  - 必填
+- `nodes`
+  - 当前整棵树的已选节点对象数组
+  - 节点既可以是文件，也可以是文件夹
+  - 如果传文件夹，后端会自动深度展开，找到可导入的文件节点
+- `nodes[].id`
+  - UNS 节点 ID
+- `nodes[].name`
+  - 节点名称
+- `nodes[].pathName`
+  - 节点路径名称
+- `nodes[].hasChildren`
+  - 是否有子节点
+- `nodes[].countChildren`
+  - 子节点数量
+- `nodes[].type`
+  - 节点类型
+- `nodes[].unsNodePath`
+  - 当前节点在树中的祖先节点 ID 数组
+  - 字段名历史保留，不再表示路径字符串
+  - 前端在提交全量选中状态时携带，后端据此推导父节点半选状态
+  - 当前前端已不再使用，不建议继续接入
 
 响应 `data` 结构：
 
@@ -816,9 +924,9 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
       "datasource_type": "table",
       "datasource_name": "报警记录表",
       "knowledge_tag": "_baojingjilubiao_5d3feea65c1942bdbb7a",
+      "uns_node_id": "2035975648114712576",
       "datasource_schema": "{...}",
-      "datasource_config_json": "{...}",
-      "checked": false
+      "datasource_config_json": "{...}"
     }
   ],
   "failed": [
@@ -826,25 +934,52 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
       "id": "2035976562024194048",
       "message": "未查询到 UNS 节点详情"
     }
+  ],
+  "removed_datasource_ids": [16],
+  "selections": [
+    {
+      "uns_node_id": "101",
+      "uns_node_name": "abi测试",
+      "is_folder": true,
+      "expanded_uns_node_ids": ["2035975648114712576", "2035976562024194048"],
+      "selection_state": "selected",
+      "derived": false
+    }
   ]
 }
 ```
 
 响应字段说明：
 - `imported`
-  - 成功导入的数据源列表
+  - 本次成功导入或复用并绑定到当前会话的数据源列表
 - `failed`
-  - 失败的节点 ID 列表及错误原因
+  - 本次失败的节点 ID 列表及错误原因
+- `removed_datasource_ids`
+  - 本次同步后，从当前会话解绑的数据源 ID 列表
+- `selections`
+  - 当前会话最新的 UNS 选择回显列表
+- `imported[].uns_node_id`
+  - 该数据源对应的 UNS 唯一节点 ID
 
 说明：
-- 后端会使用当前用户 `UserContext` 中的 token 调第三方 UNS 实例详情接口：
+- 后端会使用当前用户 `UserContext` 中的 token 调第三方 UNS 接口
+- 树节点详情接口为：
   - `GET {SUPOS_WEB}/inter-api/supos/uns/instance?id={id}`
 - 后端会使用当前用户 `UserContext` 中初始化好的 `LakeRDS` 数据库名
 - 导入后的数据源类型仍然是 `table`
-- 导入时表名取详情接口返回的 `data.alias`
+- 导入时表名取详情接口返回的 `data.alias`，并在 `datasource_config_json.table_name` 中保存为 `public.{alias}`
 - 字段定义从详情接口返回的 `data.fields` 转换
 - `datasource_schema.description` 取详情接口返回的 `data.description`
-- `datasource_config_json` 结构保持不变，仍包含 `database_name`、`table_name`、`uns_alias`、`uns_path`、`uns_path_name`
+- `datasource_config_json` 保持 `table` 数据源结构，包含 `database_name`、`table_name`、`uns_alias`、`uns_path`、`uns_path_name`
+- 对于已经导入过的同一个 UNS 节点，后端会优先复用共享数据源，而不是重复创建
+- 对于本次目标集合中已存在的数据源，不会重复拉取详情接口，只会复用并同步会话绑定
+- 如果本次提交为空集合，后端会清空当前会话的 UNS 选择和对应绑定
+- UNS 文件夹展开相关限制支持通过环境变量动态配置：
+  - `UNS_MAX_EXPANDED_FILES`
+  - `UNS_MAX_EXPAND_DEPTH`
+  - `UNS_TREE_PAGE_SIZE`
+  - `UNS_DETAIL_WORKERS`
+  - `UNS_IMPORT_MAX_CONCURRENT`
 
 ### 4.4 修改空间数据源描述
 
@@ -1464,9 +1599,12 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
    - `POST /api/insight/namespaces/{namespace_id}/datasources/upload`
 7. 加载 UNS 树时：
    - `POST /api/insight/namespaces/{namespace_id}/uns/tree`
-8. 从 UNS 节点导入时：
+8. 加载当前会话 UNS 已选节点回显时：
+   - `GET /api/insight/namespaces/{namespace_id}/uns/selections?insight_conversation_id=...`
+9. 勾选或取消勾选 UNS 节点时：
    - `POST /api/insight/namespaces/{namespace_id}/datasources/import-uns`
-9. 删除数据源时：
+   - 请求体传 `insight_conversation_id + 当前全量已选 nodes`
+11. 删除数据源时：
    - `DELETE /api/insight/namespaces/{namespace_id}/datasources/{datasource_id}`
 
 ### 10.3 聊天分析

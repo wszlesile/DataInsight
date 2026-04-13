@@ -71,6 +71,7 @@
                   <div class="uns-tree-meta">
                     <span class="meta-line">别名：{{ data.alias || '-' }}</span>
                     <span v-if="data.pathName" class="meta-line">路径：{{ data.pathName }}</span>
+                    <span v-if="data.disabledReason" class="meta-line uns-disabled-tip">{{ data.disabledReason }}</span>
                   </div>
                 </div>
               </div>
@@ -204,7 +205,6 @@ import {
   importNamespaceUnsDatasources,
   listNamespaceUnsSelections,
   listNamespaceDatasources,
-  removeNamespaceUnsSelection,
   unbindConversationDatasource,
   updateNamespaceDatasourceDescription,
   uploadNamespaceDatasource,
@@ -228,6 +228,8 @@ const unsTreeRef = ref(null)
 const unsRootNodes = ref([])
 const selectedUnsNodes = ref([])
 const backendSelectedUnsNodeIds = ref([])
+const backendPartialUnsNodeIds = ref([])
+const partialUnsFolderIds = ref([])
 const namespaceDatasources = ref([])
 const bindingDatasourceIds = ref([])
 const editingDatasourceIds = ref([])
@@ -450,8 +452,7 @@ const toUnsNodePayload = (node) => ({
   id: String(node?.id || ''),
   alias: node?.alias || '',
   name: node?.name || node?.label || '',
-  path: node?.path || node?.pathName || '',
-  pathName: node?.pathName || node?.path || '',
+  unsNodePath: Array.isArray(node?.unsNodePath) ? node.unsNodePath : [],
   hasChildren: Boolean(node?.hasChildren),
   countChildren: Number(node?.countChildren || 0),
   type: Number(node?.type ?? -1),
@@ -459,26 +460,131 @@ const toUnsNodePayload = (node) => ({
   isFolder: Boolean(node?.isFolder),
 })
 
-const handleUnsCheck = (data, checkedState) => {
-  const checkedNodes = unsTreeRef.value?.getCheckedNodes(false, false) || []
-  selectedUnsNodes.value = checkedNodes
-    .filter((item) => item.id)
-    .map((item) => toUnsNodePayload(item))
-
-  const checkedKeys = (checkedState?.checkedKeys || []).map((item) => String(item))
-  const isChecked = checkedKeys.includes(String(data?.id || ''))
-  enqueueUnsSelectionOperation(toUnsNodePayload(data), isChecked)
+const collectAncestorUnsNodeIds = (treeNode) => {
+  const ancestorIds = []
+  let current = treeNode?.parent
+  while (current && current.level > 0) {
+    const ancestorId = String(current.data?.id || '')
+    if (ancestorId) {
+      ancestorIds.unshift(ancestorId)
+    }
+    current = current.parent
+  }
+  return ancestorIds
 }
 
-const enqueueUnsSelectionOperation = (node, checked) => {
-  if (!node.id) return
+const collectCurrentCheckedUnsNodes = () => {
+  const checkedKeys = (unsTreeRef.value?.getCheckedKeys?.(false) || [])
+    .map((item) => String(item || ''))
+    .filter(Boolean)
+  return checkedKeys
+    .map((key) => unsTreeRef.value?.getNode?.(key))
+    .filter((treeNode) => treeNode?.data?.id)
+    .map((treeNode) => ({
+      ...toUnsNodePayload(treeNode.data),
+      unsNodePath: collectAncestorUnsNodeIds(treeNode),
+    }))
+}
+
+const applyUnsCheckboxVisualState = () => {
+  const treeStore = unsTreeRef.value?.store
+  const rootNode = treeStore?.root
+  if (!rootNode?.childNodes) return
+
+  const partialIdSet = new Set(partialUnsFolderIds.value.map((item) => String(item || '')).filter(Boolean))
+  const selectedIdSet = new Set(selectedUnsNodeIds.value.map((item) => String(item || '')).filter(Boolean))
+  const visit = (treeNode) => {
+    if (!treeNode) return
+    const nodeId = String(treeNode.data?.id || '')
+    const isPartial = nodeId && partialIdSet.has(nodeId)
+    const isExplicitlySelected = nodeId && selectedIdSet.has(nodeId)
+    if (treeNode.data?.isFolder) {
+      if (isPartial) {
+        treeNode.indeterminate = true
+        treeNode.checked = false
+      } else if (isExplicitlySelected) {
+        treeNode.indeterminate = false
+        treeNode.checked = true
+      } else {
+        treeNode.indeterminate = false
+      }
+    }
+    ;(treeNode.childNodes || []).forEach(visit)
+  }
+  ;(rootNode.childNodes || []).forEach(visit)
+}
+
+const refreshUnsPartialFolderIds = async () => {
+  await nextTick()
+  await new Promise((resolve) => window.setTimeout(resolve, 0))
+  const treeStore = unsTreeRef.value?.store
+  const rootNode = treeStore?.root
+  if (!rootNode?.childNodes) {
+    partialUnsFolderIds.value = []
+    return
+  }
+
+  const checkedKeySet = new Set(
+    [
+      ...backendSelectedUnsNodeIds.value,
+      ...selectedUnsNodeIds.value,
+    ]
+      .map((item) => String(item || ''))
+      .filter(Boolean)
+  )
+  const partialIds = []
+  const visit = (treeNode) => {
+    if (!treeNode) return
+    const nodeId = String(treeNode.data?.id || '')
+    const childNodes = treeNode.childNodes || []
+
+    if (!childNodes.length) {
+      const checked = checkedKeySet.has(nodeId)
+      return { selected: checked, full: checked }
+    }
+
+    const childStates = childNodes.map(visit).filter(Boolean)
+    const selfChecked = checkedKeySet.has(nodeId)
+    const hasSelectedDescendant = childStates.some((item) => item.selected)
+    const allChildrenFullySelected = childStates.length > 0 && childStates.every((item) => item.full)
+    const selected = selfChecked || hasSelectedDescendant
+    const full = selfChecked || allChildrenFullySelected
+
+    if (nodeId && treeNode.data?.isFolder && selected && !full) {
+      partialIds.push(nodeId)
+    }
+    return { selected, full }
+  }
+
+  ;(rootNode.childNodes || []).forEach(visit)
+  partialUnsFolderIds.value = Array.from(new Set([
+    ...backendPartialUnsNodeIds.value,
+    ...partialIds,
+  ]))
+  applyUnsCheckboxVisualState()
+}
+
+const handleUnsCheck = (data, checkedState) => {
+  const nodeId = String(data?.id || '')
+  const wasPartiallyChecked = Boolean(data?.isFolder) && partialUnsFolderIds.value.includes(nodeId)
+
+  if (wasPartiallyChecked && unsTreeRef.value?.setChecked) {
+    unsTreeRef.value.setChecked(nodeId, true, true)
+  }
+
+  selectedUnsNodes.value = collectCurrentCheckedUnsNodes()
+  enqueueUnsSelectionOperation(selectedUnsNodes.value)
+  refreshUnsPartialFolderIds()
+}
+
+const enqueueUnsSelectionOperation = (nodes) => {
   unsOperationQueue = unsOperationQueue
     .catch(() => undefined)
-    .then(() => syncUnsSelection(node, checked))
+    .then(() => syncUnsSelection(nodes))
   return unsOperationQueue
 }
 
-const syncUnsSelection = async (node, checked) => {
+const syncUnsSelection = async (nodes) => {
   if (!props.activeNamespaceId) {
     ElMessage.warning('请先创建或选择洞察空间')
     await fetchUnsSelections()
@@ -492,9 +598,11 @@ const syncUnsSelection = async (node, checked) => {
 
   unsSyncing.value = true
   try {
-    const response = checked
-      ? await importNamespaceUnsDatasources(props.activeNamespaceId, props.activeConversation.id, [node])
-      : await removeNamespaceUnsSelection(props.activeNamespaceId, props.activeConversation.id, node.id)
+    const response = await importNamespaceUnsDatasources(
+      props.activeNamespaceId,
+      props.activeConversation.id,
+      Array.isArray(nodes) ? nodes : []
+    )
     if (!response.data?.success) {
       throw new Error(response.data?.message || '同步 UNS 节点选择失败')
     }
@@ -519,6 +627,8 @@ const syncUnsSelection = async (node, checked) => {
 const reloadUnsTree = async () => {
   selectedUnsNodes.value = []
   backendSelectedUnsNodeIds.value = []
+  backendPartialUnsNodeIds.value = []
+  partialUnsFolderIds.value = []
   unsRootNodes.value = []
   await fetchUnsSelections()
   await fetchUnsRootNodes()
@@ -533,11 +643,15 @@ const applyUnsCheckedKeys = async () => {
     ...selectedUnsNodeIds.value,
   ]))
   unsTreeRef.value.setCheckedKeys(keys, false)
+  await refreshUnsPartialFolderIds()
 }
 
 const fetchUnsSelections = async () => {
   if (!props.activeNamespaceId || !props.activeConversation?.id) {
     backendSelectedUnsNodeIds.value = []
+    backendPartialUnsNodeIds.value = []
+    selectedUnsNodes.value = []
+    partialUnsFolderIds.value = []
     return
   }
 
@@ -545,12 +659,24 @@ const fetchUnsSelections = async () => {
     const response = await listNamespaceUnsSelections(props.activeNamespaceId, props.activeConversation.id)
     if (response.data?.success) {
       const rows = response.data.data || []
-      const checkedNodeIds = rows
+      const selectedRows = rows.filter((item) => item.selection_state !== 'partial')
+      const partialRows = rows.filter((item) => item.selection_state === 'partial')
+      const selectedNodeIds = selectedRows
         .map((item) => item.uns_node_id)
         .map((item) => String(item || ''))
         .filter(Boolean)
-      backendSelectedUnsNodeIds.value = checkedNodeIds
-      selectedUnsNodes.value = checkedNodeIds.map((id) => ({ id }))
+      const checkedNodeIds = selectedRows
+        .flatMap((item) => [
+          item.uns_node_id,
+          ...((Array.isArray(item.expanded_uns_node_ids) ? item.expanded_uns_node_ids : []).map((childId) => String(childId || ''))),
+        ])
+        .map((item) => String(item || ''))
+        .filter(Boolean)
+      backendSelectedUnsNodeIds.value = Array.from(new Set(checkedNodeIds))
+      backendPartialUnsNodeIds.value = partialRows
+        .map((item) => String(item.uns_node_id || ''))
+        .filter(Boolean)
+      selectedUnsNodes.value = selectedNodeIds.map((id) => ({ id }))
       await applyUnsCheckedKeys()
     }
   } catch (error) {
@@ -719,6 +845,8 @@ watch(
   async () => {
     selectedUnsNodes.value = []
     backendSelectedUnsNodeIds.value = []
+    backendPartialUnsNodeIds.value = []
+    partialUnsFolderIds.value = []
     unsRootNodes.value = []
     await fetchNamespaceDatasources()
     if (activeUploadMode.value === 'uns') {
@@ -949,12 +1077,29 @@ watch(
   gap: 10px;
 }
 
+.uns-tree-state-group {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .uns-tree-title {
   font-size: 13px;
   color: #0f172a;
   font-weight: 700;
   line-height: 1.4;
   word-break: break-word;
+}
+
+.uns-tree-partial {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: #fef3c7;
+  color: #92400e;
 }
 
 .uns-tree-kind {
@@ -980,6 +1125,10 @@ watch(
 .meta-line {
   line-height: 1.5;
   word-break: break-all;
+}
+
+.uns-disabled-tip {
+  color: #b45309;
 }
 
 .placeholder-title {
