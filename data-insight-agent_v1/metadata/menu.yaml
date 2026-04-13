@@ -1,0 +1,17 @@
+# ###########################################
+#               菜单资源申请定义
+#  资源定义：https://git-scm2.bluetron.cn/supos/supos-core/supos-core-modeldefs/-/blob/main/src/rbac.supos.com/MenuModelDefinition.yaml
+# ###########################################
+$kind: menu.supos.com;v1alpha1:Menu
+$metadata:
+  # 唯一键，用于实际文件路径申请配置，一个应用下不能存在重复
+  name: menu
+forceUpdate: false
+menus:
+  - code: os_data_insight_runtime
+    nameDefault: 数据洞察Agent
+    displayOrder: 1
+    url: /os/datainsight/data-insight-agent/
+    operations:
+      - code: switch_language
+        nameDefault: 生成配置

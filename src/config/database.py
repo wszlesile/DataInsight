@@ -2,6 +2,7 @@ import os
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
+from sqlalchemy.engine import URL
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from config.config import Config
@@ -9,6 +10,8 @@ from config.config import Config
 load_dotenv()
 
 db_type = Config.DB_TYPE.lower()
+if db_type == 'postgres':
+    db_type = 'postgresql'
 
 if db_type == 'sqlite':
     db_path = os.path.join(
@@ -18,13 +21,27 @@ if db_type == 'sqlite':
     engine = create_engine(f"sqlite:///{db_path}", echo=Config.DEBUG)
 elif db_type == 'mysql':
     engine = create_engine(
-        f"mysql://{Config.DB_USER}:{Config.DB_PASSWORD}@{Config.DB_HOST}:{Config.DB_PORT}/{Config.DB_NAME}",
+        URL.create(
+            drivername='mysql+pymysql',
+            username=Config.DB_USER,
+            password=Config.DB_PASSWORD,
+            host=Config.DB_HOST,
+            port=Config.DB_PORT,
+            database=Config.DB_NAME,
+        ),
         pool_pre_ping=True,
         echo=Config.DEBUG,
     )
 elif db_type == 'postgresql':
     engine = create_engine(
-        f"postgresql://{Config.PG_USER}:{Config.PG_PASSWORD}@{Config.PG_HOST}:{Config.PG_PORT}/{Config.PG_NAME}",
+        URL.create(
+            drivername='postgresql+psycopg2',
+            username=Config.DB_USER,
+            password=Config.DB_PASSWORD,
+            host=Config.DB_HOST,
+            port=Config.DB_PORT,
+            database=Config.DB_NAME,
+        ),
         pool_pre_ping=True,
         echo=Config.DEBUG,
     )

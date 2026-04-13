@@ -59,7 +59,6 @@ class InsightUserCollectController(BaseController):
                 conversation_id=data.get('insight_conversation_id', 0),
                 message_id=data.get('insight_message_id', data.get('insight_context_id', 0)),
                 artifact_id=data.get('insight_artifact_id', 0),
-                metadata=data.get('metadata_json') or {},
             )
             return jsonify(Result.success(data=collect, message='收藏成功').to_dict())
         finally:

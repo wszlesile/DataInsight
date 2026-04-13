@@ -153,12 +153,7 @@
                             targetId: item.turnId,
                             title: item.question,
                             summaryText: item.report,
-                            conversationId: activeConversationId,
-                            metadata: {
-                              turn_id: item.turnId,
-                              charts: item.charts || [],
-                              tables: item.tables || []
-                            }
+                            conversationId: activeConversationId
                           })"
                         >
                           {{ isCollected('turn', item.turnId) ? '取消收藏' : '收藏本轮' }}
@@ -262,12 +257,7 @@
                             targetId: currentTurnId,
                             title: currentQuestion,
                             summaryText: currentReport,
-                            conversationId: activeConversationId,
-                            metadata: {
-                              turn_id: currentTurnId,
-                              charts: [...currentCharts],
-                              tables: [...currentTables]
-                            }
+                            conversationId: activeConversationId
                           })"
                         >
                           {{ isCollected('turn', currentTurnId) ? '取消收藏' : '收藏本轮' }}
@@ -422,16 +412,7 @@
               targetId: turnDetail.turn.id,
               title: turnDetail.turn.user_query,
               summaryText: turnDetail.turn.final_answer,
-              conversationId: turnDetail.conversation.id,
-              metadata: {
-                turn_id: turnDetail.turn.id,
-                charts: (turnDetail.artifacts || [])
-                  .filter((artifact) => artifact.artifact_type === 'chart')
-                  .map((artifact) => ({
-                    chart_spec: artifactChartSpec(artifact),
-                    title: artifact.title || ''
-                  }))
-              }
+              conversationId: turnDetail.conversation.id
             })"
           >
             {{ isCollected('turn', turnDetail.turn.id) ? '取消收藏' : '收藏本轮' }}
@@ -484,11 +465,7 @@
                     title: artifact.title,
                     summaryText: artifact.summary_text,
                     conversationId: turnDetail.conversation.id,
-                    artifactId: artifact.id,
-                    metadata: {
-                      turn_id: turnDetail.turn.id,
-                      chart_spec: artifactChartSpec(artifact)
-                    }
+                    artifactId: artifact.id
                   })"
                 >
                   {{ isCollected('artifact', artifact.id) ? '取消收藏' : '收藏产物' }}
@@ -948,8 +925,7 @@ const toggleCollect = async ({
   title,
   summaryText,
   conversationId,
-  artifactId = 0,
-  metadata = {}
+  artifactId = 0
 }) => {
   if (!targetId) return
   try {
@@ -964,8 +940,7 @@ const toggleCollect = async ({
         summary_text: summaryText || '',
         insight_namespace_id: Number(activeNamespace.value),
         insight_conversation_id: conversationId || activeConversationId.value || 0,
-        insight_artifact_id: artifactId || 0,
-        metadata_json: metadata
+        insight_artifact_id: artifactId || 0
       })
       ElMessage.success('收藏成功')
     }
@@ -983,8 +958,7 @@ const toggleConversationCollect = async () => {
     targetId: activeConversation.value.id,
     title: activeConversation.value.title,
     summaryText: activeConversation.value.summary_text,
-    conversationId: activeConversation.value.id,
-    metadata: { conversation_id: activeConversation.value.id }
+    conversationId: activeConversation.value.id
   })
 }
 
@@ -1009,7 +983,6 @@ const toggleChartCollectForTurn = async (item) => {
   let artifactId = item.chartArtifactId || 0
   let title = `${item.question} 图表`
   let summaryText = ''
-  let chartSpec = primaryChart.chartSpec || null
 
   if (!artifactId) {
     try {
@@ -1021,7 +994,6 @@ const toggleChartCollectForTurn = async (item) => {
       artifactId = chartArtifact.artifactId
       title = chartArtifact.title || title
       summaryText = chartArtifact.summaryText || ''
-      chartSpec = chartArtifact.chartSpec || chartSpec
       item.chartArtifactId = artifactId
     } catch (error) {
       console.error('Resolve chart artifact error:', error)
@@ -1036,11 +1008,7 @@ const toggleChartCollectForTurn = async (item) => {
     title,
     summaryText,
     conversationId: activeConversationId.value,
-    artifactId,
-    metadata: {
-      turn_id: item.turnId,
-      chart_spec: chartSpec
-    }
+    artifactId
   })
 }
 
@@ -1050,7 +1018,6 @@ const toggleCurrentChartCollect = async () => {
   let artifactId = currentChartArtifactId.value || 0
   let title = `${currentQuestion.value} 图表`
   let summaryText = ''
-  let chartSpec = primaryChart.chartSpec || null
 
   if (!artifactId) {
     try {
@@ -1062,7 +1029,6 @@ const toggleCurrentChartCollect = async () => {
       artifactId = chartArtifact.artifactId
       title = chartArtifact.title || title
       summaryText = chartArtifact.summaryText || ''
-      chartSpec = chartArtifact.chartSpec || chartSpec
       currentChartArtifactId.value = artifactId
     } catch (error) {
       console.error('Resolve current chart artifact error:', error)
@@ -1077,11 +1043,7 @@ const toggleCurrentChartCollect = async () => {
     title,
     summaryText,
     conversationId: activeConversationId.value,
-    artifactId,
-    metadata: {
-      turn_id: currentTurnId.value,
-      chart_spec: chartSpec
-    }
+    artifactId
   })
 }
 

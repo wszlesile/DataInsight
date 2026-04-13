@@ -1489,12 +1489,7 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
   "title": "分析2024年Q4季度的销售趋势",
   "summary_text": "Markdown 报告",
   "insight_namespace_id": 7,
-  "insight_conversation_id": 19,
-  "metadata_json": {
-    "turn_id": 39,
-    "charts": [],
-    "tables": []
-  }
+  "insight_conversation_id": 19
 }
 ```
 
@@ -1519,7 +1514,12 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 - `insight_artifact_id`
   - 可选；收藏图表时会传
 - `metadata_json`
-  - 扩展元数据
+  - 前端无需传
+  - 后端会根据 `collect_type` 和目标对象自动补齐
+  - 当前返回里常见会生成：
+    - `conversation`：`conversation_id`
+    - `turn`：`turn_id`、`charts`
+    - `artifact`：`turn_id`、`artifact_type`、`chart_spec`
 
 #### 收藏单独图表
 
@@ -1531,11 +1531,7 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
   "summary_text": "",
   "insight_namespace_id": 7,
   "insight_conversation_id": 19,
-  "insight_artifact_id": 88,
-  "metadata_json": {
-    "turn_id": 39,
-    "chart_spec": {}
-  }
+  "insight_artifact_id": 88
 }
 ```
 

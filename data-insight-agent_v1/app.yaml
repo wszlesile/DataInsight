@@ -1,0 +1,16 @@
+$kind: apps.supos.com;v1alpha1:Application
+$metadata:
+  name: data-insight-agent
+group: datainsight
+type: agent
+showName: 数据洞察Agent
+version: 0.0.1
+vendor:
+  name: supos
+  showName: supos-developer
+  email: developer@supos.com
+  url: https://supos.com
+  bluetronId: 123456
+description: 数据洞察Agent
+icon: icon.png
+dependencies:

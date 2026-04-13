@@ -7,8 +7,25 @@ function getAuthorizationHeader() {
   return ticket.startsWith('Bearer ') ? ticket : `Bearer ${ticket}`
 }
 
+function getAppBasePath() {
+  const pathname = window.location.pathname || '/'
+  const platformMatch = pathname.match(/^\/os\/[^/]+\/[^/]+(?:\/|$)/)
+  if (platformMatch) {
+    return platformMatch[0].endsWith('/') ? platformMatch[0] : `${platformMatch[0]}/`
+  }
+  return '/'
+}
+
+function joinAppPath(path) {
+  const appBasePath = getAppBasePath().replace(/\/$/, '')
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`
+  return `${appBasePath}${normalizedPath}`
+}
+
+const API_BASE_PATH = joinAppPath('/api')
+
 const api = axios.create({
-  baseURL: '/api',
+  baseURL: API_BASE_PATH,
   timeout: 120000
 })
 
@@ -171,12 +188,12 @@ export function removeCollect(payload) {
 }
 
 export function streamAgent(params, onMessage, onError, onDone) {
-  return streamRequest('/api/agent/stream', params, onMessage, onError, onDone)
+  return streamRequest(`${API_BASE_PATH}/agent/stream`, params, onMessage, onError, onDone)
 }
 
 export function streamRerunTurn(conversationId, turnId, onMessage, onError, onDone) {
   return streamRequest(
-    `/api/insight/conversations/${conversationId}/turns/${turnId}/rerun/stream`,
+    `${API_BASE_PATH}/insight/conversations/${conversationId}/turns/${turnId}/rerun/stream`,
     {},
     onMessage,
     onError,

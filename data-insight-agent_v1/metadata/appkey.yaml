@@ -1,0 +1,13 @@
+# ###########################################
+#               应用凭证资源申请定义
+# ###########################################
+$kind: apps.supos.com;None:AppKey
+$metadata:
+  # 应用凭证名称，如存在则返回appKey,如不存在则新建并返回appKey，同app下需要唯一
+  name: DataInsight-Server
+  # 指定token要挂载的容器
+  label:
+    components: "backend"
+# 会生成相应的kernel token以变量名:SUPOS_UPPER($($metadata.name))-APPKEY注入运行环境；
+# 应用凭证类型：1:appKey; 2:aksk
+type: 1

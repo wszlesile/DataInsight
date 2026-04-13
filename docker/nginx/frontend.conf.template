@@ -1,0 +1,12 @@
+server {
+    listen       ${NGINX_PORT};
+    server_name  _;
+
+    root   /usr/share/nginx/html;
+    index  index.html;
+
+    # 单页应用路由兜底：非静态资源回退到 index.html。
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

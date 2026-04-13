@@ -6,6 +6,10 @@ from typing import Any
 load_dotenv()
 
 
+def _get_env(name: str, default: str = '') -> str:
+    return os.environ.get(name, default)
+
+
 class Config:
     """应用配置类"""
     PROFILE = os.environ.get('PROFILE', 'local')
@@ -13,25 +17,25 @@ class Config:
     SECRET_KEY = os.environ.get('SECRET_KEY', 'dev-secret-key')
     DEBUG = os.environ.get('DEBUG', 'True').lower() == 'true'
 
-    # 数据库类型: mysql, postgresql, sqlite
-    DB_TYPE = os.environ.get('DB_TYPE', 'sqlite')
+    # 数据库配置统一使用平台规范变量名：
+    # SUPOS_DATA_INSIGHT_*。
+    # 本地开发和 Docker 联调也复用这套命名，避免出现两套口径。
+    DB_RESOURCE_NAME = 'DATA_INSIGHT'
+    DB_TYPE = _get_env('SUPOS_DATA_INSIGHT_DBTYPE', 'sqlite').lower()
+    DB_HOST = _get_env('SUPOS_DATA_INSIGHT_HOST', 'localhost')
+    DB_NAME = _get_env('SUPOS_DATA_INSIGHT_DBNAME', 'data_insight')
+    DB_USER = _get_env('SUPOS_DATA_INSIGHT_USERNAME', 'root')
+    DB_PASSWORD = _get_env('SUPOS_DATA_INSIGHT_PASSWORD', '')
+    DB_URL = _get_env('SUPOS_DATA_INSIGHT_URL', '')
+    DB_PORT = int(
+        _get_env(
+            'SUPOS_DATA_INSIGHT_PORT',
+            '5432' if DB_TYPE in ('postgres', 'postgresql') else '3306',
+        )
+    )
 
-    # MySQL配置
-    DB_HOST = os.environ.get('DB_HOST', 'localhost')
-    DB_PORT = int(os.environ.get('DB_PORT', 3306))
-    DB_NAME = os.environ.get('DB_NAME', 'data_insight')
-    DB_USER = os.environ.get('DB_USER', 'root')
-    DB_PASSWORD = os.environ.get('DB_PASSWORD', '')
-
-    # Postgresql配置
-    PG_HOST = os.environ.get('PG_HOST', 'localhost')
-    PG_PORT = int(os.environ.get('PG_PORT', 5432))
-    PG_NAME = os.environ.get('PG_NAME', 'data_insight')
-    PG_USER = os.environ.get('PG_USER', 'postgres')
-    PG_PASSWORD = os.environ.get('PG_PASSWORD', '')
-
-    # SQLite配置
-    SQLITE_PATH = os.environ.get('SQLITE_PATH', 'data_insight.db')
+    # SQLite 配置
+    SQLITE_PATH = _get_env('SUPOS_DATA_INSIGHT_SQLITE_PATH', 'data_insight.db')
 
     # 图表文件临时保存目录
     TEMP_DIR = os.environ.get('TEMP_DIR', 'D:/PycharmProjects/DataInsight/temp')

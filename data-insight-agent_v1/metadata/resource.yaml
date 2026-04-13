@@ -1,0 +1,21 @@
+$kind: datalake.supos.com;v1:Resource
+$metadata:
+  name: DATA_INSIGHT
+  labels:
+    components: backend
+
+name: DATA_INSIGHT
+subCatalog: postgres
+catalog: sql
+share: true
+shareFamily: datainsight
+
+hardware:
+  cpu: 1
+  memory: 10
+  disk: 100
+
+database:
+  dbName: 
+  dbUser: 
+  dbPassword: 
