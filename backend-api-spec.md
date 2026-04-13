@@ -878,19 +878,25 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
   "nodes": [
     {
       "id": "101",
+      "alias": "_uns_abi_test",
       "name": "abi测试",
-      "pathName": "abi测试",
+      "unsNodePath": [],
       "hasChildren": true,
       "countChildren": 2,
-      "type": 0
+      "type": 0,
+      "pathType": 0,
+      "isFolder": true
     },
     {
       "id": "2035975648114712576",
+      "alias": "_baojingjilubiao_5d3feea65c1942bdbb7a",
       "name": "报警记录表",
-      "pathName": "abi测试/报警记录表",
+      "unsNodePath": ["101"],
       "hasChildren": false,
       "countChildren": 0,
-      "type": 1
+      "type": 1,
+      "pathType": 2,
+      "isFolder": false
     }
   ]
 }
@@ -908,19 +914,24 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
   - UNS 节点 ID
 - `nodes[].name`
   - 节点名称
-- `nodes[].pathName`
-  - 节点路径名称
+- `nodes[].alias`
+  - 节点别名
 - `nodes[].hasChildren`
   - 是否有子节点
 - `nodes[].countChildren`
   - 子节点数量
 - `nodes[].type`
   - 节点类型
+- `nodes[].pathType`
+  - 节点路径类型
+- `nodes[].isFolder`
+  - 是否文件夹节点
 - `nodes[].unsNodePath`
   - 当前节点在树中的祖先节点 ID 数组
   - 字段名历史保留，不再表示路径字符串
   - 前端在提交全量选中状态时携带，后端据此推导父节点半选状态
-  - 当前前端已不再使用，不建议继续接入
+  - 顺序固定为“从最远父级到最近父级”
+  - 例如节点层级为 `A / B / C / 文件D`，则文件 `D` 的 `unsNodePath` 为 `["A", "B", "C"]`
 
 响应 `data` 结构：
 
@@ -946,12 +957,32 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
   "removed_datasource_ids": [16],
   "selections": [
     {
+      "id": 21,
+      "insight_namespace_id": 7,
+      "insight_conversation_id": 19,
       "uns_node_id": "101",
       "uns_node_name": "abi测试",
+      "uns_node_path": [],
       "is_folder": true,
       "expanded_uns_node_ids": ["2035975648114712576", "2035976562024194048"],
       "selection_state": "selected",
-      "derived": false
+      "derived": false,
+      "created_at": "2026-04-13T10:20:00",
+      "updated_at": "2026-04-13T10:20:00"
+    },
+    {
+      "id": "partial:100",
+      "insight_namespace_id": 7,
+      "insight_conversation_id": 19,
+      "uns_node_id": "100",
+      "uns_node_name": "",
+      "uns_node_path": [],
+      "is_folder": true,
+      "expanded_uns_node_ids": [],
+      "selection_state": "partial",
+      "derived": true,
+      "created_at": "2026-04-13T10:20:00",
+      "updated_at": "2026-04-13T10:20:00"
     }
   ]
 }
@@ -968,6 +999,15 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
   - 当前会话最新的 UNS 选择回显列表
 - `imported[].uns_node_id`
   - 该数据源对应的 UNS 唯一节点 ID
+- `selections[].uns_node_path`
+  - 当前节点的祖先节点 ID 数组
+  - 顺序固定为“从最远父级到最近父级”
+  - 例如节点层级为 `A / B / C / 文件D`，则文件 `D` 的 `uns_node_path` 为 `["A", "B", "C"]`
+- `selections[].selection_state`
+  - `selected` 表示真实选中节点
+  - `partial` 表示由子节点推导出的半选父节点，仅用于前端回显
+- `selections[].derived`
+  - 是否后端推导出的展示节点
 
 说明：
 - 后端会使用当前用户 `UserContext` 中的 token 调第三方 UNS 接口
@@ -982,6 +1022,7 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 - 对于已经导入过的同一个 UNS 节点，后端会优先复用共享数据源，而不是重复创建
 - 对于本次目标集合中已存在的数据源，不会重复拉取详情接口，只会复用并同步会话绑定
 - 如果本次提交为空集合，后端会清空当前会话的 UNS 选择和对应绑定
+- 如果 `nodes` 非空但展开、详情查询或导入过程失败，接口返回失败并附带 `failed`
 - UNS 文件夹展开相关限制支持通过环境变量动态配置：
   - `UNS_MAX_EXPANDED_FILES`
   - `UNS_MAX_EXPAND_DEPTH`

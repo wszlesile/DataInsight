@@ -64,9 +64,10 @@
             <button
               class="conversation-create-btn"
               type="button"
+              title="新建会话"
               @click="$emit('new-conversation')"
             >
-              新增会话
+              +
             </button>
           </div>
 

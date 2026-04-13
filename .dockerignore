@@ -20,4 +20,5 @@ data_insight.db
 uv.lock
 
 src/.env
+src/.env.*
 sys_prompt.baseline.tmp.md

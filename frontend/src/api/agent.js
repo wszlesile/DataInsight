@@ -1,10 +1,10 @@
 import axios from 'axios'
 
-const SUPOS_AUTHORIZATION =
-  import.meta.env.VITE_SUPOS_AUTHORIZATION || 'Bearer JSXozLjgzZuYcDAoFCNvT'
-
 function getAuthorizationHeader() {
-  return SUPOS_AUTHORIZATION
+  const rawTicket = window.localStorage.getItem('ticket') || ''
+  const ticket = rawTicket.trim()
+  if (!ticket) return ''
+  return ticket.startsWith('Bearer ') ? ticket : `Bearer ${ticket}`
 }
 
 const api = axios.create({
