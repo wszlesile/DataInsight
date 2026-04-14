@@ -4,6 +4,12 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
+from utils.logger import logger
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+LOCAL_ECHARTS_PATH = PROJECT_ROOT / 'src' / 'static' / 'vendor' / 'echarts.min.js'
+
 
 def resolve_local_file_path(file_id: str) -> Path | None:
     """把文件标识解析为本地绝对路径。"""
@@ -14,8 +20,7 @@ def resolve_local_file_path(file_id: str) -> Path | None:
     if path.is_absolute():
         return path if path.exists() else None
 
-    project_root = Path(__file__).resolve().parents[2]
-    candidate = project_root / file_id
+    candidate = PROJECT_ROOT / file_id
     return candidate if candidate.exists() else None
 
 
@@ -44,21 +49,27 @@ def render_chart_file_to_png(file_id: str, timeout_ms: int = 30000) -> bytes | N
                 page.goto(chart_path.as_uri(), wait_until='networkidle', timeout=timeout_ms)
                 container = page.locator('.chart-container')
                 if container.count() == 0:
+                    logger.warning("图表文件渲染失败: 未找到 .chart-container, file=%s", chart_path)
                     return None
                 return container.screenshot(type='png')
             finally:
                 browser.close()
-    except Exception:
+    except Exception as exc:
+        logger.warning("图表文件渲染失败: file=%s error=%s", chart_path, exc)
         return None
 
 
 def render_chart_spec_to_png(chart_spec: dict, timeout_ms: int = 30000) -> bytes | None:
     """
     使用无头浏览器把 ECharts 配置直接渲染为 PNG。
-
     这条能力用于当前的结构化图表导出链，避免调用方必须先把图表落成 HTML 文件。
     """
     if not isinstance(chart_spec, dict) or not chart_spec:
+        return None
+
+    echarts_script = _load_local_echarts_script()
+    if not echarts_script:
+        logger.warning("图表渲染失败: 本地 echarts.min.js 资源不存在, path=%s", LOCAL_ECHARTS_PATH)
         return None
 
     html = f"""<!DOCTYPE html>
@@ -67,7 +78,7 @@ def render_chart_spec_to_png(chart_spec: dict, timeout_ms: int = 30000) -> bytes
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>chart-export</title>
-  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <script>{echarts_script}</script>
   <style>
     html, body {{
       margin: 0;
@@ -87,7 +98,7 @@ def render_chart_spec_to_png(chart_spec: dict, timeout_ms: int = 30000) -> bytes
   <div id="chart" class="chart-container"></div>
   <script>
     const option = {json.dumps(chart_spec, ensure_ascii=False)};
-    const chart = echarts.init(document.getElementById('chart'), null, {{renderer: 'canvas'}});
+    const chart = echarts.init(document.getElementById('chart'), null, {{ renderer: 'canvas' }});
     chart.setOption(option, true);
   </script>
 </body>
@@ -111,11 +122,13 @@ def render_chart_spec_to_png(chart_spec: dict, timeout_ms: int = 30000) -> bytes
                 page.goto(temp_path.as_uri(), wait_until='networkidle', timeout=timeout_ms)
                 container = page.locator('.chart-container')
                 if container.count() == 0:
+                    logger.warning("图表配置渲染失败: 未找到 .chart-container")
                     return None
                 return container.screenshot(type='png')
             finally:
                 browser.close()
-    except Exception:
+    except Exception as exc:
+        logger.warning("图表配置渲染失败: error=%s", exc)
         return None
     finally:
         if temp_path and temp_path.exists():
@@ -123,3 +136,13 @@ def render_chart_spec_to_png(chart_spec: dict, timeout_ms: int = 30000) -> bytes
                 temp_path.unlink()
             except OSError:
                 pass
+
+
+def _load_local_echarts_script() -> str:
+    if not LOCAL_ECHARTS_PATH.exists():
+        return ''
+    try:
+        return LOCAL_ECHARTS_PATH.read_text(encoding='utf-8')
+    except OSError as exc:
+        logger.warning("读取本地 echarts 资源失败: path=%s error=%s", LOCAL_ECHARTS_PATH, exc)
+        return ''

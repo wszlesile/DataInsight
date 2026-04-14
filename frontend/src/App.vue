@@ -323,8 +323,14 @@
                 <span class="detail-pill">{{ favoriteTypeLabel(collect) }}</span>
               </div>
 
-              <div v-if="favoriteChartSpec(collect)" class="favorite-turn-chart">
-                <ChartDisplay :chart-spec="favoriteChartSpec(collect)" />
+              <div v-if="favoriteCharts(collect).length" class="favorite-turn-charts">
+                <div
+                  v-for="(chart, chartIndex) in favoriteCharts(collect)"
+                  :key="`favorite-turn-${collect.id}-chart-${chart.artifactId || chartIndex}`"
+                  class="favorite-turn-chart"
+                >
+                  <ChartDisplay :chart-spec="chart.chartSpec" />
+                </div>
               </div>
 
               <div
@@ -580,15 +586,32 @@ const parseCollectMetadata = (collect) => {
   return collect.metadata_json || {}
 }
 
-const favoriteChartSpec = (collect) => {
+const collectNumber = (value) => {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+const favoriteCharts = (collect) => {
   const metadata = parseCollectMetadata(collect)
   if (metadata.chart_spec && typeof metadata.chart_spec === 'object') {
-    return sanitizeChartSpec(metadata.chart_spec)
+    return [{
+      artifactId: collectNumber(metadata.artifact_id || metadata.artifactId || 0),
+      chartSpec: sanitizeChartSpec(metadata.chart_spec)
+    }].filter((item) => item.chartSpec)
   }
   if (Array.isArray(metadata.charts) && metadata.charts.length > 0) {
-    return sanitizeChartSpec(metadata.charts[0]?.chartSpec || metadata.charts[0]?.chart_spec || null)
+    return metadata.charts
+      .map((chart) => ({
+        artifactId: collectNumber(chart?.artifactId || chart?.artifact_id || 0),
+        chartSpec: sanitizeChartSpec(chart?.chartSpec || chart?.chart_spec || null)
+      }))
+      .filter((item) => item.chartSpec)
   }
-  return null
+  return []
+}
+
+const favoriteChartSpec = (collect) => {
+  return favoriteCharts(collect)[0]?.chartSpec || null
 }
 
 const sanitizeChartSpec = (chartSpec) => {

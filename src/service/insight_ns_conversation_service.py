@@ -28,6 +28,7 @@ from model import (
 )
 from utils import (
     build_conversation_title,
+    logger,
     normalize_chart_spec,
     render_chart_spec_to_png,
     to_int,
@@ -541,6 +542,12 @@ class InsightNsConversationService:
         if isinstance(chart_spec, dict) and chart_spec:
             image_bytes = render_chart_spec_to_png(chart_spec)
         if image_bytes is None:
+            logger.warning(
+                "PDF 图表渲染被跳过: artifact_id=%s title=%s has_chart_spec=%s",
+                artifact.get('id', 0),
+                artifact.get('title', ''),
+                bool(isinstance(chart_spec, dict) and chart_spec),
+            )
             return None
 
         pil_image = PILImage.open(BytesIO(image_bytes))
