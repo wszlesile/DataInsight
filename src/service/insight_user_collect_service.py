@@ -28,14 +28,11 @@ class InsightUserCollectService:
     def __init__(self, session: Session):
         self.session = session
 
-    def list_collects(self, username: str, namespace_id: Any = None) -> list[dict[str, Any]]:
+    def list_collects(self, username: str) -> list[dict[str, Any]]:
         query = self.session.query(InsightUserCollect).filter(
             InsightUserCollect.username == username,
             InsightUserCollect.is_deleted == 0,
         )
-        namespace_id_int = _to_int(namespace_id, 0)
-        if namespace_id is not None and namespace_id_int > 0:
-            query = query.filter(InsightUserCollect.insight_namespace_id == namespace_id_int)
         collects = query.order_by(InsightUserCollect.created_at.desc(), InsightUserCollect.id.desc()).all()
         return [collect.to_dict() for collect in collects]
 

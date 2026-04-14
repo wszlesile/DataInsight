@@ -864,7 +864,7 @@ const fetchCollects = async () => {
     return
   }
   try {
-    const response = await listCollects(activeNamespace.value)
+    const response = await listCollects()
     if (response.data.success) collects.value = response.data.data || []
   } catch (error) {
     console.error('List collects error:', error)

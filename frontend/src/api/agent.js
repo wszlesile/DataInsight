@@ -171,12 +171,8 @@ export function exportTurnPdf(conversationId, turnId, payload) {
   )
 }
 
-export function listCollects(namespaceId) {
-  return api.get('/insight/collects', {
-    params: {
-      namespace_id: namespaceId
-    }
-  })
+export function listCollects() {
+  return api.get('/insight/collects')
 }
 
 export function createCollect(payload) {

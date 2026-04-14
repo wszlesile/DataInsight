@@ -1,4 +1,4 @@
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify
 
 from config.database import SessionLocal
 from controller.base_controller import BaseController
@@ -25,15 +25,11 @@ class InsightUserCollectController(BaseController):
         return user_context.username if user_context else 'anonymous'
 
     def list_collects(self):
-        """按空间查询当前用户收藏。"""
-        namespace_id = request.args.get('namespace_id')
+        """按用户维度查询当前用户全部收藏。"""
         session = SessionLocal()
         try:
             service = InsightUserCollectService(session)
-            collects = service.list_collects(
-                username=self._get_username(),
-                namespace_id=namespace_id,
-            )
+            collects = service.list_collects(username=self._get_username())
             return jsonify(Result.success(data=collects).to_dict())
         finally:
             session.close()

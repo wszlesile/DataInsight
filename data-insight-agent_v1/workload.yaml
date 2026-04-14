@@ -90,6 +90,7 @@ configMap:
     MINIMAX_M2_5_MODEL: "MiniMax-M2.7"
     MINIMAX_M2_5_BASE_URL: "https://api.minimax.chat/v1"
     MINIMAX_M2_5_API_KEY: ""
-    QWEN3_80B_MODEL: "Qwen3-80B"
-    QWEN3_80B_BASE_URL: "http://qwen3-80b:5103/v1"
-    QWEN3_80B_API_KEY: ""
+    QWEN3_80B_MODEL: Qwen3-80B
+    QWEN3_80B_API_KEY: EMPTY
+    QWEN3_80B_BASE_URL: http://192.168.8.206:5103/v1
+    SUPOS_DATA_INSIGHT_DBTYPE: postgresql

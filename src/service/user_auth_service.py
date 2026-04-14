@@ -1,6 +1,7 @@
-import requests
 import time
 from typing import Optional
+
+import requests
 
 from api import supos_kernel_api
 from config.config import Config
@@ -9,12 +10,11 @@ from utils import logger
 
 
 class AuthError(Exception):
-    """认证异常"""
-    pass
+    """认证异常。"""
 
 
 class UserAuthService:
-    """用户认证服务"""
+    """用户认证服务。"""
 
     def __init__(self):
         self.base_url = Config.SUPOS_WEB
@@ -24,22 +24,17 @@ class UserAuthService:
         self._context_cache: dict[str, tuple[float, UserContext]] = {}
 
     def verify_token(self, token: str) -> Optional[UserContext]:
-        """
-        验证token并获取用户信息
-
-        Args:
-            token: 完整的Authorization头 (Bearer <token>)
-
-        Returns:
-            UserContext: 用户上下文，验证失败返回None
-        """
+        """验证 Authorization 头并构造用户上下文。"""
         if not token:
             return None
 
         url = f"{self.base_url}{self.auth_endpoint}"
-        headers = {
-            'Authorization': token
-        }
+        headers = {'Authorization': token}
+        logger.info(
+            "开始认证校验: url=%s auth_summary=%s",
+            url,
+            self._describe_auth_header(token),
+        )
 
         try:
             response = requests.get(url, headers=headers, timeout=self.request_timeout)
@@ -52,29 +47,33 @@ class UserAuthService:
                         token,
                         database_context=supos_kernel_api.get_database_context(token),
                     )
-                else:
-                    logger.warn(f"认证失败: {result.get('message', '未知错误')}")
-                    return None
-            else:
-                logger.warn(f"认证请求失败: HTTP {response.status_code}")
+
+                logger.warning(
+                    "认证失败: auth_summary=%s message=%s",
+                    self._describe_auth_header(token),
+                    result.get('message', '未知错误'),
+                )
                 return None
-        except requests.RequestException as e:
-            logger.error(f"认证请求异常: {e}")
+
+            logger.warning(
+                "认证请求失败: url=%s status=%s auth_summary=%s response_preview=%s",
+                url,
+                response.status_code,
+                self._describe_auth_header(token),
+                self._preview_response_text(response.text),
+            )
+            return None
+        except requests.RequestException as exc:
+            logger.error(
+                "认证请求异常: url=%s auth_summary=%s error=%s",
+                url,
+                self._describe_auth_header(token),
+                exc,
+            )
             return None
 
     def get_user_context(self, auth_header: str) -> UserContext:
-        """
-        获取用户上下文，失败抛出AuthError
-
-        Args:
-            auth_header: 完整的Authorization头 (Bearer <token>)
-
-        Returns:
-            UserContext: 用户上下文
-
-        Raises:
-            AuthError: 认证失败
-        """
+        """获取用户上下文；失败抛出认证异常。"""
         user_context = self._get_cached_user_context(auth_header)
         if user_context:
             return user_context
@@ -86,7 +85,7 @@ class UserAuthService:
         return user_context
 
     def _get_cached_user_context(self, auth_header: str) -> UserContext | None:
-        """按 Authorization 头缓存用户上下文，避免每次请求都访问 SUPOS 用户接口。"""
+        """按 Authorization 头缓存用户上下文，避免重复访问认证接口。"""
         if not auth_header or self.cache_ttl_seconds <= 0:
             return None
 
@@ -105,6 +104,24 @@ class UserAuthService:
             return
         self._context_cache[auth_header] = (time.time() + self.cache_ttl_seconds, user_context)
 
+    @staticmethod
+    def _describe_auth_header(auth_header: str) -> str:
+        value = (auth_header or '').strip()
+        if not value:
+            return 'empty'
+        prefix = value[:24]
+        return (
+            f"len={len(value)} "
+            f"bearer={value.startswith('Bearer ')} "
+            f"prefix={prefix!r}"
+        )
 
-# 全局单例
+    @staticmethod
+    def _preview_response_text(text: str, max_length: int = 200) -> str:
+        normalized = (text or '').replace('\r', ' ').replace('\n', ' ').strip()
+        if len(normalized) <= max_length:
+            return normalized
+        return f"{normalized[:max_length]}..."
+
+
 user_auth_service = UserAuthService()

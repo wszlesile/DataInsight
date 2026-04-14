@@ -1462,17 +1462,12 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 
 ### 7.1 获取收藏列表
 
-`GET /api/insight/collects?namespace_id={namespace_id}`
+`GET /api/insight/collects`
 
 用途：
 
-- 拉取当前空间下可见收藏
-
-查询参数说明：
-
-- `namespace_id`
-  - 空间 ID
-  - 可选；当前前端会传
+- 拉取当前用户全部收藏
+- 收藏按“用户”维度组织，不再按空间过滤
 
 ### 7.2 创建收藏
 
