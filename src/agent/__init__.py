@@ -1,8 +1,9 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 from zoneinfo import ZoneInfo
+import re
 
 from langchain.agents import AgentState, create_agent
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
@@ -116,6 +117,48 @@ def _build_runtime_environment_message() -> SystemMessage:
     )
 
 
+def _build_relative_date_hint_message(user_message: str) -> SystemMessage | None:
+    """
+    把用户问题里的相对日期表达锚定成绝对时间提示。
+
+    这里不替模型直接写 SQL，只做稳定的日期解释，避免它随手猜成 2024/2025。
+    """
+    text = (user_message or '').strip()
+    if not text:
+        return None
+
+    now = datetime.now(ZoneInfo('Asia/Shanghai'))
+    hints: list[str] = []
+    if '今年' in text:
+        hints.append(f"- 本轮问题中的“今年”应解释为 {now.year} 年。")
+    if '去年' in text:
+        hints.append(f"- 本轮问题中的“去年”应解释为 {now.year - 1} 年。")
+    if '本月' in text:
+        hints.append(f"- 本轮问题中的“本月”应解释为 {now.year} 年 {now.month} 月。")
+    if '上月' in text:
+        last_month_year = now.year if now.month > 1 else now.year - 1
+        last_month = now.month - 1 if now.month > 1 else 12
+        hints.append(f"- 本轮问题中的“上月”应解释为 {last_month_year} 年 {last_month} 月。")
+    if '今天' in text:
+        hints.append(f"- 本轮问题中的“今天”应解释为 {now:%Y-%m-%d}。")
+    if '昨天' in text:
+        hints.append(f"- 本轮问题中的“昨天”应解释为 {(now.date() - timedelta(days=1)).isoformat()}。")
+    if '前天' in text:
+        hints.append(f"- 本轮问题中的“前天”应解释为 {(now.date() - timedelta(days=2)).isoformat()}。")
+
+    month_matches = re.findall(r'(\d{1,2})月', text)
+    if month_matches and ('今年' in text or '去年' in text):
+        anchor_year = now.year if '今年' in text else now.year - 1
+        normalized_months = [str(int(month)) for month in month_matches]
+        hints.append(
+            f"- 本轮提到的月份应优先解释为 {anchor_year} 年的这些月份：{', '.join(normalized_months)} 月。"
+        )
+
+    if not hints:
+        return None
+    return SystemMessage("本轮问题的相对日期解释：\n" + "\n".join(hints))
+
+
 def build_prompt_messages(
     user_message: str,
     namespace_id: int = 0,
@@ -153,6 +196,7 @@ def build_prompt_messages(
     merged_system_content = _merge_system_messages(
         SystemMessage(load_system_prompt()),
         _build_runtime_environment_message(),
+        _build_relative_date_hint_message(user_message),
         datasource_message,
         memory_messages,
         runtime_messages,
@@ -162,7 +206,11 @@ def build_prompt_messages(
     if merged_system_content:
         messages.append(SystemMessage(merged_system_content))
 
-    messages.extend(get_history_messages(conversation_id, max_turn_no=history_turn_limit))
+    messages.extend(get_history_messages(
+        conversation_id,
+        max_turn_no=history_turn_limit,
+        user_message=user_message,
+    ))
     messages.append(HumanMessage(user_message))
     return messages
 

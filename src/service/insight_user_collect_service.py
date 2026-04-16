@@ -3,12 +3,14 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from api import supos_kernel_api
 from model import (
     InsightNsArtifact,
     InsightNsConversation,
     InsightNsTurn,
     InsightUserCollect,
 )
+from utils import logger
 
 
 def _to_int(value: Any, default: int = 0) -> int:
@@ -95,6 +97,54 @@ class InsightUserCollectService:
         ).update({"is_deleted": 1}, synchronize_session=False)
         self.session.commit()
         return bool(deleted)
+
+    def count_collects(self, username: str) -> int:
+        return self.session.query(InsightUserCollect).filter(
+            InsightUserCollect.username == username,
+            InsightUserCollect.is_deleted == 0,
+        ).count()
+
+    def report_collect_statistics(self, username: str, authorization: str = '') -> None:
+        username = (username or '').strip()
+        authorization = (authorization or '').strip()
+        if not username:
+            logger.info("跳过收藏统计上报: username 为空")
+            return
+        if not authorization:
+            logger.info("跳过收藏统计上报: username=%s 缺少 authorization", username)
+            return
+
+        collect_count = self.count_collects(username)
+        item_list = [
+            {
+                "code": "username",
+                "name": "用户名",
+                "total": username,
+            },
+            {
+                "code": "collect_insight_result_count",
+                "name": "收藏洞察结果数",
+                "total": collect_count,
+            },
+        ]
+        try:
+            response = supos_kernel_api.track_user_statistics(
+                authorization=authorization,
+                item_list=item_list,
+            )
+            logger.info(
+                "收藏统计上报完成: username=%s collect_count=%s accepted=%s",
+                username,
+                collect_count,
+                response.get('accepted'),
+            )
+        except Exception as exc:
+            logger.warning(
+                "收藏统计上报失败: username=%s collect_count=%s error=%s",
+                username,
+                collect_count,
+                exc,
+            )
 
     def _resolve_collect_payload(
         self,

@@ -21,10 +21,35 @@ class SuposKernelApi:
     def __init__(self):
         self.supos_web = Config.SUPOS_WEB
         self.timeout = Config.SUPOS_REQUEST_TIMEOUT
+        self.log_collect_track_endpoint = Config.SUPOS_LOG_COLLECT_TRACK_ENDPOINT
         self._database_context = DatabaseContext()
         self._database_context_lock = Lock()
         self._database_pool: QueuePool | None = None
         self._database_pool_lock = Lock()
+
+    def track_user_statistics(
+        self,
+        authorization: str,
+        item_list: list[dict[str, Any]],
+        data_type: str = 'statistics',
+    ) -> dict[str, Any]:
+        """上报用户统计数据。"""
+        if not authorization:
+            raise ValueError("SUPOS authorization 不能为空")
+        if not item_list:
+            raise ValueError("item_list 不能为空")
+
+        url = f"{self.supos_web}{self.log_collect_track_endpoint}"
+        headers = {
+            "Authorization": authorization,
+        }
+        payload = {
+            "dataType": data_type,
+            "itemList": item_list,
+        }
+        response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+        response.raise_for_status()
+        return response.json()
 
     def get_database_context(self, token: str | None = None) -> DatabaseContext:
         """

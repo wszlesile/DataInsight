@@ -25,24 +25,22 @@ def _now() -> datetime:
 class InsightNamespaceService:
     """负责洞察空间的创建、查询和删除。"""
 
+    DEFAULT_NAMESPACE_NAME = '默认空间'
+
     def __init__(self, session: Session):
         self.session = session
 
     def list_namespaces(self, username: str) -> list[dict[str, Any]]:
-        """返回当前用户可见的空间列表。"""
-        namespaces = self.session.query(InsightNamespace).filter(
-            InsightNamespace.username == username,
-            InsightNamespace.is_deleted == 0,
-        ).order_by(
-            InsightNamespace.created_at.desc(),
-            InsightNamespace.id.desc(),
-        ).all()
+        """返回当前用户可见的空间列表；若为空则自动初始化默认空间。"""
+        namespaces = self._query_namespaces(username)
+        if not namespaces:
+            self._ensure_default_namespace(username)
+            namespaces = self._query_namespaces(username)
         return [self._to_dict(item) for item in namespaces]
 
     def create_namespace(self, username: str, name: str) -> dict[str, Any]:
         """
         创建空间，并同步创建一条默认会话。
-
         当前产品进入空间后就允许直接开始对话，因此把空间初始化和默认会话
         初始化放在同一事务里完成。
         """
@@ -123,7 +121,6 @@ class InsightNamespaceService:
     def delete_namespace(self, username: str, namespace_id: Any) -> bool:
         """
         软删除空间及其下所有会话级上下文数据。
-
         不改变当前架构设计，只在一个地方集中收口空间删除时需要级联清理的
         会话、轮次、消息、执行、产物、记忆、绑定关系和收藏。
         """
@@ -148,7 +145,7 @@ class InsightNamespaceService:
         # 空间本身软删除。
         namespace.is_deleted = 1
 
-        # 当前业务下空间与会话为 1:1，但这里仍按集合方式删除，便于未来 1:N 平滑演进。
+        # 当前业务下空间与会话是 1:1，但这里仍按集合方式删除，便于未来 1:N 平滑演进。
         if conversation_ids:
             self.session.query(InsightNsTurn).filter(
                 InsightNsTurn.conversation_id.in_(conversation_ids),
@@ -238,6 +235,25 @@ class InsightNamespaceService:
 
         self.session.commit()
         return True
+
+    def _query_namespaces(self, username: str) -> list[InsightNamespace]:
+        return self.session.query(InsightNamespace).filter(
+            InsightNamespace.username == username,
+            InsightNamespace.is_deleted == 0,
+        ).order_by(
+            InsightNamespace.created_at.desc(),
+            InsightNamespace.id.desc(),
+        ).all()
+
+    def _ensure_default_namespace(self, username: str) -> None:
+        existing_default = self.session.query(InsightNamespace.id).filter(
+            InsightNamespace.username == username,
+            InsightNamespace.name == self.DEFAULT_NAMESPACE_NAME,
+            InsightNamespace.is_deleted == 0,
+        ).first()
+        if existing_default is not None:
+            return
+        self.create_namespace(username=username, name=self.DEFAULT_NAMESPACE_NAME)
 
     def _to_dict(self, namespace: InsightNamespace) -> dict[str, Any]:
         return {

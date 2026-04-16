@@ -7,7 +7,7 @@ from service.user_auth_service import AuthError, user_auth_service
 from utils import logger
 
 
-ANONYMOUS_PATHS = ['/health', '/files/', '/api/']
+ANONYMOUS_PATHS = ['/health', '/files/']
 
 
 def _describe_auth_header(auth_header: str) -> str:

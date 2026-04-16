@@ -36,6 +36,7 @@ class Config:
 
     # SQLite 配置
     SQLITE_PATH = _get_env('SUPOS_DATA_INSIGHT_SQLITE_PATH', 'data_insight.db')
+    SQLITE_BUSY_TIMEOUT_SECONDS = int(os.environ.get('SUPOS_DATA_INSIGHT_SQLITE_BUSY_TIMEOUT_SECONDS', 30))
 
     # 图表文件临时保存目录
     TEMP_DIR = os.environ.get('TEMP_DIR', 'D:/PycharmProjects/DataInsight/temp')
@@ -62,6 +63,11 @@ class Config:
     # SUPOS / Kernel 配置
     SUPOS_WEB = os.environ.get('SUPOS_WEB', 'http://localhost:8080')
     SUPOS_REQUEST_TIMEOUT = int(os.environ.get('SUPOS_REQUEST_TIMEOUT', 15))
+    SUPOS_LOG_COLLECT_TRACK_ENDPOINT = os.environ.get(
+        'SUPOS_LOG_COLLECT_TRACK_ENDPOINT',
+        '/os/inter-api/log-collect-system/track',
+    )
+    PYTHON_EXEC_TIMEOUT_SECONDS = int(os.environ.get('PYTHON_EXEC_TIMEOUT_SECONDS', 90))
     UNS_MAX_EXPANDED_FILES = int(os.environ.get('UNS_MAX_EXPANDED_FILES', 200))
     UNS_MAX_EXPAND_DEPTH = int(os.environ.get('UNS_MAX_EXPAND_DEPTH', 5))
     UNS_TREE_PAGE_SIZE = int(os.environ.get('UNS_TREE_PAGE_SIZE', 100))

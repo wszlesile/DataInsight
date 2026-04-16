@@ -24,6 +24,10 @@ class InsightUserCollectController(BaseController):
         user_context = get_current_user_context()
         return user_context.username if user_context else 'anonymous'
 
+    def _get_authorization(self) -> str:
+        user_context = get_current_user_context()
+        return user_context.token if user_context else ''
+
     def list_collects(self):
         """按用户维度查询当前用户全部收藏。"""
         session = SessionLocal()
@@ -45,8 +49,9 @@ class InsightUserCollectController(BaseController):
         session = SessionLocal()
         try:
             service = InsightUserCollectService(session)
+            username = self._get_username()
             collect = service.create_collect(
-                username=self._get_username(),
+                username=username,
                 collect_type=collect_type,
                 target_id=target_id,
                 title=data.get('title', ''),
@@ -55,6 +60,10 @@ class InsightUserCollectController(BaseController):
                 conversation_id=data.get('insight_conversation_id', 0),
                 message_id=data.get('insight_message_id', data.get('insight_context_id', 0)),
                 artifact_id=data.get('insight_artifact_id', 0),
+            )
+            service.report_collect_statistics(
+                username=username,
+                authorization=self._get_authorization(),
             )
             return jsonify(Result.success(data=collect, message='收藏成功').to_dict())
         finally:
@@ -71,13 +80,18 @@ class InsightUserCollectController(BaseController):
         session = SessionLocal()
         try:
             service = InsightUserCollectService(session)
+            username = self._get_username()
             removed = service.remove_collect(
-                username=self._get_username(),
+                username=username,
                 collect_type=collect_type,
                 target_id=target_id,
             )
             if not removed:
                 return self.error_response('收藏不存在', 404)
+            service.report_collect_statistics(
+                username=username,
+                authorization=self._get_authorization(),
+            )
             return jsonify(Result.success(message='取消收藏成功').to_dict())
         finally:
             session.close()

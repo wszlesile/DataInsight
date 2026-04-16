@@ -1,6 +1,11 @@
 import json
+import multiprocessing as mp
+import os
+from queue import Empty
 import re
+import tempfile
 import time
+import traceback
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, time as datetime_time, timedelta
@@ -16,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from agent.context_engineering import CustomContext
 from api import supos_kernel_api
+from dto import DatabaseContext
 from utils import logger
 from utils import normalize_chart_spec
 
@@ -335,6 +341,63 @@ class ExePythonCodeInput(BaseModel):
     description: str = Field(description="本次代码执行任务的详细说明")
 
 
+def _serialize_exec_result(exec_result: Any) -> dict[str, Any]:
+    if isinstance(exec_result, StructuredResult):
+        return {
+            'result_kind': 'structured',
+            'payload': exec_result.model_dump(),
+        }
+    return {
+        'result_kind': 'raw',
+        'payload': None,
+    }
+
+
+def _deserialize_exec_result(payload: dict[str, Any]) -> Any:
+    if payload.get('result_kind') == 'structured' and isinstance(payload.get('payload'), dict):
+        return StructuredResult(**payload['payload'])
+    return None
+
+
+def _build_execution_result_temp_dir() -> str:
+    """返回执行结果临时目录，并确保目录存在。"""
+    from config.config import Config
+
+    base_dir = getattr(Config, 'TEMP_DIR', '') or tempfile.gettempdir()
+    result_dir = os.path.join(base_dir, 'python_exec_results')
+    os.makedirs(result_dir, exist_ok=True)
+    return result_dir
+
+
+def _write_worker_result_payload(payload: dict[str, Any]) -> str:
+    """将完整执行结果落到临时文件，避免大对象阻塞 multiprocessing.Queue。"""
+    result_dir = _build_execution_result_temp_dir()
+    with tempfile.NamedTemporaryFile(
+        mode='w',
+        encoding='utf-8',
+        suffix='.json',
+        prefix='python_exec_',
+        dir=result_dir,
+        delete=False,
+    ) as temp_file:
+        json.dump(payload, temp_file, ensure_ascii=False)
+        temp_file.flush()
+        return temp_file.name
+
+
+def _read_worker_result_payload(result_file_path: str) -> dict[str, Any]:
+    with open(result_file_path, 'r', encoding='utf-8') as result_file:
+        return json.load(result_file)
+
+
+def _remove_worker_result_payload(result_file_path: str) -> None:
+    if result_file_path:
+        try:
+            os.remove(result_file_path)
+        except FileNotFoundError:
+            pass
+
+
 def _sanitize_tool_output(output: str) -> str:
     """从 stdout/stderr 中去掉流式事件碎片，只保留有意义的执行日志。"""
     if not output:
@@ -436,6 +499,80 @@ def _build_execution_namespace() -> dict[str, Any]:
         'save_empty_analysis_result': save_empty_analysis_result,
         'save_analysis_result': save_analysis_result,
     }
+
+
+def _serialize_runtime_user_context(runtime_context: CustomContext | None) -> dict[str, Any]:
+    """从 Agent 运行时上下文提取对子进程执行真正有用的最小信息。"""
+    if runtime_context is None:
+        return {}
+
+    return {
+        'token': getattr(runtime_context, 'auth_token', '') or '',
+        'database_context': dict(getattr(runtime_context, 'database_context', {}) or {}),
+    }
+
+
+def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -> None:
+    """在子进程里恢复数据库访问所需的最小运行时上下文。"""
+    payload = runtime_user_context or {}
+    db_payload = payload.get('database_context') or {}
+    if db_payload:
+        supos_kernel_api._database_context = DatabaseContext(
+            host=str(db_payload.get('host') or ''),
+            port=str(db_payload.get('port') or ''),
+            user=str(db_payload.get('user') or ''),
+            password=str(db_payload.get('password') or ''),
+            lake_rds_database_name=str(db_payload.get('lake_rds_database_name') or ''),
+        )
+        supos_kernel_api._database_pool = None
+        return
+
+    token = str(payload.get('token') or '').strip()
+    if token:
+        supos_kernel_api.get_database_context(token)
+
+
+def _execute_generated_code_worker(
+    code: str,
+    username: str,
+    runtime_user_context: dict[str, Any],
+    result_queue: mp.Queue,
+) -> None:
+    _prime_worker_runtime_context(runtime_user_context)
+    namespace = _build_execution_namespace()
+    exec_result: Any = None
+    with _capture_runtime_io(username) as (stdout_buffer, stderr_buffer):
+        try:
+            exec(code, namespace)
+            exec_result = namespace.get('result')
+            result_file_path = _write_worker_result_payload({
+                'status': 'success',
+                'stdout_text': _sanitize_tool_output(stdout_buffer.getvalue()),
+                'stderr_text': _sanitize_tool_output(stderr_buffer.getvalue()),
+                'exec_result': _serialize_exec_result(exec_result),
+            })
+            result_queue.put({
+                'status': 'success',
+                'result_file_path': result_file_path,
+            })
+        except Exception as exc:
+            error_message = str(exc)
+            error_type = _classify_execution_error(exc, error_message)
+            result_file_path = _write_worker_result_payload({
+                'status': 'error',
+                'error_message': error_message,
+                'error_type': error_type,
+                'error_signature': _extract_error_signature(error_type, error_message),
+                'repair_instructions': _build_repair_instructions(error_type),
+                'stdout_text': _sanitize_tool_output(stdout_buffer.getvalue()),
+                'stderr_text': _sanitize_tool_output(
+                    '\n'.join(item for item in [stderr_buffer.getvalue(), traceback.format_exc()] if item)
+                ),
+            })
+            result_queue.put({
+                'status': 'error',
+                'result_file_path': result_file_path,
+            })
 
 
 @contextmanager
@@ -650,6 +787,13 @@ def _build_repair_instructions(error_type: str) -> list[str]:
             '根据 error_message 直接修正导致失败的那一步，再重新生成完整代码。',
             '如果错误发生在数据处理阶段，请先验证中间结果再进入图表和报告生成。',
         ],
+        'execution_timeout': [
+            '当前代码执行超时，说明存在无界循环、超大范围数据处理或阻塞式等待。',
+            '请先缩小数据范围、减少无必要的明细拼接与循环处理，并确保所有外部请求都具备明确超时。',
+            '如果当前分析使用的是表数据源，优先把时间过滤、字段裁剪、JOIN、GROUP BY、LIMIT 下推到 SQL 层完成，不要继续把大结果集加载到 pandas 后再 merge 或聚合。',
+            '如果跨表 JOIN 或明细关联已经连续超时，请先退化成单表分析：优先完成主表趋势、分布和有限明细，再在分析报告中明确说明关联部分受查询成本限制暂未展开。',
+            '如果需要展示明细，请先限制结果行数，再生成图表和分析报告。',
+        ],
     }
     return [*specific_instructions.get(error_type, specific_instructions['runtime_error']), *common_instructions]
 
@@ -782,57 +926,207 @@ def execute_python(
         message='分析代码已提交到本地执行器。',
     )
 
-    namespace = _build_execution_namespace()
+    from config.config import Config
+
+    timeout_seconds = max(int(getattr(Config, 'PYTHON_EXEC_TIMEOUT_SECONDS', 90) or 90), 1)
+    result_queue: mp.Queue = mp.Queue()
+    runtime_user_context = _serialize_runtime_user_context(runtime.context)
+    process = mp.Process(
+        target=_execute_generated_code_worker,
+        args=(code, getattr(runtime.context, 'username', 'anonymous'), runtime_user_context, result_queue),
+        daemon=True,
+    )
+
+    worker_result: dict[str, Any] | None = None
+    stdout_text = ''
+    stderr_text = ''
     exec_result: Any = None
-    with _capture_runtime_io(getattr(runtime.context, 'username', 'anonymous')) as (stdout_buffer, stderr_buffer):
+    process.start()
+    deadline = time.time() + timeout_seconds
+
+    while time.time() < deadline:
+        remaining_seconds = max(deadline - time.time(), 0)
         try:
-            # 生成代码只在受控的辅助函数命名空间内执行。
-            # 模型必须把最终结构化结果赋值给 `result`。
-            exec(code, namespace)
-            exec_result = namespace.get('result')
-        except Exception as exc:
-            error_message = str(exc)
-            error_type = _classify_execution_error(exc, error_message)
-            repair_instructions = _build_repair_instructions(error_type)
-            error_signature = _extract_error_signature(error_type, error_message)
-            failure_memory = _build_turn_failure_memory(
-                turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
-                current_execution_id=execution_id,
-            )
-            stdout_text = _sanitize_tool_output(stdout_buffer.getvalue())
-            stderr_text = _sanitize_tool_output(stderr_buffer.getvalue())
-            _update_execution_record(
-                execution_id,
-                execution_status='failed',
-                stdout_text=stdout_text,
-                stderr_text=stderr_text,
-                execution_seconds=int((time.time() - start_time) * 1000),
-                error_message=error_message,
-            )
-            with logger.context(**execution_log_context):
-                logger.error(f"代码执行失败（{error_type}）：{error_message}")
-            emit(
-                'status',
-                stage='tool_error',
-                level='error',
-                tool='execute_python',
-                message=f'代码执行失败（{error_type}）：{error_message}',
-            )
-            return _tool_error_message(
-                tool_call_id=runtime.tool_call_id,
-                error_type=error_type,
-                error_message=error_message,
-                repair_instructions=repair_instructions,
-                error_signature=error_signature,
-                current_failed_code=code,
-                previous_failure_messages=failure_memory.get('previous_failure_messages', []),
-                previous_failure_hints=failure_memory.get('previous_failure_hints', []),
-                stdout_text=stdout_text,
-                stderr_text=stderr_text,
-            )
-        finally:
-            stdout_text = _sanitize_tool_output(stdout_buffer.getvalue())
-            stderr_text = _sanitize_tool_output(stderr_buffer.getvalue())
+            worker_result = result_queue.get(timeout=min(0.5, remaining_seconds))
+            break
+        except Empty:
+            if not process.is_alive():
+                break
+
+    if worker_result is None and process.is_alive():
+        process.terminate()
+        process.join(5)
+        error_message = f'代码执行超时，已超过 {timeout_seconds} 秒'
+        error_type = 'execution_timeout'
+        repair_instructions = _build_repair_instructions(error_type)
+        error_signature = _extract_error_signature(error_type, error_message)
+        failure_memory = _build_turn_failure_memory(
+            turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+            current_execution_id=execution_id,
+        )
+        _update_execution_record(
+            execution_id,
+            execution_status='failed',
+            stdout_text='',
+            stderr_text='',
+            execution_seconds=int((time.time() - start_time) * 1000),
+            error_message=error_message,
+        )
+        with logger.context(**execution_log_context):
+            logger.error(error_message)
+        emit(
+            'status',
+            stage='tool_error',
+            level='error',
+            tool='execute_python',
+            message=error_message,
+        )
+        return _tool_error_message(
+            tool_call_id=runtime.tool_call_id,
+            error_type=error_type,
+            error_message=error_message,
+            repair_instructions=repair_instructions,
+            error_signature=error_signature,
+            current_failed_code=code,
+            previous_failure_messages=failure_memory.get('previous_failure_messages', []),
+            previous_failure_hints=failure_memory.get('previous_failure_hints', []),
+        )
+
+    process.join(5)
+    if process.is_alive():
+        process.terminate()
+        process.join(5)
+    process_exitcode = process.exitcode
+    process.close()
+    result_queue.close()
+    result_queue.join_thread()
+
+    if worker_result is None:
+        error_message = f'代码执行子进程异常退出，exitcode={process_exitcode}'
+        error_type = 'runtime_error'
+        repair_instructions = _build_repair_instructions(error_type)
+        error_signature = _extract_error_signature(error_type, error_message)
+        failure_memory = _build_turn_failure_memory(
+            turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+            current_execution_id=execution_id,
+        )
+        _update_execution_record(
+            execution_id,
+            execution_status='failed',
+            stdout_text='',
+            stderr_text='',
+            execution_seconds=int((time.time() - start_time) * 1000),
+            error_message=error_message,
+        )
+        with logger.context(**execution_log_context):
+            logger.error(error_message)
+        emit(
+            'status',
+            stage='tool_error',
+            level='error',
+            tool='execute_python',
+            message=error_message,
+        )
+        return _tool_error_message(
+            tool_call_id=runtime.tool_call_id,
+            error_type=error_type,
+            error_message=error_message,
+            repair_instructions=repair_instructions,
+            error_signature=error_signature,
+            current_failed_code=code,
+            previous_failure_messages=failure_memory.get('previous_failure_messages', []),
+            previous_failure_hints=failure_memory.get('previous_failure_hints', []),
+        )
+
+    result_file_path = str(worker_result.get('result_file_path') or '').strip()
+    try:
+        worker_payload = _read_worker_result_payload(result_file_path) if result_file_path else worker_result
+    except Exception as exc:
+        error_message = f'浠ｇ爜鎵ц缁撴灉鍥炶澶辫触: {exc}'
+        error_type = 'runtime_error'
+        repair_instructions = _build_repair_instructions(error_type)
+        error_signature = _extract_error_signature(error_type, error_message)
+        failure_memory = _build_turn_failure_memory(
+            turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+            current_execution_id=execution_id,
+        )
+        _update_execution_record(
+            execution_id,
+            execution_status='failed',
+            stdout_text='',
+            stderr_text='',
+            execution_seconds=int((time.time() - start_time) * 1000),
+            error_message=error_message,
+        )
+        with logger.context(**execution_log_context):
+            logger.error(error_message)
+        emit(
+            'status',
+            stage='tool_error',
+            level='error',
+            tool='execute_python',
+            message=error_message,
+        )
+        return _tool_error_message(
+            tool_call_id=runtime.tool_call_id,
+            error_type=error_type,
+            error_message=error_message,
+            repair_instructions=repair_instructions,
+            error_signature=error_signature,
+            current_failed_code=code,
+            previous_failure_messages=failure_memory.get('previous_failure_messages', []),
+            previous_failure_hints=failure_memory.get('previous_failure_hints', []),
+        )
+    finally:
+        _remove_worker_result_payload(result_file_path)
+
+    stdout_text = _sanitize_tool_output(worker_payload.get('stdout_text', ''))
+    stderr_text = _sanitize_tool_output(worker_payload.get('stderr_text', ''))
+    if worker_payload.get('status') == 'error':
+        error_message = worker_result.get('error_message', '代码执行失败')
+        error_type = worker_result.get('error_type', 'runtime_error')
+        repair_instructions = worker_result.get('repair_instructions') or _build_repair_instructions(error_type)
+        error_signature = worker_result.get('error_signature') or _extract_error_signature(error_type, error_message)
+        error_message = worker_payload.get('error_message', error_message)
+        error_type = worker_payload.get('error_type', error_type)
+        repair_instructions = worker_payload.get('repair_instructions') or _build_repair_instructions(error_type)
+        error_signature = worker_payload.get('error_signature') or _extract_error_signature(error_type, error_message)
+        failure_memory = _build_turn_failure_memory(
+            turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+            current_execution_id=execution_id,
+        )
+        _update_execution_record(
+            execution_id,
+            execution_status='failed',
+            stdout_text=stdout_text,
+            stderr_text=stderr_text,
+            execution_seconds=int((time.time() - start_time) * 1000),
+            error_message=error_message,
+        )
+        with logger.context(**execution_log_context):
+            logger.error(f"代码执行失败（{error_type}）：{error_message}")
+        emit(
+            'status',
+            stage='tool_error',
+            level='error',
+            tool='execute_python',
+            message=f'代码执行失败（{error_type}）：{error_message}',
+        )
+        return _tool_error_message(
+            tool_call_id=runtime.tool_call_id,
+            error_type=error_type,
+            error_message=error_message,
+            repair_instructions=repair_instructions,
+            error_signature=error_signature,
+            current_failed_code=code,
+            previous_failure_messages=failure_memory.get('previous_failure_messages', []),
+            previous_failure_hints=failure_memory.get('previous_failure_hints', []),
+            stdout_text=stdout_text,
+            stderr_text=stderr_text,
+        )
+
+    exec_result = _deserialize_exec_result(worker_result.get('exec_result') or {})
+    exec_result = _deserialize_exec_result(worker_payload.get('exec_result') or {})
 
     execution_seconds = int((time.time() - start_time) * 1000)
     with logger.context(**execution_log_context):

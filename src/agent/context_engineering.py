@@ -3,7 +3,7 @@ import re
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from config.database import SessionLocal
 from model import InsightDatasource, InsightNsConversation, InsightNsExecution, InsightNsRelDatasource
@@ -17,9 +17,15 @@ from utils.datasource_utils import (
 )
 
 
-NEW_ANALYSIS_SIGNAL_PATTERN = re.compile(
-    r"(今天|昨天|前天|近\d+天|最近|本周|上周|本月|上月|Q[1-4]|季度|今年|去年|同比|环比|"
-    r"\d{1,2}月\d{1,2}号|\d{4}[-/年]\d{1,2}([-/月]\d{1,2})?|明细|详情|图表|趋势|统计|分析)"
+ANALYSIS_SIGNAL_PATTERN = re.compile(
+    r"(今天|昨天|前天|最近|本周|上周|本月|上月|今年|去年|季度|Q[1-4]|同比|环比|"
+    r"\d{4}[-/年]\d{1,2}([-/月]\d{1,2})?|\d{1,2}月\d{1,2}号|"
+    r"明细|详情|图表|趋势|统计|分析|根因|时间线)"
+)
+FOLLOWUP_ANALYSIS_KEYWORDS = (
+    "继续", "刚才", "上次", "上一轮", "沿用", "基于刚才", "按刚才",
+    "继续上一个", "继续上一轮", "修复一下", "重试", "重新生成", "继续分析",
+    "continue", "previous", "last result", "same logic",
 )
 
 
@@ -30,6 +36,8 @@ class CustomContext(BaseModel):
     namespace_id: int = 0
     conversation_id: int = 0
     turn_id: int = 0
+    auth_token: str = ''
+    database_context: dict[str, Any] = Field(default_factory=dict)
 
 
 def _build_datasource_payload_item(datasource: InsightDatasource) -> dict[str, Any]:
@@ -64,30 +72,79 @@ def _build_execution_context_item(execution: InsightNsExecution, include_code: b
     return payload
 
 
-def _should_inject_execution_context(user_message: str) -> bool:
-    """
-    判断当前问题是否应该注入最近执行代码与执行产物。
-
-    只有明显承接上一轮逻辑的追问，才应该把最近执行代码完整带回给模型。
-    如果用户当前问题出现了新的日期、过滤条件、统计口径、明细或图表要求，
-    更适合按一轮新的分析任务处理，此时只保留摘要记忆，不注入旧执行代码。
-    """
+def classify_analysis_context_mode(user_message: str) -> str:
+    """区分当前请求更像“续跑分析”“新的分析任务”还是普通问答。"""
     text = (user_message or '').strip()
     if not text:
-        return True
+        return 'general'
 
     lower_text = text.lower()
-    carry_on_keywords = (
-        "继续", "刚才", "上次", "上一轮", "沿用", "基于刚才", "按刚才",
-        "continue", "previous", "last result", "same logic",
-    )
-    if any(keyword in text for keyword in carry_on_keywords) or any(keyword in lower_text for keyword in carry_on_keywords):
-        return True
+    if any(keyword in text for keyword in FOLLOWUP_ANALYSIS_KEYWORDS) or any(
+        keyword in lower_text for keyword in FOLLOWUP_ANALYSIS_KEYWORDS
+    ):
+        return 'followup'
+    if ANALYSIS_SIGNAL_PATTERN.search(text):
+        return 'fresh_analysis'
+    return 'general'
 
-    if NEW_ANALYSIS_SIGNAL_PATTERN.search(text):
-        return False
 
-    return True
+def is_analysis_like_request(user_message: str) -> bool:
+    """判断当前输入是否明显属于数据分析请求。"""
+    return classify_analysis_context_mode(user_message) in ('followup', 'fresh_analysis')
+
+
+def _should_inject_execution_context(user_message: str) -> bool:
+    """只有承接上一轮分析的请求，才注入完整执行记录与代码。"""
+    return classify_analysis_context_mode(user_message) == 'followup'
+
+
+def _build_success_fact_execution_summary(item: dict[str, Any]) -> dict[str, Any]:
+    """提炼成功执行的稳定事实，避免把失败细节和旧代码强塞给新分析。"""
+    return {
+        "execution_id": item.get("execution_id"),
+        "turn_id": item.get("turn_id"),
+        "title": item.get("title", ""),
+        "description": item.get("description", ""),
+        "execution_status": item.get("execution_status", ""),
+        "analysis_report_preview": item.get("analysis_report_preview", ""),
+        "chart_count": item.get("chart_count", 0),
+        "table_count": item.get("table_count", 0),
+        "execution_seconds": item.get("execution_seconds"),
+        "finished_at": item.get("finished_at"),
+    }
+
+
+def _prune_analysis_state_payload(payload: dict[str, Any], mode: str) -> dict[str, Any]:
+    """
+    按请求类型裁剪分析状态。
+
+    - 新分析：保留成功执行的稳定事实，不注入失败信息和旧代码。
+    - 普通问答：不强调执行上下文，避免无关分析历史干扰回答。
+    - 续跑分析：保留原始结构，允许后续逻辑读取失败线索。
+    """
+    if mode == 'followup':
+        return payload
+
+    sanitized = dict(payload)
+    recent_execution_summaries = payload.get("recent_execution_summaries") or []
+    successful_summaries = [
+        _build_success_fact_execution_summary(item)
+        for item in recent_execution_summaries
+        if isinstance(item, dict) and item.get("execution_status") == "success"
+    ]
+
+    if mode == 'fresh_analysis':
+        sanitized["recent_execution_summaries"] = successful_summaries[-2:]
+        latest_execution = payload.get("latest_execution") or {}
+        if isinstance(latest_execution, dict) and latest_execution.get("execution_status") == "success":
+            sanitized["latest_execution"] = _build_success_fact_execution_summary(latest_execution)
+        else:
+            sanitized["latest_execution"] = {}
+        return sanitized
+
+    sanitized["recent_execution_summaries"] = []
+    sanitized["latest_execution"] = {}
+    return sanitized
 
 
 def _load_conversation(conversation_id: int) -> InsightNsConversation | None:
@@ -198,7 +255,11 @@ def get_datasource_message(
     )
 
 
-def get_history_messages(conversation_id: int, max_turn_no: int | None = None) -> list[Any]:
+def get_history_messages(
+    conversation_id: int,
+    max_turn_no: int | None = None,
+    user_message: str = '',
+) -> list[Any]:
     """加载最近的用户问题和最终回答消息，用于历史上下文重放。"""
     if not conversation_id:
         return []
@@ -214,7 +275,9 @@ def get_history_messages(conversation_id: int, max_turn_no: int | None = None) -
     finally:
         session.close()
 
+    context_mode = classify_analysis_context_mode(user_message)
     result: list[Any] = []
+    last_human_text = ''
     for item in messages:
         text = (item.content or '').strip()
         if not text:
@@ -222,8 +285,13 @@ def get_history_messages(conversation_id: int, max_turn_no: int | None = None) -
         # 原始历史重放只带用户问题和助手最终回答。
         # 工具与执行细节会通过记忆消息单独注入。
         if item.role == 'user':
+            if context_mode == 'fresh_analysis' and text == last_human_text:
+                continue
+            last_human_text = text
             result.append(HumanMessage(text))
         elif item.role == 'assistant':
+            if context_mode == 'fresh_analysis':
+                continue
             result.append(AIMessage(text))
     return result
 
@@ -246,6 +314,7 @@ def get_memory_messages(
     try:
         service = ConversationContextService(session)
         messages: list[SystemMessage] = []
+        context_mode = classify_analysis_context_mode(user_message)
 
         summary_text = service.build_runtime_summary_text(conversation_id, max_turn_no=max_turn_no)
         if summary_text:
@@ -257,6 +326,10 @@ def get_memory_messages(
             active_snapshot_override=active_snapshot_override,
         )
         if analysis_state_payload:
+            analysis_state_payload = _prune_analysis_state_payload(
+                analysis_state_payload,
+                mode=context_mode,
+            )
             messages.append(SystemMessage(
                 "当前分析状态：\n"
                 f"{json.dumps(analysis_state_payload, ensure_ascii=False, indent=2)}"
@@ -265,11 +338,12 @@ def get_memory_messages(
         # 执行代码和派生产物属于更强的历史承接信息。
         # 只有明显“继续上一轮”的追问，才把它们完整注入；
         # 如果当前问题已经是新的分析请求，则避免旧执行逻辑把模型带偏。
-        if _should_inject_execution_context(user_message):
+        if context_mode == 'followup':
             recent_executions = service.get_recent_executions(
                 conversation_id,
                 limit_items=3,
                 max_turn_no=max_turn_no,
+                terminal_only=True,
             )
             if recent_executions:
                 execution_payload = [

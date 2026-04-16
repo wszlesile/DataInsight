@@ -265,7 +265,10 @@ class InsightNsRelDatasourceService:
                     if expand_result["failed"]:
                         return {
                             "success": False,
-                            "message": "UNS 节点同步失败，请稍后重试",
+                            "message": self._build_uns_failure_message(
+                                expand_result["failed"],
+                                "UNS \u8282\u70b9\u540c\u6b65\u5931\u8d25\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5",
+                            ),
                             "data": {
                                 "imported": [],
                                 "failed": expand_result["failed"],
@@ -324,7 +327,10 @@ class InsightNsRelDatasourceService:
                         if failed_rows:
                             return {
                                 "success": False,
-                                "message": "UNS 节点导入失败，请稍后重试",
+                                "message": self._build_uns_failure_message(
+                                    failed_rows,
+                                    "UNS 节点同步失败，请稍后重试",
+                                ),
                                 "data": {
                                     "imported": [],
                                     "failed": failed_rows,
@@ -374,6 +380,25 @@ class InsightNsRelDatasourceService:
                 "selections": self.list_uns_selections(insight_conversation_id),
             },
         }
+
+    def _build_uns_failure_message(
+        self,
+        failed_rows: list[dict[str, Any]],
+        default_message: str,
+    ) -> str:
+        if not failed_rows:
+            return default_message
+
+        first_message = str((failed_rows[0] or {}).get("message") or "").strip()
+        if not first_message:
+            return default_message
+        if len(failed_rows) == 1:
+            return first_message
+        return (
+            f"{first_message}\uff1b"
+            f"\u53e6\u6709 {len(failed_rows) - 1} \u4e2a\u8282\u70b9\u5904\u7406\u5931\u8d25"
+        )
+
 
     def list_uns_selections(self, insight_conversation_id: int) -> list[dict[str, Any]]:
         rows = self.session.query(InsightNsUnsSelection).filter(
@@ -1015,7 +1040,7 @@ class InsightNsRelDatasourceService:
         """按文件类型读取预览数据；异常会转换成可直接返回给前端的错误。"""
         try:
             if file_path.suffix.lower() == '.csv':
-                return pd.read_csv(file_path, nrows=50)
+                return self._read_csv_preview(file_path)
             if file_path.suffix.lower() == '.xlsx':
                 return pd.read_excel(file_path, nrows=50, engine='openpyxl')
             if file_path.suffix.lower() == '.xls':
@@ -1027,6 +1052,32 @@ class InsightNsRelDatasourceService:
             raise
         except Exception as exc:
             raise ValueError(f'文件解析失败：{exc}') from exc
+
+    def _read_csv_preview(self, file_path: Path) -> pd.DataFrame:
+        """优先自动尝试常见 CSV 编码，减少编码差异导致的上传失败。"""
+        candidate_encodings = (
+            'utf-8',
+            'utf-8-sig',
+            'gb18030',
+            'gbk',
+        )
+        last_decode_error: UnicodeDecodeError | None = None
+
+        for encoding in candidate_encodings:
+            try:
+                return pd.read_csv(file_path, nrows=50, encoding=encoding)
+            except UnicodeDecodeError as exc:
+                last_decode_error = exc
+                continue
+
+        if last_decode_error is not None:
+            raise ValueError(
+                'CSV 文件编码解析失败。系统已自动尝试 UTF-8、UTF-8-SIG、GB18030、GBK，'
+                '仍无法读取，请将文件另存为 UTF-8 编码后重试。'
+            ) from last_decode_error
+
+        # 不是编码问题时，保留原始异常语义，避免误导用户。
+        return pd.read_csv(file_path, nrows=50)
 
     def _infer_schema_type(self, series: pd.Series) -> str:
         dtype = str(series.dtype).lower()

@@ -1473,6 +1473,16 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 
 `POST /api/insight/collects`
 
+当前行为补充：
+
+- 收藏成功后，后端会统计当前用户的有效收藏总数
+- 然后调用平台统计上报接口：
+  - `POST /os/inter-api/log-collect-system/track`
+- 上报内容包含：
+  - `username`
+  - `collect_insight_result_count`
+- 该上报属于后端内部副作用，前端无需额外传参
+
 常见请求体：
 
 #### 收藏整轮结果
@@ -1546,6 +1556,15 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 ### 7.3 取消收藏
 
 `DELETE /api/insight/collects`
+
+当前行为补充：
+
+- 取消收藏成功后，后端也会重新统计当前用户的有效收藏总数
+- 然后调用平台统计上报接口：
+  - `POST /os/inter-api/log-collect-system/track`
+- 上报内容与创建收藏一致：
+  - `username`
+  - `collect_insight_result_count`
 
 请求体示例：
 

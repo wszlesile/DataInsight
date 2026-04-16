@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 from agent import CustomContext, get_input, insight_agent
+from agent.context_engineering import is_analysis_like_request
 from config.database import SessionLocal
 from service.conversation_context_service import ConversationContextService, ConversationRunContext
 from utils import logger
@@ -26,6 +27,8 @@ class AgentRequest:
     namespace_id: str
     conversation_id: str
     user_message: str
+    auth_token: str = ''
+    database_context: dict[str, Any] | None = None
 
 
 @dataclass
@@ -197,6 +200,8 @@ def _build_agent_context(agent_request: AgentRequest, runtime: ConversationRunCo
         namespace_id=runtime.conversation.insight_namespace_id,
         conversation_id=runtime.conversation.id,
         turn_id=runtime.turn.id,
+        auth_token=agent_request.auth_token or '',
+        database_context=dict(agent_request.database_context or {}),
     )
 
 
@@ -276,14 +281,19 @@ def _finalize_run(
     service: ConversationContextService,
     runtime: ConversationRunContext,
     username: str,
+    user_message: str,
+    analysis_flow_started: bool,
     assistant_message: str,
     analysis_report: str,
     charts: list[dict[str, Any]],
     tables: list[dict[str, Any]],
 ) -> AgentResponse:
     """写回最终结果并转换成控制器层可直接使用的响应对象。"""
-    if not ((assistant_message or '').strip() or (analysis_report or '').strip() or charts or tables):
-        raise ValueError('模型本轮未返回可展示内容，也未生成分析产物，请重试。')
+    has_visible_output = bool((assistant_message or '').strip() or (analysis_report or '').strip() or charts or tables)
+    if not has_visible_output:
+        raise ValueError(_build_empty_response_error(user_message, analysis_flow_started))
+    if is_analysis_like_request(user_message) and not analysis_flow_started:
+        raise ValueError('本轮未进入分析执行阶段，未生成分析图表或分析报告，请重试。')
 
     run_result = service.complete_run(
         conversation_id=runtime.conversation.id,
@@ -312,6 +322,15 @@ def _finalize_run(
     )
 
 
+def _build_empty_response_error(user_message: str, analysis_flow_started: bool) -> str:
+    """按请求类型生成更准确的兜底错误。"""
+    if analysis_flow_started:
+        return '本轮分析已启动，但未生成可展示结果，请重试。'
+    if is_analysis_like_request(user_message):
+        return '本轮未进入分析执行阶段，未生成分析图表或分析报告，请重试。'
+    return '模型本轮没有返回有效回复，请重试。'
+
+
 def _ensure_analysis_result_ready(
     analysis_report: str,
     charts: list[dict[str, Any]] | None = None,
@@ -320,6 +339,16 @@ def _ensure_analysis_result_ready(
     if analysis_report and (charts or []):
         return
     raise ValueError('本轮未生成完整分析产物：缺少图表结果或分析报告，请重新执行分析。')
+
+
+def _build_analysis_start_instruction(user_message: str) -> str:
+    """当模型没有进入分析流时，补一条最小运行时纠偏指令。"""
+    return (
+        '当前用户输入是明确的数据分析任务，不能按普通问答结束。'
+        f'请围绕这条请求真正启动分析执行：{user_message}。'
+        '必须调用 execute_python 读取当前会话已绑定的数据源，生成图表和分析报告；'
+        '不要只给自然语言说明，也不要提前结束本轮。'
+    )
 
 
 def _did_enter_analysis_flow(
@@ -514,6 +543,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
         charts: list[dict[str, Any]] = []
         tables: list[dict[str, Any]] = []
         analysis_flow_started = False
+        analysis_request_expected = is_analysis_like_request(agent_request.user_message)
 
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
             runtime_instruction = ''
@@ -531,6 +561,8 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                     runtime=runtime,
                     user_message=agent_request.user_message,
                 )
+            elif analysis_request_expected:
+                runtime_instruction = _build_analysis_start_instruction(agent_request.user_message)
 
             agent_response = insight_agent.invoke(
                 _build_agent_input_with_runtime_instruction(
@@ -578,12 +610,19 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                     continue
                 raise ValueError('刷新分析未重新执行代码，已保留本轮原有分析结果，请重试。')
 
+            if analysis_request_expected:
+                if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
+                    continue
+                raise ValueError('本轮未进入分析执行阶段，未生成分析图表或分析报告，请重试。')
+
             break
 
         return _finalize_run(
             service=service,
             runtime=runtime,
             username=agent_request.username,
+            user_message=agent_request.user_message,
+            analysis_flow_started=analysis_flow_started,
             assistant_message=assistant_message,
             analysis_report=analysis_report,
             charts=charts,
@@ -621,6 +660,7 @@ def _stream_with_runtime(
     # “原轮次重跑”并不等于“已经进入失败后的修复回合”。
     # 只有当前这次重跑真的执行过分析、且尚未成功收口时，才进入 retry 分支。
     analysis_flow_started = False
+    analysis_request_expected = is_analysis_like_request(agent_request.user_message)
 
     yield _build_progress_event(
         'session',
@@ -673,6 +713,16 @@ def _stream_with_runtime(
                     service=service,
                     runtime=runtime,
                     user_message=agent_request.user_message,
+                )
+            elif analysis_request_expected:
+                runtime_instruction = _build_analysis_start_instruction(agent_request.user_message)
+                yield _build_progress_event(
+                    'status',
+                    conversation_id=runtime.conversation.id,
+                    turn_id=runtime.turn.id,
+                    stage='analysis_retry',
+                    level='warning',
+                    message='正在重新引导模型进入分析执行阶段。',
                 )
 
             for stream_mode, chunk in insight_agent.stream(
@@ -815,12 +865,19 @@ def _stream_with_runtime(
                     continue
                 raise ValueError('刷新分析未重新执行代码，已保留本轮原有分析结果，请重试。')
 
+            if analysis_request_expected:
+                if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
+                    continue
+                raise ValueError('本轮未进入分析执行阶段，未生成分析图表或分析报告，请重试。')
+
             break
 
         response = _finalize_run(
             service=service,
             runtime=runtime,
             username=agent_request.username,
+            user_message=agent_request.user_message,
+            analysis_flow_started=analysis_flow_started,
             assistant_message=assistant_message,
             analysis_report=analysis_report,
             charts=charts,

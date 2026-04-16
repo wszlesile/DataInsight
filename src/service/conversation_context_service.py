@@ -34,6 +34,8 @@ ROLE_TO_TYPE = {
     'tool': 3,
 }
 
+TERMINAL_EXECUTION_STATUSES = ('success', 'failed')
+
 
 def _now() -> datetime:
     return datetime.now()
@@ -465,6 +467,7 @@ class ConversationContextService:
         conversation_id: Any,
         limit_items: int = 3,
         max_turn_no: int | None = None,
+        terminal_only: bool = False,
     ) -> list[InsightNsExecution]:
         conversation_id_int = to_int(conversation_id, 0)
         if conversation_id_int <= 0:
@@ -478,6 +481,8 @@ class ConversationContextService:
             InsightNsExecution.is_deleted == 0,
             InsightNsTurn.is_deleted == 0,
         )
+        if terminal_only:
+            query = query.filter(InsightNsExecution.execution_status.in_(TERMINAL_EXECUTION_STATUSES))
         if max_turn_no is not None and max_turn_no >= 0:
             query = query.filter(InsightNsTurn.turn_no <= max_turn_no)
 
@@ -713,7 +718,6 @@ class ConversationContextService:
     def _next_turn_no(self, conversation_id: int, current_turn_no: int) -> int:
         max_turn_no = self.session.query(func.max(InsightNsTurn.turn_no)).filter(
             InsightNsTurn.conversation_id == conversation_id,
-            InsightNsTurn.is_deleted == 0,
         ).scalar()
         return max(int(current_turn_no or 0), int(max_turn_no or 0)) + 1
 
@@ -858,7 +862,7 @@ class ConversationContextService:
             ).order_by(
                 InsightNsRelDatasource.sort_no.asc(),
                 InsightNsRelDatasource.id.asc(),
-            ).all()
+            ).limit(10)
             for row in namespace_rows:
                 self.session.add(InsightNsRelDatasource(
                     insight_namespace_id=conversation.insight_namespace_id,
@@ -1004,6 +1008,7 @@ class ConversationContextService:
             conversation_id,
             limit_items=limit_items,
             max_turn_no=max_turn_no,
+            terminal_only=True,
         )
         return [self._build_execution_summary_item(execution) for execution in executions]
 
@@ -1013,6 +1018,7 @@ class ConversationContextService:
             conversation_id,
             limit_items=1,
             max_turn_no=max_turn_no,
+            terminal_only=True,
         )
         if not executions:
             return {}

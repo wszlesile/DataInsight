@@ -97,9 +97,144 @@ def render_chart_spec_to_png(chart_spec: dict, timeout_ms: int = 30000) -> bytes
 <body>
   <div id="chart" class="chart-container"></div>
   <script>
+    function formatChartNumber(value) {{
+      if (value === null || value === undefined || value === '') return '';
+      const numericValue = typeof value === 'number' ? value : Number(value);
+      if (!Number.isFinite(numericValue)) return value;
+      if (Number.isInteger(numericValue)) return numericValue.toLocaleString('zh-CN');
+      return numericValue.toLocaleString('zh-CN', {{
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+      }});
+    }}
+
+    function enhanceOption(option) {{
+      const title = Array.isArray(option.title) ? option.title[0] : option.title;
+      const legend = Array.isArray(option.legend) ? option.legend[0] : option.legend;
+      const titleItem = title && typeof title === 'object' ? title : {{}};
+      const legendItem = legend && typeof legend === 'object' ? legend : {{}};
+      const titlePresent = Boolean(titleItem.text);
+      const legendPresent = Boolean(Object.keys(legendItem).length);
+
+      if (titlePresent) {{
+        titleItem.top = titleItem.top ?? 8;
+        titleItem.left = titleItem.left ?? 'center';
+        titleItem.textStyle = titleItem.textStyle && typeof titleItem.textStyle === 'object' ? titleItem.textStyle : {{}};
+        titleItem.textStyle.fontSize = titleItem.textStyle.fontSize || 16;
+        titleItem.textStyle.fontWeight = titleItem.textStyle.fontWeight || 600;
+      }}
+
+      if (legendPresent) {{
+        legendItem.type = legendItem.type || 'scroll';
+        legendItem.left = legendItem.left ?? 'center';
+        legendItem.top = legendItem.top ?? (titlePresent ? 36 : 8);
+        legendItem.itemWidth = legendItem.itemWidth || 14;
+        legendItem.itemHeight = legendItem.itemHeight || 10;
+        legendItem.textStyle = legendItem.textStyle && typeof legendItem.textStyle === 'object' ? legendItem.textStyle : {{}};
+        legendItem.textStyle.fontSize = legendItem.textStyle.fontSize || 11;
+      }}
+
+      if (Array.isArray(option.title)) option.title[0] = titleItem;
+      else if (titlePresent) option.title = titleItem;
+
+      if (Array.isArray(option.legend)) option.legend[0] = legendItem;
+      else if (legendPresent) option.legend = legendItem;
+
+      const currentGrid = Array.isArray(option.grid) ? option.grid[0] : option.grid;
+      const gridItem = currentGrid && typeof currentGrid === 'object' ? currentGrid : {{}};
+      let topOffset = 56;
+      if (titlePresent && legendPresent) topOffset = 96;
+      else if (titlePresent) topOffset = 64;
+      else if (legendPresent) topOffset = 72;
+      gridItem.top = gridItem.top ?? topOffset;
+      gridItem.left = gridItem.left ?? 56;
+      gridItem.right = gridItem.right ?? 24;
+      gridItem.bottom = gridItem.bottom ?? 56;
+      gridItem.containLabel = gridItem.containLabel ?? true;
+      if (Array.isArray(option.grid)) option.grid[0] = gridItem;
+      else option.grid = gridItem;
+
+      ['xAxis', 'yAxis'].forEach((axisKey) => {{
+        const axes = Array.isArray(option[axisKey]) ? option[axisKey] : (option[axisKey] ? [option[axisKey]] : []);
+        axes.forEach((axis) => {{
+          if (!axis || typeof axis !== 'object') return;
+          axis.axisLabel = axis.axisLabel && typeof axis.axisLabel === 'object' ? axis.axisLabel : {{}};
+          axis.axisLabel.hideOverlap = true;
+          axis.axisLabel.fontSize = axis.axisLabel.fontSize || 11;
+          axis.axisLabel.margin = axis.axisLabel.margin || 10;
+          if (axis.type === 'value' || axis.type === 'log') {{
+            axis.axisLabel.formatter = (value) => formatChartNumber(value);
+          }}
+          const categoryData = Array.isArray(axis.data) ? axis.data : [];
+          const maxLabelLength = categoryData.reduce((max, item) => Math.max(max, String(item ?? '').length), 0);
+          if (axis.type === 'category' && (categoryData.length > 8 || maxLabelLength > 8)) {{
+            axis.axisLabel.rotate = axis.axisLabel.rotate || (maxLabelLength > 14 ? 45 : 30);
+          }}
+        }});
+      }});
+
+      option.tooltip = option.tooltip && typeof option.tooltip === 'object' ? option.tooltip : {{}};
+      if (typeof option.tooltip.formatter !== 'function') {{
+        option.tooltip.formatter = (params) => {{
+          const rows = Array.isArray(params) ? params : [params];
+          return rows
+            .filter(Boolean)
+            .map((item) => {{
+              const marker = item.marker || '';
+              const seriesName = item.seriesName || item.name || '';
+              const rawValue = Array.isArray(item.value) ? item.value[item.value.length - 1] : item.value;
+              return `${{marker}}${{seriesName}}: ${{formatChartNumber(rawValue)}}`;
+            }})
+            .join('<br/>');
+        }};
+      }}
+
+      if (Array.isArray(option.series)) {{
+        option.series.forEach((series) => {{
+          if (!series || typeof series !== 'object') return;
+          series.label = series.label && typeof series.label === 'object' ? series.label : {{}};
+          series.label.fontSize = series.label.fontSize || 11;
+          series.label.overflow = series.label.overflow || 'truncate';
+          series.labelLayout = series.labelLayout && typeof series.labelLayout === 'object' ? series.labelLayout : {{}};
+          series.labelLayout.hideOverlap = true;
+          if (series.type === 'bar') {{
+            series.barMinHeight = Math.max(series.barMinHeight || 0, 6);
+          }}
+          if (series.type === 'pie') {{
+            series.avoidLabelOverlap = true;
+            series.minAngle = Math.max(series.minAngle || 0, 3);
+            series.percentPrecision = series.percentPrecision || 2;
+          }}
+        }});
+      }}
+
+      return option;
+    }}
+
+    function estimateChartHeight(option) {{
+      let height = 360;
+      const title = Array.isArray(option.title) ? option.title[0] : option.title;
+      const legend = Array.isArray(option.legend) ? option.legend[0] : option.legend;
+      const xAxis = Array.isArray(option.xAxis) ? option.xAxis[0] : option.xAxis;
+      const seriesList = Array.isArray(option.series) ? option.series : [];
+      if (title && title.text) height += 24;
+      const legendData = Array.isArray(legend?.data) ? legend.data : [];
+      if (legend) height += legendData.length > 6 ? 56 : 32;
+      const categoryData = Array.isArray(xAxis?.data) ? xAxis.data : [];
+      const maxLabelLength = categoryData.reduce((max, item) => Math.max(max, String(item ?? '').length), 0);
+      if (categoryData.length > 8 || maxLabelLength > 8) height += 48;
+      if (seriesList.some((series) => series?.type === 'pie')) {{
+        height = Math.max(height, legendData.length > 5 ? 460 : 400);
+      }}
+      return Math.min(Math.max(height, 320), 560);
+    }}
+
     const option = {json.dumps(chart_spec, ensure_ascii=False)};
-    const chart = echarts.init(document.getElementById('chart'), null, {{ renderer: 'canvas' }});
-    chart.setOption(option, true);
+    const enhancedOption = enhanceOption(option);
+    const chartContainer = document.getElementById('chart');
+    chartContainer.style.height = `${{estimateChartHeight(enhancedOption)}}px`;
+    const chart = echarts.init(chartContainer, null, {{ renderer: 'canvas' }});
+    chart.setOption(enhancedOption, true);
   </script>
 </body>
 </html>"""
