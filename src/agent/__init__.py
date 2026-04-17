@@ -234,3 +234,74 @@ def get_input(
             datasource_snapshot_override=datasource_snapshot_override,
         )
     )
+
+
+EXPLICIT_YEAR_PATTERN = re.compile(r'(?<!\d)((?:19|20)\d{2})(?!\d)')
+MONTH_TOKEN_PATTERN = re.compile(r'(?<!\d)(1[0-2]|0?[1-9])月(?:份)?')
+
+
+def _has_explicit_year(text: str) -> bool:
+    return bool(EXPLICIT_YEAR_PATTERN.search(text or ''))
+
+
+def _group_months_by_anchor_year(months: list[int], now: datetime) -> dict[int, list[int]]:
+    year_to_months: dict[int, list[int]] = {}
+    for month in months:
+        anchor_year = now.year if month <= now.month else now.year - 1
+        bucket = year_to_months.setdefault(anchor_year, [])
+        if month not in bucket:
+            bucket.append(month)
+    for bucket in year_to_months.values():
+        bucket.sort()
+    return year_to_months
+
+
+def _build_relative_date_hint_message(user_message: str) -> SystemMessage | None:
+    """
+    把用户问题里的相对日期和裸月份锚定成绝对时间提示。
+
+    这里不替模型直接写 SQL，只做稳定的日期解释，避免它随手猜成 2024/2025。
+    """
+    text = (user_message or '').strip()
+    if not text:
+        return None
+
+    now = datetime.now(ZoneInfo('Asia/Shanghai'))
+    hints: list[str] = []
+
+    if '今年' in text:
+        hints.append(f"- 本轮问题中的“今年”应解释为 {now.year} 年。")
+    if '去年' in text:
+        hints.append(f"- 本轮问题中的“去年”应解释为 {now.year - 1} 年。")
+    if '本月' in text:
+        hints.append(f"- 本轮问题中的“本月”应解释为 {now.year} 年 {now.month} 月。")
+    if '上月' in text:
+        last_month_year = now.year if now.month > 1 else now.year - 1
+        last_month = now.month - 1 if now.month > 1 else 12
+        hints.append(f"- 本轮问题中的“上月”应解释为 {last_month_year} 年 {last_month} 月。")
+    if '今天' in text:
+        hints.append(f"- 本轮问题中的“今天”应解释为 {now:%Y-%m-%d}。")
+    if '昨天' in text:
+        hints.append(f"- 本轮问题中的“昨天”应解释为 {(now.date() - timedelta(days=1)).isoformat()}。")
+    if '前天' in text:
+        hints.append(f"- 本轮问题中的“前天”应解释为 {(now.date() - timedelta(days=2)).isoformat()}。")
+
+    month_values = [int(month) for month in MONTH_TOKEN_PATTERN.findall(text)]
+    if month_values:
+        if '今年' in text or '去年' in text:
+            anchor_year = now.year if '今年' in text else now.year - 1
+            normalized_months = sorted({month for month in month_values})
+            hints.append(
+                f"- 本轮提到的月份应优先解释为 {anchor_year} 年的这些月份：{', '.join(str(month) for month in normalized_months)} 月。"
+            )
+        elif not _has_explicit_year(text):
+            year_to_months = _group_months_by_anchor_year(month_values, now)
+            for anchor_year in sorted(year_to_months):
+                months_text = ', '.join(str(month) for month in year_to_months[anchor_year])
+                hints.append(
+                    f"- 本轮未显式写年份的月份，应优先按离当前日期最近的口径解释为 {anchor_year} 年的这些月份：{months_text} 月。"
+                )
+
+    if not hints:
+        return None
+    return SystemMessage("本轮问题的相对日期解释：\n" + "\n".join(hints))

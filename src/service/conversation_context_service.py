@@ -41,6 +41,30 @@ def _now() -> datetime:
     return datetime.now()
 
 
+def _attach_chart_artifact_refs(
+    charts: list[dict[str, Any]],
+    chart_artifacts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """回填流式结果里的图表产物 id，兼容直接从 charts[] 取收藏目标的前端。"""
+    if not charts:
+        return []
+
+    artifact_ids = [
+        int(artifact.get('id', 0) or 0)
+        for artifact in (chart_artifacts or [])
+        if int(artifact.get('id', 0) or 0) > 0
+    ]
+
+    merged_charts: list[dict[str, Any]] = []
+    for index, chart in enumerate(charts):
+        chart_payload = dict(chart) if isinstance(chart, dict) else {}
+        artifact_id = artifact_ids[index] if index < len(artifact_ids) else 0
+        if artifact_id > 0:
+            chart_payload['id'] = artifact_id
+        merged_charts.append(chart_payload)
+    return merged_charts
+
+
 @dataclass
 class ConversationRunContext:
     """一轮分析启动后返回的内存态运行上下文。"""
@@ -310,11 +334,12 @@ class ConversationContextService:
 
         self._refresh_memories(conversation)
         self.session.commit()
+        chart_artifacts = [artifact for artifact in artifacts if artifact.get('artifact_type') == 'chart']
         return {
             "conversation": conversation,
             "turn": turn,
             "artifacts": artifacts,
-            "charts": charts or [],
+            "charts": _attach_chart_artifact_refs(charts or [], chart_artifacts),
             "tables": tables or [],
         }
 
@@ -896,13 +921,17 @@ class ConversationContextService:
     def _build_datasource_snapshot_item(self, datasource: InsightDatasource) -> dict[str, Any]:
         """构造一条写入会话和轮次快照中的数据源摘要。"""
         config_json = safe_json_loads(datasource.datasource_config_json, {})
-        return {
+        payload = {
             "datasource_id": datasource.id,
             "datasource_type": normalize_datasource_type(datasource.datasource_type),
             "datasource_name": datasource.datasource_name,
             "datasource_identifier": extract_datasource_identifier(datasource, config_json),
             "metadata_schema": extract_datasource_schema(datasource, config_json),
         }
+        sheet_name = str(config_json.get("sheet_name") or "").strip()
+        if sheet_name:
+            payload["sheet_name"] = sheet_name
+        return payload
 
     def _create_artifact(
         self,

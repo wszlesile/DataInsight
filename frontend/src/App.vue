@@ -779,12 +779,19 @@ const applyTooltipDisplayRules = (normalized) => {
 const sanitizeChartSpec = (chartSpec) => {
   if (!chartSpec || typeof chartSpec !== 'object') return null
   const normalized = JSON.parse(JSON.stringify(chartSpec))
+  const backendManaged = normalized.__layout_managed_by_backend === true
+  delete normalized.__layout_managed_by_backend
 
   normalized.animation = false
   normalized.animationDuration = 0
   normalized.animationDurationUpdate = 0
   normalized.animationDelay = 0
   normalized.animationDelayUpdate = 0
+
+  if (backendManaged) {
+    applyTooltipDisplayRules(normalized)
+    return normalized
+  }
 
   const axisKeys = ['xAxis', 'yAxis']
   axisKeys.forEach((axisKey) => {

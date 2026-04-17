@@ -1192,3 +1192,252 @@ class InsightNsRelDatasourceService:
             "created_at": datasource.created_at.isoformat() if datasource.created_at else None,
             "updated_at": datasource.updated_at.isoformat() if datasource.updated_at else None,
         }
+
+    def upload_file_datasource_to_namespace(
+        self,
+        insight_namespace_id: int,
+        upload_file: FileStorage,
+        upload_dir: str,
+    ) -> dict[str, Any]:
+        """上传文件并在空间下创建数据源；Excel 会按 sheet 拆成多个逻辑数据源。"""
+        if insight_namespace_id <= 0:
+            return {"success": False, "message": "空间不存在"}
+        if upload_file is None or not upload_file.filename:
+            return {"success": False, "message": "请选择要上传的文件"}
+
+        original_filename = Path(upload_file.filename).name
+        suffix = Path(original_filename).suffix.lower()
+        if suffix not in {'.csv', '.xls', '.xlsx'}:
+            return {"success": False, "message": "仅支持上传 csv、xls、xlsx 文件"}
+
+        upload_dir_path = Path(upload_dir)
+        upload_dir_path.mkdir(parents=True, exist_ok=True)
+        stored_filename = f"{uuid4().hex}{suffix}"
+        stored_path = upload_dir_path / stored_filename
+        upload_file.save(str(stored_path))
+
+        base_name = Path(original_filename).stem or f"外部数据源_{uuid4().hex[:6]}"
+        try:
+            datasource_payloads = self._build_uploaded_file_datasource_payloads(
+                insight_namespace_id=insight_namespace_id,
+                stored_path=stored_path,
+                original_filename=original_filename,
+                stored_filename=stored_filename,
+                base_name=base_name,
+            )
+        except ValueError as exc:
+            if stored_path.exists():
+                stored_path.unlink(missing_ok=True)
+            return {"success": False, "message": str(exc)}
+
+        created_datasources: list[dict[str, Any]] = []
+        for payload in datasource_payloads:
+            datasource = self._get_or_create_datasource(
+                insight_namespace_id=insight_namespace_id,
+                datasource_type='local_file',
+                datasource_name=payload["datasource_name"],
+                knowledge_tag=payload["knowledge_tag"],
+                datasource_schema=payload["datasource_schema"],
+                datasource_config_json=payload["datasource_config_json"],
+            )
+            created_datasources.append(self._datasource_to_dict(datasource))
+
+        self.session.commit()
+        message = "文件上传成功"
+        if len(created_datasources) > 1:
+            message = f"Excel 文件上传成功，已创建 {len(created_datasources)} 个工作表数据源"
+        return {
+            "success": True,
+            "message": message,
+            "data": self._build_upload_response_data(created_datasources),
+        }
+
+    def _build_file_datasource_schema(
+        self,
+        file_path: Path,
+        datasource_name: str,
+        sheet_name: str | None = None,
+    ) -> str:
+        """读取上传文件前几行数据，并推断元数据 Schema。"""
+        dataframe = self._read_file_preview(file_path, sheet_name=sheet_name)
+
+        properties: dict[str, PropertySchema] = {}
+        for column in dataframe.columns:
+            series = dataframe[column]
+            properties[str(column)] = PropertySchema(
+                type=self._infer_schema_type(series),
+                description=f"文件字段“{column}”",
+                example=self._extract_example_value(series),
+            )
+
+        description = f"用户上传的 {file_path.suffix.lstrip('.').upper()} 文件"
+        if sheet_name:
+            description = f"{description}（工作表：{sheet_name}）"
+
+        schema = DataSourceSchema(
+            name=datasource_name,
+            description=description,
+            properties=properties,
+            required=[str(column) for column in dataframe.columns],
+        )
+        return dump_json(schema.model_dump())
+
+    def _build_uploaded_file_datasource_payloads(
+        self,
+        insight_namespace_id: int,
+        stored_path: Path,
+        original_filename: str,
+        stored_filename: str,
+        base_name: str,
+    ) -> list[dict[str, str]]:
+        suffix = stored_path.suffix.lower()
+        file_path = str(stored_path).replace('\\', '/')
+        if suffix in {'.xlsx', '.xls'}:
+            workbook_group_id = f"workbook_{uuid4().hex[:16]}"
+            sheet_names = self._list_excel_sheet_names(stored_path)
+            if not sheet_names:
+                raise ValueError('Excel 文件未发现可用的工作表')
+
+            payloads: list[dict[str, str]] = []
+            sheet_count = len(sheet_names)
+            for index, raw_sheet_name in enumerate(sheet_names, start=1):
+                sheet_name = str(raw_sheet_name or '').strip() or f"Sheet{index}"
+                datasource_name = self._build_unique_datasource_name(
+                    insight_namespace_id=insight_namespace_id,
+                    base_name=f"{base_name} / {sheet_name}",
+                )
+                datasource_schema = self._build_file_datasource_schema(
+                    stored_path,
+                    datasource_name,
+                    sheet_name=sheet_name,
+                )
+                datasource_config_json = dump_json({
+                    "file_path": file_path,
+                    "original_filename": original_filename,
+                    "stored_filename": stored_filename,
+                    "file_extension": suffix.lstrip('.'),
+                    "sheet_name": sheet_name,
+                    "worksheet_index": index,
+                    "worksheet_count": sheet_count,
+                    "workbook_group_id": workbook_group_id,
+                })
+                payloads.append({
+                    "datasource_name": datasource_name,
+                    "datasource_schema": datasource_schema,
+                    "datasource_config_json": datasource_config_json,
+                    "knowledge_tag": f"upload_{workbook_group_id}_{index}",
+                })
+            return payloads
+
+        datasource_name = self._build_unique_datasource_name(
+            insight_namespace_id=insight_namespace_id,
+            base_name=base_name,
+        )
+        datasource_schema = self._build_file_datasource_schema(stored_path, datasource_name)
+        datasource_config_json = dump_json({
+            "file_path": file_path,
+            "original_filename": original_filename,
+            "stored_filename": stored_filename,
+            "file_extension": suffix.lstrip('.'),
+        })
+        return [{
+            "datasource_name": datasource_name,
+            "datasource_schema": datasource_schema,
+            "datasource_config_json": datasource_config_json,
+            "knowledge_tag": f"upload_{uuid4().hex[:16]}",
+        }]
+
+    def _list_excel_sheet_names(self, file_path: Path) -> list[str]:
+        try:
+            if file_path.suffix.lower() == '.xlsx':
+                with pd.ExcelFile(file_path, engine='openpyxl') as excel_file:
+                    return [str(name).strip() for name in excel_file.sheet_names if str(name).strip()]
+            if file_path.suffix.lower() == '.xls':
+                with pd.ExcelFile(file_path, engine='xlrd') as excel_file:
+                    return [str(name).strip() for name in excel_file.sheet_names if str(name).strip()]
+            raise ValueError(f'暂不支持解析 {file_path.suffix} 文件')
+        except ImportError as exc:
+            raise ValueError(f'文件解析依赖缺失：{exc}') from exc
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f'无法识别 Excel 工作表信息：{exc}') from exc
+
+    def _build_upload_response_data(self, created_datasources: list[dict[str, Any]]) -> dict[str, Any]:
+        if not created_datasources:
+            return {}
+        payload = dict(created_datasources[0])
+        payload["created_count"] = len(created_datasources)
+        payload["created_datasources"] = created_datasources
+        return payload
+
+    def _read_file_preview(self, file_path: Path, sheet_name: str | None = None) -> pd.DataFrame:
+        """按文件类型读取预览数据；Excel 支持指定 sheet。"""
+        try:
+            if file_path.suffix.lower() == '.csv':
+                return self._read_csv_preview(file_path)
+            if file_path.suffix.lower() == '.xlsx':
+                return pd.read_excel(
+                    file_path,
+                    nrows=50,
+                    engine='openpyxl',
+                    sheet_name=sheet_name if sheet_name else 0,
+                )
+            if file_path.suffix.lower() == '.xls':
+                return pd.read_excel(
+                    file_path,
+                    nrows=50,
+                    engine='xlrd',
+                    sheet_name=sheet_name if sheet_name else 0,
+                )
+            raise ValueError(f'暂不支持解析 {file_path.suffix} 文件')
+        except ImportError as exc:
+            raise ValueError(f'文件解析依赖缺失：{exc}') from exc
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f'文件解析失败：{exc}') from exc
+
+    def _to_dict(self, rel: InsightNsRelDatasource, datasource: InsightDatasource) -> dict[str, Any]:
+        datasource_config = safe_json_loads(datasource.datasource_config_json, {})
+        return {
+            "id": rel.id,
+            "insight_namespace_id": rel.insight_namespace_id,
+            "insight_conversation_id": rel.insight_conversation_id,
+            "datasource_id": datasource.id,
+            "datasource_type": datasource.datasource_type,
+            "datasource_name": datasource.datasource_name,
+            "knowledge_tag": datasource.knowledge_tag,
+            "uns_node_id": datasource.uns_node_id,
+            "datasource_schema": datasource.datasource_schema,
+            "datasource_config_json": datasource.datasource_config_json,
+            "sheet_name": str(datasource_config.get("sheet_name") or ''),
+            "sort_no": rel.sort_no,
+            "bind_source": rel.bind_source,
+            "created_at": rel.created_at.isoformat() if rel.created_at else None,
+            "updated_at": rel.updated_at.isoformat() if rel.updated_at else None,
+        }
+
+    def _datasource_to_dict(
+        self,
+        datasource: InsightDatasource,
+        checked: bool = False,
+        insight_conversation_id: int = 0,
+    ) -> dict[str, Any]:
+        datasource_config = safe_json_loads(datasource.datasource_config_json, {})
+        return {
+            "id": datasource.id,
+            "datasource_id": datasource.id,
+            "insight_namespace_id": datasource.insight_namespace_id,
+            "insight_conversation_id": insight_conversation_id,
+            "datasource_type": datasource.datasource_type,
+            "datasource_name": datasource.datasource_name,
+            "knowledge_tag": datasource.knowledge_tag,
+            "uns_node_id": datasource.uns_node_id,
+            "datasource_schema": datasource.datasource_schema,
+            "datasource_config_json": datasource.datasource_config_json,
+            "sheet_name": str(datasource_config.get("sheet_name") or ''),
+            "checked": checked,
+            "created_at": datasource.created_at.isoformat() if datasource.created_at else None,
+            "updated_at": datasource.updated_at.isoformat() if datasource.updated_at else None,
+        }

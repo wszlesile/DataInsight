@@ -1024,5 +1024,109 @@ result = save_analysis_result(...)
 
 ---
 
+## 后端主导的图表契约
+
+图表的最终布局稳定性由后端负责，而不是由模型临场决定。
+
+高优先级规则：
+
+- 对于适合从同一份汇总数据中生成多视角图表的分析任务，优先使用 `build_chart_suite(...)`
+- 对于单张图表，优先使用 `build_chart_result(...)`
+- 优先输出 `chart_document` 语义结构，不要手写原始 `chart_spec`
+- 只有在 helper 无法表达图表意图时，才退回到原始 `chart_spec`
+- 除非确实必要，不要花 token 手写 `grid`、`legend`、`axisLabel.rotate`、`dataZoom`、饼图 `labelLine` 等具体布局细节
+- 重点表达图表意图：图表类型、数据集、字段映射、排序、限制、堆叠、方向等
+
+构造 `charts` 时，推荐的图表项结构为：
+
+```python
+{
+    "title": "...",
+    "chart_type": "echarts",
+    "description": "...",
+    "chart_document": {...}
+}
+```
+
+后端会把 `chart_document` 编译成最终给前端消费的 `chart_spec`。
+
+对于大多数分析任务，默认应优先考虑输出 **1 到 3 张职责不同的图表**，而不是只输出一张图：
+
+- 趋势类：通常使用 `line`
+- 对比/排行类：通常使用 `bar`
+- 构成/占比类：通常使用 `pie`
+
+如果数据已经完成聚合、可以直接用于制图，优先考虑：
+
+```python
+charts = build_chart_suite(
+    data=summary_df,
+    title="2026年至今每月单位生产成本分析",
+    description="按年月汇总单位生产成本总和",
+    category_field="年月",
+    value_field="单位生产成本_元",
+)
+```
+
+`build_chart_suite(...)` 会直接返回一个图表列表，可以直接传给 `save_analysis_result(...)`。
+
+单图 helper 示例：
+
+```python
+trend_chart = build_chart_result(
+    chart_kind="line",
+    data=summary_df,
+    title="近30天销售趋势",
+    description="按天汇总销售额",
+    category_field="date",
+    value_field="sales",
+    series_field="region",
+    sort_field="date",
+    sort_order="asc",
+    label_mode="auto",
+)
+
+share_chart = build_chart_result(
+    chart_kind="pie",
+    data=share_df,
+    title="渠道占比",
+    description="按渠道汇总销售额占比",
+    category_field="channel",
+    value_field="sales",
+    top_n=8,
+)
+
+result = save_analysis_result(
+    analysis_report=analysis_report,
+    charts=[trend_chart, share_chart],
+    tables=[],
+)
+```
+
+多图 helper 示例：
+
+```python
+charts = build_chart_suite(
+    data=summary_df,
+    title="销售分析",
+    description="按区域汇总销售额",
+    category_field="region",
+    value_field="sales",
+    top_n=8,
+)
+```
+
+字段使用规则：
+
+- `chart_kind="bar"` 或 `"line"`：需要提供 `category_field` 和 `value_field`，可选 `series_field`
+- `chart_kind="pie"`：需要提供 `category_field` 和 `value_field`
+- `chart_kind="scatter"`：需要提供 `x_field` 和 `y_field`，可选 `series_field`
+- `sort_field`、`sort_order`、`limit`、`top_n`、`orientation`、`stack`、`label_mode` 只表达图表意图，不负责具体布局
+- `build_chart_suite(...)`：适用于希望后端基于同一份汇总数据规划多张图表的场景
+
+如果同一个图表可以通过 `build_chart_result(...)` 或 `build_chart_suite(...)` 表达，就不要再手写 pyecharts 的 option JSON。
+
+---
+
 *本文档版本: 1.0*
-*最后更新: 2026-03-29*
+*最后更新: 2026-04-17*

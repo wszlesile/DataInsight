@@ -309,7 +309,7 @@ class InsightNsExecution(Base):
     conversation_id = Column(Integer, nullable=False, comment='所属会话 ID')
     turn_id = Column(Integer, nullable=False, comment='所属轮次 ID')
     tool_call_id = Column(String(128), nullable=False, default='', comment='工具调用 ID')
-    title = Column(String(255), nullable=False, default='', comment='执行任务标题')
+    title = Column(String(260), nullable=False, default='', comment='执行任务标题')
     description = Column(Text, nullable=False, default='', comment='执行任务描述')
     generated_code = Column(Text, nullable=False, default='', comment='大模型生成的 Python 代码')
     execution_status = Column(String(32), nullable=False, default='running', comment='执行状态')

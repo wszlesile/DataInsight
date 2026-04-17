@@ -22,8 +22,7 @@ from pydantic import BaseModel, Field
 from agent.context_engineering import CustomContext
 from api import supos_kernel_api
 from dto import DatabaseContext
-from utils import logger
-from utils import normalize_chart_spec
+from utils import build_chart_document, build_chart_result, build_chart_suite, logger, normalize_chart_result_item
 
 CURRENT_USERNAME = ContextVar('current_username', default='anonymous')
 def _load_data_with_fed_query(sql: str,params: Optional[list[Any]] = None):
@@ -263,24 +262,7 @@ def _normalize_chart_items(
     normalized_items: list[dict[str, Any]] = []
 
     for index, chart in enumerate(charts or [], start=1):
-        if not isinstance(chart, dict):
-            raise ValueError('charts 中的每一项都必须是 dict。')
-
-        title = str(chart.get('title') or f'图表 {index}').strip()
-        chart_type = str(chart.get('chart_type') or 'echarts').strip() or 'echarts'
-        description = str(chart.get('description') or '').strip()
-        chart_spec = chart.get('chart_spec')
-
-        if not isinstance(chart_spec, dict) or not chart_spec:
-            raise ValueError('结构化图表必须提供非空 chart_spec。')
-
-        normalized_item = {
-            "title": title,
-            "chart_type": chart_type,
-            "description": description,
-            "chart_spec": normalize_chart_spec(chart_spec),
-        }
-        normalized_items.append(normalized_item)
+        normalized_items.append(normalize_chart_result_item(chart, index=index))
 
     return normalized_items
 
@@ -496,6 +478,9 @@ def _build_execution_namespace() -> dict[str, Any]:
         'get_day_range': get_day_range,
         'describe_time_coverage': describe_time_coverage,
         'build_markdown_table': build_markdown_table,
+        'build_chart_document': build_chart_document,
+        'build_chart_result': build_chart_result,
+        'build_chart_suite': build_chart_suite,
         'save_empty_analysis_result': save_empty_analysis_result,
         'save_analysis_result': save_analysis_result,
     }

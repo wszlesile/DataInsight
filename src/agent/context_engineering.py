@@ -380,3 +380,93 @@ def get_memory_messages(
         return messages
     finally:
         session.close()
+
+
+def _build_datasource_payload_item(datasource: InsightDatasource) -> dict[str, Any]:
+    """把数据源实体转换成 Prompt 约定的 JSON 结构。"""
+    config_json = safe_json_loads(datasource.datasource_config_json, {})
+    payload = {
+        "datasource_id": datasource.id,
+        "datasource_type": normalize_datasource_type(datasource.datasource_type),
+        "datasource_name": datasource.datasource_name,
+        "datasource_identifier": extract_datasource_identifier(datasource, config_json),
+        "metadata_schema": extract_datasource_schema(datasource, config_json),
+    }
+    sheet_name = str(config_json.get("sheet_name") or "").strip()
+    if sheet_name:
+        payload["sheet_name"] = sheet_name
+    return payload
+
+
+def get_datasource_message(
+    namespace_id: int,
+    conversation_id: int,
+    snapshot_override: dict[str, Any] | None = None,
+) -> SystemMessage | None:
+    """注入运行时数据源上下文，并明确 Excel 工作表数据源的读取规则。"""
+    namespace_id_int = to_int(namespace_id, 0)
+    conversation_id_int = to_int(conversation_id, 0)
+    if conversation_id_int <= 0 and namespace_id_int <= 0:
+        return None
+
+    snapshot: dict[str, Any] = snapshot_override or {}
+    if not snapshot:
+        session = SessionLocal()
+        try:
+            snapshot = ConversationContextService(session).get_active_datasource_snapshot(conversation_id_int)
+        finally:
+            session.close()
+
+    conversation = _load_conversation(conversation_id_int)
+    if conversation is not None:
+        namespace_id_int = conversation.insight_namespace_id
+    elif namespace_id_int <= 0:
+        namespace_id_int = to_int(snapshot.get('namespace_id'), 0)
+
+    snapshot_items = snapshot.get('selected_datasource_snapshot', [])
+    if snapshot_items:
+        datasource_items = snapshot_items
+    else:
+        datasource_items = [
+            _build_datasource_payload_item(datasource)
+            for datasource in _load_conversation_datasources(conversation_id_int)
+        ]
+    if not datasource_items:
+        return None
+
+    payload: dict[str, Any] = {"datasources": datasource_items}
+    selected_ids = [
+        to_int(item, 0)
+        for item in snapshot.get('selected_datasource_ids', [])
+        if to_int(item, 0) > 0
+    ]
+    if selected_ids:
+        payload["selected_datasource_ids"] = selected_ids
+    if namespace_id_int > 0:
+        payload["namespace_id"] = namespace_id_int
+
+    instruction_lines = [
+        "当前洞察空间可用的数据源信息：",
+        "- `datasources` 是当前会话可直接使用的数据源全集。",
+    ]
+    if selected_ids:
+        instruction_lines.append(
+            f"- `selected_datasource_ids` 当前为 {selected_ids}，表示这些数据源已经被当前会话选中，可直接用于本轮分析，不需要再次向用户确认数据源。"
+        )
+    else:
+        instruction_lines.append(
+            "- 当前没有显式选中的数据源；只有在 `selected_datasource_ids` 缺失或为空时，才需要判断是否向用户补充确认。"
+        )
+
+    if any(str(item.get("sheet_name") or "").strip() for item in datasource_items):
+        instruction_lines.append(
+            "- 若某个 `local_file` 数据源带有 `sheet_name`，它只代表该 Excel 的一个工作表；调用 `load_local_file(...)` 时必须显式传入同名 `sheet_name`，不要默认读取第一张工作表。"
+        )
+        instruction_lines.append(
+            "- 同一个 Excel 文件可能拆成多个数据源，它们可以共享同一个文件路径 `datasource_identifier`，但会通过 `datasource_id`、`datasource_name` 和 `sheet_name` 区分不同工作表。"
+        )
+
+    return SystemMessage(
+        "\n".join(instruction_lines) + "\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
