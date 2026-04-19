@@ -159,6 +159,14 @@
 - **返回**：`str`
 - **适用场景**：在 `analysis_report` 中输出明细表、汇总表，避免手写字符串拼接导致格式错误
 
+#### raise_no_data_error
+- **功能**：当数据加载、过滤、关联或聚合后发现结果为空时，把“当前未命中数据”的信息返回给 `execute_python` 上层
+- **参数**：
+  - `reason: str` - 直接说明哪一步没有命中数据，例如“按当前时间范围过滤后无数据”
+  - `detail_lines: list[str], optional` - 补充当前时间范围、筛选条件、关联键、中间行数等关键信息
+- **返回**：无返回值；它会立即中断当前 Python 代码执行，并把“无数据”作为可重试失败返回给上层
+- **适用场景**：原始数据为空、过滤后为空、JOIN 后为空、聚合结果为空，且你判断更可能是 SQL/筛选条件/时间窗问题，需要上层继续重试而不是直接输出空图表
+
 ### 多数据源加载场景
 
 LLM 可以根据分析需求灵活组合多个数据源：
@@ -184,6 +192,8 @@ data = load_data_with_api(endpoint="https://api.example.com/data", params={"type
 ## 结果保存规范
 
 分析结果通过一次 `save_analysis_result()` 调用统一保存。
+
+如果本轮代码在数据加载、过滤、关联或聚合之后发现 **没有命中任何可分析数据**，不要继续生成空图表，也不要把“空结果报告”直接当成成功结果保存；应调用 `raise_no_data_error(reason=..., detail_lines=[...])`，把这次“无数据”返回给 `execute_python` 上层感知并进入重试链路。
 
 ### 标准保存结构
 
@@ -233,7 +243,7 @@ data = load_data_with_api(endpoint="https://api.example.com/data", params={"type
 3. **可视化** - 使用 pyecharts/matplotlib 生成图表
 4. **构造结构化结果** - 生成一个或多个结构化图表，必要时生成结构化表格
 5. **保存分析结果** - 调用上下文传入的 `save_analysis_result()` 函数，传入分析报告、图表数组和表格数组
-6. **按需复用通用辅助函数** - 当问题涉及相对日期、跨时区时间过滤、明细表输出或空结果收口时，可以优先考虑复用 `get_day_range()`、`build_markdown_table()`、`save_empty_analysis_result()` 等辅助函数；如果当前分析不需要这些能力，则不必使用
+6. **按需复用通用辅助函数** - 当问题涉及相对日期、跨时区时间过滤、明细表输出或无数据重试时，可以优先考虑复用 `get_day_range()`、`build_markdown_table()`、`raise_no_data_error()` 等辅助函数；如果当前分析不需要这些能力，则不必使用
 ### 必须遵守
 1. **只生成数据分析相关的代码**，不生成无关代码
 2. **尊重数据隐私**，不暴露敏感信息
@@ -248,6 +258,7 @@ data = load_data_with_api(endpoint="https://api.example.com/data", params={"type
 11. **必须优先使用数据源真实字段名**：字段选择要以 `metadata_schema.properties` 中给出的真实字段名为准，不要凭空假设并不存在的字段
 12. **相对日期问题必须考虑业务时区**：遇到“今天 / 昨天 / 前天 / 近 N 天”时，必须保证时间过滤和业务时区一致；可以使用 `get_day_range()`，也可以采用其他同样正确且可读的实现方式
 13. **表数据分析优先 SQL 下推**：只要数据源类型是 `table`，且问题涉及时间过滤、分组统计、明细限制、表关联或大数据量处理，就应优先在 SQL 层完成过滤、字段裁剪、JOIN、GROUP BY、LIMIT，再把结果加载到 pandas 做轻量整理和图表构造
+14. **必须在关键中间结果上做空数据检查**：原始加载结果、时间过滤结果、关联结果、聚合结果，只要任一步变成空 DataFrame，就要立即调用 `raise_no_data_error(...)` 返回给上层重试；不要继续生成空图表，更不要把空结果当成成功分析
 
 ### 禁止行为
 1. 禁止生成涉及系统安全的代码
@@ -259,6 +270,7 @@ data = load_data_with_api(endpoint="https://api.example.com/data", params={"type
 1. 数据加载失败 → 提示用户检查数据源配置
 2. 代码执行错误 → 尝试修复代码或给出修改建议
 3. 图表生成失败 → 回退到基础表格展示
+4. 筛选/关联后无数据 → 调用 `raise_no_data_error(...)` 返回给上层继续重试，不要直接结束为“没有数据”
 
 ---
 ### 代码输出模板
@@ -274,8 +286,35 @@ from pyecharts.charts import Line, Bar, Pie
 data = load_local_file(file_path="/path/to/data.csv")
 # 或者 data = load_data_with_sql(sql="SELECT * FROM ...")
 
+if data is None or data.empty:
+    raise_no_data_error(
+        reason="原始数据加载后为空，暂时无法完成当前分析。",
+        detail_lines=[
+            "请检查 SQL、时间范围或筛选条件是否过严。",
+        ],
+    )
+
 # === 数据处理 ===
 # 业务逻辑处理...
+filtered_df = data.copy()
+
+if filtered_df.empty:
+    raise_no_data_error(
+        reason="按当前筛选条件过滤后无数据。",
+        detail_lines=[
+            "请回看本轮使用的时间范围、筛选条件或关联条件。",
+        ],
+    )
+
+summary_df = filtered_df.copy()
+
+if summary_df.empty:
+    raise_no_data_error(
+        reason="汇总结果为空，当前条件下无法生成图表。",
+        detail_lines=[
+            "请检查聚合口径、分组维度或上游过滤条件是否过严。",
+        ],
+    )
 
 # === 可视化 ===
 chart = (

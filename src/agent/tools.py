@@ -219,6 +219,31 @@ class StructuredResult(BaseModel):
     tables: list[dict[str, Any]] = Field(default_factory=list, description="表格产物列表")
 
 
+class NoDataFoundError(Exception):
+    """用于把“当前代码筛选后无数据”的情况显式上抛给 execute_python。"""
+
+    def __init__(self, reason: str, detail_lines: Optional[list[str]] = None):
+        normalized_reason = (reason or '当前条件下未命中可分析数据。').strip() or '当前条件下未命中可分析数据。'
+        normalized_details = [
+            str(item).strip()
+            for item in (detail_lines or [])
+            if str(item).strip()
+        ]
+        self.reason = normalized_reason
+        self.detail_lines = normalized_details
+        super().__init__(normalized_reason)
+
+
+def raise_no_data_error(reason: str, detail_lines: Optional[list[str]] = None) -> None:
+    """
+    在数据加载、过滤、关联或聚合后发现结果为空时，显式通知上层重试。
+
+    生成代码遇到这类情况时，不应继续生成空图表并调用 save_analysis_result() 收口，
+    而应调用本函数把“本轮未命中数据”的信息返回给 execute_python，再由上层决定是否继续重试。
+    """
+    raise NoDataFoundError(reason=reason, detail_lines=detail_lines)
+
+
 def save_empty_analysis_result(
     title: str,
     reason: str,
@@ -227,8 +252,10 @@ def save_empty_analysis_result(
     """
     在目标时间范围或关联结果为空时，生成一份可直接展示的空结果分析。
 
-    这个函数的用途不是“掩盖错误”，而是在明确无数据、无命中或无关联结果时，
-    仍然稳定地产出一份合法的结果页和分析报告，避免模型在错误方向上反复重试。
+    这个函数保留给兼容场景使用。
+
+    对于当前主链路，如果只是本轮 SQL、时间窗、筛选条件或关联条件没有命中数据，
+    应优先调用 raise_no_data_error(...) 把“无数据”返回给上层重试，而不是直接在 Python 层收口。
     """
     import html
 
@@ -339,6 +366,63 @@ def _deserialize_exec_result(payload: dict[str, Any]) -> Any:
     if payload.get('result_kind') == 'structured' and isinstance(payload.get('payload'), dict):
         return StructuredResult(**payload['payload'])
     return None
+
+
+def _build_no_data_feedback(
+    reason: str,
+    detail_lines: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    normalized_reason = (reason or '当前条件下未命中可分析数据。').strip() or '当前条件下未命中可分析数据。'
+    normalized_details = [
+        str(item).strip()
+        for item in (detail_lines or [])
+        if str(item).strip()
+    ]
+    error_message = normalized_reason
+    if normalized_details:
+        error_message = f"{normalized_reason} 细节：{'；'.join(normalized_details[:5])}"
+    return {
+        'error_type': 'no_data_found',
+        'error_message': error_message,
+        'error_signature': {
+            'error_type': 'no_data_found',
+            'signature_type': 'no_data_found',
+            'reason': normalized_reason,
+            'detail_lines': normalized_details[:5],
+        },
+        'repair_instructions': _build_repair_instructions('no_data_found'),
+    }
+
+
+def _extract_retryable_no_data_from_result(exec_result: StructuredResult) -> dict[str, Any] | None:
+    """
+    兼容旧代码路径：如果生成代码返回了只有报告、没有任何图表/表格的空结果，
+    仍将其视为“无数据”并要求上层继续重试，而不是把它当成真正成功。
+    """
+    if exec_result.charts or exec_result.tables:
+        return None
+
+    reason = ''
+    detail_lines: list[str] = []
+    for raw_line in (exec_result.analysis_report or '').splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith('- '):
+            content = line[2:].strip()
+            if not reason:
+                reason = content
+            else:
+                detail_lines.append(content)
+
+    if not reason:
+        for raw_line in (exec_result.analysis_report or '').splitlines():
+            line = raw_line.strip().lstrip('#').strip()
+            if line and line not in {'结果说明', '补充信息'}:
+                reason = line
+                break
+
+    return _build_no_data_feedback(reason=reason, detail_lines=detail_lines)
 
 
 def _build_execution_result_temp_dir() -> str:
@@ -481,6 +565,7 @@ def _build_execution_namespace() -> dict[str, Any]:
         'build_chart_document': build_chart_document,
         'build_chart_result': build_chart_result,
         'build_chart_suite': build_chart_suite,
+        'raise_no_data_error': raise_no_data_error,
         'save_empty_analysis_result': save_empty_analysis_result,
         'save_analysis_result': save_analysis_result,
     }
@@ -543,12 +628,22 @@ def _execute_generated_code_worker(
         except Exception as exc:
             error_message = str(exc)
             error_type = _classify_execution_error(exc, error_message)
+            error_signature = _extract_error_signature(error_type, error_message)
+            repair_instructions = _build_repair_instructions(error_type)
+            if isinstance(exc, NoDataFoundError):
+                no_data_feedback = _build_no_data_feedback(
+                    reason=exc.reason,
+                    detail_lines=exc.detail_lines,
+                )
+                error_message = no_data_feedback['error_message']
+                error_signature = no_data_feedback['error_signature']
+                repair_instructions = no_data_feedback['repair_instructions']
             result_file_path = _write_worker_result_payload({
                 'status': 'error',
                 'error_message': error_message,
                 'error_type': error_type,
-                'error_signature': _extract_error_signature(error_type, error_message),
-                'repair_instructions': _build_repair_instructions(error_type),
+                'error_signature': error_signature,
+                'repair_instructions': repair_instructions,
                 'stdout_text': _sanitize_tool_output(stdout_buffer.getvalue()),
                 'stderr_text': _sanitize_tool_output(
                     '\n'.join(item for item in [stderr_buffer.getvalue(), traceback.format_exc()] if item)
@@ -599,6 +694,8 @@ def _classify_execution_error(error: Exception | None, error_message: str) -> st
         return 'syntax_error'
     if isinstance(error, ModuleNotFoundError):
         return 'missing_dependency'
+    if isinstance(error, NoDataFoundError):
+        return 'no_data_found'
     if isinstance(error, FileNotFoundError):
         return 'data_source_not_found'
     if isinstance(error, KeyError):
@@ -613,6 +710,14 @@ def _classify_execution_error(error: Exception | None, error_message: str) -> st
         return 'data_type_or_time_mismatch'
     if 'not in index' in lowered or 'no such column' in lowered:
         return 'schema_or_column_mismatch'
+    if (
+        'no_data_found' in lowered
+        or '未命中可分析数据' in error_message
+        or '筛选结果为空' in error_message
+        or '过滤后无数据' in error_message
+        or '关联后无数据' in error_message
+    ):
+        return 'no_data_found'
     if 'save_analysis_result' in lowered or 'analysis_report' in lowered or 'result' in lowered:
         return 'result_contract_error'
     return 'runtime_error'
@@ -655,6 +760,10 @@ def _extract_error_signature(error_type: str, error_message: str) -> dict[str, A
 
     if error_type == 'data_type_or_time_mismatch':
         signature['signature_type'] = 'data_type_or_time_mismatch'
+        return signature
+
+    if error_type == 'no_data_found':
+        signature['signature_type'] = 'no_data_found'
         return signature
 
     signature['signature_type'] = 'generic'
@@ -709,6 +818,8 @@ def _build_turn_failure_memory(turn_id: int, current_execution_id: int) -> dict[
                 hint = f'之前已经出现字段或列不匹配问题（{field_name}），请先核对真实列名。'
             elif signature_type == 'data_type_or_time_mismatch':
                 hint = '之前已经出现时间或数据类型比较不兼容问题，请先统一类型后再过滤。'
+            elif signature_type == 'no_data_found':
+                hint = '之前已经出现“筛选/关联后无数据”，请优先检查 SQL、时间范围、筛选条件或 JOIN 条件，不要继续输出空图表。'
             else:
                 hint = f'不要再次重复已出现过的错误：{error_message[:120]}'
 
@@ -748,7 +859,7 @@ def _build_repair_instructions(error_type: str) -> list[str]:
         'schema_or_column_mismatch': [
             '字段选择必须以 metadata_schema.properties 中提供的真实字段名为准。',
             '重新检查 DataFrame 列名后再生成过滤、聚合和展示逻辑。',
-            '如果过滤后或关联后的结果为空，不要继续修改字段名；应先判断是否为空，再生成空结果分析。',
+            '如果过滤后或关联后的结果为空，不要继续修改字段名；应先判断是否为空，并调用 raise_no_data_error(reason=..., detail_lines=[...]) 把信息返回给上层重试。',
         ],
         'undefined_name': [
             '重新检查变量名、函数名和 import 是否一致，避免引用未定义对象。',
@@ -757,7 +868,12 @@ def _build_repair_instructions(error_type: str) -> list[str]:
         'data_type_or_time_mismatch': [
             '先统一时间列或比较字段的数据类型，再进行过滤或比较。',
             '遇到相对日期或时区处理时，优先考虑使用 get_day_range() 并保证两侧都是可比较的带时区时间对象。',
-            '如果目标时间窗口没有命中数据，请优先输出空结果分析，并说明数据覆盖范围，而不是继续改字段名或图表参数。',
+            '如果目标时间窗口没有命中数据，不要输出空图表或直接调用 save_empty_analysis_result() 收口；应调用 raise_no_data_error(reason=..., detail_lines=[...]) 把信息返回给上层重试。',
+        ],
+        'no_data_found': [
+            '请先复核 SQL、时间范围、筛选条件、JOIN 条件或聚合口径是否过严，再生成下一版完整代码。',
+            '在数据加载、过滤、关联、聚合完成后，必须先检查 DataFrame 是否为空；只要为空，就调用 raise_no_data_error(reason=..., detail_lines=[...])，不要继续生成空图表或空结果产物。',
+            'reason 要直接说明是哪一步没有命中数据，detail_lines 可补充当前时间范围、筛选条件、关联键或中间行数，方便上层感知后继续重试。',
         ],
         'result_contract_error': [
             '最终必须产出完整 analysis_report，并调用 save_analysis_result(analysis_report=..., charts=[...])。',
@@ -1147,6 +1263,42 @@ def execute_python(
         )
 
     if isinstance(exec_result, StructuredResult):
+        retryable_no_data = _extract_retryable_no_data_from_result(exec_result)
+        if retryable_no_data is not None:
+            failure_memory = _build_turn_failure_memory(
+                turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+                current_execution_id=execution_id,
+            )
+            _update_execution_record(
+                execution_id,
+                execution_status='failed',
+                analysis_report=exec_result.analysis_report,
+                result_payload_json=exec_result.model_dump_json(),
+                stdout_text=stdout_text,
+                stderr_text=stderr_text,
+                execution_seconds=execution_seconds,
+                error_message=retryable_no_data['error_message'],
+            )
+            emit(
+                'status',
+                stage='tool_retry',
+                level='warning',
+                tool='execute_python',
+                message='本次代码执行未命中数据，已返回上层继续重试。',
+            )
+            return _tool_error_message(
+                tool_call_id=runtime.tool_call_id,
+                error_type=retryable_no_data['error_type'],
+                error_message=retryable_no_data['error_message'],
+                repair_instructions=retryable_no_data['repair_instructions'],
+                error_signature=retryable_no_data['error_signature'],
+                current_failed_code=code,
+                previous_failure_messages=failure_memory.get('previous_failure_messages', []),
+                previous_failure_hints=failure_memory.get('previous_failure_hints', []),
+                stdout_text=stdout_text,
+                stderr_text=stderr_text,
+            )
+
         # 对外继续保持 ToolMessage JSON 结构，对内持久化完整结构化执行结果。
         _update_execution_record(
             execution_id,
