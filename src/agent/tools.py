@@ -1143,7 +1143,7 @@ def execute_python(
     try:
         worker_payload = _read_worker_result_payload(result_file_path) if result_file_path else worker_result
     except Exception as exc:
-        error_message = f'浠ｇ爜鎵ц缁撴灉鍥炶澶辫触: {exc}'
+        error_message = f'代码执行结果回读失败: {exc}'
         error_type = 'runtime_error'
         repair_instructions = _build_repair_instructions(error_type)
         error_signature = _extract_error_signature(error_type, error_message)
