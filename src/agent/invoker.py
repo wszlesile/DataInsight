@@ -287,12 +287,13 @@ def _finalize_run(
     analysis_report: str,
     charts: list[dict[str, Any]],
     tables: list[dict[str, Any]],
+    allow_report_only: bool = False,
 ) -> AgentResponse:
     """写回最终结果并转换成控制器层可直接使用的响应对象。"""
     has_visible_output = bool((assistant_message or '').strip() or (analysis_report or '').strip() or charts or tables)
     if not has_visible_output:
         raise ValueError(_build_empty_response_error(user_message, analysis_flow_started))
-    if is_analysis_like_request(user_message) and not analysis_flow_started:
+    if is_analysis_like_request(user_message) and not analysis_flow_started and not allow_report_only:
         raise ValueError('本轮未进入分析执行阶段，未生成分析图表或分析报告，请重试。')
 
     run_result = service.complete_run(
@@ -349,6 +350,89 @@ def _build_analysis_start_instruction(user_message: str) -> str:
         '必须调用 execute_python 读取当前会话已绑定的数据源，生成图表和分析报告；'
         '不要只给自然语言说明，也不要提前结束本轮。'
     )
+
+
+def _should_use_report_only_fallback(
+    *,
+    analysis_request_expected: bool,
+    round_index: int,
+    has_any_artifact: bool,
+    assistant_message: str,
+) -> bool:
+    """判断是否允许把最后一条可见回复直接当作报告产物收口。"""
+    if not analysis_request_expected:
+        return False
+    if has_any_artifact:
+        return False
+    if not (assistant_message or '').strip():
+        return False
+    return round_index >= MAX_ANALYSIS_AGENT_ROUNDS - 1
+
+
+def _promote_assistant_message_to_report(assistant_message: str, analysis_report: str) -> str:
+    """在 report-only 兜底时，把可见回复提升为分析报告内容。"""
+    return (analysis_report or '').strip() or (assistant_message or '').strip()
+
+
+def _get_selected_datasource_names(runtime: ConversationRunContext) -> list[str]:
+    """提取当前会话已绑定数据源名称，供失败原因说明使用。"""
+    snapshot = runtime.active_datasource_snapshot if isinstance(runtime.active_datasource_snapshot, dict) else {}
+    rows = snapshot.get('selected_datasource_snapshot') or []
+    names: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get('datasource_name') or '').strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
+def _build_failure_reason_reply(
+    service: ConversationContextService,
+    runtime: ConversationRunContext,
+    user_message: str,
+) -> str:
+    """当最后没有自然语言回复时，构造一条简短的失败原因说明。"""
+    executions = service.get_turn_executions(runtime.turn.id, started_at=runtime.turn.started_at)
+    latest_errors = [
+        (getattr(execution, 'error_message', '') or '').strip()
+        for execution in executions
+        if getattr(execution, 'execution_status', '') != 'success' and (getattr(execution, 'error_message', '') or '').strip()
+    ][-3:]
+    datasource_names = _get_selected_datasource_names(runtime)
+
+    parts = [
+        f"这次没有顺利完成“{(user_message or '').strip()}”的分析。"
+    ]
+    if latest_errors:
+        parts.append(f"目前能确认的直接原因是：{latest_errors[-1]}。")
+    else:
+        parts.append("这轮分析已经进入执行阶段，但最后没有成功生成可展示的图表或分析结论。")
+    if datasource_names:
+        parts.append(f"当前会话里已绑定的数据源包括：{', '.join(datasource_names)}。")
+    parts.append("你可以检查运行环境依赖是否完整，或者再明确一下分析对象、时间范围和期望指标后重试。")
+    return '\n\n'.join(parts).strip()
+
+
+def _should_use_failure_reason_fallback(
+    *,
+    analysis_request_expected: bool,
+    round_index: int,
+    has_any_artifact: bool,
+    assistant_message: str,
+) -> bool:
+    """当最后没有任何自然语言回复时，补一条失败原因说明产物。"""
+    if not analysis_request_expected:
+        return False
+    if has_any_artifact:
+        return False
+    if (assistant_message or '').strip():
+        return False
+    return round_index >= MAX_ANALYSIS_AGENT_ROUNDS - 1
 
 
 def _did_enter_analysis_flow(
@@ -544,6 +628,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
         tables: list[dict[str, Any]] = []
         analysis_flow_started = False
         analysis_request_expected = is_analysis_like_request(agent_request.user_message)
+        allow_report_only = False
 
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
             runtime_instruction = ''
@@ -597,6 +682,31 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                     continue
                 raise ValueError('模型返回了未执行的工具调用内容，未生成最终分析结果，请重试。')
 
+            if _should_use_report_only_fallback(
+                analysis_request_expected=analysis_request_expected,
+                round_index=round_index,
+                has_any_artifact=bool((analysis_report or '').strip() or charts or tables),
+                assistant_message=assistant_message,
+            ):
+                analysis_report = _promote_assistant_message_to_report(assistant_message, analysis_report)
+                allow_report_only = True
+                break
+
+            if _should_use_failure_reason_fallback(
+                analysis_request_expected=analysis_request_expected,
+                round_index=round_index,
+                has_any_artifact=bool((analysis_report or '').strip() or charts or tables),
+                assistant_message=assistant_message,
+            ):
+                assistant_message = _build_failure_reason_reply(
+                    service=service,
+                    runtime=runtime,
+                    user_message=agent_request.user_message,
+                )
+                analysis_report = _promote_assistant_message_to_report(assistant_message, analysis_report)
+                allow_report_only = True
+                break
+
             if analysis_flow_started:
                 if analysis_report and charts:
                     break
@@ -627,6 +737,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
             analysis_report=analysis_report,
             charts=charts,
             tables=tables,
+            allow_report_only=allow_report_only,
         )
     except Exception as exc:
         session.rollback()
@@ -661,6 +772,7 @@ def _stream_with_runtime(
     # 只有当前这次重跑真的执行过分析、且尚未成功收口时，才进入 retry 分支。
     analysis_flow_started = False
     analysis_request_expected = is_analysis_like_request(agent_request.user_message)
+    allow_report_only = False
 
     yield _build_progress_event(
         'session',
@@ -852,6 +964,31 @@ def _stream_with_runtime(
                     continue
                 raise ValueError('模型返回了未执行的工具调用内容，未生成最终分析结果，请重试。')
 
+            if _should_use_report_only_fallback(
+                analysis_request_expected=analysis_request_expected,
+                round_index=round_index,
+                has_any_artifact=bool((analysis_report or '').strip() or charts or tables),
+                assistant_message=assistant_message,
+            ):
+                analysis_report = _promote_assistant_message_to_report(assistant_message, analysis_report)
+                allow_report_only = True
+                break
+
+            if _should_use_failure_reason_fallback(
+                analysis_request_expected=analysis_request_expected,
+                round_index=round_index,
+                has_any_artifact=bool((analysis_report or '').strip() or charts or tables),
+                assistant_message=assistant_message,
+            ):
+                assistant_message = _build_failure_reason_reply(
+                    service=service,
+                    runtime=runtime,
+                    user_message=agent_request.user_message,
+                )
+                analysis_report = _promote_assistant_message_to_report(assistant_message, analysis_report)
+                allow_report_only = True
+                break
+
             if analysis_flow_started:
                 if analysis_report and charts:
                     break
@@ -882,8 +1019,9 @@ def _stream_with_runtime(
             analysis_report=analysis_report,
             charts=charts,
             tables=tables,
+            allow_report_only=allow_report_only,
         )
-        if response.chart_artifact_ids:
+        if response.chart_artifact_ids or response.analysis_report:
             yield _build_progress_event(
                 'result',
                 conversation_id=runtime.conversation.id,
