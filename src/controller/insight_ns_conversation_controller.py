@@ -1,5 +1,6 @@
 import json
 from io import BytesIO
+from typing import Any
 
 from flask import Blueprint, Response, jsonify, request, send_file
 
@@ -31,6 +32,20 @@ class InsightNsConversationController(BaseController):
     def _get_username(self) -> str:
         user_context = get_current_user_context()
         return user_context.username if user_context else 'anonymous'
+
+    def _build_request_runtime_context(self) -> tuple[str, dict[str, Any]]:
+        user_context = get_current_user_context()
+        database_context = getattr(user_context, 'database_context', None)
+        return (
+            getattr(user_context, 'token', '') or '',
+            {
+                'host': getattr(database_context, 'host', '') or '',
+                'port': getattr(database_context, 'port', '') or '',
+                'user': getattr(database_context, 'user', '') or '',
+                'password': getattr(database_context, 'password', '') or '',
+                'lake_rds_database_name': getattr(database_context, 'lake_rds_database_name', '') or '',
+            } if database_context else {},
+        )
 
     def create_conversation(self):
         """在指定空间下创建一条新的空会话。"""
@@ -155,12 +170,15 @@ class InsightNsConversationController(BaseController):
         """在同一轮次内流式重跑分析，不新增新轮次。"""
         from agent.invoker import stream_rerun_turn
         username = self._get_username()
+        auth_token, database_context = self._build_request_runtime_context()
 
         def generate():
             for event in stream_rerun_turn(
                 username=username,
                 conversation_id=conversation_id,
                 turn_id=turn_id,
+                auth_token=auth_token,
+                database_context=database_context,
             ):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 

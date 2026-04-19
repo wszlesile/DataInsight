@@ -937,7 +937,30 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]
         session.close()
 
 
-def stream_rerun_turn(username: str, conversation_id: Any, turn_id: Any) -> Iterator[dict[str, Any]]:
+def _build_rerun_agent_request(
+    username: str,
+    runtime: ConversationRunContext,
+    auth_token: str = '',
+    database_context: dict[str, Any] | None = None,
+) -> AgentRequest:
+    """构造刷新分析复用的 AgentRequest，并透传用户数据库上下文。"""
+    return AgentRequest(
+        username=username,
+        namespace_id=str(runtime.conversation.insight_namespace_id),
+        conversation_id=str(runtime.conversation.id),
+        user_message=runtime.turn.user_query,
+        auth_token=auth_token or '',
+        database_context=dict(database_context or {}),
+    )
+
+
+def stream_rerun_turn(
+    username: str,
+    conversation_id: Any,
+    turn_id: Any,
+    auth_token: str = '',
+    database_context: dict[str, Any] | None = None,
+) -> Iterator[dict[str, Any]]:
     """在同一轮次内重新执行一次分析，并把新结果回写到该轮。"""
     session = SessionLocal()
     service = ConversationContextService(session)
@@ -951,11 +974,11 @@ def stream_rerun_turn(username: str, conversation_id: Any, turn_id: Any) -> Iter
         session.close()
         raise ValueError('轮次详情不存在')
 
-    agent_request = AgentRequest(
+    agent_request = _build_rerun_agent_request(
         username=username,
-        namespace_id=str(runtime.conversation.insight_namespace_id),
-        conversation_id=str(runtime.conversation.id),
-        user_message=runtime.turn.user_query,
+        runtime=runtime,
+        auth_token=auth_token,
+        database_context=database_context,
     )
 
     try:
