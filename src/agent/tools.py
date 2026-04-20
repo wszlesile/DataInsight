@@ -9,6 +9,7 @@ import traceback
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, time as datetime_time, timedelta
+from difflib import SequenceMatcher
 from io import StringIO
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -162,6 +163,140 @@ def describe_time_coverage(dataframe, column_name: str) -> dict[str, Any]:
         'min_time': valid_series.min().isoformat(),
         'max_time': valid_series.max().isoformat(),
     }
+
+
+def probe_distinct_values(
+    dataframe,
+    column_name: str,
+    top_n: int = 20,
+    dropna: bool = True,
+) -> list[dict[str, Any]]:
+    """
+    返回某个字段的高频取值分布，适合在“无数据重试”时先做轻量探测。
+
+    常见用途：
+    - 看筛选字段是否真的存在预期取值
+    - 看枚举值是否存在空格、大小写、前后缀差异
+    - 给后续条件纠偏提供候选值，而不是盲目放宽语义
+    """
+    import pandas as pd
+
+    frame = _ensure_probe_dataframe(dataframe)
+    if column_name not in frame.columns:
+        raise KeyError(column_name)
+
+    normalized_top_n = max(int(top_n or 20), 1)
+    series = frame[column_name]
+    counts = series.value_counts(dropna=dropna).head(normalized_top_n)
+
+    return [
+        {
+            'value': _serialize_probe_value(index),
+            'count': int(count),
+            'normalized_value': _normalize_probe_text(index),
+        }
+        for index, count in counts.items()
+    ]
+
+
+def probe_text_candidates(
+    dataframe,
+    column_name: str,
+    keyword: str,
+    top_n: int = 10,
+) -> list[dict[str, Any]]:
+    """
+    基于字符串规范化和相似度，为目标关键词返回候选值。
+
+    适合在无数据重试时，用于判断：
+    - 用户输入值是否存在轻微格式差异
+    - 是否应该把精确匹配纠偏成 contains / LIKE
+    - 是否只是空格、大小写、连接符、中英文括号等表达差异
+    """
+    import pandas as pd
+
+    frame = _ensure_probe_dataframe(dataframe)
+    if column_name not in frame.columns:
+        raise KeyError(column_name)
+
+    normalized_keyword = _normalize_probe_text(keyword)
+    if not normalized_keyword:
+        return []
+
+    counts = frame[column_name].value_counts(dropna=True)
+    candidates: list[dict[str, Any]] = []
+    for raw_value, count in counts.items():
+        normalized_value = _normalize_probe_text(raw_value)
+        if not normalized_value:
+            continue
+        similarity = SequenceMatcher(None, normalized_keyword, normalized_value).ratio()
+        exact_match = normalized_value == normalized_keyword
+        contains_match = normalized_keyword in normalized_value or normalized_value in normalized_keyword
+        if not exact_match and not contains_match and similarity < 0.45:
+            continue
+
+        if exact_match:
+            match_type = 'exact'
+            score = 1.0
+        elif contains_match:
+            match_type = 'contains'
+            score = max(similarity, 0.8)
+        else:
+            match_type = 'similar'
+            score = similarity
+
+        candidates.append({
+            'value': _serialize_probe_value(raw_value),
+            'count': int(count),
+            'normalized_value': normalized_value,
+            'match_type': match_type,
+            'similarity': round(float(score), 4),
+        })
+
+    candidates.sort(
+        key=lambda item: (
+            {'exact': 3, 'contains': 2, 'similar': 1}.get(item['match_type'], 0),
+            item['similarity'],
+            item['count'],
+        ),
+        reverse=True,
+    )
+    return candidates[:max(int(top_n or 10), 1)]
+
+
+def _ensure_probe_dataframe(dataframe):
+    import pandas as pd
+
+    if dataframe is None:
+        return pd.DataFrame()
+    if isinstance(dataframe, pd.DataFrame):
+        return dataframe
+    return pd.DataFrame(dataframe)
+
+
+def _normalize_probe_text(value: Any) -> str:
+    if value is None:
+        return ''
+    text = str(value).strip().lower()
+    if not text or text == 'nan':
+        return ''
+    text = text.replace('（', '(').replace('）', ')')
+    text = text.replace('【', '[').replace('】', ']')
+    text = text.replace('－', '-').replace('—', '-').replace('_', '-')
+    text = re.sub(r'\s+', '', text)
+    text = re.sub(r'[-/]+', '-', text)
+    return text
+
+
+def _serialize_probe_value(value: Any) -> Any:
+    try:
+        import pandas as pd
+
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return value.item() if hasattr(value, 'item') else value
 
 
 def build_markdown_table(dataframe, columns: Optional[list[str]] = None, max_rows: int = 10) -> str:
@@ -561,6 +696,8 @@ def _build_execution_namespace() -> dict[str, Any]:
         'load_data_with_api': load_data_with_api,
         'get_day_range': get_day_range,
         'describe_time_coverage': describe_time_coverage,
+        'probe_distinct_values': probe_distinct_values,
+        'probe_text_candidates': probe_text_candidates,
         'build_markdown_table': build_markdown_table,
         'build_chart_document': build_chart_document,
         'build_chart_result': build_chart_result,
