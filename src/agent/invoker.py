@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 from agent import CustomContext, get_input, insight_agent
-from agent.context_engineering import is_analysis_like_request
+from agent.context_engineering_runtime import is_analysis_like_request
 from config.database import SessionLocal
 from service.conversation_context_service import ConversationContextService, ConversationRunContext
 from utils import logger

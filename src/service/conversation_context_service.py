@@ -5,6 +5,7 @@ from typing import Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from config import Config
 from model import (
     InsightDatasource,
     InsightNsArtifact,
@@ -15,6 +16,11 @@ from model import (
     InsightNsRelDatasource,
     InsightNsRelKnowledge,
     InsightNsTurn,
+)
+from utils.context_compression import (
+    build_llm_turn_summarizer,
+    clip_text,
+    summarize_turns_incrementally,
 )
 from utils.datasource_utils import (
     build_conversation_title,
@@ -602,7 +608,31 @@ class ConversationContextService:
         conversation_id_int = to_int(conversation_id, 0)
         if conversation_id_int <= 0:
             return ''
-        return self._build_summary_text(conversation_id_int, max_turn_no=max_turn_no)
+        return self._build_rolling_summary_payload(
+            conversation_id_int,
+            max_turn_no=max_turn_no,
+        ).get("summary_text", "")
+
+    def get_context_compression_metadata(
+        self,
+        conversation_id: Any,
+        max_turn_no: int | None = None,
+    ) -> dict[str, Any]:
+        conversation_id_int = to_int(conversation_id, 0)
+        if conversation_id_int <= 0:
+            return {}
+        payload = self._build_rolling_summary_payload(
+            conversation_id_int,
+            max_turn_no=max_turn_no,
+        )
+        return {
+            "enabled": Config.CONTEXT_COMPRESSION_ENABLED,
+            "trigger_turns": Config.CONTEXT_COMPRESSION_TRIGGER_TURNS,
+            "keep_recent_turns": Config.CONTEXT_COMPRESSION_KEEP_RECENT_TURNS,
+            "covered_until_turn_no": payload.get("covered_until_turn_no", 0),
+            "compressed_turn_count": len(payload.get("compressed_turn_summaries", []) or []),
+            "summary_updated_at": payload.get("updated_at"),
+        }
 
     def build_runtime_analysis_state(
         self,
@@ -640,6 +670,10 @@ class ConversationContextService:
                     max_turn_no=max_turn_no,
                 )
             ],
+            "context_compression": self.get_context_compression_metadata(
+                conversation_id_int,
+                max_turn_no=max_turn_no,
+            ),
             "last_turn_no": max_turn_no if max_turn_no is not None else conversation.last_turn_no,
         }
 
@@ -962,14 +996,12 @@ class ConversationContextService:
 
     def _refresh_memories(self, conversation: InsightNsConversation) -> None:
         """刷新下一轮 Prompt 组装要使用的压缩记忆。"""
-        summary_text = self.build_runtime_summary_text(conversation.id)
+        rolling_summary_payload = self._build_rolling_summary_payload(conversation.id)
+        summary_text = str(rolling_summary_payload.get("summary_text") or "")
         conversation.summary_text = summary_text
 
         # `rolling_summary` 保存自然语言压缩后的历史摘要。
-        self._upsert_memory(conversation.id, 'rolling_summary', {
-            "summary_text": summary_text,
-            "updated_at": _now().isoformat(),
-        })
+        self._upsert_memory(conversation.id, 'rolling_summary', rolling_summary_payload)
 
         # `analysis_state` 保存下一轮继续分析时要读取的结构化状态。
         self._upsert_memory(
@@ -978,15 +1010,117 @@ class ConversationContextService:
             self.build_runtime_analysis_state(conversation.id),
         )
 
-    def _build_summary_text(self, conversation_id: int, max_turn_no: int | None = None) -> str:
-        """根据最近几轮构建紧凑的自然语言摘要。"""
+    def _build_rolling_summary_payload(
+        self,
+        conversation_id: int,
+        max_turn_no: int | None = None,
+    ) -> dict[str, Any]:
         query = self.session.query(InsightNsTurn).filter(
             InsightNsTurn.conversation_id == conversation_id,
             InsightNsTurn.is_deleted == 0,
         )
         if max_turn_no is not None and max_turn_no >= 0:
             query = query.filter(InsightNsTurn.turn_no <= max_turn_no)
-        turns = query.order_by(InsightNsTurn.turn_no.desc()).limit(6).all()
+
+        turns = query.order_by(InsightNsTurn.turn_no.asc()).all()
+        if not turns:
+            return {
+                "summary_text": "",
+                "compressed_turn_summaries": [],
+                "covered_until_turn_no": 0,
+                "updated_at": _now().isoformat(),
+            }
+
+        if not Config.CONTEXT_COMPRESSION_ENABLED:
+            summary_text = self._build_summary_text(
+                conversation_id,
+                max_turn_no=max_turn_no,
+                limit_turns=6,
+            )
+            return {
+                "summary_text": summary_text,
+                "compressed_summary_text": summary_text,
+                "compressed_turn_summaries": [],
+                "covered_until_turn_no": 0,
+                "updated_at": _now().isoformat(),
+            }
+
+        trigger_turns = max(Config.CONTEXT_COMPRESSION_TRIGGER_TURNS, 1)
+        keep_recent_turns = max(Config.CONTEXT_COMPRESSION_KEEP_RECENT_TURNS, 1)
+        if len(turns) < trigger_turns:
+            summary_text = self._build_summary_text(
+                conversation_id,
+                max_turn_no=max_turn_no,
+                limit_turns=max(trigger_turns, 6),
+            )
+            return {
+                "summary_text": summary_text,
+                "compressed_summary_text": summary_text,
+                "compressed_turn_summaries": [],
+                "covered_until_turn_no": 0,
+                "updated_at": _now().isoformat(),
+            }
+
+        compressed_turns = turns[:-keep_recent_turns] if len(turns) > keep_recent_turns else []
+        compressed_payloads = self._build_turn_summary_payloads(conversation_id, compressed_turns)
+        summarizer = build_llm_turn_summarizer()
+        compressed_summary_text = summarize_turns_incrementally(
+            turn_payloads=compressed_payloads,
+            max_chars=Config.CONTEXT_COMPRESSION_MAX_SUMMARY_CHARS,
+            summarizer=summarizer,
+        )
+        recent_text = self._build_summary_text(
+            conversation_id,
+            max_turn_no=max_turn_no,
+            start_turn_no=(compressed_turns[-1].turn_no + 1) if compressed_turns else None,
+            limit_turns=keep_recent_turns,
+        )
+        summary_text = "\n".join(
+            item for item in [compressed_summary_text.strip(), recent_text.strip()] if item
+        )
+        return {
+            "summary_text": clip_text(summary_text, Config.CONTEXT_COMPRESSION_MAX_SUMMARY_CHARS),
+            "compressed_summary_text": compressed_summary_text,
+            "compressed_turn_summaries": compressed_payloads,
+            "covered_until_turn_no": compressed_turns[-1].turn_no if compressed_turns else 0,
+            "updated_at": _now().isoformat(),
+        }
+
+    def _build_turn_summary_payloads(
+        self,
+        conversation_id: int,
+        turns: list[InsightNsTurn],
+    ) -> list[dict[str, Any]]:
+        successful_turn_ids = self._get_successful_execution_turn_ids(conversation_id)
+        payloads: list[dict[str, Any]] = []
+        for turn in turns:
+            question = clip_text((turn.user_query or '').strip().replace('\n', ' '), 120)
+            answer = clip_text((turn.final_answer or turn.error_message or '').strip().replace('\n', ' '), 200)
+            payloads.append({
+                "turn_id": turn.id,
+                "turn_no": turn.turn_no,
+                "question": question,
+                "answer": answer if turn.id in successful_turn_ids and '<tool_call>' not in answer else '',
+            })
+        return payloads
+
+    def _build_summary_text(
+        self,
+        conversation_id: int,
+        max_turn_no: int | None = None,
+        start_turn_no: int | None = None,
+        limit_turns: int = 6,
+    ) -> str:
+        """根据最近几轮构建紧凑的自然语言摘要。"""
+        query = self.session.query(InsightNsTurn).filter(
+            InsightNsTurn.conversation_id == conversation_id,
+            InsightNsTurn.is_deleted == 0,
+        )
+        if start_turn_no is not None and start_turn_no > 0:
+            query = query.filter(InsightNsTurn.turn_no >= start_turn_no)
+        if max_turn_no is not None and max_turn_no >= 0:
+            query = query.filter(InsightNsTurn.turn_no <= max_turn_no)
+        turns = query.order_by(InsightNsTurn.turn_no.desc()).limit(limit_turns).all()
         turns.reverse()
         if not turns:
             return ''
@@ -994,8 +1128,8 @@ class ConversationContextService:
         successful_turn_ids = self._get_successful_execution_turn_ids(conversation_id)
         parts: list[str] = []
         for turn in turns:
-            question = (turn.user_query or '').strip().replace('\n', ' ')[:120]
-            answer = (turn.final_answer or turn.error_message or '').strip().replace('\n', ' ')[:200]
+            question = clip_text((turn.user_query or '').strip().replace('\n', ' '), 120)
+            answer = clip_text((turn.final_answer or turn.error_message or '').strip().replace('\n', ' '), 200)
             if turn.id in successful_turn_ids and answer and '<tool_call>' not in answer:
                 parts.append(f"第{turn.turn_no}轮 用户: {question}；系统结论: {answer}")
             else:
@@ -1069,7 +1203,10 @@ class ConversationContextService:
             "title": execution.title,
             "description": execution.description,
             "execution_status": execution.execution_status,
-            "analysis_report_preview": (execution.analysis_report or '')[:800],
+            "analysis_report_preview": clip_text(
+                execution.analysis_report or '',
+                Config.CONTEXT_COMPRESSION_EXECUTION_PREVIEW_CHARS,
+            ),
             "chart_count": chart_count,
             "table_count": table_count,
             "error_message": execution.error_message,
@@ -1077,9 +1214,15 @@ class ConversationContextService:
             "finished_at": execution.finished_at.isoformat() if execution.finished_at else None,
         }
         if include_code:
-            payload["generated_code"] = (execution.generated_code or '')[:3000]
+            payload["generated_code"] = clip_text(
+                execution.generated_code or '',
+                Config.CONTEXT_COMPRESSION_EXECUTION_CODE_CHARS,
+            )
         else:
-            payload["generated_code_preview"] = (execution.generated_code or '')[:1200]
+            payload["generated_code_preview"] = clip_text(
+                execution.generated_code or '',
+                Config.CONTEXT_COMPRESSION_EXECUTION_PREVIEW_CHARS,
+            )
         return payload
 
     def _build_artifact_summary_item(self, artifact: InsightNsArtifact) -> dict[str, Any]:
@@ -1091,7 +1234,10 @@ class ConversationContextService:
             "execution_id": artifact.execution_id,
             "artifact_type": artifact.artifact_type,
             "title": artifact.title,
-            "summary_text": (artifact.summary_text or '')[:500],
+            "summary_text": clip_text(
+                artifact.summary_text or '',
+                Config.CONTEXT_COMPRESSION_ARTIFACT_SUMMARY_CHARS,
+            ),
             "sort_no": artifact.sort_no,
             "created_at": artifact.created_at.isoformat() if artifact.created_at else None,
         }

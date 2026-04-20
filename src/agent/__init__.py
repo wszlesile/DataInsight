@@ -7,11 +7,9 @@ import re
 
 from langchain.agents import AgentState, create_agent
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
-from langchain_qwq import ChatQwen
 from pydantic import BaseModel, Field
 
-from agent.context_engineering import (
+from agent.context_engineering_runtime import (
     CustomContext,
     get_datasource_message,
     get_history_messages,
@@ -19,6 +17,8 @@ from agent.context_engineering import (
 )
 from agent.tools import execute_python
 from config import Config
+from utils.llm_model_factory import create_data_insight_model as _create_data_insight_model
+from utils.token_budget import describe_budget_split, estimate_messages_tokens, shrink_messages_to_budget
 
 MessageT = TypeVar("MessageT", bound=BaseMessage, covariant=True)
 SYS_PROMPT_PATH = Path(__file__).resolve().with_name('sys_prompt.md')
@@ -55,19 +55,7 @@ def load_system_prompt() -> str:
 
 def create_data_insight_model():
     """创建当前配置的聊天模型，同时保持现有模型提供方契约不变。"""
-    if Config.LLM_MODEL_ACTIVE == 'MiniMax':
-        return ChatOpenAI(
-            model=Config.MINIMAX_M2_5_MODEL,
-            api_key=Config.MINIMAX_M2_5_API_KEY,
-            base_url=Config.MINIMAX_M2_5_BASE_URL,
-            temperature=0.7,
-        )
-
-    return ChatQwen(
-        model=Config.QWEN3_80B_MODEL,
-        api_key=Config.QWEN3_80B_API_KEY,
-        base_url=Config.QWEN3_80B_BASE_URL,
-    )
+    return _create_data_insight_model()
 
 
 def create_data_insight_agent():
@@ -181,25 +169,46 @@ def build_prompt_messages(
         conversation_id=conversation_id,
         snapshot_override=datasource_snapshot_override,
     )
-    memory_messages = get_memory_messages(
-        conversation_id,
-        user_message=user_message,
-        max_turn_no=history_turn_limit,
-        active_snapshot_override=datasource_snapshot_override,
-    )
     runtime_messages = [
         SystemMessage(extra_message)
         for extra_message in (extra_system_messages or [])
         if extra_message
     ]
-
-    merged_system_content = _merge_system_messages(
+    fixed_system_messages: list[BaseMessage] = [
         SystemMessage(load_system_prompt()),
         _build_runtime_environment_message(),
-        _build_relative_date_hint_message(user_message),
-        datasource_message,
+    ]
+    relative_date_hint = _build_relative_date_hint_message(user_message)
+    if relative_date_hint is not None:
+        fixed_system_messages.append(relative_date_hint)
+    if datasource_message is not None:
+        fixed_system_messages.append(datasource_message)
+    fixed_system_messages.extend(runtime_messages)
+
+    fixed_system_content = _merge_system_messages(fixed_system_messages)
+    fixed_prompt_messages: list[BaseMessage] = []
+    if fixed_system_content:
+        fixed_prompt_messages.append(SystemMessage(fixed_system_content))
+
+    budget_split = describe_budget_split(
+        max_prompt_tokens=Config.CONTEXT_COMPRESSION_PROMPT_MAX_TOKENS,
+        fixed_tokens=estimate_messages_tokens(fixed_prompt_messages + [HumanMessage(user_message)]),
+        history_ratio=Config.CONTEXT_COMPRESSION_HISTORY_TOKEN_RATIO,
+        min_history_tokens=Config.CONTEXT_COMPRESSION_MIN_HISTORY_TOKENS,
+        min_memory_tokens=Config.CONTEXT_COMPRESSION_MIN_MEMORY_TOKENS,
+    )
+
+    memory_messages = get_memory_messages(
+        conversation_id,
+        user_message=user_message,
+        max_turn_no=history_turn_limit,
+        active_snapshot_override=datasource_snapshot_override,
+        token_budget=budget_split["memory_budget"],
+    )
+
+    merged_system_content = _merge_system_messages(
+        fixed_prompt_messages,
         memory_messages,
-        runtime_messages,
     )
 
     messages: list[BaseMessage] = []
@@ -210,9 +219,10 @@ def build_prompt_messages(
         conversation_id,
         max_turn_no=history_turn_limit,
         user_message=user_message,
+        token_budget=budget_split["history_budget"],
     ))
     messages.append(HumanMessage(user_message))
-    return messages
+    return shrink_messages_to_budget(messages, Config.CONTEXT_COMPRESSION_PROMPT_MAX_TOKENS)
 
 
 def get_input(

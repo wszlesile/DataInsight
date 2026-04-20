@@ -20,7 +20,7 @@ from langgraph.config import get_stream_writer
 from langgraph.prebuilt import ToolRuntime
 from pydantic import BaseModel, Field
 
-from agent.context_engineering import CustomContext
+from agent.context_engineering_runtime import CustomContext
 from api import supos_kernel_api
 from dto import DatabaseConnInfo
 from utils import build_chart_document, build_chart_result, build_chart_suite, logger, normalize_chart_result_item
