@@ -107,6 +107,18 @@
   - `sheet_name: str, optional` - Excel 文件时指定的工作表名称，不传则默认读取第一个工作表
 - **返回**：`pandas.DataFrame`
 
+#### load_local_file_low_memory
+- **功能**：按批次低内存读取本地 CSV 或 Excel 文件
+- **参数**：
+  - `file_path: str` - 本地文件完整路径，支持 .csv、.xlsx、.xlsm、.xls
+  - `sheet_name: str, optional` - Excel 工作表名称
+  - `chunk_size: int, default=50000` - 每批读取行数
+  - `usecols: list[str] | list[int] | str, optional` - 只读取必要列
+  - `dtype: dict | str, optional` - 显式指定列类型
+  - `parse_dates: list[str] | bool, optional` - 只解析必要的时间列
+- **返回**：批次迭代器；每次迭代返回一个较小的 `pandas.DataFrame`
+- **适用场景**：只有当本地文件全量读取已经触发内存/资源耗尽，或你明确需要用低内存方式处理大文件时，才改用它；应在批次循环中完成过滤、聚合、TopN、分布统计或有限明细截取，而不是把所有批次再拼回一个超大 DataFrame
+
 #### load_minio_file
 - **功能**：加载 MinIO 远程存储的数据文件
 - **参数**：
@@ -127,6 +139,18 @@
   - 如果需要多表联合分析，优先考虑在 SQL 中先过滤后关联；只有当 SQL 难以表达时，才在 pandas 中做小规模补充处理
   - 如果用户要求“尽量详情”，也应该先在 SQL 中缩小时间范围和字段范围，再按需保留有限条明细
   - 如果跨表 JOIN 已经出现明显超时，应优先退化成“主表趋势 + 主表明细 + 受限说明”的可交付结果，不要反复坚持高成本关联查询
+
+### 本地大文件加载策略
+
+如果当前分析命中的是 `local_file` 数据源，而且之前已经因为内存耗尽、`MemoryError` 或子进程 `exitcode=-9/137` 失败，必须切换到低内存重试策略：
+
+1. 首轮没有资源问题时，可以继续正常使用 `load_local_file(file_path=...)`
+2. 一旦出现资源耗尽，再改用 `load_local_file_low_memory(...)`，不要重复整表读入 pandas
+3. 低内存重试时，可以先读取一个很小的首批次确认列名、类型、时间列和候选取值，再决定后续过滤和统计策略
+4. 优先传 `usecols`、`dtype`、`parse_dates`，只保留真正必要的列
+5. 如果用户要的是聚合、趋势、分布、TopN 或有限明细，应在批次循环中累计最终结果，不要把全部批次重新拼回一个超大 DataFrame
+6. `CSV` 与 `Excel` 都优先走同一个低内存 helper；其中 `.xlsx/.xlsm` 更适合流式批量处理，旧版 `.xls` 只能 best-effort
+7. 如果旧版 `.xls` 在当前环境仍然无法安全低内存处理，应返回受限说明或建议转换为 `.xlsx/.csv`，不要反复继续 OOM 重试
 
 #### load_data_with_api
 - **功能**：通过 HTTP API 获取数据
@@ -302,7 +326,7 @@ data = load_data_with_api(endpoint="https://api.example.com/data", params={"type
 3. **可视化** - 使用 pyecharts/matplotlib 生成图表
 4. **构造结构化结果** - 生成一个或多个结构化图表，必要时生成结构化表格
 5. **保存分析结果** - 调用上下文传入的 `save_analysis_result()` 函数，传入分析报告、图表数组和表格数组
-6. **按需复用通用辅助函数** - 当问题涉及相对日期、跨时区时间过滤、明细表输出或无数据重试时，可以优先考虑复用 `get_day_range()`、`probe_distinct_values()`、`probe_text_candidates()`、`describe_time_coverage()`、`build_markdown_table()`、`raise_no_data_error()` 等辅助函数；如果当前分析不需要这些能力，则不必使用
+6. **按需复用通用辅助函数** - 当问题涉及相对日期、跨时区时间过滤、明细表输出、无数据重试或本地大文件加载时，可以优先考虑复用 `get_day_range()`、`load_local_file_low_memory()`、`probe_distinct_values()`、`probe_text_candidates()`、`describe_time_coverage()`、`build_markdown_table()`、`raise_no_data_error()` 等辅助函数；如果当前分析不需要这些能力，则不必使用
 ### 必须遵守
 1. **只生成数据分析相关的代码**，不生成无关代码
 2. **尊重数据隐私**，不暴露敏感信息
@@ -319,6 +343,7 @@ data = load_data_with_api(endpoint="https://api.example.com/data", params={"type
 13. **表数据分析优先 SQL 下推**：只要数据源类型是 `table`，且问题涉及时间过滤、分组统计、明细限制、表关联或大数据量处理，就应优先在 SQL 层完成过滤、字段裁剪、JOIN、GROUP BY、LIMIT，再把结果加载到 pandas 做轻量整理和图表构造
 14. **必须在关键中间结果上做空数据检查**：原始加载结果、时间过滤结果、关联结果、聚合结果，只要任一步变成空 DataFrame，就要立即调用 `raise_no_data_error(...)` 返回给上层重试；不要继续生成空图表，更不要把空结果当成成功分析
 15. **无数据重试必须先做轻量探测再纠偏**：如果原始数据非空但过滤、关联、聚合后为空，下一版代码应优先通过时间覆盖探测、字段取值探测或轻量 SQL 探测来确认问题根因；只有探测结果明确支持时，才允许调整查询条件，且调整幅度必须保持与用户原始语义一致
+16. **本地大文件失败后必须切换低内存策略**：如果外部文件已经触发内存耗尽、`MemoryError` 或子进程被 OOM 终止，下一版代码必须改用 `load_local_file_low_memory()` 或等价的批处理方案，在批次内完成过滤和累计统计，不能继续整表读入 pandas
 
 ### 禁止行为
 1. 禁止生成涉及系统安全的代码

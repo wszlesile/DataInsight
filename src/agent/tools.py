@@ -29,6 +29,11 @@ CURRENT_USERNAME = ContextVar('current_username', default='anonymous')
 def _load_data_with_fed_query(sql: str,params: Optional[list[Any]] = None):
     return supos_kernel_api.query_dataframe(sql=sql, params=params)
 
+def _ensure_local_file_exists(file_path: str) -> None:
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"文件不存在: {file_path}")
+
+
 def load_local_file(file_path: str, sheet_name: Optional[str] = None):
     """
     加载本地 CSV 或 Excel 文件，并返回 pandas DataFrame。
@@ -37,15 +42,231 @@ def load_local_file(file_path: str, sheet_name: Optional[str] = None):
     """
     import pandas as pd
 
-    import os
+    _ensure_local_file_exists(file_path)
+    lower_file_path = file_path.lower()
 
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"文件不存在: {file_path}")
-
-    if file_path.endswith('.csv'):
+    if lower_file_path.endswith('.csv'):
         return pd.read_csv(file_path)
-    if file_path.endswith(('.xlsx', '.xls')):
+    if lower_file_path.endswith(('.xlsx', '.xls', '.xlsm')):
         return pd.read_excel(file_path, sheet_name=sheet_name if sheet_name else 0)
+
+    raise ValueError(f"不支持的文件格式: {file_path}")
+
+
+def _parse_excel_usecols(
+    usecols: Optional[list[str] | list[int] | str],
+    column_names: list[str],
+) -> list[int]:
+    if usecols is None:
+        return list(range(len(column_names)))
+
+    def _deduplicate(items: list[int]) -> list[int]:
+        seen: set[int] = set()
+        result: list[int] = []
+        for item in items:
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result
+
+    if isinstance(usecols, list):
+        if all(isinstance(item, int) for item in usecols):
+            resolved = [int(item) for item in usecols if 0 <= int(item) < len(column_names)]
+            if not resolved:
+                raise ValueError('低内存读取时没有匹配到任何 Excel 列，请检查 usecols 配置。')
+            return _deduplicate(resolved)
+        requested_names = {str(item).strip() for item in usecols if str(item).strip()}
+        resolved = [index for index, name in enumerate(column_names) if name in requested_names]
+        if not resolved:
+            raise ValueError('低内存读取时没有匹配到任何 Excel 列，请检查 usecols 配置。')
+        return _deduplicate(resolved)
+
+    if isinstance(usecols, str):
+        normalized = usecols.strip()
+        if not normalized:
+            return list(range(len(column_names)))
+
+        try:
+            from openpyxl.utils.cell import column_index_from_string
+        except ImportError:
+            column_index_from_string = None
+
+        if column_index_from_string and ':' in normalized:
+            start_token, end_token = [part.strip() for part in normalized.split(':', 1)]
+            if start_token.isalpha() and end_token.isalpha():
+                start_index = column_index_from_string(start_token.upper()) - 1
+                end_index = column_index_from_string(end_token.upper()) - 1
+                return list(range(max(start_index, 0), min(end_index, len(column_names) - 1) + 1))
+
+        tokens = [token.strip() for token in normalized.split(',') if token.strip()]
+        if tokens and all(token.isdigit() for token in tokens):
+            resolved = [int(token) for token in tokens if 0 <= int(token) < len(column_names)]
+            if not resolved:
+                raise ValueError('低内存读取时没有匹配到任何 Excel 列，请检查 usecols 配置。')
+            return _deduplicate(resolved)
+        if column_index_from_string and tokens and all(token.isalpha() for token in tokens):
+            resolved = [column_index_from_string(token.upper()) - 1 for token in tokens]
+            resolved = [index for index in resolved if 0 <= index < len(column_names)]
+            if not resolved:
+                raise ValueError('低内存读取时没有匹配到任何 Excel 列，请检查 usecols 配置。')
+            return _deduplicate(resolved)
+
+        requested_names = set(tokens)
+        resolved = [index for index, name in enumerate(column_names) if name in requested_names]
+        if not resolved:
+            raise ValueError('低内存读取时没有匹配到任何 Excel 列，请检查 usecols 配置。')
+        return _deduplicate(resolved)
+
+    raise ValueError('低内存读取时暂不支持当前 usecols 类型，请改用列名列表、列序号列表或逗号分隔字符串。')
+
+
+def _apply_batch_transforms(
+    dataframe,
+    dtype: Optional[dict[str, Any] | str] = None,
+    parse_dates: Optional[list[str] | bool] = None,
+):
+    import pandas as pd
+
+    if parse_dates is True:
+        for column in dataframe.columns:
+            dataframe[column] = pd.to_datetime(dataframe[column], errors='ignore')
+    elif isinstance(parse_dates, list):
+        for column in parse_dates:
+            if column in dataframe.columns:
+                dataframe[column] = pd.to_datetime(dataframe[column], errors='coerce')
+
+    if dtype is None:
+        return dataframe
+
+    if isinstance(dtype, dict):
+        matched_dtype = {column: value for column, value in dtype.items() if column in dataframe.columns}
+        if matched_dtype:
+            return dataframe.astype(matched_dtype)
+        return dataframe
+
+    return dataframe.astype(dtype)
+
+
+def _iter_excel_rows_in_batches(
+    file_path: str,
+    sheet_name: Optional[str] = None,
+    chunk_size: int = 50000,
+    usecols: Optional[list[str] | list[int] | str] = None,
+    dtype: Optional[dict[str, Any] | str] = None,
+    parse_dates: Optional[list[str] | bool] = None,
+):
+    import pandas as pd
+
+    normalized_chunk_size = max(int(chunk_size or 50000), 1)
+    lower_file_path = file_path.lower()
+
+    if lower_file_path.endswith(('.xlsx', '.xlsm')):
+        try:
+            from openpyxl import load_workbook
+        except ImportError as exc:
+            raise ValueError('当前环境缺少 openpyxl，无法对 .xlsx/.xlsm 文件执行低内存分批读取。') from exc
+
+        workbook = load_workbook(file_path, read_only=True, data_only=True)
+        try:
+            worksheet = workbook[sheet_name] if sheet_name else workbook.worksheets[0]
+            row_iterator = worksheet.iter_rows(values_only=True)
+            headers = next(row_iterator, None)
+            if headers is None:
+                return
+
+            column_names = [str(value).strip() if value is not None else '' for value in headers]
+            selected_indexes = _parse_excel_usecols(usecols, column_names)
+            selected_columns = [column_names[index] or f'column_{index + 1}' for index in selected_indexes]
+            batch_rows: list[list[Any]] = []
+
+            for row in row_iterator:
+                current_row = row or ()
+                batch_rows.append([
+                    current_row[index] if index < len(current_row) else None
+                    for index in selected_indexes
+                ])
+                if len(batch_rows) >= normalized_chunk_size:
+                    batch_frame = pd.DataFrame(batch_rows, columns=selected_columns)
+                    yield _apply_batch_transforms(batch_frame, dtype=dtype, parse_dates=parse_dates)
+                    batch_rows = []
+
+            if batch_rows:
+                batch_frame = pd.DataFrame(batch_rows, columns=selected_columns)
+                yield _apply_batch_transforms(batch_frame, dtype=dtype, parse_dates=parse_dates)
+        finally:
+            workbook.close()
+        return
+
+    if lower_file_path.endswith('.xls'):
+        try:
+            import xlrd
+        except ImportError as exc:
+            raise ValueError('当前环境缺少 xlrd，无法对 .xls 文件执行低内存分批读取；必要时请提示用户转换为 .xlsx 或 CSV。') from exc
+
+        workbook = xlrd.open_workbook(file_path, on_demand=True)
+        try:
+            worksheet = workbook.sheet_by_name(sheet_name) if sheet_name else workbook.sheet_by_index(0)
+            if worksheet.nrows == 0:
+                return
+
+            column_names = [str(value).strip() if value is not None else '' for value in worksheet.row_values(0)]
+            selected_indexes = _parse_excel_usecols(usecols, column_names)
+            selected_columns = [column_names[index] or f'column_{index + 1}' for index in selected_indexes]
+
+            for start_row in range(1, worksheet.nrows, normalized_chunk_size):
+                end_row = min(start_row + normalized_chunk_size, worksheet.nrows)
+                batch_rows = []
+                for row_index in range(start_row, end_row):
+                    row_values = worksheet.row_values(row_index)
+                    batch_rows.append([
+                        row_values[index] if index < len(row_values) else None
+                        for index in selected_indexes
+                    ])
+                if batch_rows:
+                    batch_frame = pd.DataFrame(batch_rows, columns=selected_columns)
+                    yield _apply_batch_transforms(batch_frame, dtype=dtype, parse_dates=parse_dates)
+        finally:
+            workbook.release_resources()
+        return
+
+    raise ValueError(f'不支持的 Excel 文件格式: {file_path}')
+
+
+def load_local_file_low_memory(
+    file_path: str,
+    sheet_name: Optional[str] = None,
+    chunk_size: int = 50000,
+    usecols: Optional[list[str] | list[int] | str] = None,
+    dtype: Optional[dict[str, Any] | str] = None,
+    parse_dates: Optional[list[str] | bool] = None,
+    low_memory: bool = True,
+):
+    """按批次低内存读取本地 CSV 或 Excel，适合 OOM 后的修复性重试场景。"""
+    import pandas as pd
+
+    _ensure_local_file_exists(file_path)
+    lower_file_path = file_path.lower()
+    normalized_chunk_size = max(int(chunk_size or 50000), 1)
+
+    if lower_file_path.endswith('.csv'):
+        return pd.read_csv(
+            file_path,
+            chunksize=normalized_chunk_size,
+            usecols=usecols,
+            dtype=dtype,
+            parse_dates=parse_dates,
+            low_memory=low_memory,
+        )
+
+    if lower_file_path.endswith(('.xlsx', '.xls', '.xlsm')):
+        return _iter_excel_rows_in_batches(
+            file_path=file_path,
+            sheet_name=sheet_name,
+            chunk_size=normalized_chunk_size,
+            usecols=usecols,
+            dtype=dtype,
+            parse_dates=parse_dates,
+        )
 
     raise ValueError(f"不支持的文件格式: {file_path}")
 
@@ -560,6 +781,19 @@ def _extract_retryable_no_data_from_result(exec_result: StructuredResult) -> dic
     return _build_no_data_feedback(reason=reason, detail_lines=detail_lines)
 
 
+def _classify_process_exit(process_exitcode: int | None) -> tuple[str, str]:
+    normalized_exitcode = int(process_exitcode) if process_exitcode is not None else 0
+    if normalized_exitcode in (-9, 137):
+        return (
+            'resource_exhausted',
+            f'代码执行子进程异常退出，exitcode={normalized_exitcode}。这通常意味着内存耗尽或被系统因资源压力终止，请按大文件/低内存策略重写加载逻辑。',
+        )
+    return (
+        'runtime_error',
+        f'代码执行子进程异常退出，exitcode={normalized_exitcode}',
+    )
+
+
 def _build_execution_result_temp_dir() -> str:
     """返回执行结果临时目录，并确保目录存在。"""
     from config.config import Config
@@ -691,6 +925,7 @@ def _build_execution_namespace() -> dict[str, Any]:
     """向生成代码暴露允许使用的辅助函数命名空间。"""
     return {
         'load_local_file': load_local_file,
+        'load_local_file_low_memory': load_local_file_low_memory,
         'load_minio_file': load_minio_file,
         'load_data_with_sql': load_data_with_sql,
         'load_data_with_api': load_data_with_api,
@@ -839,8 +1074,12 @@ def _classify_execution_error(error: Exception | None, error_message: str) -> st
         return 'schema_or_column_mismatch'
     if isinstance(error, NameError):
         return 'undefined_name'
+    if isinstance(error, MemoryError):
+        return 'resource_exhausted'
 
     lowered = (error_message or '').lower()
+    if 'memoryerror' in lowered or 'cannot allocate memory' in lowered or 'out of memory' in lowered:
+        return 'resource_exhausted'
     if 'got an unexpected keyword argument' in lowered:
         return 'library_api_signature_mismatch'
     if 'invalid comparison' in lowered or ('datetime' in lowered and 'timestamp' in lowered):
@@ -899,6 +1138,14 @@ def _extract_error_signature(error_type: str, error_message: str) -> dict[str, A
         signature['signature_type'] = 'data_type_or_time_mismatch'
         return signature
 
+    if error_type == 'resource_exhausted':
+        exitcode_match = re.search(r'exitcode=(-?\d+)', error_message or '')
+        signature.update({
+            'signature_type': 'resource_exhausted',
+            'exitcode': int(exitcode_match.group(1)) if exitcode_match else None,
+        })
+        return signature
+
     if error_type == 'no_data_found':
         signature['signature_type'] = 'no_data_found'
         return signature
@@ -955,6 +1202,8 @@ def _build_turn_failure_memory(turn_id: int, current_execution_id: int) -> dict[
                 hint = f'之前已经出现字段或列不匹配问题（{field_name}），请先核对真实列名。'
             elif signature_type == 'data_type_or_time_mismatch':
                 hint = '之前已经出现时间或数据类型比较不兼容问题，请先统一类型后再过滤。'
+            elif signature_type == 'resource_exhausted':
+                hint = '之前已经出现内存或资源耗尽问题，请优先改用 load_local_file_low_memory(...) 分批读取，并在批次内完成过滤、聚合或累计统计。'
             elif signature_type == 'no_data_found':
                 hint = '之前已经出现“筛选/关联后无数据”，请优先检查 SQL、时间范围、筛选条件或 JOIN 条件，不要继续输出空图表。'
             else:
@@ -1020,6 +1269,14 @@ def _build_repair_instructions(error_type: str) -> list[str]:
             '当前错误属于库函数签名不兼容；请只修正报错位置的非法参数，不要重写与该错误无关的数据处理和图表逻辑。',
             '如果某个 opts 或图表参数不被当前版本支持，请删除该非法参数，或改成更基础、更稳定的默认写法。',
             '优先保留图表结构、数据处理和报告逻辑，只对报错的 API 调用做最小修改。',
+        ],
+        'resource_exhausted': [
+            '当前失败更像是大文件加载或内存耗尽，不要再一次性把整份本地文件完整加载到 pandas 内存中。',
+            '如果是本地文件，请改用 load_local_file_low_memory(...) 分批读取；可以先取第一个小批次确认列名、类型、时间列和候选取值，再继续正式分析。',
+            '优先只读取必要列，并在每个批次内完成过滤、聚合、TopN 累计或有限明细截取，不要把所有批次重新拼成一个超大 DataFrame。',
+            'CSV 和 Excel 都优先走 load_local_file_low_memory(...)；其中 .xlsx/.xlsm 支持流式批量读取，.xls 只能 best-effort 低内存处理。',
+            '如果用户要的是聚合、趋势、分布、TopN 或有限明细，就在批次循环中累计最终结果，只保留用于图表和报告生成的小结果。',
+            '如果旧版 .xls 文件在当前环境仍无法安全低内存处理，应明确返回受限说明或建议转换为 .xlsx/CSV，不要继续反复 OOM 重试。',
         ],
         'runtime_error': [
             '根据 error_message 直接修正导致失败的那一步，再重新生成完整代码。',
@@ -1240,8 +1497,7 @@ def execute_python(
     result_queue.join_thread()
 
     if worker_result is None:
-        error_message = f'代码执行子进程异常退出，exitcode={process_exitcode}'
-        error_type = 'runtime_error'
+        error_type, error_message = _classify_process_exit(process_exitcode)
         repair_instructions = _build_repair_instructions(error_type)
         error_signature = _extract_error_signature(error_type, error_message)
         failure_memory = _build_turn_failure_memory(
