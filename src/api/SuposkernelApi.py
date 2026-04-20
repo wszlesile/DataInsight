@@ -136,10 +136,10 @@ class SuposKernelApi:
             db_info.port = '31432'
             db_info.user = 'fedquery'
             db_info.password = 'fedquery'
-            db_info.lake_rds_database_name = 'fqe_ddc0ef5614'
+            db_info.lake_rds_database_name = 'fqe_uns'
         else:
             self._fill_kernel_database_context(token, db_info)
-            db_info.lake_rds_database_name = self._fetch_lake_rds_database_name(token)
+            db_info.lake_rds_database_name = 'fqe_uns'#self._fetch_lake_rds_database_name(token)
 
         self._database_context = db_info
         self._database_pool = None
