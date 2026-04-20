@@ -45,7 +45,7 @@ class UserAuthService:
                     return UserContext.from_auth_response(
                         data,
                         token,
-                        database_context=supos_kernel_api.get_database_context(token),
+                        database_conn_info=supos_kernel_api.get_database_conn_info(token),
                     )
 
                 logger.warning(

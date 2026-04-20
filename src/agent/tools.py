@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 
 from agent.context_engineering import CustomContext
 from api import supos_kernel_api
-from dto import DatabaseContext
+from dto import DatabaseConnInfo
 from utils import build_chart_document, build_chart_result, build_chart_suite, logger, normalize_chart_result_item
 
 CURRENT_USERNAME = ContextVar('current_username', default='anonymous')
@@ -950,28 +950,28 @@ def _serialize_runtime_user_context(runtime_context: CustomContext | None) -> di
 
     return {
         'token': getattr(runtime_context, 'auth_token', '') or '',
-        'database_context': dict(getattr(runtime_context, 'database_context', {}) or {}),
+        'database_conn_info': dict(getattr(runtime_context, 'database_conn_info', {}) or {}),
     }
 
 
 def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -> None:
     """在子进程里恢复数据库访问所需的最小运行时上下文。"""
     payload = runtime_user_context or {}
-    db_payload = payload.get('database_context') or {}
-    if db_payload:
-        supos_kernel_api._database_context = DatabaseContext(
-            host=str(db_payload.get('host') or ''),
-            port=str(db_payload.get('port') or ''),
-            user=str(db_payload.get('user') or ''),
-            password=str(db_payload.get('password') or ''),
-            lake_rds_database_name=str(db_payload.get('lake_rds_database_name') or ''),
+    conn_info_payload = payload.get('database_conn_info') or {}
+    if conn_info_payload:
+        supos_kernel_api._database_conn_info = DatabaseConnInfo(
+            host=str(conn_info_payload.get('host') or ''),
+            port=str(conn_info_payload.get('port') or ''),
+            user=str(conn_info_payload.get('user') or ''),
+            password=str(conn_info_payload.get('password') or ''),
+            lake_rds_database_name=str(conn_info_payload.get('lake_rds_database_name') or ''),
         )
         supos_kernel_api._database_pool = None
         return
 
     token = str(payload.get('token') or '').strip()
     if token:
-        supos_kernel_api.get_database_context(token)
+        supos_kernel_api.get_database_conn_info(token)
 
 
 def _execute_generated_code_worker(

@@ -11,7 +11,7 @@ import requests
 from sqlalchemy.pool import QueuePool
 
 from config.config import Config
-from dto import DatabaseContext
+from dto import DatabaseConnInfo
 from utils import logger
 
 KERNEL_TOKEN_PATH = Path("/var/run/secrets/supos.com/serviceaccount/token")
@@ -22,8 +22,8 @@ class SuposKernelApi:
         self.supos_web = Config.SUPOS_WEB
         self.timeout = Config.SUPOS_REQUEST_TIMEOUT
         self.log_collect_track_endpoint = Config.SUPOS_LOG_COLLECT_TRACK_ENDPOINT
-        self._database_context = DatabaseContext()
-        self._database_context_lock = Lock()
+        self._database_conn_info = DatabaseConnInfo()
+        self._database_conn_info_lock = Lock()
         self._database_pool: QueuePool | None = None
         self._database_pool_lock = Lock()
 
@@ -51,22 +51,22 @@ class SuposKernelApi:
         response.raise_for_status()
         return response.json()
 
-    def get_database_context(self, token: str | None = None) -> DatabaseContext:
+    def get_database_conn_info(self, token: str | None = None) -> DatabaseConnInfo:
         """
-        获取系统级数据库连接上下文单例。
+        获取系统级数据库连接信息单例。
 
         第一次在拿到用户 token 后初始化；后续所有用户上下文都复用同一个实例。
         """
-        if self._database_context.is_ready():
-            return self._database_context
+        if self._database_conn_info.is_ready():
+            return self._database_conn_info
         if not token:
-            return self._database_context
+            return self._database_conn_info
 
-        with self._database_context_lock:
-            if self._database_context.is_ready():
-                return self._database_context
-            self._initialize_database_context(token)
-            return self._database_context
+        with self._database_conn_info_lock:
+            if self._database_conn_info.is_ready():
+                return self._database_conn_info
+            self._initialize_database_conn_info(token)
+            return self._database_conn_info
 
     def get_database_pool(self, token: str | None = None) -> QueuePool | None:
         """
@@ -75,8 +75,8 @@ class SuposKernelApi:
         这里复用 SQLAlchemy 的连接池能力，但不使用 PostgreSQL dialect 初始化探测，
         避免 FedQuery 方言与 `pg_catalog.version()` 等标准探测 SQL 不兼容。
         """
-        database_context = self.get_database_context(token)
-        if not database_context.is_ready():
+        database_conn_info = self.get_database_conn_info(token)
+        if not database_conn_info.is_ready():
             return None
         if self._database_pool is not None:
             return self._database_pool
@@ -84,7 +84,7 @@ class SuposKernelApi:
         with self._database_pool_lock:
             if self._database_pool is not None:
                 return self._database_pool
-            self._database_pool = self._create_database_pool(database_context)
+            self._database_pool = self._create_database_pool(database_conn_info)
             return self._database_pool
 
     def query_dataframe(self, sql: str, params: list[Any] | None = None):
@@ -104,9 +104,9 @@ class SuposKernelApi:
 
         时间类字段会在驱动层统一按字符串返回，确保上层 DataFrame 行为稳定一致。
         """
-        database_context = self.get_database_context()
-        if not database_context.is_ready():
-            raise ValueError("数据库上下文尚未初始化，请先完成一次用户认证")
+        database_conn_info = self.get_database_conn_info()
+        if not database_conn_info.is_ready():
+            raise ValueError("数据库连接信息尚未初始化，请先完成一次用户认证")
 
         with self.borrow_database_connection() as dbapi_connection:
             with dbapi_connection.cursor() as cursor:
@@ -129,22 +129,22 @@ class SuposKernelApi:
         finally:
             pooled_connection.close()
 
-    def _initialize_database_context(self, token: str) -> None:
-        db_info = DatabaseContext()
+    def _initialize_database_conn_info(self, token: str) -> None:
+        conn_info = DatabaseConnInfo()
         if Config.PROFILE == 'local':
-            db_info.host = '192.168.19.228'
-            db_info.port = '31432'
-            db_info.user = 'fedquery'
-            db_info.password = 'fedquery'
-            db_info.lake_rds_database_name = 'fqe_uns'
+            conn_info.host = '192.168.19.228'
+            conn_info.port = '31432'
+            conn_info.user = 'fedquery'
+            conn_info.password = 'fedquery'
+            conn_info.lake_rds_database_name = 'fqe_uns'
         else:
-            self._fill_kernel_database_context(token, db_info)
-            db_info.lake_rds_database_name = 'fqe_uns'#self._fetch_lake_rds_database_name(token)
+            self._fill_kernel_database_conn_info(token, conn_info)
+            conn_info.lake_rds_database_name = 'fqe_uns'#self._fetch_lake_rds_database_name(token)
 
-        self._database_context = db_info
+        self._database_conn_info = conn_info
         self._database_pool = None
 
-    def _fill_kernel_database_context(self, token: str, db_info: DatabaseContext) -> None:
+    def _fill_kernel_database_conn_info(self, token: str, conn_info: DatabaseConnInfo) -> None:
         url = f"{self.supos_web}/apis/ns/v1/supbase-ds/SQL/fedquery/fedquery_system"
         params = {"{kinds}": "datasources.supos.com;v1alpha1:DSource"}
         headers = {"Authorization": token}
@@ -162,15 +162,15 @@ class SuposKernelApi:
             ):
                 spec = data["spec"]
                 if spec.get("username") and spec.get("password"):
-                    db_info.host = str(data.get("ip") or db_info.host or '')
-                    db_info.port = str(data.get("port") or '')
-                    db_info.user = str(spec.get("username") or '')
-                    db_info.password = str(spec.get("password") or '')
+                    conn_info.host = str(data.get("ip") or conn_info.host or '')
+                    conn_info.port = str(data.get("port") or '')
+                    conn_info.user = str(spec.get("username") or '')
+                    conn_info.password = str(spec.get("password") or '')
                     logger.info("[SuposKernel] 成功获取数据库连接信息")
         except requests.RequestException:
-            logger.warn("[SuposKernel] 获取 database_info 失败", exc_info=True)
+            logger.warn("[SuposKernel] 获取 database_conn_info 失败", exc_info=True)
         except ValueError:
-            logger.warn("[SuposKernel] 解析 database_info 响应失败", exc_info=True)
+            logger.warn("[SuposKernel] 解析 database_conn_info 响应失败", exc_info=True)
 
     def _fetch_lake_rds_database_name(self, token: str) -> str:
         """补充当前系统默认使用的 LakeRDS 数据库名称。"""
@@ -195,22 +195,22 @@ class SuposKernelApi:
             logger.warn("[SuposKernel] 解析 LakeRDS 数据库响应失败", exc_info=True)
         return ''
 
-    def _create_database_pool(self, database_context: DatabaseContext) -> QueuePool:
+    def _create_database_pool(self, database_conn_info: DatabaseConnInfo) -> QueuePool:
         return QueuePool(
-            creator=lambda: self._create_dbapi_connection(database_context),
+            creator=lambda: self._create_dbapi_connection(database_conn_info),
             pool_size=5,
             max_overflow=10,
             recycle=1800,
             pre_ping=False,
         )
 
-    def _create_dbapi_connection(self, database_context: DatabaseContext):
+    def _create_dbapi_connection(self, database_conn_info: DatabaseConnInfo):
         dbapi_connection = psycopg2.connect(
-            host=database_context.host,
-            user=database_context.user,
-            password=database_context.password,
-            database=database_context.lake_rds_database_name,
-            port=int(database_context.port),
+            host=database_conn_info.host,
+            user=database_conn_info.user,
+            password=database_conn_info.password,
+            database=database_conn_info.lake_rds_database_name,
+            port=int(database_conn_info.port),
         )
         self._register_time_text_casts(dbapi_connection)
         return dbapi_connection

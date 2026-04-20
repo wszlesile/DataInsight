@@ -28,7 +28,7 @@ class AgentRequest:
     conversation_id: str
     user_message: str
     auth_token: str = ''
-    database_context: dict[str, Any] | None = None
+    database_conn_info: dict[str, Any] | None = None
 
 
 @dataclass
@@ -201,7 +201,7 @@ def _build_agent_context(agent_request: AgentRequest, runtime: ConversationRunCo
         conversation_id=runtime.conversation.id,
         turn_id=runtime.turn.id,
         auth_token=agent_request.auth_token or '',
-        database_context=dict(agent_request.database_context or {}),
+        database_conn_info=dict(agent_request.database_conn_info or {}),
     )
 
 
@@ -1079,16 +1079,16 @@ def _build_rerun_agent_request(
     username: str,
     runtime: ConversationRunContext,
     auth_token: str = '',
-    database_context: dict[str, Any] | None = None,
+    database_conn_info: dict[str, Any] | None = None,
 ) -> AgentRequest:
-    """构造刷新分析复用的 AgentRequest，并透传用户数据库上下文。"""
+    """构造刷新分析复用的 AgentRequest，并透传用户数据库连接信息。"""
     return AgentRequest(
         username=username,
         namespace_id=str(runtime.conversation.insight_namespace_id),
         conversation_id=str(runtime.conversation.id),
         user_message=runtime.turn.user_query,
         auth_token=auth_token or '',
-        database_context=dict(database_context or {}),
+        database_conn_info=dict(database_conn_info or {}),
     )
 
 
@@ -1097,7 +1097,7 @@ def stream_rerun_turn(
     conversation_id: Any,
     turn_id: Any,
     auth_token: str = '',
-    database_context: dict[str, Any] | None = None,
+    database_conn_info: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """在同一轮次内重新执行一次分析，并把新结果回写到该轮。"""
     session = SessionLocal()
@@ -1116,7 +1116,7 @@ def stream_rerun_turn(
         username=username,
         runtime=runtime,
         auth_token=auth_token,
-        database_context=database_context,
+        database_conn_info=database_conn_info,
     )
 
     try:

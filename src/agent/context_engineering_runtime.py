@@ -40,7 +40,7 @@ class CustomContext(BaseModel):
     conversation_id: int = 0
     turn_id: int = 0
     auth_token: str = ''
-    database_context: dict[str, Any] = Field(default_factory=dict)
+    database_conn_info: dict[str, Any] = Field(default_factory=dict)
 
 
 def classify_analysis_context_mode(user_message: str) -> str:

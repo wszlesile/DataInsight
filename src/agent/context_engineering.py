@@ -37,7 +37,7 @@ class CustomContext(BaseModel):
     conversation_id: int = 0
     turn_id: int = 0
     auth_token: str = ''
-    database_context: dict[str, Any] = Field(default_factory=dict)
+    database_conn_info: dict[str, Any] = Field(default_factory=dict)
 
 
 def _build_datasource_payload_item(datasource: InsightDatasource) -> dict[str, Any]:

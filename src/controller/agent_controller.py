@@ -28,7 +28,7 @@ def _build_agent_request(data: dict):
     from agent.invoker import AgentRequest
 
     user_context = get_current_user_context()
-    database_context = getattr(user_context, 'database_context', None)
+    database_conn_info = getattr(user_context, 'database_conn_info', None)
     return AgentRequest(
         # 用户名
         username=user_context.username if user_context else 'anonymous',
@@ -39,13 +39,13 @@ def _build_agent_request(data: dict):
         # 用户消息
         user_message=(data.get('user_message') or '').strip(),
         auth_token=getattr(user_context, 'token', '') or '',
-        database_context={
-            'host': getattr(database_context, 'host', '') or '',
-            'port': getattr(database_context, 'port', '') or '',
-            'user': getattr(database_context, 'user', '') or '',
-            'password': getattr(database_context, 'password', '') or '',
-            'lake_rds_database_name': getattr(database_context, 'lake_rds_database_name', '') or '',
-        } if database_context else {},
+        database_conn_info={
+            'host': getattr(database_conn_info, 'host', '') or '',
+            'port': getattr(database_conn_info, 'port', '') or '',
+            'user': getattr(database_conn_info, 'user', '') or '',
+            'password': getattr(database_conn_info, 'password', '') or '',
+            'lake_rds_database_name': getattr(database_conn_info, 'lake_rds_database_name', '') or '',
+        } if database_conn_info else {},
     )
 
 

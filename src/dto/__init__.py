@@ -29,8 +29,8 @@ class DataSourceSchema(BaseModel):
 
 
 @dataclass
-class DatabaseContext:
-    """Table/UNS 查询共用的数据库连接上下文。"""
+class DatabaseConnInfo:
+    """Table/UNS 查询共用的数据库连接信息。"""
 
     host: str = ''
     port: str = ''
@@ -61,15 +61,15 @@ class UserContext:
     user_code: str
     # 当前认证 token。
     token: str
-    # 系统级数据库连接上下文单例引用。
-    database_context: DatabaseContext = field(default_factory=DatabaseContext)
+    # 当前请求可见的数据库连接信息快照。
+    database_conn_info: DatabaseConnInfo = field(default_factory=DatabaseConnInfo)
 
     @classmethod
     def from_auth_response(
         cls,
         data: dict,
         token: str,
-        database_context: DatabaseContext | None = None,
+        database_conn_info: DatabaseConnInfo | None = None,
     ) -> 'UserContext':
         """从认证接口响应中构造用户上下文。"""
         user_session = data.get('userSessionInfo', {})
@@ -80,7 +80,7 @@ class UserContext:
             staff_name=user_session.get('staffName', ''),
             user_code=data.get('userCode', ''),
             token=token,
-            database_context=database_context or DatabaseContext(),
+            database_conn_info=database_conn_info or DatabaseConnInfo(),
         )
 
 
@@ -92,7 +92,7 @@ def get_current_user_context():
 
 
 __all__ = [
-    'DatabaseContext',
+    'DatabaseConnInfo',
     'UserContext',
     'get_current_user_context',
     'PropertySchema',
