@@ -518,6 +518,39 @@ def _get_latest_failed_generated_code(executions: list[Any]) -> str:
     return ''
 
 
+def _extract_execution_error_type(execution: Any) -> str:
+    """从执行记录中提取结构化错误类型，旧数据回退到错误文本启发式识别。"""
+    payload_text = (getattr(execution, 'result_payload_json', '') or '').strip()
+    if payload_text:
+        try:
+            payload = json.loads(payload_text)
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            error_type = str(payload.get('error_type') or '').strip()
+            if error_type:
+                return error_type
+            error_signature = payload.get('error_signature')
+            if isinstance(error_signature, dict):
+                signature_type = str(
+                    error_signature.get('error_type') or error_signature.get('signature_type') or ''
+                ).strip()
+                if signature_type:
+                    return signature_type
+
+    error_message = (getattr(execution, 'error_message', '') or '').strip()
+    lowered = error_message.lower()
+    if any(marker in lowered for marker in ('filenotfounderror', 'no such file', 'file not found')):
+        return 'data_source_not_found'
+    if any(marker in error_message for marker in ('文件不存在', '数据源不存在', '表不存在', '接口不可访问')):
+        return 'data_source_not_found'
+    if any(marker in lowered for marker in ('no_data_found', 'no data found')):
+        return 'no_data_found'
+    if any(marker in error_message for marker in ('未命中可分析数据', '筛选结果为空', '过滤后无数据', '关联后无数据')):
+        return 'no_data_found'
+    return ''
+
+
 def _build_analysis_recovery_instruction(
     service: ConversationContextService,
     runtime: ConversationRunContext,
@@ -534,6 +567,11 @@ def _build_analysis_recovery_instruction(
         if execution.execution_status != 'success' and (execution.error_message or '').strip()
     ]
     latest_errors = failed_errors[-3:]
+    latest_error_types = [
+        error_type
+        for error_type in (_extract_execution_error_type(execution) for execution in executions)
+        if error_type
+    ][-3:]
     failed_pattern_hints = _build_failed_pattern_hints(executions)
     latest_failed_code = _get_latest_failed_generated_code(executions)
 
@@ -544,6 +582,8 @@ def _build_analysis_recovery_instruction(
     if latest_errors:
         lines.append('最近的执行错误如下：')
         lines.extend(f'- {item}' for item in latest_errors)
+    if latest_error_types:
+        lines.append(f'最近的结构化错误类型：{", ".join(latest_error_types)}。')
 
     if failed_pattern_hints:
         lines.append('本轮已经确认的失败写法如下，新的修复代码中不要再次出现：')
@@ -552,7 +592,23 @@ def _build_analysis_recovery_instruction(
     lines.extend([
         '请基于上一版失败代码做最小必要修补，不要整段重写与当前错误无关的逻辑。',
         '请直接修正完整 Python 代码并再次调用 execute_python。',
-        '优先检查：时间过滤是否命中数据、过滤后数据集是否为空、关联结果是否为空；如果为空，应调用 raise_no_data_error(...) 把“无数据”返回给 execute_python，再由上层继续重试，而不是继续误改字段名或图表参数，更不要输出空图表收口。',
+    ])
+    latest_error_type = latest_error_types[-1] if latest_error_types else ''
+    if latest_error_type in {'data_source_not_found', 'data_source_unavailable'}:
+        lines.extend([
+            '最近失败属于数据源不可用或数据源标识错误，不是 no_data_found。',
+            '不要调用 raise_no_data_error(...) 包装文件不存在、表不存在、路径不可访问或接口不可访问；raise_no_data_error 只用于数据源已成功加载后，过滤/关联/聚合结果为空。',
+            '只能原样使用当前数据源上下文提供的文件路径、表名或接口地址；如果已原样使用仍不可访问，应调用 request_retry(retry_type="data_source_unavailable", message=..., diagnostics=..., repair_instructions=...) 返回结构化反馈，或让本轮失败结束，不要伪装成空数据分析。',
+        ])
+    elif latest_error_type == 'no_data_found':
+        lines.append(
+            '最近失败属于 no_data_found：请优先检查时间过滤是否命中数据、过滤后数据集是否为空、关联结果是否为空；如果探测后仍为空，应调用 raise_no_data_error(...) 把“无数据”返回给 execute_python，而不是继续误改字段名或图表参数。'
+        )
+    else:
+        lines.append(
+            '只有在数据源已经成功加载后，过滤、关联或聚合结果为空时，才允许调用 raise_no_data_error(...)；文件、表或接口不可访问不属于无数据。'
+        )
+    lines.extend([
         '不要向用户解释工具错误，不要再次询问用户，也不要用自然语言提前结束本轮。',
         '只有成功生成完整的结构化图表结果和分析报告，这一轮分析才算完成。',
     ])

@@ -11,7 +11,7 @@ from contextvars import ContextVar
 from datetime import datetime, time as datetime_time, timedelta
 from difflib import SequenceMatcher
 from io import StringIO
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from zoneinfo import ZoneInfo
 
 from langchain_core.messages import ToolMessage
@@ -575,6 +575,23 @@ class StructuredResult(BaseModel):
     tables: list[dict[str, Any]] = Field(default_factory=list, description="表格产物列表")
 
 
+class RetryResult(BaseModel):
+    """Structured feedback that asks the agent to generate another code attempt."""
+
+    retry_type: Literal[
+        "probe_feedback",
+        "data_source_unavailable",
+        "missing_structured_artifact",
+        "missing_report",
+        "incomplete_result",
+        "contract_error",
+    ] = Field(description="Why the current execution needs another attempt.")
+    message: str = Field(description="Human-readable retry reason.")
+    diagnostics: dict[str, Any] = Field(default_factory=dict, description="Structured diagnostic facts.")
+    repair_instructions: list[str] = Field(default_factory=list, description="Targeted next-step instructions.")
+    analysis_report: str = Field(default="", description="Optional diagnostic report; not a final answer.")
+
+
 class NoDataFoundError(Exception):
     """用于把“当前代码筛选后无数据”的情况显式上抛给 execute_python。"""
 
@@ -598,6 +615,41 @@ def raise_no_data_error(reason: str, detail_lines: Optional[list[str]] = None) -
     而应调用本函数把“本轮未命中数据”的信息返回给 execute_python，再由上层决定是否继续重试。
     """
     raise NoDataFoundError(reason=reason, detail_lines=detail_lines)
+
+
+def request_retry(
+    retry_type: str,
+    message: str,
+    diagnostics: Optional[dict[str, Any]] = None,
+    repair_instructions: Optional[list[str]] = None,
+    analysis_report: str = "",
+) -> RetryResult:
+    """Return structured retry feedback from generated probe code."""
+    allowed_types = {
+        "probe_feedback",
+        "data_source_unavailable",
+        "missing_structured_artifact",
+        "missing_report",
+        "incomplete_result",
+        "contract_error",
+    }
+    normalized_retry_type = str(retry_type or "").strip() or "contract_error"
+    if normalized_retry_type not in allowed_types:
+        normalized_retry_type = "contract_error"
+
+    normalized_message = str(message or "").strip() or "当前代码执行完成，但仍需要重新生成代码继续分析。"
+    normalized_instructions = [
+        str(item).strip()
+        for item in (repair_instructions or [])
+        if str(item).strip()
+    ]
+    return RetryResult(
+        retry_type=normalized_retry_type,  # type: ignore[arg-type]
+        message=normalized_message,
+        diagnostics=diagnostics or {},
+        repair_instructions=normalized_instructions,
+        analysis_report=str(analysis_report or "").strip(),
+    )
 
 
 def save_empty_analysis_result(
@@ -712,6 +764,11 @@ def _serialize_exec_result(exec_result: Any) -> dict[str, Any]:
             'result_kind': 'structured',
             'payload': exec_result.model_dump(),
         }
+    if isinstance(exec_result, RetryResult):
+        return {
+            'result_kind': 'retry',
+            'payload': exec_result.model_dump(),
+        }
     return {
         'result_kind': 'raw',
         'payload': None,
@@ -721,6 +778,8 @@ def _serialize_exec_result(exec_result: Any) -> dict[str, Any]:
 def _deserialize_exec_result(payload: dict[str, Any]) -> Any:
     if payload.get('result_kind') == 'structured' and isinstance(payload.get('payload'), dict):
         return StructuredResult(**payload['payload'])
+    if payload.get('result_kind') == 'retry' and isinstance(payload.get('payload'), dict):
+        return RetryResult(**payload['payload'])
     return None
 
 
@@ -750,35 +809,50 @@ def _build_no_data_feedback(
     }
 
 
-def _extract_retryable_no_data_from_result(exec_result: StructuredResult) -> dict[str, Any] | None:
-    """
-    兼容旧代码路径：如果生成代码返回了只有报告、没有任何图表/表格的空结果，
-    仍将其视为“无数据”并要求上层继续重试，而不是把它当成真正成功。
-    """
-    if exec_result.charts or exec_result.tables:
-        return None
+def _build_retry_error_signature(retry_result: RetryResult) -> dict[str, Any]:
+    return {
+        'error_type': retry_result.retry_type,
+        'signature_type': retry_result.retry_type,
+        'message': retry_result.message,
+        'diagnostics': retry_result.diagnostics,
+    }
 
-    reason = ''
-    detail_lines: list[str] = []
-    for raw_line in (exec_result.analysis_report or '').splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith('- '):
-            content = line[2:].strip()
-            if not reason:
-                reason = content
-            else:
-                detail_lines.append(content)
 
-    if not reason:
-        for raw_line in (exec_result.analysis_report or '').splitlines():
-            line = raw_line.strip().lstrip('#').strip()
-            if line and line not in {'结果说明', '补充信息'}:
-                reason = line
-                break
+def _validate_structured_result_contract(exec_result: StructuredResult) -> RetryResult | None:
+    report_text = (exec_result.analysis_report or '').strip()
+    if not report_text:
+        return request_retry(
+            retry_type="missing_report",
+            message="当前代码返回了结构化结果，但 analysis_report 为空。",
+            diagnostics={
+                "chart_count": len(exec_result.charts or []),
+                "table_count": len(exec_result.tables or []),
+            },
+            repair_instructions=[
+                "下一版代码必须先构造完整 Markdown 分析报告。",
+                "调用 save_analysis_result(...) 时传入非空 analysis_report。",
+            ],
+        )
 
-    return _build_no_data_feedback(reason=reason, detail_lines=detail_lines)
+    if not (exec_result.charts or exec_result.tables):
+        return request_retry(
+            retry_type="missing_structured_artifact",
+            message="当前代码只生成了分析报告，没有生成图表或结构化表格。",
+            diagnostics={
+                "analysis_report_preview": report_text[:800],
+                "chart_count": 0,
+                "table_count": 0,
+            },
+            repair_instructions=[
+                "下一版代码保留已有统计口径、筛选条件和核心结论。",
+                "至少补充一个 charts 或 tables 结构化产物。",
+                "趋势、对比、TopN 等场景优先生成 charts；单指标或明细汇总可以生成 tables。",
+                "不要把自然语言报告直接作为最终结果结束。",
+            ],
+            analysis_report=report_text,
+        )
+
+    return None
 
 
 def _classify_process_exit(process_exitcode: int | None) -> tuple[str, str]:
@@ -938,6 +1012,7 @@ def _build_execution_namespace() -> dict[str, Any]:
         'build_chart_result': build_chart_result,
         'build_chart_suite': build_chart_suite,
         'raise_no_data_error': raise_no_data_error,
+        'request_retry': request_retry,
         'save_empty_analysis_result': save_empty_analysis_result,
         'save_analysis_result': save_analysis_result,
     }
@@ -1225,7 +1300,7 @@ def _build_repair_instructions(error_type: str) -> list[str]:
     """根据错误类型生成定向修复建议。"""
     common_instructions = [
         '重新生成完整可执行代码，不要只修改局部片段。',
-        '保留 save_analysis_result(...) 并把返回值赋给 result。',
+        '正式分析代码应调用 save_analysis_result(...) 并把返回值赋给 result；探测或结构化反馈代码应调用 request_retry(...) 并把返回值赋给 result。',
         '如果当前修正思路与上一次相同且未解决错误，请更换实现方式后再重试。',
     ]
 
@@ -1241,6 +1316,8 @@ def _build_repair_instructions(error_type: str) -> list[str]:
         'data_source_not_found': [
             '检查数据源标识、文件路径、表名或接口地址是否与当前数据源上下文一致。',
             '不要凭空假设新的文件路径或表名。',
+            '这类错误表示必要数据源不可访问或标识不匹配，不属于 no_data_found；不要调用 raise_no_data_error(...) 包装文件不存在、表不存在或接口不可访问。',
+            '如果已原样使用当前数据源上下文中的标识但仍不可访问，应调用 request_retry(retry_type="data_source_unavailable", ...) 返回结构化反馈，或让本轮失败，不要伪装成空数据分析。',
         ],
         'schema_or_column_mismatch': [
             '字段选择必须以 metadata_schema.properties 中提供的真实字段名为准。',
@@ -1261,9 +1338,36 @@ def _build_repair_instructions(error_type: str) -> list[str]:
             '在数据加载、过滤、关联、聚合完成后，必须先检查 DataFrame 是否为空；只要为空，就调用 raise_no_data_error(reason=..., detail_lines=[...])，不要继续生成空图表或空结果产物。',
             'reason 要直接说明是哪一步没有命中数据，detail_lines 可补充当前时间范围、筛选条件、关联键或中间行数，方便上层感知后继续重试。',
         ],
+        'probe_feedback': [
+            '当前反馈是数据探测结果，不是最终分析报告；请基于 diagnostics 中的候选值、时间覆盖或字段分布重写正式分析代码。',
+            '下一版代码应切换为 execution_intent = "analysis"，并调用 save_analysis_result(...) 返回最终分析结果。',
+            '不要再次只输出探测报告；如果候选值仍有歧义，再返回 request_retry(retry_type="probe_feedback", ...)。',
+        ],
+        'data_source_unavailable': [
+            '当前反馈表示必要数据源不可访问或标识无法解析，不是筛选条件未命中数据。',
+            '不要调用 raise_no_data_error(...)，也不要继续生成空图表或空报告伪装成功。',
+            '只能原样使用当前数据源上下文提供的文件路径、表名或接口地址；如果仍不可访问，应保持 data_source_unavailable 语义并让上层失败收口。',
+        ],
+        'missing_structured_artifact': [
+            '当前代码已经生成分析报告，但没有生成 charts 或 tables 结构化产物。',
+            '下一版代码应保留已有统计口径、筛选条件和核心结论，至少补充一个 charts 或 tables。',
+            '趋势、对比、TopN 等场景优先生成 charts；单指标或明细汇总可以生成 tables。',
+        ],
+        'missing_report': [
+            '当前结果缺少非空 analysis_report；请先构造完整 Markdown 分析报告，再调用 save_analysis_result(...)。',
+            '不要只返回图表或表格，最终结果必须同时包含可读报告和结构化产物。',
+        ],
+        'incomplete_result': [
+            '当前执行结果不完整；请根据 diagnostics 补齐缺失的报告、图表或表格后重新生成完整代码。',
+            '不要把中间探测信息包装成最终分析报告。',
+        ],
+        'contract_error': [
+            '当前代码主动返回了契约问题反馈；请根据 message、diagnostics 和 repair_instructions 重新生成完整代码。',
+            '如果本轮是探测，请返回 request_retry(...)；如果本轮是正式分析，请返回 save_analysis_result(...)。',
+        ],
         'result_contract_error': [
-            '最终必须产出完整 analysis_report，并调用 save_analysis_result(analysis_report=..., charts=[...])。',
-            '不要遗漏 result 变量，也不要返回空的 analysis_report 或空的结构化图表配置。',
+            '最终必须产出完整 analysis_report，并调用 save_analysis_result(analysis_report=..., charts=[...], tables=[...])。',
+            '不要遗漏 result 变量，也不要返回空的 analysis_report 或 charts/tables 同时为空的结构化结果。',
         ],
         'library_api_signature_mismatch': [
             '当前错误属于库函数签名不兼容；请只修正报错位置的非法参数，不要重写与该错误无关的数据处理和图表逻辑。',
@@ -1300,6 +1404,10 @@ def _tool_error_message(
     error_message: str,
     repair_instructions: list[str],
     error_signature: dict[str, Any] | None = None,
+    feedback_kind: str = '',
+    retry_reason_code: str = '',
+    diagnostics: dict[str, Any] | None = None,
+    analysis_report: str = '',
     current_failed_code: str = '',
     previous_failure_messages: list[str] | None = None,
     previous_failure_hints: list[str] | None = None,
@@ -1320,6 +1428,14 @@ def _tool_error_message(
         'previous_failure_hints': (previous_failure_hints or [])[-3:],
         'previous_failure_count': len(previous_failure_messages or []),
     }
+    if feedback_kind:
+        payload['feedback_kind'] = feedback_kind
+    if retry_reason_code:
+        payload['retry_reason_code'] = retry_reason_code
+    if diagnostics:
+        payload['diagnostics'] = diagnostics
+    if analysis_report:
+        payload['analysis_report'] = analysis_report[:2000]
     if stdout_text:
         payload['stdout_text'] = stdout_text[:1000]
     if stderr_text:
@@ -1592,6 +1708,13 @@ def execute_python(
         _update_execution_record(
             execution_id,
             execution_status='failed',
+            result_payload_json=json.dumps({
+                'status': 'failed',
+                'error_type': error_type,
+                'error_message': error_message,
+                'error_signature': error_signature,
+                'repair_instructions': repair_instructions,
+            }, ensure_ascii=False),
             stdout_text=stdout_text,
             stderr_text=stderr_text,
             execution_seconds=int((time.time() - start_time) * 1000),
@@ -1655,9 +1778,50 @@ def execute_python(
             message=stderr_text[:1000],
         )
 
+    if isinstance(exec_result, RetryResult):
+        retry_error_signature = _build_retry_error_signature(exec_result)
+        retry_repair_instructions = exec_result.repair_instructions or _build_repair_instructions(exec_result.retry_type)
+        failure_memory = _build_turn_failure_memory(
+            turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+            current_execution_id=execution_id,
+        )
+        _update_execution_record(
+            execution_id,
+            execution_status='failed',
+            analysis_report=exec_result.analysis_report,
+            result_payload_json=exec_result.model_dump_json(),
+            stdout_text=stdout_text,
+            stderr_text=stderr_text,
+            execution_seconds=execution_seconds,
+            error_message=exec_result.message,
+        )
+        emit(
+            'status',
+            stage='tool_retry',
+            level='warning',
+            tool='execute_python',
+            message=exec_result.message,
+        )
+        return _tool_error_message(
+            tool_call_id=runtime.tool_call_id,
+            error_type=exec_result.retry_type,
+            error_message=exec_result.message,
+            repair_instructions=retry_repair_instructions,
+            error_signature=retry_error_signature,
+            feedback_kind='retryable_feedback',
+            retry_reason_code=exec_result.retry_type,
+            diagnostics=exec_result.diagnostics,
+            analysis_report=exec_result.analysis_report,
+            current_failed_code=code,
+            previous_failure_messages=failure_memory.get('previous_failure_messages', []),
+            previous_failure_hints=failure_memory.get('previous_failure_hints', []),
+            stdout_text=stdout_text,
+            stderr_text=stderr_text,
+        )
+
     if isinstance(exec_result, StructuredResult):
-        retryable_no_data = _extract_retryable_no_data_from_result(exec_result)
-        if retryable_no_data is not None:
+        contract_retry = _validate_structured_result_contract(exec_result)
+        if contract_retry is not None:
             failure_memory = _build_turn_failure_memory(
                 turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
                 current_execution_id=execution_id,
@@ -1665,26 +1829,30 @@ def execute_python(
             _update_execution_record(
                 execution_id,
                 execution_status='failed',
-                analysis_report=exec_result.analysis_report,
-                result_payload_json=exec_result.model_dump_json(),
+                analysis_report=contract_retry.analysis_report or exec_result.analysis_report,
+                result_payload_json=contract_retry.model_dump_json(),
                 stdout_text=stdout_text,
                 stderr_text=stderr_text,
                 execution_seconds=execution_seconds,
-                error_message=retryable_no_data['error_message'],
+                error_message=contract_retry.message,
             )
             emit(
                 'status',
                 stage='tool_retry',
                 level='warning',
                 tool='execute_python',
-                message='本次代码执行未命中数据，已返回上层继续重试。',
+                message=contract_retry.message,
             )
             return _tool_error_message(
                 tool_call_id=runtime.tool_call_id,
-                error_type=retryable_no_data['error_type'],
-                error_message=retryable_no_data['error_message'],
-                repair_instructions=retryable_no_data['repair_instructions'],
-                error_signature=retryable_no_data['error_signature'],
+                error_type=contract_retry.retry_type,
+                error_message=contract_retry.message,
+                repair_instructions=contract_retry.repair_instructions or _build_repair_instructions(contract_retry.retry_type),
+                error_signature=_build_retry_error_signature(contract_retry),
+                feedback_kind='retryable_feedback',
+                retry_reason_code=contract_retry.retry_type,
+                diagnostics=contract_retry.diagnostics,
+                analysis_report=contract_retry.analysis_report,
                 current_failed_code=code,
                 previous_failure_messages=failure_memory.get('previous_failure_messages', []),
                 previous_failure_hints=failure_memory.get('previous_failure_hints', []),
