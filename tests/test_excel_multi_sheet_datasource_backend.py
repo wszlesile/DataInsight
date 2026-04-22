@@ -16,7 +16,8 @@ SRC_ROOT = PROJECT_ROOT / 'src'
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from agent.context_engineering import get_datasource_message
+from agent.context_engineering_runtime import get_datasource_message
+from config import Config
 from config.database import Base
 from model import InsightDatasource, InsightNamespace
 from service.conversation_context_service import ConversationContextService
@@ -126,6 +127,51 @@ class ExcelMultiSheetDatasourceBackendTestCase(unittest.TestCase):
         self.assertIn('"sheet_name": "detail"', message.content)
         self.assertIn("sheet_name", message.content)
         self.assertIn("load_local_file", message.content)
+
+    def test_file_upload_records_size_but_prompt_only_exposes_recommended_loader(self):
+        original_threshold = Config.LOCAL_FILE_LOW_MEMORY_THRESHOLD_BYTES
+        Config.LOCAL_FILE_LOW_MEMORY_THRESHOLD_BYTES = 1
+        try:
+            service = InsightNsRelDatasourceService(self.session)
+            upload = self._build_excel_upload()
+
+            with tempfile.TemporaryDirectory() as upload_dir:
+                result = service.upload_file_datasource_to_namespace(
+                    insight_namespace_id=self.namespace.id,
+                    upload_file=upload,
+                    upload_dir=upload_dir,
+                )
+
+            self.assertTrue(result["success"])
+            datasource = self.session.query(InsightDatasource).filter(
+                InsightDatasource.insight_namespace_id == self.namespace.id,
+                InsightDatasource.is_deleted == 0,
+            ).order_by(InsightDatasource.id.asc()).first()
+            self.assertIsNotNone(datasource)
+
+            config = json.loads(datasource.datasource_config_json)
+            self.assertIsInstance(config.get("file_size_bytes"), int)
+            self.assertGreater(config["file_size_bytes"], 0)
+
+            snapshot_item = ConversationContextService(self.session)._build_datasource_snapshot_item(datasource)
+            self.assertEqual(snapshot_item["recommended_loader"], "load_local_file_low_memory")
+            self.assertNotIn("file_size_bytes", snapshot_item)
+
+            message = get_datasource_message(
+                namespace_id=self.namespace.id,
+                conversation_id=0,
+                snapshot_override={
+                    "namespace_id": self.namespace.id,
+                    "selected_datasource_snapshot": [snapshot_item],
+                    "selected_datasource_ids": [datasource.id],
+                },
+            )
+
+            self.assertIsNotNone(message)
+            self.assertIn('"recommended_loader": "load_local_file_low_memory"', message.content)
+            self.assertNotIn("file_size_bytes", message.content)
+        finally:
+            Config.LOCAL_FILE_LOW_MEMORY_THRESHOLD_BYTES = original_threshold
 
 
 if __name__ == '__main__':

@@ -28,6 +28,7 @@ from utils.datasource_utils import (
     extract_datasource_identifier,
     extract_datasource_schema,
     normalize_datasource_type,
+    recommend_local_file_loader,
     safe_json_loads,
     to_int,
 )
@@ -957,13 +958,19 @@ class ConversationContextService:
     def _build_datasource_snapshot_item(self, datasource: InsightDatasource) -> dict[str, Any]:
         """构造一条写入会话和轮次快照中的数据源摘要。"""
         config_json = safe_json_loads(datasource.datasource_config_json, {})
+        datasource_type = normalize_datasource_type(datasource.datasource_type)
         payload = {
             "datasource_id": datasource.id,
-            "datasource_type": normalize_datasource_type(datasource.datasource_type),
+            "datasource_type": datasource_type,
             "datasource_name": datasource.datasource_name,
             "datasource_identifier": extract_datasource_identifier(datasource, config_json),
             "metadata_schema": extract_datasource_schema(datasource, config_json),
         }
+        if datasource_type == "local_file":
+            payload["recommended_loader"] = recommend_local_file_loader(
+                config_json,
+                Config.LOCAL_FILE_LOW_MEMORY_THRESHOLD_BYTES,
+            )
         sheet_name = str(config_json.get("sheet_name") or "").strip()
         if sheet_name:
             payload["sheet_name"] = sheet_name

@@ -84,6 +84,7 @@
 
 3. **结构化表格 (Table，可选)**
    - 当问题需要明细、分组统计或结果表展示时，可以输出一个或多个结构化表格
+   - 表格主要作为图表的补充说明；不要为了省事只生成表格
 
 ---
 
@@ -148,15 +149,16 @@
 
 ### 本地大文件加载策略
 
-如果当前分析命中的是 `local_file` 数据源，而且之前已经因为内存耗尽、`MemoryError` 或子进程 `exitcode=-9/137` 失败，必须切换到低内存重试策略：
+如果当前分析命中的是 `local_file` 数据源，优先根据数据源上下文中的 `recommended_loader` 选择加载函数：
 
-1. 首轮没有资源问题时，可以继续正常使用 `load_local_file(file_path=...)`
-2. 一旦出现资源耗尽，再改用 `load_local_file_low_memory(...)`，不要重复整表读入 pandas
-3. 低内存重试时，可以先读取一个很小的首批次确认列名、类型、时间列和候选取值，再决定后续过滤和统计策略
-4. 优先传 `usecols`、`dtype`、`parse_dates`，只保留真正必要的列
+1. `recommended_loader = "load_local_file"`：使用 `load_local_file(file_path=...)`，它会一次性返回完整 `pandas.DataFrame`
+2. `recommended_loader = "load_local_file_low_memory"`：首轮就必须使用 `load_local_file_low_memory(...)`，它返回批次迭代器，必须用 `for chunk in ...` 逐批处理
+3. 使用 `load_local_file_low_memory(...)` 时，不能把返回值当作完整 DataFrame 直接 `.groupby()`、`.filter()`、画图或取列
+4. 使用低内存读取时，优先传 `usecols`、`dtype`、`parse_dates`，只保留真正必要的列
 5. 如果用户要的是聚合、趋势、分布、TopN 或有限明细，应在批次循环中累计最终结果，不要把全部批次重新拼回一个超大 DataFrame
-6. `CSV` 与 `Excel` 都优先走同一个低内存 helper；其中 `.xlsx/.xlsm` 更适合流式批量处理，旧版 `.xls` 只能 best-effort
-7. 如果旧版 `.xls` 在当前环境仍然无法安全低内存处理，应返回受限说明或建议转换为 `.xlsx/.csv`，不要反复继续 OOM 重试
+6. 如果之前已经因为内存耗尽、`MemoryError` 或子进程 `exitcode=-9/137` 失败，即使 `recommended_loader` 缺失或为 `load_local_file`，下一版也必须切换到 `load_local_file_low_memory(...)`
+7. `CSV` 与 `Excel` 都可以走同一个低内存 helper；其中 `.xlsx/.xlsm` 更适合流式批量处理，旧版 `.xls` 只能 best-effort
+8. 如果旧版 `.xls` 在当前环境仍然无法安全低内存处理，应返回受限说明或建议转换为 `.xlsx/.csv`，不要反复继续 OOM 重试
 
 #### load_data_with_api
 - **功能**：通过 HTTP API 获取数据
@@ -274,7 +276,7 @@ execution_intent = "probe"     # 数据探测
 - `execution_intent = "probe"`：用于在上一轮 `no_data_found`、字段不匹配、时间范围不匹配、JOIN 不命中等情况下探测真实数据情况；最后必须调用 `request_retry(...)`，并赋值给变量 `result`；通常使用 `retry_type="probe_feedback"`。
 - 如果上一轮是文件不存在、表不存在、路径不可访问或接口不可访问，优先修正为上下文中的原始数据源标识；如果已确认标识原样使用仍不可访问，应返回 `request_retry(retry_type="data_source_unavailable", ...)`，不要切换成 `raise_no_data_error(...)`。
 - 探测代码不能调用 `save_analysis_result(...)`，不能把候选值、字段分布或时间覆盖探测信息包装成最终分析报告。
-- 最终分析代码不能只给自然语言报告；如果不适合生成图表，也必须至少生成一个结构化 `tables` 产物。
+- 最终分析代码不能只给自然语言报告；默认应优先生成 `charts`，并按需附带 `tables`。只有单指标统计、明细列表、无明显可视化价值的汇总结果，才允许只生成 `tables`。
 
 ### 无数据重试时的数据探测与纠偏规范
 
@@ -314,7 +316,8 @@ execution_intent = "probe"     # 数据探测
 - `analysis_report`：最终 Markdown 分析报告
 - `charts`：图表数组，可以为空，也可以包含一个或多个图表
 - `tables`：表格数组，可以为空，也可以包含一个或多个结构化表格
-- 最终分析结果中 `charts` 和 `tables` 不能同时为空；如果没有合适图表，必须用 `tables` 返回单指标、汇总或明细结构化结果
+- 最终分析结果中 `charts` 和 `tables` 不能同时为空；默认优先生成 `charts`，再用 `tables` 补充明细或汇总。只有单指标统计、明细列表、无明显可视化价值的汇总结果，才允许 tables-only。
+- 趋势、对比、分布、排名、占比、TopN、多维聚合、时间序列等场景必须优先生成 `charts`，不要偷懒只生成 `tables`
 
 该保存函数会通过上下文消息传入，包含：
 - 函数名称
@@ -334,6 +337,8 @@ execution_intent = "probe"     # 数据探测
   - `description`
   - `chart_spec`
 - `chart_spec` 应是前端可直接渲染的结构化图表配置
+- 写入 `chart_spec.series[*].data` 的值必须是 Python 原生 `int`、`float` 或 `str` 等可 JSON 序列化类型；不要直接传入 `numpy.int64`、`numpy.float64`、pandas 标量、`None`、`NaN` 或 `Inf`
+- 如果统计值来自 pandas/numpy，传给图表前必须显式转换，例如 `total_sales = int(total_sales)` 或 `add_yaxis(..., [int(total_sales)])`
 
 **tables 内容要求**：
 - `tables` 中每一项都表示一个结构化表格结果
@@ -354,7 +359,7 @@ execution_intent = "probe"     # 数据探测
 1. **数据加载** - 使用上下文传入的加载工具函数加载数据
 2. **数据处理** - 使用 pandas 进行数据清洗、转换、聚合等
 3. **可视化** - 使用 pyecharts/matplotlib 生成图表
-4. **构造结构化结果** - 生成一个或多个结构化图表，必要时生成结构化表格
+4. **构造结构化结果** - 默认生成一个或多个结构化图表，必要时附带结构化表格
 5. **保存分析结果或返回探测反馈** - `analysis` 代码调用 `save_analysis_result()`；`probe` 代码调用 `request_retry()`
 6. **按需复用通用辅助函数** - 当问题涉及相对日期、跨时区时间过滤、明细表输出、无数据重试、本地大文件加载或图表产物构造时，可以优先考虑复用 `get_day_range()`、`load_local_file_low_memory()`、`probe_distinct_values()`、`probe_text_candidates()`、`describe_time_coverage()`、`build_markdown_table()`、`build_chart_result()`、`build_chart_suite()`、`raise_no_data_error()`、`request_retry()` 等辅助函数；如果当前分析不需要这些能力，则不必使用
 ### 必须遵守
@@ -831,6 +836,7 @@ LLM 需要理解数据源元数据 `metadata_schema` 的结构：
 - `datasource_type`：数据源类型标识，使用 `local_file`、`minio_file`、`table`、`api`
 - `datasource_name`：数据源名称
 - `datasource_identifier`：数据源唯一定位标识
+- `recommended_loader`：仅 `local_file` 数据源可能提供，表示后端根据文件大小推荐的加载函数；如果存在，必须优先遵守
 - `metadata_schema`：该数据源的元数据 Schema
 
 **使用规则**：
@@ -889,6 +895,7 @@ LLM 需要理解数据源元数据 `metadata_schema` 的结构：
 - 需要关联多个数据表进行分析时，从 `datasources` 中选择合适的数据源
 - 如果存在 `selected_datasource_ids`，表示当前会话本轮限定的数据源范围，应优先在 `datasources` 中按这些 ID 取子集
 - 根据 `datasource_type` 选择对应的加载函数：`local_file` 调用 `load_local_file`，`minio_file` 调用 `load_minio_file`，`table` 用 `load_data_with_sql`，`api` 调用 `load_data_with_api`
+- 对 `local_file` 数据源，如果存在 `recommended_loader`，必须优先使用该字段指定的加载函数，不要自行改用另一个 loader
 - 根据 `metadata_schema` 理解各数据源的字段含义和类型
 
 **LLM 分析数据源时的理解步骤**：

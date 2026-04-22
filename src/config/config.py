@@ -68,6 +68,8 @@ class Config:
         '/os/inter-api/log-collect-system/track',
     )
     PYTHON_EXEC_TIMEOUT_SECONDS = int(os.environ.get('PYTHON_EXEC_TIMEOUT_SECONDS', 90))
+    LOCAL_FILE_LOW_MEMORY_THRESHOLD_MB = int(os.environ.get('LOCAL_FILE_LOW_MEMORY_THRESHOLD_MB', 100))
+    LOCAL_FILE_LOW_MEMORY_THRESHOLD_BYTES = LOCAL_FILE_LOW_MEMORY_THRESHOLD_MB * 1024 * 1024
     UNS_MAX_EXPANDED_FILES = int(os.environ.get('UNS_MAX_EXPANDED_FILES', 200))
     UNS_MAX_EXPAND_DEPTH = int(os.environ.get('UNS_MAX_EXPAND_DEPTH', 5))
     UNS_TREE_PAGE_SIZE = int(os.environ.get('UNS_TREE_PAGE_SIZE', 100))

@@ -10,6 +10,7 @@ from utils.datasource_utils import (
     extract_datasource_identifier,
     extract_datasource_schema,
     normalize_datasource_type,
+    recommend_local_file_loader,
     safe_json_loads,
     to_int,
 )
@@ -31,7 +32,7 @@ __all__ = [
     'DEFAULT_CONVERSATION_TITLE', 'DATASOURCE_TYPE_MAPPING',
     'build_conversation_title', 'dump_json', 'extract_datasource_identifier',
     'extract_datasource_schema', 'normalize_datasource_type',
-    'safe_json_loads', 'to_int',
+    'recommend_local_file_loader', 'safe_json_loads', 'to_int',
     'render_chart_spec_to_png', 'validate_chart_spec_layout',
     'build_chart_document', 'build_chart_result', 'build_chart_suite', 'compile_chart_document', 'normalize_chart_result_item',
     'normalize_chart_spec', 'finalize_chart_spec',

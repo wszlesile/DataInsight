@@ -12,6 +12,7 @@ if str(SRC_ROOT) not in sys.path:
 from agent.invoker import (  # noqa: E402
     MAX_ANALYSIS_AGENT_ROUNDS,
     _build_failure_reason_reply,
+    _ensure_analysis_result_ready,
     _promote_assistant_message_to_report,
     _should_use_failure_reason_fallback,
     _should_use_report_only_fallback,
@@ -101,6 +102,16 @@ class AnalysisReportFallbackTestCase(unittest.TestCase):
             _promote_assistant_message_to_report("assistant reply", "existing report"),
             "existing report",
         )
+
+    def test_analysis_result_ready_accepts_tables_as_structured_artifact(self) -> None:
+        try:
+            _ensure_analysis_result_ready(
+                analysis_report="## 汇总\n\n已完成统计。",
+                charts=[],
+                tables=[{"title": "统计表", "columns": ["指标", "值"], "rows": [["销量", 100]]}],
+            )
+        except ValueError as exc:
+            self.fail(f"tables-only structured result should be accepted: {exc}")
 
 
 if __name__ == "__main__":

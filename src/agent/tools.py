@@ -1,4 +1,5 @@
 import json
+import math
 import multiprocessing as mp
 import os
 from queue import Empty
@@ -703,6 +704,7 @@ class RetryResult(BaseModel):
         "missing_report",
         "incomplete_result",
         "contract_error",
+        "chart_contract_error",
     ] = Field(description="Why the current execution needs another attempt.")
     message: str = Field(description="Human-readable retry reason.")
     diagnostics: dict[str, Any] = Field(default_factory=dict, description="Structured diagnostic facts.")
@@ -750,6 +752,7 @@ def request_retry(
         "missing_report",
         "incomplete_result",
         "contract_error",
+        "chart_contract_error",
     }
     normalized_retry_type = str(retry_type or "").strip() or "contract_error"
     if normalized_retry_type not in allowed_types:
@@ -936,6 +939,58 @@ def _build_retry_error_signature(retry_result: RetryResult) -> dict[str, Any]:
     }
 
 
+def _is_invalid_chart_data_value(value: Any) -> bool:
+    """Return True when a chart data point cannot be rendered by ECharts."""
+    if value is None:
+        return True
+    if isinstance(value, float):
+        return math.isnan(value) or math.isinf(value)
+    if hasattr(value, "item"):
+        try:
+            return _is_invalid_chart_data_value(value.item())
+        except Exception:
+            return False
+    if isinstance(value, dict):
+        return any(_is_invalid_chart_data_value(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_is_invalid_chart_data_value(item) for item in value)
+    return False
+
+
+def _find_invalid_chart_data_points(charts: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    invalid_points: list[dict[str, Any]] = []
+    for chart_index, chart in enumerate(charts or []):
+        if not isinstance(chart, dict):
+            continue
+        chart_spec = chart.get("chart_spec") or {}
+        if not isinstance(chart_spec, dict):
+            continue
+        series_items = chart_spec.get("series") or []
+        if isinstance(series_items, dict):
+            series_items = [series_items]
+        if not isinstance(series_items, list):
+            continue
+        for series_index, series in enumerate(series_items):
+            if not isinstance(series, dict):
+                continue
+            data_items = series.get("data") or []
+            if not isinstance(data_items, list):
+                continue
+            for data_index, value in enumerate(data_items):
+                if _is_invalid_chart_data_value(value):
+                    invalid_points.append({
+                        "chart_index": chart_index,
+                        "chart_title": str(chart.get("title") or ""),
+                        "series_index": series_index,
+                        "series_name": str(series.get("name") or ""),
+                        "data_index": data_index,
+                        "value_repr": repr(value),
+                    })
+                    if len(invalid_points) >= 10:
+                        return invalid_points
+    return invalid_points
+
+
 def _validate_structured_result_contract(exec_result: StructuredResult) -> RetryResult | None:
     report_text = (exec_result.analysis_report or '').strip()
     if not report_text:
@@ -966,6 +1021,27 @@ def _validate_structured_result_contract(exec_result: StructuredResult) -> Retry
                 "至少补充一个 charts 或 tables 结构化产物。",
                 "趋势、对比、TopN 等场景优先生成 charts；单指标或明细汇总可以生成 tables。",
                 "不要把自然语言报告直接作为最终结果结束。",
+            ],
+            analysis_report=report_text,
+        )
+
+    invalid_chart_points = _find_invalid_chart_data_points(exec_result.charts)
+    if invalid_chart_points:
+        return request_retry(
+            retry_type="chart_contract_error",
+            message="当前代码生成了图表，但图表数据中包含 None/null/NaN/Inf 等不可展示值，可能导致前端图表空白。",
+            diagnostics={
+                "analysis_report_preview": report_text[:800],
+                "chart_count": len(exec_result.charts or []),
+                "table_count": len(exec_result.tables or []),
+                "invalid_chart_points": invalid_chart_points,
+            },
+            repair_instructions=[
+                "下一版代码保留已有统计口径、筛选条件和核心结论。",
+                "把所有传入 charts/chart_spec/series.data 的统计值转换为 Python 原生 int、float 或 str。",
+                "不要把 numpy.int64、numpy.float64、pandas 标量、NaN、Inf 或 None 直接传给 pyecharts/ECharts。",
+                "典型修复：total_sales = int(total_sales)，或 add_yaxis(..., [int(total_sales)])。",
+                "生成图表前检查 series.data，确保不存在 None/null/NaN/Inf。",
             ],
             analysis_report=report_text,
         )

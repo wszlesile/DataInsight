@@ -379,11 +379,12 @@ def _build_empty_response_error(user_message: str, analysis_flow_started: bool) 
 def _ensure_analysis_result_ready(
     analysis_report: str,
     charts: list[dict[str, Any]] | None = None,
+    tables: list[dict[str, Any]] | None = None,
 ) -> None:
     """分析型请求必须真实产出结构化分析结果。"""
-    if analysis_report and (charts or []):
+    if analysis_report and ((charts or []) or (tables or [])):
         return
-    raise ValueError('本轮未生成完整分析产物：缺少图表结果或分析报告，请重新执行分析。')
+    raise ValueError('本轮未生成完整分析产物：缺少结构化图表/表格结果或分析报告，请重新执行分析。')
 
 
 def _build_analysis_start_instruction(user_message: str) -> str:
@@ -485,6 +486,7 @@ def _did_enter_analysis_flow(
     raw_tool_call_detected: bool,
     analysis_report: str,
     charts: list[dict[str, Any]] | None = None,
+    tables: list[dict[str, Any]] | None = None,
 ) -> bool:
     """
     判断当前轮次是否已经进入真实的数据分析执行链。
@@ -497,7 +499,7 @@ def _did_enter_analysis_flow(
         return True
     if runtime.is_rerun:
         return False
-    if analysis_report or (charts or []):
+    if analysis_report or (charts or []) or (tables or []):
         return True
     return False
 
@@ -853,6 +855,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 raw_tool_call_detected=raw_tool_call_detected,
                 analysis_report=analysis_report,
                 charts=charts,
+                tables=tables,
             )
             analysis_flow_started = analysis_flow_started or entered_analysis_flow
             analysis_report, charts, tables = _resolve_analysis_outputs(
@@ -863,7 +866,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 tables=tables,
             )
 
-            if raw_tool_call_detected and not (analysis_report or charts):
+            if raw_tool_call_detected and not (analysis_report or charts or tables):
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
                 raise ValueError('模型返回了未执行的工具调用内容，未生成最终分析结果，请重试。')
@@ -894,11 +897,11 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 break
 
             if analysis_flow_started:
-                if analysis_report and charts:
+                if analysis_report and (charts or tables):
                     break
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
-                _ensure_analysis_result_ready(analysis_report=analysis_report, charts=charts)
+                _ensure_analysis_result_ready(analysis_report=analysis_report, charts=charts, tables=tables)
                 break
 
             if runtime.is_rerun:
@@ -1138,7 +1141,7 @@ def _stream_with_runtime(
                                 service=service,
                                 runtime=runtime,
                             )
-                            if execution_report and execution_charts:
+                            if execution_report and (execution_charts or execution_tables):
                                 analysis_report = execution_report
                                 charts = execution_charts
                                 tables = execution_tables
@@ -1164,6 +1167,7 @@ def _stream_with_runtime(
                 raw_tool_call_detected=raw_tool_call_detected,
                 analysis_report=analysis_report,
                 charts=charts,
+                tables=tables,
             )
             analysis_flow_started = analysis_flow_started or entered_analysis_flow
             analysis_report, charts, tables = _resolve_analysis_outputs(
@@ -1174,7 +1178,7 @@ def _stream_with_runtime(
                 tables=tables,
             )
 
-            if raw_tool_call_detected and not (analysis_report or charts):
+            if raw_tool_call_detected and not (analysis_report or charts or tables):
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
                 raise ValueError('模型返回了未执行的工具调用内容，未生成最终分析结果，请重试。')
@@ -1205,11 +1209,11 @@ def _stream_with_runtime(
                 break
 
             if analysis_flow_started:
-                if analysis_report and charts:
+                if analysis_report and (charts or tables):
                     break
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
-                _ensure_analysis_result_ready(analysis_report=analysis_report, charts=charts)
+                _ensure_analysis_result_ready(analysis_report=analysis_report, charts=charts, tables=tables)
                 break
 
             if runtime.is_rerun:

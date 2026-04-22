@@ -1292,6 +1292,7 @@ class InsightNsRelDatasourceService:
     ) -> list[dict[str, str]]:
         suffix = stored_path.suffix.lower()
         file_path = str(stored_path).replace('\\', '/')
+        file_size_bytes = stored_path.stat().st_size
         if suffix in {'.xlsx', '.xls'}:
             workbook_group_id = f"workbook_{uuid4().hex[:16]}"
             sheet_names = self._list_excel_sheet_names(stored_path)
@@ -1316,6 +1317,7 @@ class InsightNsRelDatasourceService:
                     "original_filename": original_filename,
                     "stored_filename": stored_filename,
                     "file_extension": suffix.lstrip('.'),
+                    "file_size_bytes": file_size_bytes,
                     "sheet_name": sheet_name,
                     "worksheet_index": index,
                     "worksheet_count": sheet_count,
@@ -1339,6 +1341,7 @@ class InsightNsRelDatasourceService:
             "original_filename": original_filename,
             "stored_filename": stored_filename,
             "file_extension": suffix.lstrip('.'),
+            "file_size_bytes": file_size_bytes,
         })
         return [{
             "datasource_name": datasource_name,

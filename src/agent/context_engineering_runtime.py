@@ -14,6 +14,7 @@ from utils.datasource_utils import (
     extract_datasource_identifier,
     extract_datasource_schema,
     normalize_datasource_type,
+    recommend_local_file_loader,
     safe_json_loads,
     to_int,
 )
@@ -105,13 +106,19 @@ def _prune_analysis_state_payload(payload: dict[str, Any], mode: str) -> dict[st
 
 def _build_datasource_payload_item(datasource: InsightDatasource) -> dict[str, Any]:
     config_json = safe_json_loads(datasource.datasource_config_json, {})
+    datasource_type = normalize_datasource_type(datasource.datasource_type)
     payload = {
         "datasource_id": datasource.id,
-        "datasource_type": normalize_datasource_type(datasource.datasource_type),
+        "datasource_type": datasource_type,
         "datasource_name": datasource.datasource_name,
         "datasource_identifier": extract_datasource_identifier(datasource, config_json),
         "metadata_schema": extract_datasource_schema(datasource, config_json),
     }
+    if datasource_type == "local_file":
+        payload["recommended_loader"] = recommend_local_file_loader(
+            config_json,
+            Config.LOCAL_FILE_LOW_MEMORY_THRESHOLD_BYTES,
+        )
     sheet_name = str(config_json.get("sheet_name") or "").strip()
     if sheet_name:
         payload["sheet_name"] = sheet_name
@@ -238,6 +245,8 @@ def get_datasource_message(
     instruction_lines = [
         "当前洞察空间可用的数据源信息：",
         "- `datasources` 是当前会话可直接使用的数据源全集。",
+        "- 如果 `local_file` 数据源包含 `recommended_loader`，必须优先遵守该推荐加载函数。",
+        "- `recommended_loader=load_local_file` 表示普通文件读取，返回完整 DataFrame；`recommended_loader=load_local_file_low_memory` 表示大文件分批读取，返回批次迭代器，必须用 `for chunk in ...` 逐批处理。",
     ]
     if selected_ids:
         instruction_lines.append(

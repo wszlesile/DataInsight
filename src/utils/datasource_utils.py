@@ -37,6 +37,15 @@ def to_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def recommend_local_file_loader(config_json: dict[str, Any], threshold_bytes: int) -> str:
+    """根据落库文件大小推荐本地文件加载函数。"""
+    file_size_bytes = to_int(config_json.get('file_size_bytes'), 0)
+    normalized_threshold = max(to_int(threshold_bytes, 0), 0)
+    if normalized_threshold > 0 and file_size_bytes >= normalized_threshold:
+        return 'load_local_file_low_memory'
+    return 'load_local_file'
+
+
 def build_conversation_title(user_message: str) -> str:
     """根据最新一轮用户问题生成简短会话标题。"""
     text = (user_message or '').strip().replace('\n', ' ')
