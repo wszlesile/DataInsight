@@ -115,7 +115,9 @@ class ConversationContextService:
                 user_message=user_message,
             )
 
-        self._ensure_conversation_resource_bindings(conversation)
+        # 默认会话数据源继承逻辑先保留方法但暂停启用。
+        # 当前会话未显式绑定数据源时，应由 Agent 自然提示用户先关联数据源。
+        # self._ensure_conversation_resource_bindings(conversation)
 
         # 第一步：生成当前会话维度上的最新数据源选择快照。
         next_turn_no = self._next_turn_no(conversation.id, conversation.last_turn_no or 0)

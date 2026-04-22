@@ -26,6 +26,124 @@ from dto import DatabaseConnInfo
 from utils import build_chart_document, build_chart_result, build_chart_suite, logger, normalize_chart_result_item
 
 CURRENT_USERNAME = ContextVar('current_username', default='anonymous')
+
+TOOL_ERROR_CURRENT_CODE_MAX_CHARS = int(os.environ.get('TOOL_ERROR_CURRENT_CODE_MAX_CHARS', '3500'))
+TOOL_ERROR_TEXT_MAX_CHARS = int(os.environ.get('TOOL_ERROR_TEXT_MAX_CHARS', '1800'))
+TOOL_ERROR_PREVIOUS_ITEM_MAX_CHARS = int(os.environ.get('TOOL_ERROR_PREVIOUS_ITEM_MAX_CHARS', '700'))
+TOOL_ERROR_INSTRUCTION_MAX_CHARS = int(os.environ.get('TOOL_ERROR_INSTRUCTION_MAX_CHARS', '700'))
+TOOL_ERROR_STDIO_MAX_CHARS = int(os.environ.get('TOOL_ERROR_STDIO_MAX_CHARS', '800'))
+TOOL_ERROR_CODE_CONTEXT_MAX_CHARS = int(os.environ.get('TOOL_ERROR_CODE_CONTEXT_MAX_CHARS', '1800'))
+GENERATED_CODE_FILENAME = '<generated_analysis_code>'
+GENERATED_CODE_CONTEXT_RADIUS = 2
+
+CHART_CONTRACT_ERROR_MARKERS = (
+    'structured chart item',
+    'chart_document',
+    'chart_spec',
+    'chart_kind',
+    'unsupported chart_kind',
+    'charts items',
+    'charts item',
+    'xaxis',
+    'yaxis',
+    'series',
+)
+
+
+def _clip_retry_context_text(text: Any, max_chars: int) -> str:
+    """Bound retry feedback so repeated tool failures do not exhaust model context."""
+    value = str(text or '')
+    if max_chars <= 0 or len(value) <= max_chars:
+        return value
+    suffix = f'\n...[truncated {len(value) - max_chars} chars for retry context budget]'
+    return value[:max(0, max_chars - len(suffix))] + suffix
+
+
+def _clip_retry_context_list(items: list[Any] | None, max_items: int, max_chars: int) -> list[str]:
+    return [
+        _clip_retry_context_text(item, max_chars)
+        for item in (items or [])[-max_items:]
+        if str(item or '').strip()
+    ]
+
+
+def _is_chart_contract_error_message(error_message: str) -> bool:
+    lowered = (error_message or '').lower()
+    if any(marker in lowered for marker in (
+        'structured chart item',
+        'chart_document',
+        'chart_spec',
+        'chart_kind',
+        'unsupported chart_kind',
+        'charts items',
+        'charts item',
+        'xaxis',
+        'yaxis',
+    )):
+        return True
+    return 'series' in lowered and any(marker in lowered for marker in ('chart', 'echarts', 'axis'))
+
+
+def _build_generated_code_error_context(
+    code: str,
+    error: Exception,
+    traceback_text: str,
+) -> dict[str, Any]:
+    """Extract the generated-code line that caused a Python runtime error."""
+    line_no: int | None = None
+    column_no: int | None = None
+
+    if isinstance(error, SyntaxError):
+        if isinstance(error.lineno, int):
+            line_no = error.lineno
+        if isinstance(error.offset, int):
+            column_no = error.offset
+
+    traceback_obj = getattr(error, '__traceback__', None)
+    if traceback_obj is not None:
+        for frame in traceback.extract_tb(traceback_obj):
+            if frame.filename in {GENERATED_CODE_FILENAME, '<string>'}:
+                line_no = frame.lineno
+
+    code_lines = str(code or '').splitlines()
+    context_lines: list[dict[str, Any]] = []
+    error_line = ''
+    if line_no is not None and 1 <= line_no <= len(code_lines):
+        error_line = code_lines[line_no - 1]
+        start = max(1, line_no - GENERATED_CODE_CONTEXT_RADIUS)
+        end = min(len(code_lines), line_no + GENERATED_CODE_CONTEXT_RADIUS)
+        for current_line_no in range(start, end + 1):
+            context_lines.append({
+                'line_no': current_line_no,
+                'code': code_lines[current_line_no - 1],
+                'is_error_line': current_line_no == line_no,
+            })
+
+    return {
+        'filename': GENERATED_CODE_FILENAME,
+        'line_no': line_no,
+        'column_no': column_no,
+        'error_line': error_line,
+        'context_lines': context_lines,
+        'traceback_excerpt': _clip_retry_context_text(traceback_text, TOOL_ERROR_CODE_CONTEXT_MAX_CHARS),
+    }
+
+
+def _format_error_message_with_code_location(
+    error_message: str,
+    code_error_context: dict[str, Any] | None,
+) -> str:
+    line_no = (code_error_context or {}).get('line_no')
+    error_line = str((code_error_context or {}).get('error_line') or '').strip()
+    if not line_no:
+        return error_message
+
+    location = f'错误定位：生成代码第 {line_no} 行'
+    if error_line:
+        location = f'{location}：{error_line}'
+    return f'{error_message}\n{location}'
+
+
 def _load_data_with_fed_query(sql: str,params: Optional[list[Any]] = None):
     return supos_kernel_api.query_dataframe(sql=sql, params=params)
 
@@ -1060,7 +1178,7 @@ def _execute_generated_code_worker(
     exec_result: Any = None
     with _capture_runtime_io(username) as (stdout_buffer, stderr_buffer):
         try:
-            exec(code, namespace)
+            exec(compile(code, GENERATED_CODE_FILENAME, 'exec'), namespace)
             exec_result = namespace.get('result')
             result_file_path = _write_worker_result_payload({
                 'status': 'success',
@@ -1073,8 +1191,18 @@ def _execute_generated_code_worker(
                 'result_file_path': result_file_path,
             })
         except Exception as exc:
-            error_message = str(exc)
-            error_type = _classify_execution_error(exc, error_message)
+            raw_error_message = str(exc)
+            full_traceback = traceback.format_exc()
+            code_error_context = _build_generated_code_error_context(
+                code=code,
+                error=exc,
+                traceback_text=full_traceback,
+            )
+            error_message = _format_error_message_with_code_location(
+                raw_error_message,
+                code_error_context,
+            )
+            error_type = _classify_execution_error(exc, raw_error_message)
             error_signature = _extract_error_signature(error_type, error_message)
             repair_instructions = _build_repair_instructions(error_type)
             if isinstance(exc, NoDataFoundError):
@@ -1090,10 +1218,11 @@ def _execute_generated_code_worker(
                 'error_message': error_message,
                 'error_type': error_type,
                 'error_signature': error_signature,
+                'code_error_context': code_error_context,
                 'repair_instructions': repair_instructions,
                 'stdout_text': _sanitize_tool_output(stdout_buffer.getvalue()),
                 'stderr_text': _sanitize_tool_output(
-                    '\n'.join(item for item in [stderr_buffer.getvalue(), traceback.format_exc()] if item)
+                    '\n'.join(item for item in [stderr_buffer.getvalue(), full_traceback] if item)
                 ),
             })
             result_queue.put({
@@ -1155,6 +1284,8 @@ def _classify_execution_error(error: Exception | None, error_message: str) -> st
     lowered = (error_message or '').lower()
     if 'memoryerror' in lowered or 'cannot allocate memory' in lowered or 'out of memory' in lowered:
         return 'resource_exhausted'
+    if _is_chart_contract_error_message(error_message):
+        return 'chart_contract_error'
     if 'got an unexpected keyword argument' in lowered:
         return 'library_api_signature_mismatch'
     if 'invalid comparison' in lowered or ('datetime' in lowered and 'timestamp' in lowered):
@@ -1223,6 +1354,10 @@ def _extract_error_signature(error_type: str, error_message: str) -> dict[str, A
 
     if error_type == 'no_data_found':
         signature['signature_type'] = 'no_data_found'
+        return signature
+
+    if error_type == 'chart_contract_error':
+        signature['signature_type'] = 'chart_contract_error'
         return signature
 
     signature['signature_type'] = 'generic'
@@ -1365,11 +1500,20 @@ def _build_repair_instructions(error_type: str) -> list[str]:
             '当前代码主动返回了契约问题反馈；请根据 message、diagnostics 和 repair_instructions 重新生成完整代码。',
             '如果本轮是探测，请返回 request_retry(...)；如果本轮是正式分析，请返回 save_analysis_result(...)。',
         ],
+        'chart_contract_error': [
+            '当前失败是图表产物契约错误，不是数据查询失败；不要改成 no_data_found，也不要只输出自然语言报告。',
+            '下一版禁止继续使用 matplotlib/base64 图片、手写 chart_spec 或自造 chart_type/chart_kind 结构。',
+            '必须优先用 build_chart_result(...) 或 build_chart_suite(...) 生成 charts；bar/line 需要 category_field 和 value_field，pie 需要 category_field 和 value_field，scatter 需要 x_field 和 y_field。',
+            'charts 应直接等于 helper 的返回结果，例如 charts = [build_chart_result(...)] 或 charts = build_chart_suite(...)，然后调用 save_analysis_result(analysis_report=..., charts=charts, tables=...)。',
+            '如果确实不适合生成图表，也必须用 tables 返回结构化汇总，不能让 charts 和 tables 同时为空。',
+        ],
         'result_contract_error': [
+            '如果错误与 charts/chart_spec/chart_document 有关，下一版不要手写图表 JSON，直接改用 build_chart_result(...) 或 build_chart_suite(...)。',
             '最终必须产出完整 analysis_report，并调用 save_analysis_result(analysis_report=..., charts=[...], tables=[...])。',
             '不要遗漏 result 变量，也不要返回空的 analysis_report 或 charts/tables 同时为空的结构化结果。',
         ],
         'library_api_signature_mismatch': [
+            '如果报错来自 pyecharts/matplotlib 或图表参数，优先改用 build_chart_result(...) 或 build_chart_suite(...)，不要继续试底层图表 API。',
             '当前错误属于库函数签名不兼容；请只修正报错位置的非法参数，不要重写与该错误无关的数据处理和图表逻辑。',
             '如果某个 opts 或图表参数不被当前版本支持，请删除该非法参数，或改成更基础、更稳定的默认写法。',
             '优先保留图表结构、数据处理和报告逻辑，只对报错的 API 调用做最小修改。',
@@ -1383,7 +1527,8 @@ def _build_repair_instructions(error_type: str) -> list[str]:
             '如果旧版 .xls 文件在当前环境仍无法安全低内存处理，应明确返回受限说明或建议转换为 .xlsx/CSV，不要继续反复 OOM 重试。',
         ],
         'runtime_error': [
-            '根据 error_message 直接修正导致失败的那一步，再重新生成完整代码。',
+            '优先查看 error_message 中的“错误定位”和 code_error_context.line_no/code_error_context.context_lines，直接修正生成代码中对应行附近的逻辑。',
+            '如果 code_error_context 中给出了 traceback_excerpt，请结合最后一帧生成代码位置判断根因，不要只根据异常类型泛泛重写。',
             '如果错误发生在数据处理阶段，请先验证中间结果再进入图表和报告生成。',
         ],
         'execution_timeout': [
@@ -1404,6 +1549,7 @@ def _tool_error_message(
     error_message: str,
     repair_instructions: list[str],
     error_signature: dict[str, Any] | None = None,
+    code_error_context: dict[str, Any] | None = None,
     feedback_kind: str = '',
     retry_reason_code: str = '',
     diagnostics: dict[str, Any] | None = None,
@@ -1415,17 +1561,47 @@ def _tool_error_message(
     stderr_text: str = '',
 ) -> ToolMessage:
     """构造统一的结构化工具错误反馈，供 Agent 循环继续修正。"""
+    clipped_current_code = _clip_retry_context_text(current_failed_code, TOOL_ERROR_CURRENT_CODE_MAX_CHARS)
+    clipped_error_message = _clip_retry_context_text(error_message, TOOL_ERROR_TEXT_MAX_CHARS)
+    clipped_error_signature = dict(error_signature or {})
+    if 'message' in clipped_error_signature:
+        clipped_error_signature['message'] = _clip_retry_context_text(
+            clipped_error_signature.get('message'),
+            TOOL_ERROR_TEXT_MAX_CHARS,
+        )
+    clipped_code_error_context = dict(code_error_context or {})
+    if clipped_code_error_context.get('traceback_excerpt'):
+        clipped_code_error_context['traceback_excerpt'] = _clip_retry_context_text(
+            clipped_code_error_context.get('traceback_excerpt'),
+            TOOL_ERROR_CODE_CONTEXT_MAX_CHARS,
+        )
+
     payload = {
         'tool': 'execute_python',
         'status': 'failed',
         'error_type': error_type,
-        'error_message': error_message,
-        'repair_instructions': repair_instructions,
-        'error_signature': error_signature or {},
+        'error_message': clipped_error_message,
+        'error_message_truncated': clipped_error_message != (error_message or ''),
+        'repair_instructions': _clip_retry_context_list(
+            repair_instructions,
+            max_items=8,
+            max_chars=TOOL_ERROR_INSTRUCTION_MAX_CHARS,
+        ),
+        'error_signature': clipped_error_signature,
+        'code_error_context': clipped_code_error_context,
         'minimal_patch_required': True,
-        'current_failed_code': current_failed_code or '',
-        'previous_failure_messages': (previous_failure_messages or [])[-3:],
-        'previous_failure_hints': (previous_failure_hints or [])[-3:],
+        'current_failed_code': clipped_current_code,
+        'current_failed_code_truncated': clipped_current_code != (current_failed_code or ''),
+        'previous_failure_messages': _clip_retry_context_list(
+            previous_failure_messages,
+            max_items=3,
+            max_chars=TOOL_ERROR_PREVIOUS_ITEM_MAX_CHARS,
+        ),
+        'previous_failure_hints': _clip_retry_context_list(
+            previous_failure_hints,
+            max_items=3,
+            max_chars=TOOL_ERROR_PREVIOUS_ITEM_MAX_CHARS,
+        ),
         'previous_failure_count': len(previous_failure_messages or []),
     }
     if feedback_kind:
@@ -1435,11 +1611,11 @@ def _tool_error_message(
     if diagnostics:
         payload['diagnostics'] = diagnostics
     if analysis_report:
-        payload['analysis_report'] = analysis_report[:2000]
+        payload['analysis_report'] = _clip_retry_context_text(analysis_report, TOOL_ERROR_TEXT_MAX_CHARS)
     if stdout_text:
-        payload['stdout_text'] = stdout_text[:1000]
+        payload['stdout_text'] = _clip_retry_context_text(stdout_text, TOOL_ERROR_STDIO_MAX_CHARS)
     if stderr_text:
-        payload['stderr_text'] = stderr_text[:1000]
+        payload['stderr_text'] = _clip_retry_context_text(stderr_text, TOOL_ERROR_STDIO_MAX_CHARS)
 
     return ToolMessage(
         content=json.dumps(payload, ensure_ascii=False),
@@ -1701,6 +1877,7 @@ def execute_python(
         error_type = worker_payload.get('error_type', error_type)
         repair_instructions = worker_payload.get('repair_instructions') or _build_repair_instructions(error_type)
         error_signature = worker_payload.get('error_signature') or _extract_error_signature(error_type, error_message)
+        code_error_context = worker_payload.get('code_error_context') if isinstance(worker_payload.get('code_error_context'), dict) else {}
         failure_memory = _build_turn_failure_memory(
             turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
             current_execution_id=execution_id,
@@ -1713,6 +1890,7 @@ def execute_python(
                 'error_type': error_type,
                 'error_message': error_message,
                 'error_signature': error_signature,
+                'code_error_context': code_error_context,
                 'repair_instructions': repair_instructions,
             }, ensure_ascii=False),
             stdout_text=stdout_text,
@@ -1735,6 +1913,7 @@ def execute_python(
             error_message=error_message,
             repair_instructions=repair_instructions,
             error_signature=error_signature,
+            code_error_context=code_error_context,
             current_failed_code=code,
             previous_failure_messages=failure_memory.get('previous_failure_messages', []),
             previous_failure_hints=failure_memory.get('previous_failure_hints', []),

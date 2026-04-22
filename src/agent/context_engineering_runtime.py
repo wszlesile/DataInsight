@@ -214,7 +214,15 @@ def get_datasource_message(
             for datasource in _load_conversation_datasources(conversation_id_int)
         ]
     if not datasource_items:
-        return None
+        payload: dict[str, Any] = {"datasources": [], "selected_datasource_ids": []}
+        if namespace_id_int > 0:
+            payload["namespace_id"] = namespace_id_int
+        return SystemMessage(
+            "当前会话没有关联任何可直接使用的数据源。\n"
+            "- 如果用户当前是在发起数据分析、统计、绘图、报表或依赖数据源内容的问题，不要调用 `execute_python`，不要生成 Python 代码。\n"
+            "- 请直接用自然语言告诉用户：当前会话还没有关联数据源，需要先关联相关数据源后再进行分析。\n"
+            f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+        )
 
     payload: dict[str, Any] = {"datasources": datasource_items}
     selected_ids = [

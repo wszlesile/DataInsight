@@ -18,7 +18,7 @@ from agent.context_engineering_runtime import (
 from agent.tools import execute_python
 from config import Config
 from utils.llm_model_factory import create_data_insight_model as _create_data_insight_model
-from utils.token_budget import describe_budget_split, estimate_messages_tokens, shrink_messages_to_budget
+from utils.token_budget import describe_budget_split, estimate_message_tokens, estimate_messages_tokens
 
 MessageT = TypeVar("MessageT", bound=BaseMessage, covariant=True)
 SYS_PROMPT_PATH = Path(__file__).resolve().with_name('sys_prompt.md')
@@ -92,6 +92,28 @@ def _merge_system_messages(*parts: BaseMessage | list[BaseMessage] | None) -> st
             append_message(part)
 
     return '\n\n'.join(item for item in merged_parts if item)
+
+
+def _fit_optional_messages_within_budget(
+    messages: list[BaseMessage],
+    token_budget: int | None,
+) -> list[BaseMessage]:
+    """Strictly fit optional context; oversized optional items are dropped."""
+    if token_budget is None:
+        return list(messages)
+    remaining = int(token_budget or 0)
+    if remaining <= 0:
+        return []
+
+    selected: list[BaseMessage] = []
+    used = 0
+    for message in messages:
+        cost = estimate_message_tokens(message)
+        if used + cost > remaining:
+            continue
+        selected.append(message)
+        used += cost
+    return selected
 
 
 def _build_runtime_environment_message() -> SystemMessage:
@@ -174,40 +196,54 @@ def build_prompt_messages(
         for extra_message in (extra_system_messages or [])
         if extra_message
     ]
-    fixed_system_messages: list[BaseMessage] = [
+    # Keep these sections mandatory. MiniMax still receives one merged
+    # SystemMessage, but budget trimming must not drop system rules,
+    # current datasource context, runtime repair hints, or the user tail.
+    mandatory_system_messages: list[BaseMessage] = [
         SystemMessage(load_system_prompt()),
         _build_runtime_environment_message(),
     ]
     relative_date_hint = _build_relative_date_hint_message(user_message)
     if relative_date_hint is not None:
-        fixed_system_messages.append(relative_date_hint)
+        mandatory_system_messages.append(relative_date_hint)
     if datasource_message is not None:
-        fixed_system_messages.append(datasource_message)
-    fixed_system_messages.extend(runtime_messages)
+        mandatory_system_messages.append(datasource_message)
+    mandatory_system_messages.extend(runtime_messages)
 
-    fixed_system_content = _merge_system_messages(fixed_system_messages)
-    fixed_prompt_messages: list[BaseMessage] = []
-    if fixed_system_content:
-        fixed_prompt_messages.append(SystemMessage(fixed_system_content))
+    mandatory_system_content = _merge_system_messages(mandatory_system_messages)
+    mandatory_system_message = SystemMessage(mandatory_system_content) if mandatory_system_content else None
+    user_tail_message = HumanMessage(user_message)
+    mandatory_messages: list[BaseMessage] = []
+    if mandatory_system_message is not None:
+        mandatory_messages.append(mandatory_system_message)
+    mandatory_messages.append(user_tail_message)
 
     budget_split = describe_budget_split(
         max_prompt_tokens=Config.CONTEXT_COMPRESSION_PROMPT_MAX_TOKENS,
-        fixed_tokens=estimate_messages_tokens(fixed_prompt_messages + [HumanMessage(user_message)]),
+        fixed_tokens=estimate_messages_tokens(mandatory_messages),
         history_ratio=Config.CONTEXT_COMPRESSION_HISTORY_TOKEN_RATIO,
         min_history_tokens=Config.CONTEXT_COMPRESSION_MIN_HISTORY_TOKENS,
         min_memory_tokens=Config.CONTEXT_COMPRESSION_MIN_MEMORY_TOKENS,
     )
 
-    memory_messages = get_memory_messages(
-        conversation_id,
-        user_message=user_message,
-        max_turn_no=history_turn_limit,
-        active_snapshot_override=datasource_snapshot_override,
-        token_budget=budget_split["memory_budget"],
+    memory_messages = (
+        get_memory_messages(
+            conversation_id,
+            user_message=user_message,
+            max_turn_no=history_turn_limit,
+            active_snapshot_override=datasource_snapshot_override,
+            token_budget=budget_split["memory_budget"],
+        )
+        if budget_split["memory_budget"] > 0
+        else []
+    )
+    memory_messages = _fit_optional_messages_within_budget(
+        memory_messages,
+        budget_split["memory_budget"],
     )
 
     merged_system_content = _merge_system_messages(
-        fixed_prompt_messages,
+        mandatory_system_message,
         memory_messages,
     )
 
@@ -215,14 +251,19 @@ def build_prompt_messages(
     if merged_system_content:
         messages.append(SystemMessage(merged_system_content))
 
-    messages.extend(get_history_messages(
-        conversation_id,
-        max_turn_no=history_turn_limit,
-        user_message=user_message,
-        token_budget=budget_split["history_budget"],
-    ))
-    messages.append(HumanMessage(user_message))
-    return shrink_messages_to_budget(messages, Config.CONTEXT_COMPRESSION_PROMPT_MAX_TOKENS)
+    if budget_split["history_budget"] > 0:
+        history_messages = get_history_messages(
+            conversation_id,
+            max_turn_no=history_turn_limit,
+            user_message=user_message,
+            token_budget=budget_split["history_budget"],
+        )
+        messages.extend(_fit_optional_messages_within_budget(
+            history_messages,
+            budget_split["history_budget"],
+        ))
+    messages.append(user_tail_message)
+    return messages
 
 
 def get_input(

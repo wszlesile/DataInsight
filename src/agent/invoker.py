@@ -1,5 +1,6 @@
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Iterator
 
@@ -16,7 +17,29 @@ UNEXPECTED_KWARG_PATTERN = re.compile(
 )
 MISSING_DEP_PATTERN = re.compile(r"No module named '(?P<module>[^']+)'")
 MAX_ANALYSIS_AGENT_ROUNDS = 3
+RETRY_LATEST_ERROR_LIMIT = 3
+RETRY_PATTERN_HINT_LIMIT = 5
+RETRY_ERROR_MAX_CHARS = 700
+RETRY_HINT_MAX_CHARS = 500
+RETRY_FAILED_CODE_MAX_CHARS = 5000
+RETRY_RECOVERY_INSTRUCTION_MAX_CHARS = 14000
+CHART_CONTRACT_ERROR_MARKERS = (
+    'chart_contract_error',
+    'structured chart item',
+    'chart_document',
+    'chart_spec',
+    'chart_kind',
+    'unsupported chart_kind',
+    'charts items',
+    'xaxis',
+    'yaxis',
+    'series',
+)
 REGENERATE_REQUEST_PATTERN = re.compile(r'^(重新生成|重试|重新执行|重新跑一次|再生成一次|再来一次)$')
+NO_DATASOURCE_ANALYSIS_REPLY = (
+    '当前会话还没有关联任何数据源，暂时无法执行数据分析。'
+    '请先在当前会话中关联相关数据源，然后再发起分析。'
+)
 
 
 @dataclass
@@ -277,6 +300,27 @@ def _build_rerun_instruction(runtime: ConversationRunContext) -> str:
     )
 
 
+def _has_bound_datasource(runtime: ConversationRunContext) -> bool:
+    """判断当前会话快照中是否有可用于本轮分析的数据源。"""
+    snapshot = runtime.active_datasource_snapshot if isinstance(runtime.active_datasource_snapshot, dict) else {}
+    selected_ids = [
+        item
+        for item in snapshot.get('selected_datasource_ids', [])
+        if item
+    ]
+    selected_items = [
+        item
+        for item in snapshot.get('selected_datasource_snapshot', [])
+        if isinstance(item, dict) and item
+    ]
+    return bool(selected_ids or selected_items)
+
+
+def _should_finish_without_datasource(runtime: ConversationRunContext, user_message: str) -> bool:
+    """分析型请求在当前会话无绑定数据源时，不进入 execute_python。"""
+    return is_analysis_like_request(user_message) and not _has_bound_datasource(runtime)
+
+
 def _finalize_run(
     service: ConversationContextService,
     runtime: ConversationRunContext,
@@ -470,6 +514,50 @@ def _format_tool_call_message(tool_call: dict[str, Any]) -> str:
     return f"准备调用工具：{tool_name}"
 
 
+def _clip_retry_text(text: Any, max_chars: int) -> str:
+    value = str(text or '')
+    if max_chars <= 0 or len(value) <= max_chars:
+        return value
+    suffix = f'\n...[truncated {len(value) - max_chars} chars for retry context budget]'
+    return value[:max(0, max_chars - len(suffix))] + suffix
+
+
+def _is_chart_contract_error_text(text: str) -> bool:
+    lowered = (text or '').lower()
+    if any(marker in lowered for marker in (
+        'chart_contract_error',
+        'structured chart item',
+        'chart_document',
+        'chart_spec',
+        'chart_kind',
+        'unsupported chart_kind',
+        'charts items',
+        'xaxis',
+        'yaxis',
+    )):
+        return True
+    return 'series' in lowered and any(marker in lowered for marker in ('chart', 'echarts', 'axis'))
+
+
+def _normalize_failure_for_summary(error_message: str) -> str:
+    normalized = re.sub(r'\s+', ' ', (error_message or '').strip())
+    return _clip_retry_text(normalized, 180)
+
+
+def _build_failure_frequency_summary(executions: list[Any]) -> list[str]:
+    errors = [
+        _normalize_failure_for_summary(getattr(execution, 'error_message', '') or '')
+        for execution in executions
+        if getattr(execution, 'execution_status', '') != 'success'
+        and (getattr(execution, 'error_message', '') or '').strip()
+    ]
+    counts = Counter(item for item in errors if item)
+    return [
+        f'{message} × {count}'
+        for message, count in counts.most_common(5)
+    ]
+
+
 def _build_failed_pattern_hints(executions: list[Any]) -> list[str]:
     """从当前轮失败记录中提取“不要重复犯错”的提示。"""
     hints: list[str] = []
@@ -478,6 +566,16 @@ def _build_failed_pattern_hints(executions: list[Any]) -> list[str]:
     for execution in executions:
         error_message = (getattr(execution, 'error_message', '') or '').strip()
         if not error_message:
+            continue
+
+        if _is_chart_contract_error_text(error_message):
+            hint = (
+                '当前失败属于图表产物契约错误：不要继续使用 matplotlib/base64 或手写 chart_spec；'
+                '下一版必须改用 build_chart_result(...) 或 build_chart_suite(...) 生成 charts。'
+            )
+            if hint not in seen:
+                seen.add(hint)
+                hints.append(hint)
             continue
 
         unexpected_kwarg_match = UNEXPECTED_KWARG_PATTERN.search(error_message)
@@ -499,12 +597,12 @@ def _build_failed_pattern_hints(executions: list[Any]) -> list[str]:
                 hints.append(hint)
             continue
 
-        normalized_error = error_message[:160]
+        normalized_error = _clip_retry_text(error_message, RETRY_HINT_MAX_CHARS)
         if normalized_error not in seen:
             seen.add(normalized_error)
             hints.append(f'避免再次触发已出现过的错误：{normalized_error}')
 
-    return hints[:5]
+    return [_clip_retry_text(hint, RETRY_HINT_MAX_CHARS) for hint in hints[:RETRY_PATTERN_HINT_LIMIT]]
 
 
 def _get_latest_failed_generated_code(executions: list[Any]) -> str:
@@ -514,7 +612,7 @@ def _get_latest_failed_generated_code(executions: list[Any]) -> str:
             continue
         generated_code = (getattr(execution, 'generated_code', '') or '').strip()
         if generated_code:
-            return generated_code
+            return _clip_retry_text(generated_code, RETRY_FAILED_CODE_MAX_CHARS)
     return ''
 
 
@@ -548,6 +646,8 @@ def _extract_execution_error_type(execution: Any) -> str:
         return 'no_data_found'
     if any(marker in error_message for marker in ('未命中可分析数据', '筛选结果为空', '过滤后无数据', '关联后无数据')):
         return 'no_data_found'
+    if _is_chart_contract_error_text(error_message):
+        return 'chart_contract_error'
     return ''
 
 
@@ -566,13 +666,17 @@ def _build_analysis_recovery_instruction(
         for execution in executions
         if execution.execution_status != 'success' and (execution.error_message or '').strip()
     ]
-    latest_errors = failed_errors[-3:]
+    latest_errors = [
+        _clip_retry_text(item, RETRY_ERROR_MAX_CHARS)
+        for item in failed_errors[-RETRY_LATEST_ERROR_LIMIT:]
+    ]
     latest_error_types = [
         error_type
         for error_type in (_extract_execution_error_type(execution) for execution in executions)
         if error_type
     ][-3:]
     failed_pattern_hints = _build_failed_pattern_hints(executions)
+    failure_summary = _build_failure_frequency_summary(executions)
     latest_failed_code = _get_latest_failed_generated_code(executions)
 
     lines = [
@@ -585,6 +689,10 @@ def _build_analysis_recovery_instruction(
     if latest_error_types:
         lines.append(f'最近的结构化错误类型：{", ".join(latest_error_types)}。')
 
+    if failure_summary:
+        lines.append('本轮重复失败摘要如下，优先修复出现次数最多的问题，不要沿着同一错误反复试错：')
+        lines.extend(f'- {_clip_retry_text(item, RETRY_ERROR_MAX_CHARS)}' for item in failure_summary)
+
     if failed_pattern_hints:
         lines.append('本轮已经确认的失败写法如下，新的修复代码中不要再次出现：')
         lines.extend(f'- {item}' for item in failed_pattern_hints)
@@ -594,7 +702,13 @@ def _build_analysis_recovery_instruction(
         '请直接修正完整 Python 代码并再次调用 execute_python。',
     ])
     latest_error_type = latest_error_types[-1] if latest_error_types else ''
-    if latest_error_type in {'data_source_not_found', 'data_source_unavailable'}:
+    if latest_error_type == 'chart_contract_error' or any(_is_chart_contract_error_text(item) for item in failed_errors):
+        lines.extend([
+            '本轮已出现图表产物契约错误。下一版必须把修复重点放在 charts 构造，不要重新发散数据查询逻辑。',
+            '禁止继续使用 matplotlib、base64 图片、手写 chart_spec 或自造 chart_type/chart_kind 结构。',
+            '请使用 build_chart_result(...) 或 build_chart_suite(...) 生成 charts；如果无法生成图表，则至少用 tables 返回结构化汇总。',
+        ])
+    elif latest_error_type in {'data_source_not_found', 'data_source_unavailable'}:
         lines.extend([
             '最近失败属于数据源不可用或数据源标识错误，不是 no_data_found。',
             '不要调用 raise_no_data_error(...) 包装文件不存在、表不存在、路径不可访问或接口不可访问；raise_no_data_error 只用于数据源已成功加载后，过滤/关联/聚合结果为空。',
@@ -624,7 +738,7 @@ def _build_analysis_recovery_instruction(
     if round_index >= MAX_ANALYSIS_AGENT_ROUNDS - 1:
         lines.append('这已经是本轮最后一次修复机会；如果仍无法完成，请让本轮以失败结束，而不是伪装成成功。')
 
-    return '\n'.join(lines)
+    return _clip_retry_text('\n'.join(lines), RETRY_RECOVERY_INSTRUCTION_MAX_CHARS)
 
 
 def _extract_invoke_result(messages: list[Any]) -> tuple[str, str, list[dict[str, Any]], list[dict[str, Any]], bool]:
@@ -685,6 +799,22 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
         analysis_flow_started = False
         analysis_request_expected = is_analysis_like_request(agent_request.user_message)
         allow_report_only = False
+
+        if _should_finish_without_datasource(runtime, agent_request.user_message):
+            assistant_message = NO_DATASOURCE_ANALYSIS_REPLY
+            allow_report_only = True
+            return _finalize_run(
+                service=service,
+                runtime=runtime,
+                username=agent_request.username,
+                user_message=agent_request.user_message,
+                analysis_flow_started=analysis_flow_started,
+                assistant_message=assistant_message,
+                analysis_report=analysis_report,
+                charts=charts,
+                tables=tables,
+                allow_report_only=allow_report_only,
+            )
 
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
             runtime_instruction = ''
@@ -856,6 +986,35 @@ def _stream_with_runtime(
         )
 
     try:
+        if _should_finish_without_datasource(runtime, agent_request.user_message):
+            assistant_message = NO_DATASOURCE_ANALYSIS_REPLY
+            allow_report_only = True
+            yield _build_progress_event(
+                'assistant',
+                conversation_id=runtime.conversation.id,
+                turn_id=runtime.turn.id,
+                stage='no_datasource',
+                message=assistant_message,
+            )
+            _finalize_run(
+                service=service,
+                runtime=runtime,
+                username=agent_request.username,
+                user_message=agent_request.user_message,
+                analysis_flow_started=analysis_flow_started,
+                assistant_message=assistant_message,
+                analysis_report=analysis_report,
+                charts=charts,
+                tables=tables,
+                allow_report_only=allow_report_only,
+            )
+            yield _build_progress_event(
+                'done',
+                conversation_id=runtime.conversation.id,
+                turn_id=runtime.turn.id,
+            )
+            return
+
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
             raw_tool_call_detected = False
             runtime_instruction = ''
