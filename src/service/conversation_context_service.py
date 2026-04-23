@@ -127,10 +127,7 @@ class ConversationContextService:
 
         # 第二步：把本轮使用的数据源快照固化到 turn 上，
         # 避免后续轮次覆盖这一轮的历史事实。
-        turn_snapshot = self._build_turn_datasource_snapshot(
-            conversation_id=conversation.id,
-            datasource_ids=selected_ids,
-        )
+        turn_snapshot = list(active_snapshot.get('selected_datasource_snapshot') or [])
 
         conversation.active_datasource_snapshot = dump_json(active_snapshot)
         conversation.last_turn_no = next_turn_no
@@ -811,6 +808,21 @@ class ConversationContextService:
         """
         snapshot = safe_json_loads(conversation.active_datasource_snapshot, {})
         selected_datasource_ids = self._load_bound_datasource_ids(conversation.id)
+        datasource_limit = max(int(getattr(Config, 'DATASOURCE_CONTEXT_MAX_COUNT', 10) or 0), 0)
+
+        if datasource_limit > 0 and len(selected_datasource_ids) > datasource_limit:
+            snapshot["namespace_id"] = conversation.insight_namespace_id
+            snapshot["conversation_id"] = conversation.id
+            snapshot["selected_datasource_ids"] = selected_datasource_ids
+            snapshot["selected_datasource_snapshot"] = []
+            snapshot["datasource_context_policy"] = {
+                "status": "too_many_datasources",
+                "bound_datasource_count": len(selected_datasource_ids),
+                "max_datasource_count": datasource_limit,
+            }
+            snapshot["updated_at"] = _now().isoformat()
+            return snapshot
+
         selected_datasource_snapshot = self._build_turn_datasource_snapshot(
             conversation_id=conversation.id,
             datasource_ids=selected_datasource_ids,

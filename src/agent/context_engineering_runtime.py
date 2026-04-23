@@ -212,6 +212,22 @@ def get_datasource_message(
     elif namespace_id_int <= 0:
         namespace_id_int = to_int(snapshot.get('namespace_id'), 0)
 
+    policy = snapshot.get('datasource_context_policy') if isinstance(snapshot, dict) else {}
+    if isinstance(policy, dict) and policy.get('status') == 'too_many_datasources':
+        payload: dict[str, Any] = {
+            "datasources": [],
+            "selected_datasource_ids": [],
+            "datasource_context_policy": policy,
+        }
+        if namespace_id_int > 0:
+            payload["namespace_id"] = namespace_id_int
+        return SystemMessage(
+            "当前会话关联的数据源数量超过当前安全上下文上限。\n"
+            "- 如果用户当前是在发起数据分析、统计、绘图、报表或依赖数据源内容的问题，不要调用 `execute_python`，不要生成 Python 代码。\n"
+            "- 请直接用自然语言告诉用户：当前会话关联的数据源过多，需要先减少到更聚焦的范围后再进行分析。\n"
+            f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+        )
+
     snapshot_items = snapshot.get('selected_datasource_snapshot', [])
     if snapshot_items:
         datasource_items = snapshot_items

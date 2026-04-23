@@ -276,6 +276,7 @@ execution_intent = "probe"     # 数据探测
 - `execution_intent = "probe"`：用于在上一轮 `no_data_found`、字段不匹配、时间范围不匹配、JOIN 不命中等情况下探测真实数据情况；最后必须调用 `request_retry(...)`，并赋值给变量 `result`；通常使用 `retry_type="probe_feedback"`。
 - 如果上一轮是文件不存在、表不存在、路径不可访问或接口不可访问，优先修正为上下文中的原始数据源标识；如果已确认标识原样使用仍不可访问，应返回 `request_retry(retry_type="data_source_unavailable", ...)`，不要切换成 `raise_no_data_error(...)`。
 - 探测代码不能调用 `save_analysis_result(...)`，不能把候选值、字段分布或时间覆盖探测信息包装成最终分析报告。
+- 探测代码同样必须遵守 `local_file` 数据源的 `recommended_loader`：如果推荐 `load_local_file_low_memory`，禁止先用 `load_local_file(...)` 全量加载；应按探测目标选择首批、有限批次或流式遍历全部批次，并且只保留字段列表、计数、min/max、TopN、候选值等轻量摘要。
 - 最终分析代码不能只给自然语言报告；默认应优先生成 `charts`，并按需附带 `tables`。只有单指标统计、明细列表、无明显可视化价值的汇总结果，才允许只生成 `tables`。
 
 ### 无数据重试时的数据探测与纠偏规范
@@ -288,7 +289,8 @@ execution_intent = "probe"     # 数据探测
 2. 如果是时间条件导致无数据，优先用 `describe_time_coverage(...)` 查看真实时间覆盖范围，再判断是否只是时区、边界或日期表达方式问题
 3. 如果是分类字段、枚举字段或文本字段导致无数据，优先用 `probe_distinct_values(...)` 或 `probe_text_candidates(...)` 查看真实候选值
 4. 如果是 `table` 数据源，优先写轻量 SQL 做探测，例如 `COUNT(*)`、`MIN/MAX 时间`、`GROUP BY ... LIMIT 20`，不要为了探测把整表拉满
-5. 只有在探测结果明确支持的情况下，才允许对查询条件做轻量纠偏，然后重新生成完整分析代码
+5. 如果是 `local_file` 数据源，先根据 `recommended_loader` 选择加载方式；大文件探测应使用 `load_local_file_low_memory(...)` 分批处理，可以为了总行数、时间覆盖、过滤命中数或 TopN 分布流式遍历完整文件，但不能把全部批次 `concat` 成完整 DataFrame
+6. 只有在探测结果明确支持的情况下，才允许对查询条件做轻量纠偏，然后重新生成完整分析代码
 
 **允许的纠偏方式**：
 
@@ -428,6 +430,8 @@ result = request_retry(
     ],
 )
 ```
+
+如果当前问题涉及的是 `local_file` 大文件数据源，探测也必须遵守 `recommended_loader`：当 `recommended_loader="load_local_file_low_memory"` 时，不要先调用 `load_local_file(...)`；应通过 `for chunk in load_local_file_low_memory(...)` 分批累计 `row_count`、时间 `min/max`、TopN 候选值等轻量摘要，再用 `request_retry(retry_type="probe_feedback", diagnostics=...)` 返回探测结果。
 
 如果当前问题涉及的是 SQL 数据源，也可以先写轻量探测 SQL，例如：
 

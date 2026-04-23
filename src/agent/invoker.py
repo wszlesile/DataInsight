@@ -40,6 +40,12 @@ NO_DATASOURCE_ANALYSIS_REPLY = (
     '当前会话还没有关联任何数据源，暂时无法执行数据分析。'
     '请先在当前会话中关联相关数据源，然后再发起分析。'
 )
+TOO_MANY_DATASOURCES_ANALYSIS_REPLY_TEMPLATE = (
+    '当前会话关联了 {count} 个数据源，超过当前可安全分析的上限 {limit} 个，'
+    '暂时无法直接执行分析。为了避免上下文过长导致选错数据源或分析失败，'
+    '请先减少当前会话关联的数据源数量，建议只保留和本次问题最相关的 {limit} 个以内，'
+    '然后再发起分析。'
+)
 
 
 @dataclass
@@ -314,6 +320,39 @@ def _has_bound_datasource(runtime: ConversationRunContext) -> bool:
         if isinstance(item, dict) and item
     ]
     return bool(selected_ids or selected_items)
+
+
+def _get_too_many_datasource_policy(runtime: ConversationRunContext) -> dict[str, int]:
+    """读取当前会话数据源数量超过安全上下文上限的状态。"""
+    snapshot = runtime.active_datasource_snapshot if isinstance(runtime.active_datasource_snapshot, dict) else {}
+    policy = snapshot.get('datasource_context_policy') if isinstance(snapshot, dict) else {}
+    if not isinstance(policy, dict) or policy.get('status') != 'too_many_datasources':
+        return {}
+
+    try:
+        count = int(policy.get('bound_datasource_count') or 0)
+    except (TypeError, ValueError):
+        count = 0
+    try:
+        limit = int(policy.get('max_datasource_count') or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if count <= 0 or limit <= 0 or count <= limit:
+        return {}
+    return {"count": count, "limit": limit}
+
+
+def _should_finish_with_too_many_datasources(runtime: ConversationRunContext, user_message: str) -> bool:
+    """分析型请求在数据源过多时，不进入 execute_python。"""
+    return is_analysis_like_request(user_message) and bool(_get_too_many_datasource_policy(runtime))
+
+
+def _build_too_many_datasources_reply(runtime: ConversationRunContext) -> str:
+    policy = _get_too_many_datasource_policy(runtime)
+    return TOO_MANY_DATASOURCES_ANALYSIS_REPLY_TEMPLATE.format(
+        count=policy.get('count', 0),
+        limit=policy.get('limit', 0),
+    )
 
 
 def _should_finish_without_datasource(runtime: ConversationRunContext, user_message: str) -> bool:
@@ -818,6 +857,22 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 allow_report_only=allow_report_only,
             )
 
+        if _should_finish_with_too_many_datasources(runtime, agent_request.user_message):
+            assistant_message = _build_too_many_datasources_reply(runtime)
+            allow_report_only = True
+            return _finalize_run(
+                service=service,
+                runtime=runtime,
+                username=agent_request.username,
+                user_message=agent_request.user_message,
+                analysis_flow_started=analysis_flow_started,
+                assistant_message=assistant_message,
+                analysis_report=analysis_report,
+                charts=charts,
+                tables=tables,
+                allow_report_only=allow_report_only,
+            )
+
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
             runtime_instruction = ''
             if analysis_flow_started:
@@ -997,6 +1052,35 @@ def _stream_with_runtime(
                 conversation_id=runtime.conversation.id,
                 turn_id=runtime.turn.id,
                 stage='no_datasource',
+                message=assistant_message,
+            )
+            _finalize_run(
+                service=service,
+                runtime=runtime,
+                username=agent_request.username,
+                user_message=agent_request.user_message,
+                analysis_flow_started=analysis_flow_started,
+                assistant_message=assistant_message,
+                analysis_report=analysis_report,
+                charts=charts,
+                tables=tables,
+                allow_report_only=allow_report_only,
+            )
+            yield _build_progress_event(
+                'done',
+                conversation_id=runtime.conversation.id,
+                turn_id=runtime.turn.id,
+            )
+            return
+
+        if _should_finish_with_too_many_datasources(runtime, agent_request.user_message):
+            assistant_message = _build_too_many_datasources_reply(runtime)
+            allow_report_only = True
+            yield _build_progress_event(
+                'assistant',
+                conversation_id=runtime.conversation.id,
+                turn_id=runtime.turn.id,
+                stage='too_many_datasources',
                 message=assistant_message,
             )
             _finalize_run(
