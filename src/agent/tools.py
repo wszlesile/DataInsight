@@ -49,6 +49,74 @@ CHART_CONTRACT_ERROR_MARKERS = (
     'yaxis',
     'series',
 )
+DATAFRAME_FIELD_EXPR_PATTERN = r"(?:[A-Za-z_]\w*\s*\[\s*['\"][^'\"]+['\"]\s*\])|(?:[A-Za-z_]\w*\.[A-Za-z_]\w*)"
+SQL_EXACT_FILTER_PATTERN = re.compile(
+    r"(?P<field>(?:[\w]+\.)?[\w\"`]+)\s*=\s*'(?P<literal>[^']+)'",
+    re.IGNORECASE,
+)
+SQL_FUZZY_FILTER_PATTERN = re.compile(
+    r"(?P<field>(?:[\w]+\.)?[\w\"`]+)\s+(?P<operator>like|ilike)\s+'(?P<literal>[^']+)'",
+    re.IGNORECASE,
+)
+PANDAS_EXACT_FILTER_PATTERNS = (
+    re.compile(
+        rf"(?P<field>{DATAFRAME_FIELD_EXPR_PATTERN})\s*==\s*(['\"])(?P<literal>.+?)\2",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?P<field>{DATAFRAME_FIELD_EXPR_PATTERN})\s*\.eq\(\s*(['\"])(?P<literal>.+?)\2",
+        re.IGNORECASE,
+    ),
+)
+PANDAS_FUZZY_FILTER_PATTERNS = (
+    re.compile(
+        rf"(?P<field>{DATAFRAME_FIELD_EXPR_PATTERN})\s*\.str\.contains\(\s*(['\"])(?P<literal>.+?)\2",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"contains\(\s*(?P<field>{DATAFRAME_FIELD_EXPR_PATTERN})\s*,\s*(['\"])(?P<literal>.+?)\2",
+        re.IGNORECASE,
+    ),
+)
+QUERY_CONSTRAINT_MATCH_MODES = {'exact', 'fuzzy'}
+QUERY_CONSTRAINT_GRAIN_PATTERNS = {
+    'month': (
+        re.compile(r"date_trunc\(\s*['\"]month['\"]", re.IGNORECASE),
+        re.compile(r"strftime\(\s*['\"]%Y-%m['\"]", re.IGNORECASE),
+        re.compile(r"to_char\([^)]*['\"]YYYY-MM['\"]", re.IGNORECASE),
+        re.compile(r"substr\([^)]*,\s*1\s*,\s*7\)", re.IGNORECASE),
+        re.compile(r"left\([^)]*,\s*7\)", re.IGNORECASE),
+        re.compile(r"\.dt\.to_period\(\s*['\"]M['\"]\s*\)", re.IGNORECASE),
+        re.compile(r"\.dt\.month\b", re.IGNORECASE),
+        re.compile(r"\bmonth\b", re.IGNORECASE),
+        re.compile(r"年月"),
+        re.compile(r"月度"),
+    ),
+    'day': (
+        re.compile(r"date_trunc\(\s*['\"]day['\"]", re.IGNORECASE),
+        re.compile(r"strftime\(\s*['\"]%Y-%m-%d['\"]", re.IGNORECASE),
+        re.compile(r"to_char\([^)]*['\"]YYYY-MM-DD['\"]", re.IGNORECASE),
+        re.compile(r"\.dt\.date\b", re.IGNORECASE),
+        re.compile(r"\bday\b", re.IGNORECASE),
+        re.compile(r"日期"),
+        re.compile(r"天"),
+    ),
+    'year': (
+        re.compile(r"date_trunc\(\s*['\"]year['\"]", re.IGNORECASE),
+        re.compile(r"strftime\(\s*['\"]%Y['\"]", re.IGNORECASE),
+        re.compile(r"to_char\([^)]*['\"]YYYY['\"]", re.IGNORECASE),
+        re.compile(r"\.dt\.year\b", re.IGNORECASE),
+        re.compile(r"\byear\b", re.IGNORECASE),
+        re.compile(r"年份"),
+        re.compile(r"年度"),
+    ),
+    'week': (
+        re.compile(r"date_trunc\(\s*['\"]week['\"]", re.IGNORECASE),
+        re.compile(r"\.dt\.isocalendar\(\)\.week", re.IGNORECASE),
+        re.compile(r"\bweek\b", re.IGNORECASE),
+        re.compile(r"周"),
+    ),
+}
 
 
 def _clip_retry_context_text(text: Any, max_chars: int) -> str:
@@ -143,6 +211,208 @@ def _format_error_message_with_code_location(
     if error_line:
         location = f'{location}：{error_line}'
     return f'{error_message}\n{location}'
+
+
+def _normalize_filter_text(text: str) -> str:
+    normalized = str(text or '').strip().lower()
+    normalized = normalized.replace('%', '').replace('_', '')
+    normalized = re.sub(r'[\s\'"`]+', '', normalized)
+    return normalized
+
+
+def _extract_code_filter_literals(code: str) -> list[dict[str, str]]:
+    text = str(code or '')
+    matches: list[dict[str, str]] = []
+
+    for match in SQL_EXACT_FILTER_PATTERN.finditer(text):
+        literal = str(match.group('literal') or '').strip()
+        if literal:
+            matches.append({
+                'kind': 'sql_exact',
+                'field': str(match.group('field') or '').strip(),
+                'literal': literal,
+            })
+
+    for match in SQL_FUZZY_FILTER_PATTERN.finditer(text):
+        literal = str(match.group('literal') or '').strip()
+        if literal:
+            matches.append({
+                'kind': 'sql_fuzzy',
+                'field': str(match.group('field') or '').strip(),
+                'literal': literal,
+            })
+
+    for pattern in PANDAS_EXACT_FILTER_PATTERNS:
+        for match in pattern.finditer(text):
+            literal = str(match.group('literal') or '').strip()
+            if literal:
+                matches.append({
+                    'kind': 'pandas_exact',
+                    'field': str(match.group('field') or '').strip(),
+                    'literal': literal,
+                })
+
+    for pattern in PANDAS_FUZZY_FILTER_PATTERNS:
+        for match in pattern.finditer(text):
+            literal = str(match.group('literal') or '').strip()
+            if literal:
+                matches.append({
+                    'kind': 'pandas_fuzzy',
+                    'field': str(match.group('field') or '').strip(),
+                    'literal': literal,
+                })
+    return matches
+
+
+def _validate_query_constraints_schema(query_constraints: Any) -> list[str]:
+    if not isinstance(query_constraints, dict):
+        return ['query_constraints 必须是 dict。']
+
+    errors: list[str] = []
+    if not any(key in query_constraints for key in ('time_range', 'target_filters', 'aggregation')):
+        errors.append('query_constraints 至少包含 time_range、target_filters、aggregation 中的一项。')
+
+    time_range = query_constraints.get('time_range')
+    if time_range is not None:
+        if not isinstance(time_range, dict):
+            errors.append('time_range 必须是 dict。')
+        else:
+            if time_range.get('start') is not None and not isinstance(time_range.get('start'), str):
+                errors.append('time_range.start 必须是字符串。')
+            if time_range.get('end') is not None and not isinstance(time_range.get('end'), str):
+                errors.append('time_range.end 必须是字符串。')
+            if 'end_exclusive' in time_range and not isinstance(time_range.get('end_exclusive'), bool):
+                errors.append('time_range.end_exclusive 必须是 bool。')
+
+    target_filters = query_constraints.get('target_filters')
+    if target_filters is not None:
+        if not isinstance(target_filters, list):
+            errors.append('target_filters 必须是 list。')
+        else:
+            for index, item in enumerate(target_filters):
+                if not isinstance(item, dict):
+                    errors.append(f'target_filters[{index}] 必须是 dict。')
+                    continue
+                if not isinstance(item.get('semantic_role'), str) or not str(item.get('semantic_role') or '').strip():
+                    errors.append(f'target_filters[{index}].semantic_role 必须是非空字符串。')
+                if not isinstance(item.get('value'), str) or not str(item.get('value') or '').strip():
+                    errors.append(f'target_filters[{index}].value 必须是非空字符串。')
+                if str(item.get('match_mode') or '').strip().lower() not in QUERY_CONSTRAINT_MATCH_MODES:
+                    errors.append(f'target_filters[{index}].match_mode 必须是 exact 或 fuzzy。')
+                if item.get('field_hint') is not None and not isinstance(item.get('field_hint'), str):
+                    errors.append(f'target_filters[{index}].field_hint 必须是字符串。')
+
+    aggregation = query_constraints.get('aggregation')
+    if aggregation is not None:
+        if not isinstance(aggregation, dict):
+            errors.append('aggregation 必须是 dict。')
+        else:
+            if aggregation.get('grain') is not None and not isinstance(aggregation.get('grain'), str):
+                errors.append('aggregation.grain 必须是字符串。')
+            if aggregation.get('metric') is not None and not isinstance(aggregation.get('metric'), str):
+                errors.append('aggregation.metric 必须是字符串。')
+
+    if query_constraints.get('notes') is not None and not isinstance(query_constraints.get('notes'), str):
+        errors.append('notes 必须是字符串。')
+    return errors
+
+
+def _build_query_constraint_error(
+    error_type: str,
+    error_message: str,
+    diagnostics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        'error_type': error_type,
+        'error_message': error_message,
+        'diagnostics': diagnostics or {},
+    }
+
+
+def _check_target_filter_constraints(query_constraints: dict[str, Any], code: str) -> dict[str, Any] | None:
+    filters = _extract_code_filter_literals(code)
+    for item in query_constraints.get('target_filters') or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get('match_mode') or '').strip().lower() != 'exact':
+            continue
+
+        expected_value = _normalize_filter_text(item.get('value', ''))
+        if len(expected_value) < 2:
+            continue
+
+        exact_matches = [
+            filter_item for filter_item in filters
+            if filter_item.get('kind') in {'sql_exact', 'pandas_exact'}
+            and _normalize_filter_text(filter_item.get('literal', '')) == expected_value
+        ]
+        fuzzy_matches = [
+            filter_item for filter_item in filters
+            if filter_item.get('kind') in {'sql_fuzzy', 'pandas_fuzzy'}
+            and _normalize_filter_text(filter_item.get('literal', '')) == expected_value
+        ]
+        if fuzzy_matches and not exact_matches:
+            return _build_query_constraint_error(
+                'query_constraint_violation',
+                f'query_constraints 要求 `{item.get("semantic_role", "target_filter")}` 使用精确匹配，但当前代码把 `{item.get("value", "")}` 实现成了模糊匹配。',
+                diagnostics={
+                    'violated_constraint': 'target_filters',
+                    'constraint_item': item,
+                    'matched_fuzzy_filters': fuzzy_matches[:5],
+                },
+            )
+    return None
+
+
+def _check_time_range_constraint(query_constraints: dict[str, Any], code: str) -> dict[str, Any] | None:
+    time_range = query_constraints.get('time_range')
+    if not isinstance(time_range, dict):
+        return None
+
+    start = str(time_range.get('start') or '').strip()
+    end = str(time_range.get('end') or '').strip()
+    missing_parts = []
+    if start and start not in code:
+        missing_parts.append('start')
+    if end and end not in code:
+        missing_parts.append('end')
+    if not missing_parts:
+        return None
+
+    return _build_query_constraint_error(
+        'query_constraint_violation',
+        f'query_constraints 中声明的时间范围没有完整体现在当前代码里，缺失部分：{", ".join(missing_parts)}。',
+        diagnostics={
+            'violated_constraint': 'time_range',
+            'time_range': time_range,
+            'missing_parts': missing_parts,
+        },
+    )
+
+
+def _check_aggregation_constraint(query_constraints: dict[str, Any], code: str) -> dict[str, Any] | None:
+    aggregation = query_constraints.get('aggregation')
+    if not isinstance(aggregation, dict):
+        return None
+
+    grain = str(aggregation.get('grain') or '').strip().lower()
+    if not grain:
+        return None
+
+    patterns = QUERY_CONSTRAINT_GRAIN_PATTERNS.get(grain)
+    if not patterns:
+        return None
+    if any(pattern.search(code) for pattern in patterns):
+        return None
+
+    return _build_query_constraint_error(
+        'query_constraint_violation',
+        f'query_constraints 要求按 `{grain}` 粒度统计，但当前代码里没有识别到对应的聚合粒度实现。',
+        diagnostics={
+            'violated_constraint': 'aggregation',
+            'aggregation': aggregation,
+        },
+    )
 
 
 def _load_data_with_fed_query(sql: str,params: Optional[list[Any]] = None):
@@ -705,6 +975,9 @@ class RetryResult(BaseModel):
         "incomplete_result",
         "contract_error",
         "chart_contract_error",
+        "missing_query_constraints",
+        "invalid_query_constraints",
+        "query_constraint_violation",
     ] = Field(description="Why the current execution needs another attempt.")
     message: str = Field(description="Human-readable retry reason.")
     diagnostics: dict[str, Any] = Field(default_factory=dict, description="Structured diagnostic facts.")
@@ -753,6 +1026,9 @@ def request_retry(
         "incomplete_result",
         "contract_error",
         "chart_contract_error",
+        "missing_query_constraints",
+        "invalid_query_constraints",
+        "query_constraint_violation",
     }
     normalized_retry_type = str(retry_type or "").strip() or "contract_error"
     if normalized_retry_type not in allowed_types:
@@ -771,6 +1047,58 @@ def request_retry(
         repair_instructions=normalized_instructions,
         analysis_report=str(analysis_report or "").strip(),
     )
+
+
+def validate_query_constraints(
+    query_constraints: Any,
+    sql: str = '',
+    filter_expressions: Optional[list[str]] = None,
+    aggregation_hints: Optional[list[str]] = None,
+) -> RetryResult | None:
+    """Validate analysis-stage query constraints against SQL / pandas filtering implementations."""
+    schema_errors = _validate_query_constraints_schema(query_constraints)
+    if schema_errors:
+        return request_retry(
+            retry_type="invalid_query_constraints",
+            message='query_constraints 结构不合法，请先修正查询约束声明。',
+            diagnostics={'schema_errors': schema_errors},
+            repair_instructions=[
+                'query_constraints 必须是可求值的 dict，并包含与当前问题相关的 time_range、target_filters、aggregation。',
+                'target_filters 中每个对象至少要包含 semantic_role、value、match_mode；match_mode 只能是 exact 或 fuzzy。',
+            ],
+        )
+
+    code_fragments = [str(sql or '').strip(), *[str(item or '').strip() for item in (filter_expressions or [])], *[str(item or '').strip() for item in (aggregation_hints or [])]]
+    combined_code = '\n'.join(fragment for fragment in code_fragments if fragment)
+    if not combined_code:
+        return request_retry(
+            retry_type="query_constraint_violation",
+            message='validate_query_constraints(...) 没有收到可校验的 SQL、过滤表达式或聚合提示。',
+            diagnostics={'query_constraints': query_constraints},
+            repair_instructions=[
+                '先生成 SQL 字符串或 pandas/DataFrame 过滤表达式，再调用 validate_query_constraints(...)。',
+                'analysis 场景下不要跳过查询约束校验。',
+            ],
+        )
+
+    for checker in (
+        _check_target_filter_constraints,
+        _check_time_range_constraint,
+        _check_aggregation_constraint,
+    ):
+        issue = checker(query_constraints, combined_code)
+        if issue is not None:
+            return request_retry(
+                retry_type=str(issue.get('error_type') or 'query_constraint_violation'),
+                message=str(issue.get('error_message') or '当前实现没有满足 query_constraints 声明的查询约束。'),
+                diagnostics=issue.get('diagnostics') if isinstance(issue.get('diagnostics'), dict) else {},
+                repair_instructions=[
+                    '先保持 query_constraints 不变，再重写 SQL / pandas / 文件过滤实现，使其符合时间范围、目标筛选和聚合粒度约束。',
+                    '如果 target_filters 里的 match_mode = "exact"，正式 analysis 代码不要把同一个值实现成 LIKE、ILIKE、contains 或 str.contains(...)。',
+                    '如果需要先探测候选值，请改成 execution_intent = "probe"，不要在 analysis 阶段继续放宽口径。',
+                ],
+            )
+    return None
 
 
 def save_empty_analysis_result(
@@ -1201,6 +1529,7 @@ def _build_execution_namespace() -> dict[str, Any]:
         'describe_time_coverage': describe_time_coverage,
         'probe_distinct_values': probe_distinct_values,
         'probe_text_candidates': probe_text_candidates,
+        'validate_query_constraints': validate_query_constraints,
         'build_markdown_table': build_markdown_table,
         'build_chart_document': build_chart_document,
         'build_chart_result': build_chart_result,
@@ -1588,6 +1917,19 @@ def _build_repair_instructions(error_type: str) -> list[str]:
             '如果错误与 charts/chart_spec/chart_document 有关，下一版不要手写图表 JSON，直接改用 build_chart_result(...)、build_multi_metric_chart_result(...) 或 build_chart_suite(...)。',
             '最终必须产出完整 analysis_report，并调用 save_analysis_result(analysis_report=..., charts=[...], tables=[...])。',
             '不要遗漏 result 变量，也不要返回空的 analysis_report 或 charts/tables 同时为空的结构化结果。',
+        ],
+        'missing_query_constraints': [
+            '正式 analysis 代码必须在顶部声明 query_constraints；probe 代码不要生成 query_constraints。',
+            '先描述与当前问题相关的 time_range、target_filters 和 aggregation，再生成 SQL 或 pandas/DataFrame 筛选实现。',
+        ],
+        'invalid_query_constraints': [
+            '请先修正 query_constraints 结构，再重新生成 SQL 或 pandas/DataFrame 实现。',
+            'target_filters 中每个对象至少要包含 semantic_role、value 和 match_mode；其中 match_mode 只能是 exact 或 fuzzy。',
+        ],
+        'query_constraint_violation': [
+            '保持 query_constraints 不变，重写 SQL / pandas / 文件筛选实现，使其符合声明的时间范围、目标筛选和聚合粒度。',
+            'analysis 代码应先生成 SQL 或过滤表达式，再调用 validate_query_constraints(...)；只有在其返回 None 时才能继续正式分析。',
+            '当 match_mode = "exact" 时，不要把同一个值实现成 LIKE、ILIKE、contains 或 str.contains(...)；如果需要先探测候选值，请切换为 execution_intent = "probe"。',
         ],
         'library_api_signature_mismatch': [
             '如果报错来自 pyecharts/matplotlib 或图表参数，优先改用 build_chart_result(...)、build_multi_metric_chart_result(...) 或 build_chart_suite(...)，不要继续试底层图表 API。',

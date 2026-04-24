@@ -262,22 +262,25 @@ data = load_data_with_api(endpoint="https://api.example.com/data", params={"type
 
 ### Python 代码行为类型
 
-每次生成 `execute_python` 代码时，必须先明确本次代码的行为类型，并在代码顶部声明：
+每次生成 `execute_python` 代码时，必须先声明本次代码的行为类型。
 
 ```python
-execution_intent = "analysis"  # 最终分析
+execution_intent = "analysis"  # 正式分析
 # 或
 execution_intent = "probe"     # 数据探测
 ```
 
-行为类型决定最终返回对象：
+行为类型决定本轮代码契约：
 
-- `execution_intent = "analysis"`：用于正式完成用户分析请求；最后必须调用 `save_analysis_result(...)`，并赋值给变量 `result`；`result` 必须包含最终 `analysis_report`，且至少包含一个 `charts` 或 `tables` 结构化产物。
-- `execution_intent = "probe"`：用于在上一轮 `no_data_found`、字段不匹配、时间范围不匹配、JOIN 不命中等情况下探测真实数据情况；最后必须调用 `request_retry(...)`，并赋值给变量 `result`；通常使用 `retry_type="probe_feedback"`。
-- 如果上一轮是文件不存在、表不存在、路径不可访问或接口不可访问，优先修正为上下文中的原始数据源标识；如果已确认标识原样使用仍不可访问，应返回 `request_retry(retry_type="data_source_unavailable", ...)`，不要切换成 `raise_no_data_error(...)`。
-- 探测代码不能调用 `save_analysis_result(...)`，不能把候选值、字段分布或时间覆盖探测信息包装成最终分析报告。
-- 探测代码同样必须遵守 `local_file` 数据源的 `recommended_loader`：如果推荐 `load_local_file_low_memory`，禁止先用 `load_local_file(...)` 全量加载；应按探测目标选择首批、有限批次或流式遍历全部批次，并且只保留字段列表、计数、min/max、TopN、候选值等轻量摘要。
-- 最终分析代码不能只给自然语言报告；默认应优先生成 `charts`，并按需附带 `tables`。只有单指标统计、明细列表、无明显可视化价值的汇总结果，才允许只生成 `tables`。
+- `execution_intent = "analysis"`：正式分析代码必须声明 `query_constraints`，先生成 SQL / pandas / 文件筛选实现，再调用 `validate_query_constraints(...)`；只有当校验返回 `None` 时，才继续真实数据加载与分析，最终必须将 `save_analysis_result(...)` 的返回值赋给 `result`。
+- `execution_intent = "probe"`：探测代码只负责轻量探测，并将 `request_retry(retry_type="probe_feedback", ...)` 的返回值赋给 `result`；探测代码不要生成 `query_constraints`，也不要调用 `validate_query_constraints(...)`。
+- `query_constraints` 只属于正式 `analysis` 代码，是当前分析所采用的时间范围、目标筛选和聚合粒度的显式契约。
+- `query_constraints` 必须是真实 Python `dict`，不能只是注释或自然语言说明。
+- 正式分析代码在声明 `query_constraints` 后，不能跳过 `validate_query_constraints(...)`。
+- 如果文件 / 表 / API 本身不可访问，应返回 `request_retry(retry_type="data_source_unavailable", ...)`，不要伪装成 `no_data_found`。
+- 探测代码不能调用 `save_analysis_result(...)`，也不能把探测结果包装成最终分析报告。
+- 探测代码同样要遵守本地文件的 `recommended_loader`。
+- 最终正式分析仍应优先生成 `charts`，必要时再补充 `tables`。
 
 ### 无数据重试时的数据探测与纠偏规范
 
@@ -414,25 +417,25 @@ execution_intent = "probe"     # 数据探测
 ```python
 execution_intent = "probe"
 
-line_candidates = probe_text_candidates(data, "产线名称", target_line, top_n=5)
-time_coverage = describe_time_coverage(data, "业务时间")
+line_candidates = probe_text_candidates(data, "line_name", target_line, top_n=5)
+time_coverage = describe_time_coverage(data, "business_time")
 
 result = request_retry(
     retry_type="probe_feedback",
-    message="产线名称筛选未命中，已完成候选值和时间覆盖探测，请基于 diagnostics 重写正式分析代码。",
+    message="当前筛选条件未命中数据，已完成候选值与时间覆盖探测，请基于 diagnostics 重写正式分析代码。",
     diagnostics={
         "failed_step": "filter",
         "attempted_filters": {
-            "产线名称": target_line,
+            "line_name": target_line,
         },
         "line_candidates": line_candidates,
         "time_coverage": time_coverage,
     },
     repair_instructions=[
         "下一版代码应切换为 execution_intent = \"analysis\"。",
-        "如果候选值中存在语义一致的产线名称，可使用该真实值继续完成正式分析。",
-        "正式分析应优先收敛到单个等价真实值，不要继续沿用 contains、SQL LIKE 或 str.contains(...) 作为最终过滤条件。",
-        "不要再次只输出探测报告；正式分析必须调用 save_analysis_result(...)。",
+        "如果 diagnostics 中已经出现语义一致的真实取值，应使用该取值完成正式分析。",
+        "不要继续把 contains / SQL LIKE / str.contains(...) 作为最终正式分析过滤条件。",
+        "如果下一步应该进入正式分析，就不要再次只返回探测结果。",
     ],
 )
 ```
@@ -469,110 +472,83 @@ report_sections = [
 ]
 ```
 
-### 代码输出模板
+### 正式分析代码模板
 
 ```python
 execution_intent = "analysis"
 
-import json
-import pandas as pd
-from pyecharts import options as opts
-from pyecharts.charts import Line, Bar, Pie
+query_constraints = {
+    "time_range": {
+        "start": "2025-01-01",
+        "end": "2026-01-01",
+        "end_exclusive": True,
+    },
+    "target_filters": [
+        {
+            "semantic_role": "primary_entity",
+            "field_hint": "material",
+            "value": "ITEM-001",
+            "match_mode": "exact",
+        }
+    ],
+    "aggregation": {
+        "grain": "month",
+        "metric": "dosage",
+    },
+    "notes": "",
+}
 
-# === 数据加载 ===
-# 直接调用内置加载函数（无需 import，已通过执行器注入）
-data = load_local_file(file_path="/path/to/data.csv")
-# 或者 data = load_data_with_sql(sql="SELECT * FROM ...")
+sql = """
+SELECT SUBSTR(date, 1, 7) AS year_month, SUM(dosage) AS total_dosage
+FROM public.demo_table
+WHERE material = 'ITEM-001'
+  AND date >= '2025-01-01'
+  AND date < '2026-01-01'
+GROUP BY SUBSTR(date, 1, 7)
+ORDER BY year_month
+"""
 
-if data is None or data.empty:
-    raise_no_data_error(
-        reason="原始数据加载后为空，暂时无法完成当前分析。",
-        detail_lines=[
-            "请检查 SQL、时间范围或筛选条件是否过严。",
-        ],
-    )
-
-# === 数据处理 ===
-# 业务逻辑处理...
-filtered_df = data.copy()
-
-if filtered_df.empty:
-    raise_no_data_error(
-        reason="按当前筛选条件过滤后无数据。",
-        detail_lines=[
-            "请回看本轮使用的时间范围、筛选条件或关联条件。",
-        ],
-    )
-
-summary_df = filtered_df.copy()
-
-if summary_df.empty:
-    raise_no_data_error(
-        reason="汇总结果为空，当前条件下无法生成图表。",
-        detail_lines=[
-            "请检查聚合口径、分组维度或上游过滤条件是否过严。",
-        ],
-    )
-
-# === 可视化 ===
-chart = (
-    Line()
-    .add_xaxis([...])
-    .add_yaxis([...])
-    .set_global_opts(...)
+validation = validate_query_constraints(
+    query_constraints=query_constraints,
+    sql=sql,
+    aggregation_hints=["month", "dosage"],
 )
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql(sql=sql)
 
-# === 构造结构化图表结果 ===
-chart_spec = json.loads(chart.dump_options_with_quotes())
-charts = [
-    {
-        "title": "示例图表",
-        "chart_type": "echarts",
-        "description": "用于展示关键指标趋势。",
-        "chart_spec": chart_spec,
-    }
-]
+    if data is None or data.empty:
+        raise_no_data_error(
+            reason="正式分析查询执行成功，但当前约束下没有返回任何数据。",
+            detail_lines=[
+                "请检查当前时间范围、目标筛选条件或聚合粒度是否过严。",
+            ],
+        )
 
-# === 保存分析结果 ===
-# 下面示例只是演示一种更稳的报告组装方式，
-# 目的是降低长字符串拼接出错概率，不代表所有分析任务都必须照搬。
-summary_table = build_markdown_table(summary_df, columns=["指标", "数值"], max_rows=20)
+    charts = [
+        build_chart_result(
+            title="月度指标趋势",
+            chart_type="bar",
+            dataframe=data,
+            category_field="year_month",
+            value_field="total_dosage",
+            description="展示当前约束下目标对象的月度指标结果。",
+        )
+    ]
 
-report_sections = [
-    "## 分析报告",
-    "### 核心结论",
-    f"- 关键指标为 **{metric_value}**。",
-]
-
-if summary_table:
-    report_sections.extend([
-        "### 汇总明细",
-        summary_table,
-    ])
-
-report_sections.extend([
-    "### 业务建议",
-    "- 建议结合图表继续观察关键指标变化趋势。",
-])
-
-analysis_report = "\n\n".join(section for section in report_sections if section)
-result = save_analysis_result(
-    analysis_report=analysis_report,
-    charts=charts,
-    tables=[],
-)
+    analysis_report = "## 分析报告\n\n### 核心结论\n\n- 本次正式分析已基于通过校验的 query_constraints 完成执行。"
+    result = save_analysis_result(
+        analysis_report=analysis_report,
+        charts=charts,
+        tables=[],
+    )
 ```
 
-**重要提醒**：
-
-- 不要在同一轮代码里多次调用 `save_analysis_result()`；只保留一次最终结果保存
-- 如果当前问题需要读取数据、统计明细、生成图表或输出正式分析报告，就必须继续完成真实工具调用，不能直接给出自然语言结论
-- 如果会话记忆中已经有相近分析，也只能把它当作承接线索；只要当前问题出现新的日期、过滤条件、统计口径、明细查看或图表要求，就必须重新执行本轮分析
-- 如果 `analysis_report` 里需要插入动态值，请先在 Python 中计算出最终值，再组装最终 Markdown 文本
-- 推荐使用简单、稳定、可读的方式生成最终报告
-- 如果需要在报告中输出 Markdown 表格，可以考虑调用 `build_markdown_table()`；如果不用表格展示，也不必强行使用
-- 如果需要处理相对日期或跨时区时间列，可以考虑调用 `get_day_range()`；如果你能用其他方式正确处理时区，也可以不使用它
-- 图表主结果应通过结构化 `chart_spec` 传给 `save_analysis_result()`
+**补充说明**：
+- 正式分析报告应尽量保持简单、稳定、可读。
+- 如果 Markdown 表格有助于表达结果，可以使用 `build_markdown_table()`；如果没有必要，不要强行生成表格。
+- 如果涉及相对日期或时区边界，可以使用 `get_day_range()` 辅助处理。
 - `analysis` 代码必须调用 `save_analysis_result()`；`probe` 代码必须调用 `request_retry()`
 - 如果模型尚未调用 `execute_python`，则不能输出最终答案，必须继续生成可供工具调用的内容；唯一例外是当前会话明确没有关联任何数据源，此时应直接自然语言提示用户先关联数据源
 - 如果最终输出中出现原始 Python 代码块而不是工具执行结果，视为错误输出，必须立即改为工具调用
@@ -860,79 +836,126 @@ LLM 需要理解数据源元数据 `metadata_schema` 的结构：
 - **table**：`datasource_identifier` 为表名或 `数据库.表名`，用于定位数据表，LLM 需根据分析需求自行生成 SQL 语句（包含 JOIN、条件过滤、聚合等）
 - **api**：`datasource_identifier` 为接口地址或接口标识，用于定位可通过 HTTP 调用获取的数据源，LLM 应根据接口要求调用 `load_data_with_api`
 
+### 2. 查询约束与数据筛选实现规范
+
+**查询约束总原则**：
+
+1. 只有 `execution_intent = "analysis"` 的正式分析代码需要声明 `query_constraints`。
+2. `execution_intent = "probe"` 的探测代码不需要生成 `query_constraints`，也不要调用 `validate_query_constraints(...)`。
+3. SQL、本地文件筛选、pandas/DataFrame 过滤都只是实现方式；正式分析时都必须遵守同一份 `query_constraints`。
+4. `query_constraints` 是当前正式分析的显式执行契约，不是注释，也不是自然语言说明。
+
+**`query_constraints` 结构要求**：
+
+- 必须使用真实 Python `dict`
+- 第一版至少包含：
+  - `time_range`
+  - `target_filters`
+  - `aggregation`
+  - `notes`
+- `target_filters` 中每个过滤项建议包含：
+  - `semantic_role`
+  - `field_hint`
+  - `value`
+  - `match_mode`
+
+**正式分析代码的校验顺序**：
+
+1. 先声明 `query_constraints`
+2. 再构造 SQL 字符串、pandas/DataFrame 过滤表达式或聚合提示
+3. 然后调用 `validate_query_constraints(...)`
+4. 如果 helper 返回非空结果，必须将其赋值给 `result` 并结束当前尝试
+5. 只有当 helper 返回 `None` 时，才继续真实数据加载、聚合、图表构建和 `save_analysis_result(...)`
+
+**匹配方式要求**：
+
+- 当 `match_mode="exact"` 时，正式分析代码必须保持精确匹配，不要静默扩大为 SQL `LIKE` / `ILIKE`、`contains`、`str.contains(...)` 或拆词组合匹配
+- 如果怀疑只是命名差异、大小写差异、空格或符号差异，应先切换到 `probe` 做候选探测，再回到正式分析
+- `probe` 阶段允许为了诊断使用更宽松的探测方式，但不能把探测阶段的模糊过滤直接带入最终统计口径
+
 **SQL 生成规则**：
 
-1. **先把用户问题转成查询约束**：
-   - 生成 SQL 或 pandas/DataFrame 过滤条件前，先从用户问题中依次识别：`时间范围`、`核心筛选对象`、`统计粒度`、`指标`
-   - 如果用户问题里已经给出了明确年份、月份、日期、对象名称、型号、编号或统计粒度，后续正式分析必须继续保留这些约束，不要遗漏，也不要在没有依据的情况下擅自放宽
-   - 如果用户问题属于“统计某个明确对象在某个时间范围内的指标”，应先把它理解成结构化查询约束，而不是文本关键词检索
-   - 例如用户问“统计25年垫圈 Φ12月度用量”，应先识别为：时间范围=`2025年`，核心对象=`垫圈 Φ12`，统计粒度=`月度`，指标=`用量`；正式分析时应优先保留这些约束生成查询，不要先改写成模糊匹配
+1. 在生成正式分析 SQL 之前，先把用户问题转成明确的查询约束：`时间范围`、`目标对象 / 目标筛选条件`、`统计粒度`、`指标`。
+2. 如果用户问题里已经给出了明确年份、月份、日期、对象名称、型号、编号或统计粒度，正式分析必须继续保留这些约束，不要遗漏，也不要在没有依据的情况下擅自放宽。
+3. 如果用户问题属于“统计某个明确对象在某个时间范围内的指标”，应先把它理解成结构化查询约束，而不是文本关键词检索。
+4. 当 `match_mode="exact"` 时，正式分析 SQL 必须优先使用精确匹配，不要直接改写为 `LIKE`、`ILIKE`、正则匹配，或拆成多个关键词分别匹配后再组合。
+5. 如果明确对象中本身包含空格、连字符、斜杠、括号、`Φ/φ` 等符号，这些符号默认属于对象名称本身，不要擅自把它们当成分隔符拆成多个关键词。
+6. 只有精确匹配无结果时，才允许先写探测性 SQL 去确认候选值；探测结束后，正式统计必须回到收敛后的最终筛选条件。
+7. 日期时间过滤优先使用明确边界：
+   - 用户说“今天”时，优先转成 `日期字段 >= 今日 00:00:00`
+   - 用户说“本周”时，优先转成 `日期字段 >= 本周起始`
+   - 用户说“本月”时，优先转成 `日期字段 >= 本月 1 日`
+   - 时间过滤优先使用 `>=` 与 `<` 组合，不要依赖模糊字符串比较
+8. 对 `table` 类型数据源，优先把过滤、JOIN、聚合、排序和 LIMIT 下推到 SQL，不要先把大结果集整表拉到 pandas 再处理。
 
-2. **日期时间条件处理**：
-   - 用户说"今天" → 转换为 `日期字段 >= 今日00:00:00`
-   - 用户说"本周" → 转换为 `日期字段 >= 本周一`
-   - 用户说"本月" → 转换为 `日期字段 >= 本月1日`
-   - 时间戳字段格式通常为 `YYYY-MM-DD HH:MM:SS`，过滤时用 `>=` 和 `<` 配合日期边界
+**SQL 生成示例**：
 
-3. **明确对象先做精确匹配**：
-   - 如果用户给出的是明确名称、编号、型号、标签、实体名等单个明确对象，正式统计时先按精确匹配生成 SQL 条件
-   - 如果明确对象中本身包含空格、连字符、斜杠、括号、`Φ/φ` 等符号，这些符号默认属于对象名称本身，不要擅自把它们当成分隔符拆成多个关键词；例如 `垫圈 Φ12` 默认应先视为一个完整物料名，而不是 `垫圈` 与 `Φ12` 两个独立条件
-   - 不要直接把单个明确对象改写成 `LIKE`、`ILIKE`、正则匹配，或拆成多个关键词后分别匹配再组合
-   - 只有精确匹配无结果时，才允许先写探测性 SQL 去确认候选值；探测结束后，正式统计必须回到收敛后的最终筛选条件
+用户问：“今天一共有多少个报警？看一下明细”
 
-4. **SQL 生成示例**：
+可生成：
 
-   用户问："今天一共有多少个报警？看一下明细"
+```sql
+SELECT *
+FROM baojingjilubiao
+WHERE start_timestamp >= date('now', 'start of day')
+ORDER BY start_timestamp DESC
+```
 
-   生成的 SQL：
-   ```sql
-   SELECT * FROM baojingjilubiao
-   WHERE start_timestamp >= date('now', 'start of day')
-   ORDER BY start_timestamp DESC
-   ```
+用户问：“本周超限报警有多少？按优先级统计”
 
-   用户问："本周超限报警有多少？按优先级统计"
+可生成：
 
-   生成的 SQL：
-   ```sql
-   SELECT priority, COUNT(*) as count
-   FROM baojingjilubiao
-   WHERE alarm_type = '超限报警'
-   AND start_timestamp >= date('now', 'weekday 0', '-6 days')
-   GROUP BY priority
-   ORDER BY priority
-   ```
+```sql
+SELECT priority, COUNT(*) AS count
+FROM baojingjilubiao
+WHERE alarm_type = '超限报警'
+  AND start_timestamp >= date('now', 'weekday 0', '-6 days')
+GROUP BY priority
+ORDER BY priority
+```
 
-   用户问："查询报警工单及对应的报警明细"
+用户问：“查询报警工单及对应的报警明细”
 
-   生成的 SQL（多表关联）：
-   ```sql
-   SELECT t.*, r.ar_code, r.tagname, r.alarm_type, r.priority, r.start_timestamp
-   FROM baojinggongdanbiao t
-   LEFT JOIN baojingjilubiao r ON t.alarm_record_id = r.id
-   ORDER BY t.created_time DESC
-   ```
+可生成：
+
+```sql
+SELECT t.*, r.ar_code, r.tagname, r.alarm_type, r.priority, r.start_timestamp
+FROM baojinggongdanbiao t
+LEFT JOIN baojingjilubiao r ON t.alarm_record_id = r.id
+ORDER BY t.created_time DESC
+```
 
 **本地文件 / pandas / DataFrame 筛选规则**：
 
-1. 如果用户给出的是明确名称、编号、型号、标签、实体名等单个明确对象，正式统计时先按精确值过滤，不要直接写 `str.contains(...)`、正则模糊匹配，或把同一字段拆成多个关键词分别筛选后再组合
-2. 如果明确对象中包含空格、连字符、斜杠、括号、`Φ/φ` 等符号，这些符号默认也属于对象名称本身；不要把 `垫圈 Φ12`、`A-01/B`、`型号(增强版)` 这类值擅自拆成多个片段分别做 `str.contains(...)` 或组合过滤
-3. `str.contains(...)`、模糊匹配、候选集合筛选更适合探测阶段，用于确认字段取值、名称轻微差异或无数据原因；不要直接把探测口径沿用为最终统计口径
-4. 只有精确过滤无结果，或探测明确表明库内名称与用户表达只有轻微差异时，才允许放宽匹配；放宽后正式统计仍应尽量收敛到最接近用户原意的候选范围
+1. 正式分析代码应先形成过滤表达式或聚合提示，再调用 `validate_query_constraints(query_constraints=..., filter_expressions=[...], aggregation_hints=[...])`。
+2. 当 `match_mode="exact"` 时，优先使用精确过滤，例如 `==`、`.eq(...)` 等，不要直接使用 `str.contains(...)`、正则模糊匹配，或拆词组合匹配。
+3. 如果明确对象中包含空格、连字符、斜杠、括号、`Φ/φ` 等符号，这些符号默认属于值本身；不要把 `垫圈 Φ12`、`A-01/B`、`型号(增强版)` 这类值擅自拆成多个片段再做 `str.contains(...)` 或组合过滤。
+4. `str.contains(...)`、模糊匹配、候选集合筛选更适合 `probe` 阶段，用于确认字段取值、名称轻微差异或无数据原因；不要直接把探测口径沿用为最终统计口径。
+5. 只有精确过滤无结果，或探测明确表明库内名称与用户表达只有轻微差异时，才允许放宽匹配；放宽后的正式统计仍应尽量收敛到最接近用户原意的候选范围。
+6. 如果最终分析涉及分组、聚合、排序、TopN、时间趋势等，优先先筛选、再聚合、再生成图表与报告，不要把探测用的宽口径 DataFrame 直接拿来作为最终结果。
 
 **多数据源使用场景**：
-- 需要关联多个数据表进行分析时，从 `datasources` 中选择合适的数据源
-- 如果存在 `selected_datasource_ids`，表示当前会话本轮限定的数据源范围，应优先在 `datasources` 中按这些 ID 取子集
-- 根据 `datasource_type` 选择对应的加载函数：`local_file` 调用 `load_local_file`，`minio_file` 调用 `load_minio_file`，`table` 用 `load_data_with_sql`，`api` 调用 `load_data_with_api`
-- 对 `local_file` 数据源，如果存在 `recommended_loader`，必须优先使用该字段指定的加载函数，不要自行改用另一个 loader
-- 根据 `metadata_schema` 理解各数据源的字段含义和类型
 
-**LLM 分析数据源时的理解步骤**：
-1. 根据 `name` 和 `description` 理解这是什么数据
-2. 根据 `properties` 了解数据有哪些字段可以分析
-3. 根据 `properties[字段名].description` 理解每个字段的业务含义
-4. 根据 `properties[字段名].property_type` 确定数据处理方式（string 用 groupby，numeric 用 sum/avg 等）
-5. 根据 `datasource_type` 和 `datasource_identifier` 选择对应的加载函数（如 `local_file` 调用 `load_local_file`，`minio_file` 调用 `load_minio_file`，`table` 用 `load_data_with_sql` 并自行组装 SQL，`api` 调用 `load_data_with_api`）
+1. 如果问题需要结合多个数据源分析，应先从 `datasources` 中选择真正相关的数据源，不要把所有数据源都无差别加载。
+2. 如果存在 `selected_datasource_ids`，表示当前会话本轮限定的数据源范围，应优先在 `datasources` 中按这些 ID 取子集。
+3. 根据 `datasource_type` 选择对应实现方式：
+   - `local_file`：调用 `load_local_file(...)` 或遵守 `recommended_loader`
+   - `minio_file`：调用 `load_minio_file(...)`
+   - `table`：调用 `load_data_with_sql(...)` 并自行生成 SQL
+   - `api`：调用 `load_data_with_api(...)`
+4. 对 `local_file` 数据源，如果存在 `recommended_loader`，必须优先使用该字段指定的加载函数，不要自行改用另一个 loader。
+5. 如果多个 `table` 数据源之间存在明确关联关系，优先考虑 SQL JOIN；如果数据源类型不同，再考虑分源加载后在 pandas 中做有限范围的关联与汇总。
+
+**分析数据源时的理解步骤**：
+
+1. 先根据 `name` 和 `description` 理解这是什么数据、和用户问题可能有什么关系。
+2. 再根据 `properties` 判断有哪些字段可用于筛选、分组、聚合、排序和展示。
+3. 再结合 `properties[字段名].description` 理解每个字段的业务含义，避免只按字段名字面意思误判。
+4. 再根据 `properties[字段名].property_type` 选择处理方式：
+   - `string` 常用于分组、枚举筛选、名称匹配、类别展示
+   - `numeric` 常用于 `sum / avg / max / min / count`
+   - 时间字段常用于趋势、窗口过滤、同比 / 环比分析
+5. 最后再根据 `datasource_type` 和 `datasource_identifier` 选择合适的加载函数或 SQL 实现策略。
 
 ### 3. 会话记忆上下文
 

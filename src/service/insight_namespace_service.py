@@ -26,6 +26,7 @@ class InsightNamespaceService:
     """负责洞察空间的创建、查询和删除。"""
 
     DEFAULT_NAMESPACE_NAME = '默认空间'
+    DEFAULT_CONVERSATION_NAME = '默认会话'
 
     def __init__(self, session: Session):
         self.session = session
@@ -68,7 +69,7 @@ class InsightNamespaceService:
         # 当前业务下空间与会话是 1:1，因此创建空间时同步创建一条真实会话。
         conversation = InsightNsConversation(
             insight_namespace_id=namespace.id,
-            title=normalized_name,
+            title=self.DEFAULT_CONVERSATION_NAME,
             status='active',
             summary_text='',
             active_datasource_snapshot='{}',
