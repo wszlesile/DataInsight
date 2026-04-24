@@ -77,15 +77,11 @@ class Config:
     UNS_IMPORT_MAX_CONCURRENT = int(os.environ.get('UNS_IMPORT_MAX_CONCURRENT', 2))
 
     # LLM配置
-    LLM_MODEL_ACTIVE=os.environ.get('LLM_MODEL_ACTIVE', 'MiniMax-M2.5')
-
-    MINIMAX_M2_5_MODEL = os.environ.get('MINIMAX_M2_5_MODEL', 'MiniMax-M2.5')
-    MINIMAX_M2_5_API_KEY = os.environ.get('MINIMAX_M2_5_API_KEY', '')
-    MINIMAX_M2_5_BASE_URL = os.environ.get('MINIMAX_M2_5_BASE_URL', 'https://api.minimax.chat/v1')
-
-    QWEN3_80B_MODEL =  os.environ.get('QWEN3_80B_MODEL', 'Qwen3-80B')
-    QWEN3_80B_API_KEY = os.environ.get('QWEN3_80B_API_KEY', 'EMPTY')
-    QWEN3_80B_BASE_URL = os.environ.get('QWEN3_80B_BASE_URL', 'http://192.168.8.206:5103/v1')
+    LLM_MODEL_ACTIVE = os.environ.get('LLM_MODEL_ACTIVE', 'minimax')
+    MODEL = os.environ.get('MODEL', 'MiniMax-M2.5')
+    API_KEY = os.environ.get('API_KEY', '')
+    BASE_URL = os.environ.get('BASE_URL', 'https://api.minimax.chat/v1')
+    TEMPERATURE = float(os.environ.get('TEMPERATURE', 0.7))
 
     CONTEXT_COMPRESSION_ENABLED = os.environ.get('CONTEXT_COMPRESSION_ENABLED', 'true').lower() == 'true'
     CONTEXT_COMPRESSION_USE_LLM = os.environ.get('CONTEXT_COMPRESSION_USE_LLM', 'true').lower() == 'true'

@@ -200,8 +200,10 @@ npm run build
 - `TEMP_DIR`
 - `UPLOAD_DIR`
 - `LLM_MODEL_ACTIVE`
-- `MINIMAX_M2_5_*`
-- `QWEN3_80B_*`
+- `MODEL`
+- `API_KEY`
+- `BASE_URL`
+- `TEMPERATURE`
 
 ## 文档
 

@@ -75,7 +75,7 @@ configMap:
     LOG_LEVEL: "INFO"
     LOG_ENABLE_FILE: "true"
     LOG_RETENTION_DAYS: "15"
-    SUPOS_WEB: "http://127.0.0.1:8080"
+    SUPOS_WEB: "http://192.168.236.56:8080"
     SUPOS_REQUEST_TIMEOUT: "15"
     USER_CONTEXT_CACHE_TTL_SECONDS: "600"
     UNS_MAX_EXPANDED_FILES: "200"
@@ -87,10 +87,8 @@ configMap:
     GUNICORN_THREADS: "4"
     GUNICORN_TIMEOUT: "600"
     LLM_MODEL_ACTIVE: "MiniMax"
-    MINIMAX_M2_5_MODEL: "MiniMax-M2.7"
-    MINIMAX_M2_5_BASE_URL: "https://api.minimax.chat/v1"
-    MINIMAX_M2_5_API_KEY: ""
-    QWEN3_80B_MODEL: Qwen3-80B
-    QWEN3_80B_API_KEY: EMPTY
-    QWEN3_80B_BASE_URL: http://192.168.8.206:5103/v1
+    MODEL: "MiniMax-M2.7-highspeed"
+    BASE_URL: "https://aiapi.bluetron.cn/v1"
+    API_KEY: "sk-rohA7NQvRpgND2Zv1rsWzVVpH8EEZYk5F2ir0Bhfiv8lIhD6"
+    TEMPERATURE: "0.7"
     SUPOS_DATA_INSIGHT_DBTYPE: postgresql
