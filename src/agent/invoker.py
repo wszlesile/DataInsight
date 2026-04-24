@@ -6,6 +6,7 @@ from typing import Any, Iterator
 
 from agent import CustomContext, get_input, insight_agent
 from agent.context_engineering_runtime import is_analysis_like_request
+from config import Config
 from config.database import SessionLocal
 from service.conversation_context_service import ConversationContextService, ConversationRunContext
 from utils import logger
@@ -323,18 +324,21 @@ def _has_bound_datasource(runtime: ConversationRunContext) -> bool:
 
 
 def _get_too_many_datasource_policy(runtime: ConversationRunContext) -> dict[str, int]:
-    """读取当前会话数据源数量超过安全上下文上限的状态。"""
+    """基于当前会话真实数据源数量实时判断是否超出安全上下文上限。"""
     snapshot = runtime.active_datasource_snapshot if isinstance(runtime.active_datasource_snapshot, dict) else {}
-    policy = snapshot.get('datasource_context_policy') if isinstance(snapshot, dict) else {}
-    if not isinstance(policy, dict) or policy.get('status') != 'too_many_datasources':
-        return {}
-
+    selected_ids = [
+        item
+        for item in snapshot.get('selected_datasource_ids', [])
+        if item
+    ]
+    selected_items = [
+        item
+        for item in snapshot.get('selected_datasource_snapshot', [])
+        if isinstance(item, dict) and item
+    ]
+    count = len(selected_ids) if selected_ids else len(selected_items)
     try:
-        count = int(policy.get('bound_datasource_count') or 0)
-    except (TypeError, ValueError):
-        count = 0
-    try:
-        limit = int(policy.get('max_datasource_count') or 0)
+        limit = max(int(getattr(Config, 'DATASOURCE_CONTEXT_MAX_COUNT', 10) or 0), 0)
     except (TypeError, ValueError):
         limit = 0
     if count <= 0 or limit <= 0 or count <= limit:
@@ -657,25 +661,32 @@ def _get_latest_failed_generated_code(executions: list[Any]) -> str:
     return ''
 
 
+def _extract_execution_payload(execution: Any) -> dict[str, Any]:
+    """解析执行记录中的结构化 payload。"""
+    payload_text = (getattr(execution, 'result_payload_json', '') or '').strip()
+    if not payload_text:
+        return {}
+    try:
+        payload = json.loads(payload_text)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _extract_execution_error_type(execution: Any) -> str:
     """从执行记录中提取结构化错误类型，旧数据回退到错误文本启发式识别。"""
-    payload_text = (getattr(execution, 'result_payload_json', '') or '').strip()
-    if payload_text:
-        try:
-            payload = json.loads(payload_text)
-        except Exception:
-            payload = {}
-        if isinstance(payload, dict):
-            error_type = str(payload.get('error_type') or '').strip()
-            if error_type:
-                return error_type
-            error_signature = payload.get('error_signature')
-            if isinstance(error_signature, dict):
-                signature_type = str(
-                    error_signature.get('error_type') or error_signature.get('signature_type') or ''
-                ).strip()
-                if signature_type:
-                    return signature_type
+    payload = _extract_execution_payload(execution)
+    if payload:
+        error_type = str(payload.get('error_type') or '').strip()
+        if error_type:
+            return error_type
+        error_signature = payload.get('error_signature')
+        if isinstance(error_signature, dict):
+            signature_type = str(
+                error_signature.get('error_type') or error_signature.get('signature_type') or ''
+            ).strip()
+            if signature_type:
+                return signature_type
 
     error_message = (getattr(execution, 'error_message', '') or '').strip()
     lowered = error_message.lower()
@@ -690,6 +701,61 @@ def _extract_execution_error_type(execution: Any) -> str:
     if _is_chart_contract_error_text(error_message):
         return 'chart_contract_error'
     return ''
+
+
+def _collect_probe_candidate_values(diagnostics: dict[str, Any]) -> list[tuple[str, str]]:
+    """从 probe diagnostics 中提取候选值文本。"""
+    if not isinstance(diagnostics, dict):
+        return []
+
+    collected: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for key, value in diagnostics.items():
+        lowered_key = str(key or '').lower()
+        if 'candidate' not in lowered_key:
+            continue
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            candidate_text = ''
+            if isinstance(item, str):
+                candidate_text = item.strip()
+            elif isinstance(item, dict):
+                for candidate_field in ('value', 'name', 'material', 'candidate', 'text', 'label'):
+                    candidate_text = str(item.get(candidate_field) or '').strip()
+                    if candidate_text:
+                        break
+            if not candidate_text:
+                continue
+            signature = (str(key), candidate_text)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            collected.append(signature)
+    return collected
+
+
+def _pick_exact_probe_candidate(user_query: str, diagnostics: dict[str, Any]) -> tuple[str, str]:
+    """当 probe 已给出足够明确的候选值时，挑选最接近用户原意的单个真实值。"""
+    candidates = _collect_probe_candidate_values(diagnostics)
+    if not candidates:
+        return '', ''
+    if len(candidates) == 1:
+        return candidates[0]
+
+    query_text = str(user_query or '').strip()
+    if not query_text:
+        return '', ''
+
+    matched = [
+        (key, candidate)
+        for key, candidate in candidates
+        if candidate and candidate in query_text
+    ]
+    if len(matched) == 1:
+        return matched[0]
+
+    return '', ''
 
 
 def _build_analysis_recovery_instruction(
@@ -719,6 +785,24 @@ def _build_analysis_recovery_instruction(
     failed_pattern_hints = _build_failed_pattern_hints(executions)
     failure_summary = _build_failure_frequency_summary(executions)
     latest_failed_code = _get_latest_failed_generated_code(executions)
+    latest_probe_feedback_payload = next(
+        (
+            payload
+            for execution in reversed(executions)
+            for payload in [_extract_execution_payload(execution)]
+            if payload.get('error_type') == 'probe_feedback'
+        ),
+        {},
+    )
+    latest_probe_diagnostics = (
+        latest_probe_feedback_payload.get('diagnostics')
+        if isinstance(latest_probe_feedback_payload.get('diagnostics'), dict)
+        else {}
+    )
+    exact_probe_candidate_key, exact_probe_candidate = _pick_exact_probe_candidate(
+        runtime.turn.user_query,
+        latest_probe_diagnostics,
+    )
 
     lines = [
         '本轮已经进入数据分析执行阶段。',
@@ -742,6 +826,23 @@ def _build_analysis_recovery_instruction(
         '请基于上一版失败代码做最小必要修补，不要整段重写与当前错误无关的逻辑。',
         '请直接修正完整 Python 代码并再次调用 execute_python。',
     ])
+    if 'probe_feedback' in latest_error_types:
+        lines.append(
+            '最近一轮是 probe_feedback：探测阶段使用的 LIKE/contains 只用于确认候选值，下一版正式分析不能直接沿用这些模糊条件。'
+        )
+        if exact_probe_candidate:
+            field_hint = '目标字段'
+            lowered_key = exact_probe_candidate_key.lower()
+            if 'material' in lowered_key:
+                field_hint = 'material'
+            lines.extend([
+                f'最近探测已给出足够明确的候选值：`{exact_probe_candidate}`。',
+                f"下一版必须切换为 execution_intent = \"analysis\"，并对 {field_hint} 使用单个精确筛选条件（例如 `{field_hint} = '{exact_probe_candidate}'`）；禁止继续使用 LIKE、ILIKE、contains、str.contains(...) 或前缀匹配。",
+            ])
+        else:
+            lines.append(
+                '如果 diagnostics 中候选值已经足够明确，应从中选择单个真实值收敛成精确筛选条件；不要把 probe 中的 LIKE/contains 直接延续到正式分析。'
+            )
     latest_error_type = latest_error_types[-1] if latest_error_types else ''
     if latest_error_type == 'chart_contract_error' or any(_is_chart_contract_error_text(item) for item in failed_errors):
         lines.extend([

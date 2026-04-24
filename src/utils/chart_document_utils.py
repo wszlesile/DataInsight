@@ -126,6 +126,76 @@ def build_chart_result(
     }
 
 
+def build_multi_metric_chart_result(
+    *,
+    data: Any,
+    title: str,
+    category_field: str,
+    value_fields: list[str] | tuple[str, ...],
+    description: str = "",
+    value_labels: list[str] | tuple[str, ...] | None = None,
+    chart_kind: str = "bar",
+    sort_field: str | None = None,
+    sort_order: str = "desc",
+    limit: int | None = None,
+    orientation: str = "auto",
+    label_mode: str = "hidden",
+    stack: bool = False,
+) -> dict[str, Any]:
+    chart_kind_value = _normalize_chart_kind(chart_kind)
+    if chart_kind_value != "bar":
+        raise ValueError("build_multi_metric_chart_result currently supports chart_kind='bar' only.")
+
+    dataset = _normalize_dataset(data)
+    normalized_value_fields = _normalize_string_list(value_fields)
+    if len(normalized_value_fields) < 2:
+        raise ValueError("build_multi_metric_chart_result requires at least two value_fields.")
+
+    normalized_value_labels = _normalize_string_list(value_labels or [], dedupe=False)
+    if normalized_value_labels and len(normalized_value_labels) != len(normalized_value_fields):
+        raise ValueError("value_labels length must match value_fields length.")
+
+    category_name = str(category_field or "").strip()
+    if not category_name:
+        raise ValueError("build_multi_metric_chart_result requires category_field.")
+
+    document = {
+        "version": DEFAULT_DOCUMENT_VERSION,
+        "chart_kind": chart_kind_value,
+        "title": str(title or "").strip(),
+        "description": str(description or "").strip(),
+        "dataset": dataset,
+        "encoding": {
+            "category_field": category_name,
+            "value_field": normalized_value_fields[0],
+            "value_fields": normalized_value_fields,
+            "value_labels": normalized_value_labels,
+            "series_field": None,
+            "x_field": category_name,
+            "y_field": normalized_value_fields[0],
+        },
+        "transform": {
+            "sort_field": str(sort_field or normalized_value_fields[0]).strip() or None,
+            "sort_order": "asc" if str(sort_order or "").lower() == "asc" else "desc",
+            "limit": _to_positive_int(limit),
+            "top_n": None,
+        },
+        "presentation": {
+            "orientation": _normalize_orientation(orientation),
+            "label_mode": _normalize_label_mode(label_mode),
+            "stack": bool(stack),
+            "merge_tail": False,
+        },
+    }
+    _validate_chart_document(document)
+    return {
+        "title": str(title or "").strip(),
+        "chart_type": "echarts",
+        "description": str(description or "").strip(),
+        "chart_document": document,
+    }
+
+
 def build_chart_suite(
     *,
     data: Any,
@@ -314,6 +384,23 @@ def normalize_chart_document(
         encoding.get("y"),
         document.get("value_field"),
     )
+    value_fields = _normalize_string_list(
+        encoding.get("value_fields")
+        or encoding.get("values")
+        or document.get("value_fields")
+        or []
+    )
+    value_labels = _normalize_string_list(
+        encoding.get("value_labels")
+        or encoding.get("labels")
+        or document.get("value_labels")
+        or [],
+        dedupe=False,
+    )
+    if value_fields and not value_field:
+        value_field = value_fields[0]
+    if value_field and not value_fields:
+        value_fields = [value_field]
     series_field = _coalesce_field(
         encoding.get("series_field"),
         encoding.get("series"),
@@ -331,6 +418,7 @@ def normalize_chart_document(
         document.get("y_field"),
         value_field,
     )
+    default_sort_field = value_fields[0] if len(value_fields) > 1 else value_field
 
     normalized = {
         "version": str(document.get("version") or DEFAULT_DOCUMENT_VERSION),
@@ -341,6 +429,8 @@ def normalize_chart_document(
         "encoding": {
             "category_field": category_field,
             "value_field": value_field,
+            "value_fields": value_fields,
+            "value_labels": value_labels,
             "series_field": series_field,
             "x_field": x_field,
             "y_field": y_field,
@@ -350,7 +440,7 @@ def normalize_chart_document(
                 transform.get("sort_field"),
                 transform.get("sort_by"),
                 document.get("sort_field"),
-                value_field,
+                default_sort_field,
             ),
             "sort_order": "asc" if str(transform.get("sort_order") or document.get("sort_order") or "").lower() == "asc" else "desc",
             "limit": _to_positive_int(transform.get("limit") or document.get("limit")),
@@ -436,7 +526,11 @@ def _compile_cartesian_chart(document: dict[str, Any]) -> dict[str, Any]:
 
     category_field = encoding["category_field"]
     value_field = encoding["value_field"]
+    value_fields = list(encoding.get("value_fields") or [])
     series_field = encoding.get("series_field")
+
+    if chart_kind == "bar" and len(value_fields) > 1 and not series_field:
+        return _compile_multi_metric_bar_chart(document, rows)
 
     rows = _sort_rows(rows, transform.get("sort_field"), transform.get("sort_order"))
     if transform.get("limit"):
@@ -505,6 +599,60 @@ def _compile_cartesian_chart(document: dict[str, Any]) -> dict[str, Any]:
     else:
         spec["legend"] = {"show": False}
     return spec
+
+
+def _compile_multi_metric_bar_chart(document: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
+    encoding = document["encoding"]
+    presentation = document["presentation"]
+    transform = document["transform"]
+
+    category_field = encoding["category_field"]
+    value_fields = list(encoding.get("value_fields") or [])
+    value_labels = list(encoding.get("value_labels") or [])
+
+    rows = _sort_rows(rows, transform.get("sort_field"), transform.get("sort_order"))
+    rows = _limit_rows(rows, transform.get("limit"))
+
+    categories = _ordered_unique([row.get(category_field) for row in rows])
+    categories = ["" if value is None else str(value) for value in categories]
+
+    category_rows: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        category_value = "" if row.get(category_field) is None else str(row.get(category_field))
+        category_rows[category_value] = row
+
+    series_items = []
+    for index, value_field in enumerate(value_fields):
+        display_name = value_labels[index] if index < len(value_labels) and value_labels[index] else value_field
+        series_items.append({
+            "type": "bar",
+            "name": display_name,
+            "data": [category_rows.get(category, {}).get(value_field) for category in categories],
+            "label": {"show": presentation["label_mode"] == "always"},
+        })
+
+    if presentation.get("stack"):
+        for item in series_items:
+            item["stack"] = "total"
+
+    orientation = _resolve_bar_orientation(categories, "bar", presentation.get("orientation"))
+    if orientation == "horizontal":
+        x_axis = {"type": "value"}
+        y_axis = {"type": "category", "data": categories}
+    else:
+        x_axis = {"type": "category", "data": categories}
+        y_axis = {"type": "value"}
+
+    legend_data = [item["name"] for item in series_items if item.get("name")]
+    return {
+        "title": {"text": document["title"]},
+        "tooltip": {"trigger": "axis"},
+        "legend": {"data": legend_data},
+        "grid": {"left": 56, "right": 32, "top": 64, "bottom": 56, "containLabel": True},
+        "xAxis": x_axis,
+        "yAxis": y_axis,
+        "series": series_items,
+    }
 
 
 def _build_scatter_spec(document: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -591,10 +739,16 @@ def _compile_pie_chart(document: dict[str, Any]) -> dict[str, Any]:
 def _validate_chart_document(document: dict[str, Any]) -> None:
     chart_kind = document["chart_kind"]
     encoding = document["encoding"]
+    value_fields = list(encoding.get("value_fields") or [])
 
     if chart_kind in {"bar", "line", "pie"}:
-        if not encoding.get("category_field") or not encoding.get("value_field"):
+        if not encoding.get("category_field") or (not encoding.get("value_field") and not value_fields):
             raise ValueError(f"{chart_kind} chart_document requires category_field and value_field.")
+    if len(value_fields) > 1:
+        if chart_kind != "bar":
+            raise ValueError("multi-metric chart_document currently supports bar charts only.")
+        if encoding.get("series_field"):
+            raise ValueError("multi-metric chart_document cannot be combined with series_field.")
     if chart_kind == "scatter":
         if not encoding.get("x_field") or not encoding.get("y_field"):
             raise ValueError("scatter chart_document requires x_field and y_field.")
@@ -608,6 +762,7 @@ def _validate_chart_document(document: dict[str, Any]) -> None:
         encoding.get("y_field"),
         document["transform"].get("sort_field"),
     ]
+    field_candidates.extend(value_fields)
     for field_name in field_candidates:
         if field_name and field_name not in columns:
             raise ValueError(f"chart_document field '{field_name}' is not present in dataset columns.")
@@ -805,6 +960,30 @@ def _coalesce_field(*values: Any) -> str | None:
         if text:
             return text
     return None
+
+
+def _normalize_string_list(value: Any, *, dedupe: bool = True) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        candidates = [value]
+    elif isinstance(value, (list, tuple, set)):
+        candidates = list(value)
+    else:
+        raise ValueError("expected a string list.")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if dedupe:
+            if text in seen:
+                continue
+            seen.add(text)
+        normalized.append(text)
+    return normalized
 
 
 def mark_chart_spec_backend_managed(chart_spec: Any) -> dict[str, Any]:

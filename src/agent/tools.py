@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from agent.context_engineering_runtime import CustomContext
 from api import supos_kernel_api
 from dto import DatabaseConnInfo
-from utils import build_chart_document, build_chart_result, build_chart_suite, logger, normalize_chart_result_item
+from utils import build_chart_document, build_chart_result, build_chart_suite, build_multi_metric_chart_result, logger, normalize_chart_result_item
 
 CURRENT_USERNAME = ContextVar('current_username', default='anonymous')
 
@@ -1205,6 +1205,7 @@ def _build_execution_namespace() -> dict[str, Any]:
         'build_chart_document': build_chart_document,
         'build_chart_result': build_chart_result,
         'build_chart_suite': build_chart_suite,
+        'build_multi_metric_chart_result': build_multi_metric_chart_result,
         'raise_no_data_error': raise_no_data_error,
         'request_retry': request_retry,
         'save_empty_analysis_result': save_empty_analysis_result,
@@ -1579,17 +1580,17 @@ def _build_repair_instructions(error_type: str) -> list[str]:
         'chart_contract_error': [
             '当前失败是图表产物契约错误，不是数据查询失败；不要改成 no_data_found，也不要只输出自然语言报告。',
             '下一版禁止继续使用 matplotlib/base64 图片、手写 chart_spec 或自造 chart_type/chart_kind 结构。',
-            '必须优先用 build_chart_result(...) 或 build_chart_suite(...) 生成 charts；bar/line 需要 category_field 和 value_field，pie 需要 category_field 和 value_field，scatter 需要 x_field 和 y_field。',
-            'charts 应直接等于 helper 的返回结果，例如 charts = [build_chart_result(...)] 或 charts = build_chart_suite(...)，然后调用 save_analysis_result(analysis_report=..., charts=charts, tables=...)。',
+            '必须优先用 build_chart_result(...)、build_multi_metric_chart_result(...) 或 build_chart_suite(...) 生成 charts；bar/line 需要 category_field 和 value_field，多指标柱图需要 category_field 和 value_fields，pie 需要 category_field 和 value_field，scatter 需要 x_field 和 y_field。',
+            'charts 应直接等于 helper 的返回结果，例如 charts = [build_chart_result(...)]、charts = [build_multi_metric_chart_result(...)] 或 charts = build_chart_suite(...)，然后调用 save_analysis_result(analysis_report=..., charts=charts, tables=...)。',
             '如果确实不适合生成图表，也必须用 tables 返回结构化汇总，不能让 charts 和 tables 同时为空。',
         ],
         'result_contract_error': [
-            '如果错误与 charts/chart_spec/chart_document 有关，下一版不要手写图表 JSON，直接改用 build_chart_result(...) 或 build_chart_suite(...)。',
+            '如果错误与 charts/chart_spec/chart_document 有关，下一版不要手写图表 JSON，直接改用 build_chart_result(...)、build_multi_metric_chart_result(...) 或 build_chart_suite(...)。',
             '最终必须产出完整 analysis_report，并调用 save_analysis_result(analysis_report=..., charts=[...], tables=[...])。',
             '不要遗漏 result 变量，也不要返回空的 analysis_report 或 charts/tables 同时为空的结构化结果。',
         ],
         'library_api_signature_mismatch': [
-            '如果报错来自 pyecharts/matplotlib 或图表参数，优先改用 build_chart_result(...) 或 build_chart_suite(...)，不要继续试底层图表 API。',
+            '如果报错来自 pyecharts/matplotlib 或图表参数，优先改用 build_chart_result(...)、build_multi_metric_chart_result(...) 或 build_chart_suite(...)，不要继续试底层图表 API。',
             '当前错误属于库函数签名不兼容；请只修正报错位置的非法参数，不要重写与该错误无关的数据处理和图表逻辑。',
             '如果某个 opts 或图表参数不被当前版本支持，请删除该非法参数，或改成更基础、更稳定的默认写法。',
             '优先保留图表结构、数据处理和报告逻辑，只对报错的 API 调用做最小修改。',

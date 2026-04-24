@@ -815,11 +815,6 @@ class ConversationContextService:
             snapshot["conversation_id"] = conversation.id
             snapshot["selected_datasource_ids"] = selected_datasource_ids
             snapshot["selected_datasource_snapshot"] = []
-            snapshot["datasource_context_policy"] = {
-                "status": "too_many_datasources",
-                "bound_datasource_count": len(selected_datasource_ids),
-                "max_datasource_count": datasource_limit,
-            }
             snapshot["updated_at"] = _now().isoformat()
             return snapshot
 

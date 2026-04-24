@@ -212,8 +212,24 @@ def get_datasource_message(
     elif namespace_id_int <= 0:
         namespace_id_int = to_int(snapshot.get('namespace_id'), 0)
 
-    policy = snapshot.get('datasource_context_policy') if isinstance(snapshot, dict) else {}
-    if isinstance(policy, dict) and policy.get('status') == 'too_many_datasources':
+    selected_ids = [
+        item
+        for item in snapshot.get('selected_datasource_ids', [])
+        if item
+    ]
+    selected_items = [
+        item
+        for item in snapshot.get('selected_datasource_snapshot', [])
+        if isinstance(item, dict) and item
+    ]
+    datasource_limit = max(int(getattr(Config, 'DATASOURCE_CONTEXT_MAX_COUNT', 10) or 0), 0)
+    datasource_count = len(selected_ids) if selected_ids else len(selected_items)
+    if datasource_limit > 0 and datasource_count > datasource_limit:
+        policy = {
+            "status": "too_many_datasources",
+            "bound_datasource_count": datasource_count,
+            "max_datasource_count": datasource_limit,
+        }
         payload: dict[str, Any] = {
             "datasources": [],
             "selected_datasource_ids": [],

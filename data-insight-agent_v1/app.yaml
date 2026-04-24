@@ -3,7 +3,7 @@ $metadata:
   name: data-insight-agent
 group: datainsight
 type: agent
-showName: 数据洞察Agent
+showName: 数据洞察智能体
 version: 0.0.1
 vendor:
   name: supos
@@ -11,6 +11,6 @@ vendor:
   email: developer@supos.com
   url: https://supos.com
   bluetronId: 123456
-description: 数据洞察Agent
+description: 数据洞察智能体
 icon: icon.png
 dependencies:

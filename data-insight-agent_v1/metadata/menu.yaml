@@ -9,7 +9,7 @@ $metadata:
 forceUpdate: false
 menus:
   - code: os_data_insight_runtime
-    nameDefault: 数据洞察Agent
+    nameDefault: 数据洞察智能体
     displayOrder: 1
     url: /os/datainsight/data-insight-agent/
     operations:

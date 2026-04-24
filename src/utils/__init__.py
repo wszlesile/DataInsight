@@ -16,6 +16,7 @@ from utils.datasource_utils import (
 )
 from utils.chart_document_utils import (
     build_chart_document,
+    build_multi_metric_chart_result,
     build_chart_result,
     build_chart_suite,
     compile_chart_document,
@@ -34,6 +35,6 @@ __all__ = [
     'extract_datasource_schema', 'normalize_datasource_type',
     'recommend_local_file_loader', 'safe_json_loads', 'to_int',
     'render_chart_spec_to_png', 'validate_chart_spec_layout',
-    'build_chart_document', 'build_chart_result', 'build_chart_suite', 'compile_chart_document', 'normalize_chart_result_item',
+    'build_chart_document', 'build_multi_metric_chart_result', 'build_chart_result', 'build_chart_suite', 'compile_chart_document', 'normalize_chart_result_item',
     'normalize_chart_spec', 'finalize_chart_spec',
 ]

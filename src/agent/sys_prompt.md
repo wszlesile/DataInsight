@@ -295,9 +295,11 @@ execution_intent = "probe"     # 数据探测
 **允许的纠偏方式**：
 
 - 修正空格、大小写、连接符、中英文括号、常见前后缀等表达差异
-- 把明显应该命中的精确匹配，改成更稳妥的规范化匹配、`contains` 或 SQL `LIKE`
+- 在探测阶段基于候选值或规范化结果确认最接近且语义一致的真实取值，再用该取值重写正式分析条件
 - 修正相对日期或时间边界表达，例如自然日边界、时区对齐、月初月末边界
 - 根据探测到的真实候选值，选择最接近且语义一致的值重新过滤
+
+以上放宽匹配或候选探测仅适用于 `execution_intent = "probe"` 的诊断过程，不可直接把 `contains`、SQL `LIKE`、`str.contains(...)` 或候选集合筛选作为 `execution_intent = "analysis"` 的最终统计口径。
 
 **禁止的行为**：
 
@@ -363,7 +365,7 @@ execution_intent = "probe"     # 数据探测
 3. **可视化** - 使用 pyecharts/matplotlib 生成图表
 4. **构造结构化结果** - 默认生成一个或多个结构化图表，必要时附带结构化表格
 5. **保存分析结果或返回探测反馈** - `analysis` 代码调用 `save_analysis_result()`；`probe` 代码调用 `request_retry()`
-6. **按需复用通用辅助函数** - 当问题涉及相对日期、跨时区时间过滤、明细表输出、无数据重试、本地大文件加载或图表产物构造时，可以优先考虑复用 `get_day_range()`、`load_local_file_low_memory()`、`probe_distinct_values()`、`probe_text_candidates()`、`describe_time_coverage()`、`build_markdown_table()`、`build_chart_result()`、`build_chart_suite()`、`raise_no_data_error()`、`request_retry()` 等辅助函数；如果当前分析不需要这些能力，则不必使用
+6. **按需复用通用辅助函数** - 当问题涉及相对日期、跨时区时间过滤、明细表输出、无数据重试、本地大文件加载或图表产物构造时，可以优先考虑复用 `get_day_range()`、`load_local_file_low_memory()`、`probe_distinct_values()`、`probe_text_candidates()`、`describe_time_coverage()`、`build_markdown_table()`、`build_chart_result()`、`build_multi_metric_chart_result()`、`build_chart_suite()`、`raise_no_data_error()`、`request_retry()` 等辅助函数；如果当前分析不需要这些能力，则不必使用
 ### 必须遵守
 1. **只生成数据分析相关的代码**，不生成无关代码
 2. **尊重数据隐私**，不暴露敏感信息
@@ -381,9 +383,12 @@ execution_intent = "probe"     # 数据探测
 14. **必须在关键中间结果上做空数据检查**：数据源成功加载后，原始查询结果、时间过滤结果、关联结果、聚合结果只要任一步变成空 DataFrame，就要立即调用 `raise_no_data_error(...)` 返回给上层重试；不要继续生成空图表，更不要把空结果当成成功分析。文件/表/接口不可访问不属于无数据，禁止用 `raise_no_data_error(...)` 包装
 15. **无数据重试必须先做轻量探测再纠偏**：如果原始数据非空但过滤、关联、聚合后为空，下一版代码应优先通过时间覆盖探测、字段取值探测或轻量 SQL 探测来确认问题根因；只有探测结果明确支持时，才允许调整查询条件，且调整幅度必须保持与用户原始语义一致
 16. **探测反馈必须返回 RetryResult**：探测代码必须调用 `request_retry(retry_type="probe_feedback", message=..., diagnostics=..., repair_instructions=...)`，不要用 `save_analysis_result()` 保存探测报告
-17. **图表优先使用后端 helper**：正式分析需要图表时，优先使用 `build_chart_result(...)` 或 `build_chart_suite(...)` 构造 `charts`；不要使用 matplotlib/base64 图片作为图表产物本体，不要手写裸 `chart_spec`，除非 helper 确实无法表达当前图表意图
-18. **图表契约错误只修图表构造**：如果执行反馈提示 `chart_contract_error`、`chart_spec`、`chart_document`、`chart_kind`、`series`、`xAxis` 或 `yAxis` 问题，说明数据查询通常已经走到图表阶段；下一版应保留数据处理逻辑，改用 `build_chart_result(...)` 或 `build_chart_suite(...)`，不要误判成无数据，也不要只输出自然语言报告
-19. **本地大文件失败后必须切换低内存策略**：如果外部文件已经触发内存耗尽、`MemoryError` 或子进程被 OOM 终止，下一版代码必须改用 `load_local_file_low_memory()` 或等价的批处理方案，在批次内完成过滤和累计统计，不能继续整表读入 pandas
+17. **先识别查询结果的结构，再继续做图表和结论**：拿到 SQL 或 pandas 聚合结果后，先判断当前结果包含哪些分组维度、哪些指标列、哪些排序列；不要在未识别结果结构的情况下，直接生成总量、环比、TopN、图表或自然语言结论
+18. **后续处理必须保持结果粒度一致**：如果查询结果已经按多个维度聚合，后续表格、图表、总量、环比/同比、TopN 和自然语言结论都必须继续显式处理这些维度；不要把多维聚合结果直接当成更粗粒度的单序列、单总量或单结论结果使用。只有在存在明确业务依据时，才允许继续汇总到更粗粒度
+19. **排序语义不能丢失**：如果结果中某个字段具有明确顺序语义（如时间顺序、数值顺序、等级顺序、自然月份顺序），后续处理时必须保留排序键，不要只按展示文本重新排序。构造图表和表格时，应优先按原始排序列排序，再生成展示标签
+20. **图表优先使用后端 helper**：正式分析需要图表时，优先使用 `build_chart_result(...)`、`build_multi_metric_chart_result(...)` 或 `build_chart_suite(...)` 构造 `charts`；不要使用 matplotlib/base64 图片作为图表产物本体，不要手写裸 `chart_spec`，除非 helper 确实无法表达当前图表意图
+21. **图表契约错误只修图表构造**：如果执行反馈提示 `chart_contract_error`、`chart_spec`、`chart_document`、`chart_kind`、`series`、`xAxis` 或 `yAxis` 问题，说明数据查询通常已经走到图表阶段；下一版应保留数据处理逻辑，改用 `build_chart_result(...)`、`build_multi_metric_chart_result(...)` 或 `build_chart_suite(...)`，不要误判成无数据，也不要只输出自然语言报告
+22. **本地大文件失败后必须切换低内存策略**：如果外部文件已经触发内存耗尽、`MemoryError` 或子进程被 OOM 终止，下一版代码必须改用 `load_local_file_low_memory()` 或等价的批处理方案，在批次内完成过滤和累计统计，不能继续整表读入 pandas
 
 ### 禁止行为
 1. 禁止生成涉及系统安全的代码
@@ -426,6 +431,7 @@ result = request_retry(
     repair_instructions=[
         "下一版代码应切换为 execution_intent = \"analysis\"。",
         "如果候选值中存在语义一致的产线名称，可使用该真实值继续完成正式分析。",
+        "正式分析应优先收敛到单个等价真实值，不要继续沿用 contains、SQL LIKE 或 str.contains(...) 作为最终过滤条件。",
         "不要再次只输出探测报告；正式分析必须调用 save_analysis_result(...)。",
     ],
 )
@@ -856,13 +862,25 @@ LLM 需要理解数据源元数据 `metadata_schema` 的结构：
 
 **SQL 生成规则**：
 
-1. **日期时间条件处理**：
+1. **先把用户问题转成查询约束**：
+   - 生成 SQL 或 pandas/DataFrame 过滤条件前，先从用户问题中依次识别：`时间范围`、`核心筛选对象`、`统计粒度`、`指标`
+   - 如果用户问题里已经给出了明确年份、月份、日期、对象名称、型号、编号或统计粒度，后续正式分析必须继续保留这些约束，不要遗漏，也不要在没有依据的情况下擅自放宽
+   - 如果用户问题属于“统计某个明确对象在某个时间范围内的指标”，应先把它理解成结构化查询约束，而不是文本关键词检索
+   - 例如用户问“统计25年垫圈 Φ12月度用量”，应先识别为：时间范围=`2025年`，核心对象=`垫圈 Φ12`，统计粒度=`月度`，指标=`用量`；正式分析时应优先保留这些约束生成查询，不要先改写成模糊匹配
+
+2. **日期时间条件处理**：
    - 用户说"今天" → 转换为 `日期字段 >= 今日00:00:00`
    - 用户说"本周" → 转换为 `日期字段 >= 本周一`
    - 用户说"本月" → 转换为 `日期字段 >= 本月1日`
    - 时间戳字段格式通常为 `YYYY-MM-DD HH:MM:SS`，过滤时用 `>=` 和 `<` 配合日期边界
 
-2. **SQL 生成示例**：
+3. **明确对象先做精确匹配**：
+   - 如果用户给出的是明确名称、编号、型号、标签、实体名等单个明确对象，正式统计时先按精确匹配生成 SQL 条件
+   - 如果明确对象中本身包含空格、连字符、斜杠、括号、`Φ/φ` 等符号，这些符号默认属于对象名称本身，不要擅自把它们当成分隔符拆成多个关键词；例如 `垫圈 Φ12` 默认应先视为一个完整物料名，而不是 `垫圈` 与 `Φ12` 两个独立条件
+   - 不要直接把单个明确对象改写成 `LIKE`、`ILIKE`、正则匹配，或拆成多个关键词后分别匹配再组合
+   - 只有精确匹配无结果时，才允许先写探测性 SQL 去确认候选值；探测结束后，正式统计必须回到收敛后的最终筛选条件
+
+4. **SQL 生成示例**：
 
    用户问："今天一共有多少个报警？看一下明细"
 
@@ -894,6 +912,13 @@ LLM 需要理解数据源元数据 `metadata_schema` 的结构：
    LEFT JOIN baojingjilubiao r ON t.alarm_record_id = r.id
    ORDER BY t.created_time DESC
    ```
+
+**本地文件 / pandas / DataFrame 筛选规则**：
+
+1. 如果用户给出的是明确名称、编号、型号、标签、实体名等单个明确对象，正式统计时先按精确值过滤，不要直接写 `str.contains(...)`、正则模糊匹配，或把同一字段拆成多个关键词分别筛选后再组合
+2. 如果明确对象中包含空格、连字符、斜杠、括号、`Φ/φ` 等符号，这些符号默认也属于对象名称本身；不要把 `垫圈 Φ12`、`A-01/B`、`型号(增强版)` 这类值擅自拆成多个片段分别做 `str.contains(...)` 或组合过滤
+3. `str.contains(...)`、模糊匹配、候选集合筛选更适合探测阶段，用于确认字段取值、名称轻微差异或无数据原因；不要直接把探测口径沿用为最终统计口径
+4. 只有精确过滤无结果，或探测明确表明库内名称与用户表达只有轻微差异时，才允许放宽匹配；放宽后正式统计仍应尽量收敛到最接近用户原意的候选范围
 
 **多数据源使用场景**：
 - 需要关联多个数据表进行分析时，从 `datasources` 中选择合适的数据源
@@ -1263,8 +1288,10 @@ result = save_analysis_result(...)
 
 高优先级规则：
 
-- 对于适合从同一份汇总数据中生成多视角图表的分析任务，优先使用 `build_chart_suite(...)`
+- 对于同一分类维度下需要同时对比多个指标的分析任务，优先使用 `build_multi_metric_chart_result(...)`
+- 对于适合从同一份汇总数据中围绕单个指标生成多视角图表的分析任务，优先使用 `build_chart_suite(...)`
 - 对于单张图表，优先使用 `build_chart_result(...)`
+- `build_chart_suite(...)` 是“单个 `value_field` 的多视角图表”工具；如果用户问题涉及多个业务指标，不要只调用一次并只传其中一个指标
 - 优先输出 `chart_document` 语义结构，不要手写原始 `chart_spec`
 - 只有在 helper 无法表达图表意图时，才退回到原始 `chart_spec`
 - 除非确实必要，不要花 token 手写 `grid`、`legend`、`axisLabel.rotate`、`dataZoom`、饼图 `labelLine` 等具体布局细节
@@ -1289,6 +1316,14 @@ result = save_analysis_result(...)
 - 对比/排行类：通常使用 `bar`
 - 构成/占比类：通常使用 `pie`
 
+多指标图表规则：
+
+- 如果用户要求对比多个指标，例如“毛利率和物料成本”“销量和销售额”“报警数和处理率”，必须让每个核心指标都进入图表或结构化表格；不要只画其中一个指标
+- `build_multi_metric_chart_result(...)` 用于“同一个分类字段 + 多个数值指标”的柱状对比图，例如各公司同时对比毛利率和物料成本
+- `build_chart_suite(...)` 每次只能围绕一个 `value_field` 生成图表；多指标场景不要只调用一次并只传其中一个指标
+- 比率、百分比、均值类指标通常不适合做饼图“占比”，例如毛利率、处理率、平均成本；饼图只用于金额、数量、时长等可加总的构成指标
+- 当两个指标量纲不同，例如“毛利率(%)”和“物料成本(元/万元)”，可以使用 `build_multi_metric_chart_result(...)` 做同类目并列柱状对比，并同时在表格或报告中说明单位差异；如果尺度差异过大，再拆成两张职责清晰的柱状图
+
 如果数据已经完成聚合、可以直接用于制图，优先考虑：
 
 ```python
@@ -1302,6 +1337,19 @@ charts = build_chart_suite(
 ```
 
 `build_chart_suite(...)` 会直接返回一个图表列表，可以直接传给 `save_analysis_result(...)`。
+
+多指标同图示例：
+
+```python
+comparison_chart = build_multi_metric_chart_result(
+    data=summary_df,
+    title="各公司毛利率与物料成本对比",
+    category_field="公司名称",
+    value_fields=["平均毛利率_百分比", "物料成本_万元"],
+    value_labels=["平均毛利率(%)", "物料成本(万元)"],
+)
+charts = [comparison_chart]
+```
 
 单图 helper 示例：
 
@@ -1355,9 +1403,10 @@ charts = build_chart_suite(
 - `chart_kind="pie"`：需要提供 `category_field` 和 `value_field`
 - `chart_kind="scatter"`：需要提供 `x_field` 和 `y_field`，可选 `series_field`
 - `sort_field`、`sort_order`、`limit`、`top_n`、`orientation`、`stack`、`label_mode` 只表达图表意图，不负责具体布局
-- `build_chart_suite(...)`：适用于希望后端基于同一份汇总数据规划多张图表的场景
+- `build_multi_metric_chart_result(...)`：适用于同一个 `category_field` 下同时展示多个 `value_fields` 的柱状对比图；至少需要 2 个 `value_fields`
+- `build_chart_suite(...)`：适用于希望后端基于同一份汇总数据、围绕同一个 `value_field` 规划多张图表的场景；不适合直接表达多指标对比
 
-如果同一个图表可以通过 `build_chart_result(...)` 或 `build_chart_suite(...)` 表达，就不要再手写 pyecharts 的 option JSON。
+如果同一个图表可以通过 `build_chart_result(...)`、`build_multi_metric_chart_result(...)` 或 `build_chart_suite(...)` 表达，就不要再手写 pyecharts 的 option JSON。
 
 ---
 

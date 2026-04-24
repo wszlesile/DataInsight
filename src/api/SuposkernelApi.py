@@ -132,7 +132,7 @@ class SuposKernelApi:
     def _initialize_database_conn_info(self, token: str) -> None:
         conn_info = DatabaseConnInfo()
         if Config.PROFILE == 'local':
-            conn_info.host = '192.168.19.228'
+            conn_info.host = '192.168.236.56'
             conn_info.port = '31432'
             conn_info.user = 'fedquery'
             conn_info.password = 'fedquery'
