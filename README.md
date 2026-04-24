@@ -199,7 +199,7 @@ npm run build
 - `SQLITE_PATH`
 - `TEMP_DIR`
 - `UPLOAD_DIR`
-- `LLM_MODEL_ACTIVE`
+- `LLM_PROVIDER`
 - `MODEL`
 - `API_KEY`
 - `BASE_URL`

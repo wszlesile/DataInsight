@@ -86,7 +86,7 @@ configMap:
     WEB_CONCURRENCY: "2"
     GUNICORN_THREADS: "4"
     GUNICORN_TIMEOUT: "600"
-    LLM_MODEL_ACTIVE: "MiniMax"
+    LLM_PROVIDER: "MiniMax"
     MODEL: "MiniMax-M2.7-highspeed"
     BASE_URL: "https://aiapi.bluetron.cn/v1"
     API_KEY: "sk-rohA7NQvRpgND2Zv1rsWzVVpH8EEZYk5F2ir0Bhfiv8lIhD6"

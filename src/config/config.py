@@ -77,7 +77,7 @@ class Config:
     UNS_IMPORT_MAX_CONCURRENT = int(os.environ.get('UNS_IMPORT_MAX_CONCURRENT', 2))
 
     # LLM配置
-    LLM_MODEL_ACTIVE = os.environ.get('LLM_MODEL_ACTIVE', 'minimax')
+    LLM_PROVIDER = os.environ.get('LLM_PROVIDER', 'minimax')
     MODEL = os.environ.get('MODEL', 'MiniMax-M2.5')
     API_KEY = os.environ.get('API_KEY', '')
     BASE_URL = os.environ.get('BASE_URL', 'https://api.minimax.chat/v1')

@@ -44,13 +44,13 @@ def resolve_model_provider(active_provider: str) -> ModelProvider:
 
     supported = ', '.join(provider.name for provider in MODEL_PROVIDERS)
     raise ValueError(
-        f"Unsupported LLM_MODEL_ACTIVE='{active_provider}'. Supported providers: {supported}"
+        f"Unsupported LLM_PROVIDER='{active_provider}'. Supported providers: {supported}"
     )
 
 
 def create_data_insight_model():
     """Create the currently configured chat model used by the insight agent."""
-    provider = resolve_model_provider(Config.LLM_MODEL_ACTIVE)
+    provider = resolve_model_provider(Config.LLM_PROVIDER)
     if provider.adapter == 'openai':
         return ChatOpenAI(
             model=Config.MODEL,
