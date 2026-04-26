@@ -80,6 +80,7 @@ class Config:
     LLM_PROVIDER = os.environ.get('LLM_PROVIDER', 'minimax')
     MODEL = os.environ.get('MODEL', 'MiniMax-M2.5')
     API_KEY = os.environ.get('API_KEY', '')
+    SUPOS_LLM_GATEWAY_API_KEY = os.environ.get('SUPOS_DATAINSIGHT-SERVER_APPKEY', '')
     BASE_URL = os.environ.get('BASE_URL', 'https://api.minimax.chat/v1')
     TEMPERATURE = float(os.environ.get('TEMPERATURE', 0.7))
 

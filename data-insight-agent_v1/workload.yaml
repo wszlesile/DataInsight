@@ -75,7 +75,7 @@ configMap:
     LOG_LEVEL: "INFO"
     LOG_ENABLE_FILE: "true"
     LOG_RETENTION_DAYS: "15"
-    SUPOS_WEB: "http://192.168.236.56:8080"
+    SUPOS_WEB: "http://192.168.12.65:8080"
     SUPOS_REQUEST_TIMEOUT: "15"
     USER_CONTEXT_CACHE_TTL_SECONDS: "600"
     UNS_MAX_EXPANDED_FILES: "200"
@@ -86,9 +86,16 @@ configMap:
     WEB_CONCURRENCY: "2"
     GUNICORN_THREADS: "4"
     GUNICORN_TIMEOUT: "600"
-    LLM_PROVIDER: "MiniMax"
-    MODEL: "MiniMax-M2.7-highspeed"
-    BASE_URL: "https://aiapi.bluetron.cn/v1"
-    API_KEY: "sk-rohA7NQvRpgND2Zv1rsWzVVpH8EEZYk5F2ir0Bhfiv8lIhD6"
+    LLM_PROVIDER: "supos_llm_gateway"
+    MODEL: ""
+    BASE_URL: "http://platform-llm-gateway:3000/os/llm-gateway/v1"
+    API_KEY: ""
+    SUPOS_DATAINSIGHT-SERVER_APPKEY: "sk-kQKMTKyEQA7X6eZ_d4gDA9DjEOMMiipm60OvGGcVz6HRMOr8B5yMBrzgYr0"
     TEMPERATURE: "0.7"
     SUPOS_DATA_INSIGHT_DBTYPE: postgresql
+    SUPOS_DATA_INSIGHT_HOST: lake-postgres-5bfc0e4bc075-pgbouncer
+    SUPOS_DATA_INSIGHT_PORT: 6432
+    SUPOS_DATA_INSIGHT_URL: lake-postgres-5bfc0e4bc075-pgbouncer:6432
+    SUPOS_DATA_INSIGHT_USERNAME: supos_2d76206c
+    SUPOS_DATA_INSIGHT_DBNAME: datainsight
+    SUPOS_DATA_INSIGHT_PASSWORD: pU4{Bw2>sY&7E8J7y9J>
