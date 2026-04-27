@@ -104,23 +104,19 @@ class InsightUserCollectService:
             InsightUserCollect.is_deleted == 0,
         ).count()
 
-    def report_collect_statistics(self, username: str, authorization: str = '') -> None:
-        username = (username or '').strip()
+    def count_all_collects(self) -> int:
+        return self.session.query(InsightUserCollect).filter(
+            InsightUserCollect.is_deleted == 0,
+        ).count()
+
+    def report_collect_statistics(self, authorization: str = '') -> None:
         authorization = (authorization or '').strip()
-        if not username:
-            logger.info("跳过收藏统计上报: username 为空")
-            return
         if not authorization:
-            logger.info("跳过收藏统计上报: username=%s 缺少 authorization", username)
+            logger.info("跳过收藏统计上报: 缺少 authorization")
             return
 
-        collect_count = self.count_collects(username)
+        collect_count = self.count_all_collects()
         item_list = [
-            {
-                "code": "username",
-                "name": username,
-                "total": 1,
-            },
             {
                 "code": "collect_insight_result_count",
                 "name": "收藏洞察结果数",
@@ -133,15 +129,13 @@ class InsightUserCollectService:
                 item_list=item_list,
             )
             logger.info(
-                "收藏统计上报完成: username=%s collect_count=%s accepted=%s",
-                username,
+                "收藏统计上报完成: collect_count=%s accepted=%s",
                 collect_count,
                 response.get('accepted'),
             )
         except Exception as exc:
             logger.warning(
-                "收藏统计上报失败: username=%s collect_count=%s error=%s",
-                username,
+                "收藏统计上报失败: collect_count=%s error=%s",
                 collect_count,
                 exc,
             )

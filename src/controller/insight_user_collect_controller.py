@@ -61,10 +61,7 @@ class InsightUserCollectController(BaseController):
                 message_id=data.get('insight_message_id', data.get('insight_context_id', 0)),
                 artifact_id=data.get('insight_artifact_id', 0),
             )
-            service.report_collect_statistics(
-                username=username,
-                authorization=self._get_authorization(),
-            )
+            service.report_collect_statistics(authorization=self._get_authorization())
             return jsonify(Result.success(data=collect, message='收藏成功').to_dict())
         finally:
             session.close()
@@ -88,10 +85,7 @@ class InsightUserCollectController(BaseController):
             )
             if not removed:
                 return self.error_response('收藏不存在', 404)
-            service.report_collect_statistics(
-                username=username,
-                authorization=self._get_authorization(),
-            )
+            service.report_collect_statistics(authorization=self._get_authorization())
             return jsonify(Result.success(message='取消收藏成功').to_dict())
         finally:
             session.close()
