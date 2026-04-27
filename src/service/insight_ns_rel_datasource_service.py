@@ -442,7 +442,7 @@ class InsightNsRelDatasourceService:
         return selected_rows + partial_rows
 
     def delete_namespace_datasource(self, insight_namespace_id: int, datasource_id: int) -> dict[str, Any]:
-        """删除空间级数据源；若仍被会话引用，则阻止删除。"""
+        """删除空间级数据源，并自动解除该数据源的所有会话引用。"""
         datasource = self.session.query(InsightDatasource).filter(
             InsightDatasource.id == datasource_id,
             InsightDatasource.insight_namespace_id == insight_namespace_id,
@@ -451,15 +451,14 @@ class InsightNsRelDatasourceService:
         if datasource is None:
             return {"success": False, "message": "数据源不存在"}
 
-        reference_count = self.session.query(InsightNsRelDatasource.id).filter(
+        self.session.query(InsightNsRelDatasource).filter(
+            InsightNsRelDatasource.insight_namespace_id == insight_namespace_id,
             InsightNsRelDatasource.datasource_id == datasource_id,
             InsightNsRelDatasource.is_deleted == 0,
-        ).count()
-        if reference_count > 0:
-            return {
-                "success": False,
-                "message": f"当前数据源已被 {reference_count} 个会话引用，请先解绑后再删除",
-            }
+        ).update(
+            {InsightNsRelDatasource.is_deleted: 1},
+            synchronize_session=False,
+        )
 
         datasource.is_deleted = 1
         self.session.commit()

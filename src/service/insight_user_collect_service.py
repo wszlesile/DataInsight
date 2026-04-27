@@ -118,8 +118,8 @@ class InsightUserCollectService:
         item_list = [
             {
                 "code": "username",
-                "name": "用户名",
-                "total": username,
+                "name": username,
+                "total": 1,
             },
             {
                 "code": "collect_insight_result_count",

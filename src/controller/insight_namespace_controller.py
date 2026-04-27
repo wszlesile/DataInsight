@@ -161,7 +161,7 @@ class InsightNamespaceController(BaseController):
             session.close()
 
     def delete_datasource(self, namespace_id: int, datasource_id: int):
-        """删除空间级数据源；若被会话引用则要求先解绑。"""
+        """删除空间级数据源，并自动解除关联的会话引用。"""
         session = SessionLocal()
         try:
             service = InsightNsRelDatasourceService(session)
