@@ -11,6 +11,6 @@ vendor:
   email: developer@supos.com
   url: https://supos.com
   bluetronId: 123456
-description: 数据洞察智能体
+description: 构建于工厂操作系统之上的数据认知中枢，通过对话式交互将分散的工业数据转化为可解释的业务洞察，让业务人员以自然语言直接探查全域数据资产，实现从数据资源到决策依据的即时转化。
 icon: icon.png
 dependencies:
