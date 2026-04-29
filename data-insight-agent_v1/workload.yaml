@@ -5,7 +5,7 @@ $metadata:
 components:
   backend:
     container:
-      image: data-insight-backend:0.0.1
+      image: registry.bluetron.cn/jenkins/data-insight-backend:0.0.1
       ports:
         - containerPort: 5000
       readinessProbe:
@@ -33,7 +33,7 @@ components:
 
   frontend:
     container:
-      image: data-insight-frontend:0.0.1
+      image: registry.bluetron.cn/jenkins/data-insight-frontend:0.0.1
       ports:
         - containerPort: 80
       readinessProbe:
@@ -88,7 +88,7 @@ configMap:
     GUNICORN_TIMEOUT: "600"
     LLM_PROVIDER: "supos_llm_gateway"
     MODEL: ""
-    BASE_URL: "http://platform-llm-gateway:3000/os/llm-gateway/v1"
+    BASE_URL: ""
     API_KEY: ""
     SUPOS_DATAINSIGHT-SERVER_APPKEY: "sk-kQKMTKyEQA7X6eZ_d4gDA9DjEOMMiipm60OvGGcVz6HRMOr8B5yMBrzgYr0"
     TEMPERATURE: "0.7"

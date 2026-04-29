@@ -37,7 +37,7 @@ MODEL_PROVIDERS: tuple[ModelProvider, ...] = (
         name='supos_llm_gateway',
         adapter='openai',
         aliases=('supos_llm_gateway', 'supos-llm-gateway', 'supos'),
-        api_key_attr='SUPOS_DATAINSIGHT-SERVER_APPKEY',
+        api_key_attr='SUPOS_LLM_GATEWAY_API_KEY',
     ),
 )
 
@@ -86,9 +86,15 @@ def _resolve_supos_gateway_model(base_url: str, api_key: str) -> str:
     return model_id
 
 
-def _resolve_model_name(provider: ModelProvider, api_key: str) -> str:
+def _resolve_provider_base_url(provider: ModelProvider) -> str:
     if provider.name == 'supos_llm_gateway':
-        return _resolve_supos_gateway_model(Config.BASE_URL, api_key)
+        return f"{Config.SUPOS_WEB.rstrip('/')}/os/llm-gateway/v1"
+    return Config.BASE_URL
+
+
+def _resolve_model_name(provider: ModelProvider, api_key: str, base_url: str) -> str:
+    if provider.name == 'supos_llm_gateway':
+        return _resolve_supos_gateway_model(base_url, api_key)
     return Config.MODEL
 
 
@@ -96,19 +102,20 @@ def create_data_insight_model():
     """Create the currently configured chat model used by the insight agent."""
     provider = resolve_model_provider(Config.LLM_PROVIDER)
     api_key = getattr(Config, provider.api_key_attr)
-    model_name = _resolve_model_name(provider, api_key)
+    base_url = _resolve_provider_base_url(provider)
+    model_name = _resolve_model_name(provider, api_key, base_url)
     if provider.adapter == 'openai':
         return ChatOpenAI(
             model=model_name,
             api_key=api_key,
-            base_url=Config.BASE_URL,
+            base_url=base_url,
             temperature=Config.TEMPERATURE,
         )
     if provider.adapter == 'qwen':
         return ChatQwen(
             model=model_name,
             api_key=api_key,
-            base_url=Config.BASE_URL,
+            base_url=base_url,
         )
 
     raise ValueError(f"Unsupported LLM adapter='{provider.adapter}' for provider '{provider.name}'")
