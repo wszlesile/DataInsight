@@ -37,7 +37,7 @@ MODEL_PROVIDERS: tuple[ModelProvider, ...] = (
         name='supos_llm_gateway',
         adapter='openai',
         aliases=('supos_llm_gateway', 'supos-llm-gateway', 'supos'),
-        api_key_attr='SUPOS_LLM_GATEWAY_API_KEY',
+        api_key_attr='SUPOS_DATAINSIGHT-SERVER_APPKEY',
     ),
 )
 
