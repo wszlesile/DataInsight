@@ -17,6 +17,7 @@ from agent.context_engineering_runtime import (
 )
 from agent.tools import execute_python
 from config import Config
+from utils import logger
 from utils.llm_model_factory import create_data_insight_model as _create_data_insight_model
 from utils.token_budget import describe_budget_split, estimate_message_tokens, estimate_messages_tokens
 
@@ -68,7 +69,14 @@ def create_data_insight_agent():
     )
 
 
-insight_agent = create_data_insight_agent()
+@lru_cache(maxsize=1)
+def get_data_insight_agent():
+    """Lazy-create the DataInsight Agent so provider failures happen inside request handling."""
+    try:
+        return create_data_insight_agent()
+    except Exception as exc:
+        logger.error("Agent 初始化失败: %s", exc, exc_info=True)
+        raise
 
 
 def _merge_system_messages(*parts: BaseMessage | list[BaseMessage] | None) -> str:

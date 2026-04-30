@@ -207,6 +207,7 @@ npm run build
 - `TEMPERATURE`
 
 当 `LLM_PROVIDER=supos_llm_gateway` 时，`BASE_URL` 和 `MODEL` 不从环境变量读取；后端会使用 `${SUPOS_WEB}/os/llm-gateway/v1` 作为 OpenAI 协议地址，请求 `${SUPOS_WEB}/os/llm-gateway/v1/models`，并使用返回 `data` 数组第一个对象的 `id` 作为模型名；请求头使用 `Authorization: Bearer ${SUPOS_DATAINSIGHT-SERVER_APPKEY}`。
+模型列表查询使用 `SUPOS_LLM_GATEWAY_MODEL_TIMEOUT_SECONDS` 控制超时，默认 5 秒，避免网关不可用时阻塞 SSE 错误返回。
 
 ## 文档
 

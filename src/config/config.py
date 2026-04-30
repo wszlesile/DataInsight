@@ -63,6 +63,9 @@ class Config:
     # SUPOS / Kernel 配置
     SUPOS_WEB = os.environ.get('SUPOS_WEB', 'http://localhost:8080')
     SUPOS_REQUEST_TIMEOUT = int(os.environ.get('SUPOS_REQUEST_TIMEOUT', 15))
+    SUPOS_LLM_GATEWAY_MODEL_TIMEOUT_SECONDS = float(
+        os.environ.get('SUPOS_LLM_GATEWAY_MODEL_TIMEOUT_SECONDS', 5)
+    )
     SUPOS_LOG_COLLECT_TRACK_ENDPOINT = os.environ.get(
         'SUPOS_LOG_COLLECT_TRACK_ENDPOINT',
         '/os/inter-api/log-collect-system/track',

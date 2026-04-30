@@ -4,12 +4,13 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Iterator
 
-from agent import CustomContext, get_input, insight_agent
+from agent import CustomContext, get_data_insight_agent, get_input
 from agent.context_engineering_runtime import is_analysis_like_request
 from config import Config
 from config.database import SessionLocal
 from service.conversation_context_service import ConversationContextService, ConversationRunContext
 from utils import logger
+from utils.llm_error_utils import get_user_facing_agent_error
 
 THINK_BLOCK_PATTERN = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
 TOOL_CALL_BLOCK_PATTERN = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", flags=re.DOTALL)
@@ -995,7 +996,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
             elif analysis_request_expected:
                 runtime_instruction = _build_analysis_start_instruction(agent_request.user_message)
 
-            agent_response = insight_agent.invoke(
+            agent_response = get_data_insight_agent().invoke(
                 _build_agent_input_with_runtime_instruction(
                     agent_request=agent_request,
                     runtime=runtime,
@@ -1088,13 +1089,21 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
         )
     except Exception as exc:
         session.rollback()
+        user_error_message = get_user_facing_agent_error(exc)
+        logger.error(
+            "Agent 执行失败: conversation_id=%s turn_id=%s error=%s",
+            runtime.conversation.id,
+            runtime.turn.id,
+            exc,
+            exc_info=True,
+        )
         service.fail_run(
             runtime.conversation.id,
             runtime.turn.id,
-            str(exc),
+            user_error_message,
             preserve_existing_results=runtime.is_rerun,
         )
-        raise
+        raise RuntimeError(user_error_message) from exc
     finally:
         session.close()
 
@@ -1242,7 +1251,7 @@ def _stream_with_runtime(
                     message='正在重新引导模型进入分析执行阶段。',
                 )
 
-            for stream_mode, chunk in insight_agent.stream(
+            for stream_mode, chunk in get_data_insight_agent().stream(
                 _build_agent_input_with_runtime_instruction(
                     agent_request=agent_request,
                     runtime=runtime,
@@ -1446,10 +1455,18 @@ def _stream_with_runtime(
         )
     except Exception as exc:
         service.session.rollback()
+        user_error_message = get_user_facing_agent_error(exc)
+        logger.error(
+            "Agent 流式执行失败: conversation_id=%s turn_id=%s error=%s",
+            runtime.conversation.id,
+            runtime.turn.id,
+            exc,
+            exc_info=True,
+        )
         service.fail_run(
             runtime.conversation.id,
             runtime.turn.id,
-            str(exc),
+            user_error_message,
             preserve_existing_results=runtime.is_rerun,
         )
         yield _build_progress_event(
@@ -1458,7 +1475,7 @@ def _stream_with_runtime(
             turn_id=runtime.turn.id,
             stage='error',
             level='error',
-            message=str(exc),
+            message=user_error_message,
         )
     finally:
         logger.reset_context(log_context_token)

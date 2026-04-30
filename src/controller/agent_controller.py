@@ -4,6 +4,7 @@ from flask import Blueprint, Response, jsonify
 
 from controller.base_controller import BaseController
 from dto import get_current_user_context
+from utils.llm_error_utils import get_user_facing_agent_error
 from utils.response import Result
 
 
@@ -59,9 +60,9 @@ class AgentController(BaseController):
         if not agent_request.user_message:
             return self.error_response('user_message 不能为空')
 
-        from agent.invoker import invoke_agent
-
         try:
+            from agent.invoker import invoke_agent
+
             response = invoke_agent(agent_request)
             return jsonify(Result.success(data={
                 'username': response.username,
@@ -75,7 +76,7 @@ class AgentController(BaseController):
                 'chart_artifact_ids': response.chart_artifact_ids or [],
             }).to_dict())
         except Exception as exc:
-            return self.error_response(f'Agent 执行失败: {str(exc)}')
+            return self.error_response(f'Agent 执行失败: {get_user_facing_agent_error(exc)}')
 
     def stream_invoke(self):
         """处理一次流式分析请求，并按 SSE 事件持续输出进度。"""
@@ -84,10 +85,13 @@ class AgentController(BaseController):
         if not agent_request.user_message:
             return self.error_response('user_message 不能为空')
 
-        from agent.invoker import stream_invoke_agent
-
         def generate():
-            for event in stream_invoke_agent(agent_request):
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            try:
+                from agent.invoker import stream_invoke_agent
+
+                for event in stream_invoke_agent(agent_request):
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            except Exception as exc:
+                yield f"data: {json.dumps({'type': 'error', 'stage': 'error', 'level': 'error', 'message': f'Agent 执行失败: {get_user_facing_agent_error(exc)}'}, ensure_ascii=False)}\n\n"
 
         return Response(generate(), mimetype='text/event-stream')

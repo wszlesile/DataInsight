@@ -1,4 +1,5 @@
 import json
+import socket
 from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -7,6 +8,7 @@ from langchain_openai import ChatOpenAI
 from langchain_qwq import ChatQwen
 
 from config import Config
+from utils.llm_error_utils import LLMProviderUnavailableError
 
 
 @dataclass(frozen=True)
@@ -69,20 +71,25 @@ def _resolve_supos_gateway_model(base_url: str, api_key: str) -> str:
         method='GET',
     )
     try:
-        with urlopen(request, timeout=Config.SUPOS_REQUEST_TIMEOUT) as response:
+        timeout = max(float(Config.SUPOS_LLM_GATEWAY_MODEL_TIMEOUT_SECONDS), 0.1)
+        with urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode('utf-8'))
     except HTTPError as exc:
-        raise RuntimeError(f'Failed to query supos LLM gateway models: HTTP {exc.code}') from exc
+        raise LLMProviderUnavailableError(f'Failed to query supos LLM gateway models: HTTP {exc.code}') from exc
+    except socket.timeout as exc:
+        raise LLMProviderUnavailableError(
+            f'Failed to query supos LLM gateway models: timed out after {timeout:g}s'
+        ) from exc
     except URLError as exc:
-        raise RuntimeError(f'Failed to query supos LLM gateway models: {exc.reason}') from exc
+        raise LLMProviderUnavailableError(f'Failed to query supos LLM gateway models: {exc.reason}') from exc
 
     models = payload.get('data')
     if not isinstance(models, list) or not models:
-        raise ValueError('Supos LLM gateway models response must contain a non-empty data array')
+        raise LLMProviderUnavailableError('Supos LLM gateway models response must contain a non-empty data array')
 
     model_id = models[0].get('id') if isinstance(models[0], dict) else None
     if not model_id:
-        raise ValueError('Supos LLM gateway first model entry must contain id')
+        raise LLMProviderUnavailableError('Supos LLM gateway first model entry must contain id')
     return model_id
 
 

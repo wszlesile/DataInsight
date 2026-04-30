@@ -213,30 +213,33 @@ function streamRequest(url, params, onMessage, onError, onDone) {
     body: JSON.stringify(params || {}),
     signal: controller.signal
   })
-    .then(response => {
+    .then(async response => {
+      if (!response.ok) {
+        throw new Error(await extractStreamErrorMessage(response))
+      }
+      if (!response.body) {
+        throw new Error('流式响应为空，无法获取实时分析结果。')
+      }
+
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
 
-      const read = () => {
-        reader.read().then(({ done, value }) => {
-          if (done) {
-            if (buffer.trim()) {
-              parseEvents(buffer, onMessage)
-            }
-            if (onDone) onDone()
-            return
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) {
+          if (buffer.trim()) {
+            parseEvents(buffer, onMessage)
           }
+          if (onDone) onDone()
+          return
+        }
 
-          buffer += decoder.decode(value, { stream: true })
-          const segments = buffer.split('\n\n')
-          buffer = segments.pop() || ''
-          segments.forEach(segment => parseEvents(segment, onMessage))
-          read()
-        })
+        buffer += decoder.decode(value, { stream: true })
+        const segments = buffer.split('\n\n')
+        buffer = segments.pop() || ''
+        segments.forEach(segment => parseEvents(segment, onMessage))
       }
-
-      read()
     })
     .catch(error => {
       if (error.name !== 'AbortError' && onError) {
@@ -245,6 +248,21 @@ function streamRequest(url, params, onMessage, onError, onDone) {
     })
 
   return controller
+}
+
+async function extractStreamErrorMessage(response) {
+  const fallback = `请求失败（HTTP ${response.status}）`
+  try {
+    const contentType = response.headers.get('Content-Type') || ''
+    if (contentType.includes('application/json')) {
+      const data = await response.json()
+      return data?.message || data?.error || fallback
+    }
+    const text = (await response.text()).trim()
+    return text || fallback
+  } catch (error) {
+    return fallback
+  }
 }
 
 function parseEvents(segment, onMessage) {
