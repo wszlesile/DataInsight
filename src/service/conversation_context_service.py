@@ -375,8 +375,10 @@ class ConversationContextService:
 
         turn.status = 'failed'
         turn.error_message = error_message
+        turn.final_answer = error_message
         turn.finished_at = _now()
         conversation.status = 'active'
+        conversation.insight_result = error_message
         conversation.last_message_at = _now()
         conversation.updated_at = _now()
 
