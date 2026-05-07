@@ -49,6 +49,35 @@ CHART_CONTRACT_ERROR_MARKERS = (
     'yaxis',
     'series',
 )
+REPORT_CHART_DUMP_OBJECT_MARKERS = (
+    "{'version':",
+    '{"version":',
+    "{'chart_kind':",
+    '{"chart_kind":',
+    "{'chart_document':",
+    '{"chart_document":',
+    "{'chart_spec':",
+    '{"chart_spec":',
+)
+REPORT_CHART_DUMP_FIELD_MARKERS = (
+    'chart_kind',
+    'chart_document',
+    'chart_spec',
+    'dataset',
+    'columns',
+    'rows',
+    'encoding',
+    'category_field',
+    'value_field',
+    'x_field',
+    'y_field',
+    'transform',
+    'presentation',
+    'xaxis',
+    'yaxis',
+    'series',
+)
+REPORT_CHART_DUMP_SCAN_MAX_CHARS = 20000
 DATAFRAME_FIELD_EXPR_PATTERN = r"(?:[A-Za-z_]\w*\s*\[\s*['\"][^'\"]+['\"]\s*\])|(?:[A-Za-z_]\w*\.[A-Za-z_]\w*)"
 SQL_EXACT_FILTER_PATTERN = re.compile(
     r"(?P<field>(?:[\w]+\.)?[\w\"`]+)\s*=\s*'(?P<literal>[^']+)'",
@@ -1319,6 +1348,34 @@ def _find_invalid_chart_data_points(charts: list[dict[str, Any]] | None) -> list
     return invalid_points
 
 
+def _split_report_scan_blocks(report_text: str) -> list[str]:
+    text = (report_text or '')[:REPORT_CHART_DUMP_SCAN_MAX_CHARS]
+    blocks = [block.strip() for block in re.split(r'\n\s*\n|```', text) if block.strip()]
+    return blocks or ([text.strip()] if text.strip() else [])
+
+
+def _find_chart_structure_dump_in_report(report_text: str) -> dict[str, Any] | None:
+    for block in _split_report_scan_blocks(report_text):
+        lowered = block.lower()
+        object_like = any(marker in lowered for marker in REPORT_CHART_DUMP_OBJECT_MARKERS)
+        if not object_like:
+            continue
+
+        matched_markers = [
+            marker
+            for marker in REPORT_CHART_DUMP_FIELD_MARKERS
+            if marker in lowered
+        ]
+        if len(matched_markers) < 3:
+            continue
+
+        return {
+            "matched_markers": matched_markers[:10],
+            "dump_preview": block[:800],
+        }
+    return None
+
+
 def _validate_structured_result_contract(exec_result: StructuredResult) -> RetryResult | None:
     report_text = (exec_result.analysis_report or '').strip()
     if not report_text:
@@ -1333,6 +1390,26 @@ def _validate_structured_result_contract(exec_result: StructuredResult) -> Retry
                 "下一版代码必须先构造完整 Markdown 分析报告。",
                 "调用 save_analysis_result(...) 时传入非空 analysis_report。",
             ],
+        )
+
+    chart_dump = _find_chart_structure_dump_in_report(report_text)
+    if chart_dump is not None:
+        return request_retry(
+            retry_type="chart_contract_error",
+            message="当前 analysis_report 中包含图表结构对象 dump，不能把 chart_document/chart_spec/chart dict 写入最终报告。",
+            diagnostics={
+                "analysis_report_preview": report_text[:800],
+                "chart_count": len(exec_result.charts or []),
+                "table_count": len(exec_result.tables or []),
+                "chart_dump": chart_dump,
+            },
+            repair_instructions=[
+                "下一版代码保留已生成的 charts 结构化产物，但必须重写 analysis_report。",
+                "analysis_report 只能包含 Markdown 自然语言结论、指标说明和表格文本；不要插入 charts[0]、charts[0]['chart_document']、chart_spec、chart_document 或图表 dict。",
+                "如果报告中需要引用图表，只写自然语言，例如：下方图表展示每日产量变化趋势。",
+                "图表对象只能通过 save_analysis_result(..., charts=charts, ...) 的 charts 参数返回。",
+            ],
+            analysis_report=report_text,
         )
 
     if not (exec_result.charts or exec_result.tables):
