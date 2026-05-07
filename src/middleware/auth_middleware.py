@@ -30,13 +30,13 @@ def _normalize_bearer_token(raw_token: str) -> str:
 
 
 def _extract_auth_header() -> tuple[str, str]:
-    cookie_token = (request.cookies.get('suposTicket') or '').strip()
-    if cookie_token:
-        return _normalize_bearer_token(cookie_token), 'cookie:suposTicket'
-
     header_token = (request.headers.get('Authorization', '') or '').strip()
     if header_token:
         return header_token, 'header:Authorization'
+
+    cookie_token = (request.cookies.get('suposTicket') or '').strip()
+    if cookie_token:
+        return _normalize_bearer_token(cookie_token), 'cookie:suposTicket'
 
     return '', 'none'
 
