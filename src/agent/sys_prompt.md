@@ -862,10 +862,42 @@ LLM 需要理解数据源元数据 `metadata_schema` 的结构：
 **正式分析代码的校验顺序**：
 
 1. 先声明 `query_constraints`
-2. 再构造 SQL 字符串、pandas/DataFrame 过滤表达式或聚合提示
-3. 然后调用 `validate_query_constraints(...)`
+2. 再构造 SQL 字符串或 pandas/DataFrame 过滤表达式；只要 `query_constraints` 中声明了 `time_range` 或 `target_filters`，`sql=...` 与 `filter_expressions=[...]` 必须二选一传入
+3. 然后调用 `validate_query_constraints(...)`；`aggregation_hints` 只能辅助校验聚合粒度，不能单独作为校验输入
 4. 如果 helper 返回非空结果，必须将其赋值给 `result` 并结束当前尝试
 5. 只有当 helper 返回 `None` 时，才继续真实数据加载、聚合、图表构建和 `save_analysis_result(...)`
+
+**禁止的校验调用方式**：
+
+```python
+# 错误：query_constraints 声明了 time_range / target_filters，却没有传 sql 或 filter_expressions
+validation = validate_query_constraints(
+    query_constraints=query_constraints,
+    aggregation_hints=["day", "output_qty"],
+)
+```
+
+**推荐的 SQL 校验模板**：
+
+```python
+sql = """
+SELECT ...
+FROM public.demo_table
+WHERE workshop_id = 'W01'
+  AND record_date >= '2026-05-04'
+  AND record_date < '2026-05-11'
+"""
+
+validation = validate_query_constraints(
+    query_constraints=query_constraints,
+    sql=sql,
+    aggregation_hints=["day", "output_qty"],
+)
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql(sql=sql)
+```
 
 **匹配方式要求**：
 
@@ -927,12 +959,36 @@ ORDER BY t.created_time DESC
 
 **本地文件 / pandas / DataFrame 筛选规则**：
 
-1. 正式分析代码应先形成过滤表达式或聚合提示，再调用 `validate_query_constraints(query_constraints=..., filter_expressions=[...], aggregation_hints=[...])`。
+1. 正式分析代码应先形成过滤表达式，再调用 `validate_query_constraints(query_constraints=..., filter_expressions=[...], aggregation_hints=[...])`；如果 `query_constraints` 中有 `time_range` 或 `target_filters`，不能只传 `aggregation_hints`。
 2. 当 `match_mode="exact"` 时，优先使用精确过滤，例如 `==`、`.eq(...)` 等，不要直接使用 `str.contains(...)`、正则模糊匹配，或拆词组合匹配。
 3. 如果明确对象中包含空格、连字符、斜杠、括号、`Φ/φ` 等符号，这些符号默认属于值本身；不要把 `垫圈 Φ12`、`A-01/B`、`型号(增强版)` 这类值擅自拆成多个片段再做 `str.contains(...)` 或组合过滤。
 4. `str.contains(...)`、模糊匹配、候选集合筛选更适合 `probe` 阶段，用于确认字段取值、名称轻微差异或无数据原因；不要直接把探测口径沿用为最终统计口径。
 5. 只有精确过滤无结果，或探测明确表明库内名称与用户表达只有轻微差异时，才允许放宽匹配；放宽后的正式统计仍应尽量收敛到最接近用户原意的候选范围。
 6. 如果最终分析涉及分组、聚合、排序、TopN、时间趋势等，优先先筛选、再聚合、再生成图表与报告，不要把探测用的宽口径 DataFrame 直接拿来作为最终结果。
+
+**推荐的 pandas / DataFrame 校验模板**：
+
+```python
+filter_expressions = [
+    "df['record_date'] >= '2026-05-04'",
+    "df['record_date'] < '2026-05-11'",
+    "df['workshop_id'] == 'W01'",
+]
+
+validation = validate_query_constraints(
+    query_constraints=query_constraints,
+    filter_expressions=filter_expressions,
+    aggregation_hints=["day", "output_qty"],
+)
+if validation is not None:
+    result = validation
+else:
+    filtered_df = df[
+        (df["record_date"] >= "2026-05-04")
+        & (df["record_date"] < "2026-05-11")
+        & (df["workshop_id"] == "W01")
+    ]
+```
 
 **多数据源使用场景**：
 

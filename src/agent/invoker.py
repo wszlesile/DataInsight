@@ -18,6 +18,10 @@ UNEXPECTED_KWARG_PATTERN = re.compile(
     r"(?P<owner>[A-Za-z_][A-Za-z0-9_]*)\.__init__\(\) got an unexpected keyword argument '(?P<arg>[^']+)'"
 )
 MISSING_DEP_PATTERN = re.compile(r"No module named '(?P<module>[^']+)'")
+ANALYSIS_EXPLICIT_TIME_PATTERN = re.compile(
+    r"(今天|昨天|前天|本周|上周|本月|上月|今年|去年|近\s*\d+\s*[天日周月年]|"
+    r"\d{4}[-/年]\d{1,2}([-/月]\d{1,2})?|\d{1,2}月\d{1,2}日)"
+)
 MAX_ANALYSIS_AGENT_ROUNDS = 3
 RETRY_LATEST_ERROR_LIMIT = 3
 RETRY_PATTERN_HINT_LIMIT = 5
@@ -706,6 +710,63 @@ def _extract_execution_error_type(execution: Any) -> str:
     return ''
 
 
+def _user_query_has_explicit_time_range(user_query: str) -> bool:
+    return bool(ANALYSIS_EXPLICIT_TIME_PATTERN.search(str(user_query or '')))
+
+
+def _ensure_explicit_time_range_guard_memory(
+    runtime: ConversationRunContext,
+    *,
+    source_error_type: str,
+) -> None:
+    if not _user_query_has_explicit_time_range(getattr(runtime.turn, 'user_query', '') or ''):
+        return
+
+    short_term_memory = getattr(runtime, 'short_term_memory', None)
+    if not isinstance(short_term_memory, dict):
+        short_term_memory = {}
+        setattr(runtime, 'short_term_memory', short_term_memory)
+
+    guard = short_term_memory.get('explicit_time_range_guard')
+    if not isinstance(guard, dict):
+        guard = {}
+    guard.update({
+        'active': True,
+        'source_error_type': source_error_type,
+        'user_query': getattr(runtime.turn, 'user_query', '') or '',
+    })
+    short_term_memory['explicit_time_range_guard'] = guard
+
+
+def _update_short_term_memory_from_tool_payload(runtime: ConversationRunContext, payload: dict[str, Any]) -> None:
+    if not isinstance(payload, dict):
+        return
+    if payload.get('tool') not in ('', None, 'execute_python'):
+        return
+
+    error_type = str(
+        payload.get('error_type')
+        or payload.get('retry_type')
+        or payload.get('retry_reason_code')
+        or ''
+    ).strip()
+    if error_type in {'no_data_found', 'probe_feedback'}:
+        _ensure_explicit_time_range_guard_memory(runtime, source_error_type=error_type)
+
+
+def _update_short_term_memory_from_messages(runtime: ConversationRunContext, messages: list[Any]) -> None:
+    for message in messages or []:
+        content = getattr(message, 'content', None)
+        if not isinstance(content, str) or not content.strip().startswith('{'):
+            continue
+        try:
+            payload = json.loads(content)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            _update_short_term_memory_from_tool_payload(runtime, payload)
+
+
 def _collect_probe_candidate_values(diagnostics: dict[str, Any]) -> list[tuple[str, str]]:
     """从 probe diagnostics 中提取候选值文本。"""
     if not isinstance(diagnostics, dict):
@@ -811,6 +872,13 @@ def _build_analysis_recovery_instruction(
         '本轮已经进入数据分析执行阶段。',
         f'当前轮次累计执行了 {len(executions)} 次 Python 分析代码，但仍未成功生成完整分析产物。',
     ]
+    explicit_time_range_guard = getattr(runtime, 'short_term_memory', {}).get('explicit_time_range_guard', {})
+    if isinstance(explicit_time_range_guard, dict) and explicit_time_range_guard.get('active'):
+        lines.extend([
+            '本轮短期记忆：用户问题里有明确时间范围，且本轮已经出现过无数据或探测反馈。',
+            '后续所有 analysis 代码必须保持用户原始时间范围对应的 query_constraints.time_range；不能改成 diagnostics、探测 SQL 或数据库实际数据覆盖范围。',
+            '如果目标时间范围内仍无数据，应返回无数据反馈或无数据结论，不要为了生成成功结果而改查其他时间范围。',
+        ])
     if latest_errors:
         lines.append('最近的执行错误如下：')
         lines.extend(f'- {item}' for item in latest_errors)
@@ -832,6 +900,12 @@ def _build_analysis_recovery_instruction(
     if 'probe_feedback' in latest_error_types:
         lines.append(
             '最近一轮是 probe_feedback：探测阶段使用的 LIKE/contains 只用于确认候选值，下一版正式分析不能直接沿用这些模糊条件。'
+        )
+        lines.append(
+            '如果用户问题里有明确时间范围，不能把正式分析的 query_constraints.time_range 改成 diagnostics 里的数据覆盖范围；数据覆盖范围只能用于解释为什么目标时间窗无数据。'
+        )
+        lines.append(
+            '如果 probe 已确认用户明确时间范围内无数据，下一版应保持原始时间范围并调用 raise_no_data_error(...) 返回无数据反馈，不要为了命中数据改查其他时间范围。'
         )
         if exact_probe_candidate:
             field_hint = '目标字段'
@@ -862,6 +936,9 @@ def _build_analysis_recovery_instruction(
     elif latest_error_type == 'no_data_found':
         lines.append(
             '最近失败属于 no_data_found：请优先检查时间过滤是否命中数据、过滤后数据集是否为空、关联结果是否为空；如果探测后仍为空，应调用 raise_no_data_error(...) 把“无数据”返回给 execute_python，而不是继续误改字段名或图表参数。'
+        )
+        lines.append(
+            '如果用户问题里有明确时间范围，必须继续保持该时间范围；不要把 query_constraints.time_range 改成探测到的数据覆盖范围来制造命中结果。'
         )
     else:
         lines.append(
@@ -1004,6 +1081,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 ),
                 context=_build_agent_context(agent_request, runtime),
             )
+            _update_short_term_memory_from_messages(runtime, agent_response.get('messages', []))
             assistant_message, analysis_report, charts, tables, raw_tool_call_detected = _extract_invoke_result(
                 agent_response.get('messages', [])
             )
@@ -1267,6 +1345,13 @@ def _stream_with_runtime(
                             tool_calls = getattr(message, 'tool_calls', None)
                             raw_tool_call = _extract_raw_tool_call(getattr(message, 'content', ''))
                             cleaned = _clean_message_content(getattr(message, 'content', ''))
+                            if isinstance(cleaned, str) and cleaned.strip().startswith('{'):
+                                try:
+                                    tool_feedback_payload = json.loads(cleaned)
+                                except Exception:
+                                    tool_feedback_payload = {}
+                                if isinstance(tool_feedback_payload, dict):
+                                    _update_short_term_memory_from_tool_payload(runtime, tool_feedback_payload)
 
                             if tool_calls:
                                 if cleaned and not _is_internal_assistant_message(cleaned):

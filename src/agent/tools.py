@@ -1,3 +1,4 @@
+import ast
 import json
 import math
 import multiprocessing as mp
@@ -400,6 +401,9 @@ def _check_time_range_constraint(query_constraints: dict[str, Any], code: str) -
 
     start = str(time_range.get('start') or '').strip()
     end = str(time_range.get('end') or '').strip()
+    if _month_grain_filter_satisfies_time_range(start, end, time_range, code):
+        return None
+
     missing_parts = []
     if start and start not in code:
         missing_parts.append('start')
@@ -416,6 +420,41 @@ def _check_time_range_constraint(query_constraints: dict[str, Any], code: str) -
             'time_range': time_range,
             'missing_parts': missing_parts,
         },
+    )
+
+
+def _month_grain_filter_satisfies_time_range(
+    start: str,
+    end: str,
+    time_range: dict[str, Any],
+    code: str,
+) -> bool:
+    if not start or not end or not bool(time_range.get('end_exclusive')):
+        return False
+    try:
+        start_date = datetime.strptime(start, '%Y-%m-%d').date()
+        end_date = datetime.strptime(end, '%Y-%m-%d').date()
+    except ValueError:
+        return False
+
+    if start_date.day != 1:
+        return False
+    next_month_year = start_date.year + (1 if start_date.month == 12 else 0)
+    next_month = 1 if start_date.month == 12 else start_date.month + 1
+    if end_date.year != next_month_year or end_date.month != next_month or end_date.day != 1:
+        return False
+
+    start_month = start_date.strftime('%Y-%m')
+    end_month = end_date.strftime('%Y-%m')
+    if re.search(rf"['\"]{re.escape(start_month)}['\"]", code):
+        if re.search(rf"==\s*['\"]{re.escape(start_month)}['\"]", code) or re.search(
+            rf"=\s*['\"]{re.escape(start_month)}['\"]",
+            code,
+        ):
+            return True
+    return (
+        re.search(rf">=\s*['\"]{re.escape(start_month)}['\"]", code) is not None
+        and re.search(rf"<\s*['\"]{re.escape(end_month)}['\"]", code) is not None
     )
 
 
@@ -1029,6 +1068,43 @@ class NoDataFoundError(Exception):
         super().__init__(normalized_reason)
 
 
+PROBE_TIME_RANGE_DRIFT_PATTERNS = (
+    re.compile(r'真实数据覆盖范围.*重新生成分析代码'),
+    re.compile(r'数据覆盖范围.*重新生成分析代码'),
+    re.compile(r'调整时间范围'),
+    re.compile(r'改查.*时间范围'),
+    re.compile(r'查询可用.*时间范围'),
+    re.compile(r'使用.*数据覆盖范围.*分析'),
+)
+
+PROBE_TIME_RANGE_GUARD_INSTRUCTIONS = [
+    'diagnostics 是探测证据，不是正式分析口径；数据覆盖范围只能用于解释无数据原因。',
+    '如果用户问题里有明确时间范围，不能替换用户明确时间范围，也不能把 diagnostics 里的数据覆盖范围写回 query_constraints.time_range。',
+    '如果探测确认用户明确时间范围内无数据，下一版应保持原始时间范围并返回无数据反馈或无数据结论，不要为了命中数据改查其他时间范围。',
+]
+
+
+def _normalize_probe_feedback_repair_instructions(instructions: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for instruction in instructions:
+        if any(pattern.search(instruction) for pattern in PROBE_TIME_RANGE_DRIFT_PATTERNS):
+            continue
+        if instruction in seen:
+            continue
+        seen.add(instruction)
+        normalized.append(instruction)
+
+    for guard_instruction in PROBE_TIME_RANGE_GUARD_INSTRUCTIONS:
+        if guard_instruction in seen:
+            continue
+        seen.add(guard_instruction)
+        normalized.append(guard_instruction)
+
+    return normalized
+
+
 def raise_no_data_error(reason: str, detail_lines: Optional[list[str]] = None) -> None:
     """
     在数据加载、过滤、关联或聚合后发现结果为空时，显式通知上层重试。
@@ -1069,6 +1145,8 @@ def request_retry(
         for item in (repair_instructions or [])
         if str(item).strip()
     ]
+    if normalized_retry_type == "probe_feedback":
+        normalized_instructions = _normalize_probe_feedback_repair_instructions(normalized_instructions)
     return RetryResult(
         retry_type=normalized_retry_type,  # type: ignore[arg-type]
         message=normalized_message,
@@ -1076,6 +1154,130 @@ def request_retry(
         repair_instructions=normalized_instructions,
         analysis_report=str(analysis_report or "").strip(),
     )
+
+
+def _extract_static_string_assignment(tree: ast.AST, name: str) -> str:
+    for node in getattr(tree, 'body', []):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
+            continue
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            return node.value.value.strip()
+    return ''
+
+
+def _has_static_assignment(tree: ast.AST, name: str) -> bool:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
+            return True
+    return False
+
+
+def _called_function_names(tree: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            names.add(func.id)
+        elif isinstance(func, ast.Attribute):
+            names.add(func.attr)
+    return names
+
+
+def _validate_generated_code_contract(code: str) -> RetryResult | None:
+    """Validate the static tool contract of generated Python code before execution."""
+    try:
+        tree = ast.parse(code or '')
+    except SyntaxError as exc:
+        return request_retry(
+            retry_type="contract_error",
+            message=f"生成的 Python 代码存在语法错误，无法执行：{exc.msg}",
+            diagnostics={"line_no": exc.lineno, "offset": exc.offset},
+            repair_instructions=[
+                "重新生成完整可执行 Python 代码。",
+                "必须在顶部声明 execution_intent = \"analysis\" 或 execution_intent = \"probe\"。",
+            ],
+        )
+
+    execution_intent = _extract_static_string_assignment(tree, 'execution_intent')
+    has_query_constraints = _has_static_assignment(tree, 'query_constraints')
+    calls = _called_function_names(tree)
+
+    if execution_intent not in {'analysis', 'probe'}:
+        return request_retry(
+            retry_type="contract_error",
+            message='生成代码必须在顶部声明 execution_intent = "analysis" 或 execution_intent = "probe"。',
+            diagnostics={
+                'execution_intent': execution_intent,
+                'has_query_constraints': has_query_constraints,
+                'called_functions': sorted(calls),
+            },
+            repair_instructions=[
+                '不要只补 execution_intent；请根据当前代码目的重写成完整 probe 或完整 analysis 代码。',
+                '如果当前代码只是查看字段、打印样例、探测候选值、确认时间覆盖或数据分布，应改成完整 probe：execution_intent = "probe"，最后 result = request_retry(...)。',
+                '如果当前代码要正式回答用户问题，应改成完整 analysis：execution_intent、query_constraints、SQL/filter_expressions、validate_query_constraints(...)、数据加载、空数据检查、图表/表格和 result = save_analysis_result(...) 必须一次性齐全。',
+            ],
+        )
+
+    if execution_intent == 'analysis':
+        missing_items: list[str] = []
+        if not has_query_constraints:
+            missing_items.append('query_constraints')
+        if 'validate_query_constraints' not in calls:
+            missing_items.append('validate_query_constraints(...)')
+        if 'save_analysis_result' not in calls:
+            missing_items.append('save_analysis_result(...)')
+        if missing_items:
+            return request_retry(
+                retry_type="missing_query_constraints",
+                message=f'正式 analysis 代码缺少必要契约：{", ".join(missing_items)}。',
+                diagnostics={
+                    'execution_intent': execution_intent,
+                    'has_query_constraints': has_query_constraints,
+                    'called_functions': sorted(calls),
+                    'missing_items': missing_items,
+                },
+                repair_instructions=[
+                    '不要只在半成品代码上逐项补字段；请重写为完整 analysis 模板后再执行。',
+                    'analysis 代码必须先声明 query_constraints，再生成 SQL 或 pandas/DataFrame 过滤表达式。',
+                    'analysis 代码必须调用 validate_query_constraints(...)；只有返回 None 时才能继续加载数据、聚合、构造图表和调用 save_analysis_result(...)。',
+                    'analysis 代码最终必须构造 analysis_report、charts 或 tables，并将 save_analysis_result(...) 的返回值赋给 result。',
+                    '如果 validate_query_constraints(...) 返回 RetryResult，必须将其赋给 result 并结束当前尝试。',
+                ],
+            )
+
+    if execution_intent == 'probe':
+        violations: list[str] = []
+        if has_query_constraints:
+            violations.append('probe 代码不要声明 query_constraints')
+        if 'validate_query_constraints' in calls:
+            violations.append('probe 代码不要调用 validate_query_constraints(...)')
+        if 'request_retry' not in calls:
+            violations.append('probe 代码必须调用 request_retry(...)')
+        if 'save_analysis_result' in calls:
+            violations.append('probe 代码不要调用 save_analysis_result(...)')
+        if violations:
+            return request_retry(
+                retry_type="contract_error",
+                message=f'探测 probe 代码不符合契约：{"；".join(violations)}。',
+                diagnostics={
+                    'execution_intent': execution_intent,
+                    'has_query_constraints': has_query_constraints,
+                    'called_functions': sorted(calls),
+                    'violations': violations,
+                },
+                repair_instructions=[
+                    'probe 代码只做轻量探测，并调用 request_retry(retry_type="probe_feedback", ...) 返回结构化反馈。',
+                    'probe 代码不要生成 query_constraints，也不要调用 validate_query_constraints(...) 或 save_analysis_result(...)。',
+                ],
+            )
+
+    return None
 
 
 def validate_query_constraints(
@@ -1097,9 +1299,17 @@ def validate_query_constraints(
             ],
         )
 
-    code_fragments = [str(sql or '').strip(), *[str(item or '').strip() for item in (filter_expressions or [])], *[str(item or '').strip() for item in (aggregation_hints or [])]]
-    combined_code = '\n'.join(fragment for fragment in code_fragments if fragment)
-    if not combined_code:
+    filter_fragments = [
+        str(sql or '').strip(),
+        *[str(item or '').strip() for item in (filter_expressions or [])],
+    ]
+    filter_code = '\n'.join(fragment for fragment in filter_fragments if fragment)
+    aggregation_fragments = [
+        filter_code,
+        *[str(item or '').strip() for item in (aggregation_hints or [])],
+    ]
+    aggregation_code = '\n'.join(fragment for fragment in aggregation_fragments if fragment)
+    if not aggregation_code:
         return request_retry(
             retry_type="query_constraint_violation",
             message='validate_query_constraints(...) 没有收到可校验的 SQL、过滤表达式或聚合提示。',
@@ -1110,12 +1320,33 @@ def validate_query_constraints(
             ],
         )
 
-    for checker in (
-        _check_target_filter_constraints,
-        _check_time_range_constraint,
-        _check_aggregation_constraint,
-    ):
-        issue = checker(query_constraints, combined_code)
+    requires_filter_code = (
+        isinstance(query_constraints.get('time_range'), dict)
+        or bool(query_constraints.get('target_filters') or [])
+    )
+    if requires_filter_code and not filter_code:
+        return request_retry(
+            retry_type="query_constraint_violation",
+            message='validate_query_constraints(...) 声明了时间范围或目标筛选约束，但没有收到可校验的 SQL 或过滤表达式。',
+            diagnostics={
+                'query_constraints': query_constraints,
+                'missing_inputs': ['sql', 'filter_expressions'],
+            },
+            repair_instructions=[
+                '先生成 SQL 字符串或 pandas/DataFrame 过滤表达式，再调用 validate_query_constraints(query_constraints=query_constraints, sql=sql, ...)。',
+                'aggregation_hints 只能用于辅助校验聚合粒度，不能替代 SQL 或过滤表达式来证明 time_range / target_filters 已落实。',
+            ],
+        )
+
+    checker_inputs = (
+        (_check_target_filter_constraints, filter_code),
+        (_check_time_range_constraint, filter_code),
+        (_check_aggregation_constraint, aggregation_code),
+    )
+    for checker, code_to_check in checker_inputs:
+        if not code_to_check:
+            continue
+        issue = checker(query_constraints, code_to_check)
         if issue is not None:
             return request_retry(
                 retry_type=str(issue.get('error_type') or 'query_constraint_violation'),
@@ -1953,11 +2184,14 @@ def _build_repair_instructions(error_type: str) -> list[str]:
         ],
         'no_data_found': [
             '请先复核 SQL、时间范围、筛选条件、JOIN 条件或聚合口径是否过严，再生成下一版完整代码。',
+            '如果用户问题里有明确时间范围，必须保持原始 query_constraints.time_range 不变；探测得到的数据覆盖范围只能用于解释无数据原因，不能替换成正式分析的时间范围。',
             '在数据加载、过滤、关联、聚合完成后，必须先检查 DataFrame 是否为空；只要为空，就调用 raise_no_data_error(reason=..., detail_lines=[...])，不要继续生成空图表或空结果产物。',
             'reason 要直接说明是哪一步没有命中数据，detail_lines 可补充当前时间范围、筛选条件、关联键或中间行数，方便上层感知后继续重试。',
         ],
         'probe_feedback': [
             '当前反馈是数据探测结果，不是最终分析报告；请基于 diagnostics 中的候选值、时间覆盖或字段分布重写正式分析代码。',
+            '如果用户问题里有明确时间范围，下一版 analysis 只能保留原始 query_constraints.time_range；diagnostics 里的数据覆盖范围不能被写回 query_constraints.time_range。',
+            '如果探测确认用户明确时间范围内无数据，应返回无数据反馈或无数据结论，不要为了命中数据改查其他时间范围。',
             '下一版代码应切换为 execution_intent = "analysis"，并调用 save_analysis_result(...) 返回最终分析结果。',
             '不要再次只输出探测报告；如果候选值仍有歧义，再返回 request_retry(retry_type="probe_feedback", ...)。',
         ],
@@ -2208,6 +2442,47 @@ def execute_python(
         tool='execute_python',
         message='分析代码已提交到本地执行器。',
     )
+
+    contract_retry = _validate_generated_code_contract(code)
+    if contract_retry is not None:
+        retry_repair_instructions = contract_retry.repair_instructions or _build_repair_instructions(contract_retry.retry_type)
+        failure_memory = _build_turn_failure_memory(
+            turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+            current_execution_id=execution_id,
+        )
+        _update_execution_record(
+            execution_id,
+            execution_status='failed',
+            analysis_report=contract_retry.analysis_report,
+            result_payload_json=contract_retry.model_dump_json(),
+            stdout_text='',
+            stderr_text='',
+            execution_seconds=int((time.time() - start_time) * 1000),
+            error_message=contract_retry.message,
+        )
+        with logger.context(**execution_log_context):
+            logger.warning(contract_retry.message)
+        emit(
+            'status',
+            stage='tool_retry',
+            level='warning',
+            tool='execute_python',
+            message=contract_retry.message,
+        )
+        return _tool_error_message(
+            tool_call_id=runtime.tool_call_id,
+            error_type=contract_retry.retry_type,
+            error_message=contract_retry.message,
+            repair_instructions=retry_repair_instructions,
+            error_signature=_build_retry_error_signature(contract_retry),
+            feedback_kind='retryable_feedback',
+            retry_reason_code=contract_retry.retry_type,
+            diagnostics=contract_retry.diagnostics,
+            analysis_report=contract_retry.analysis_report,
+            current_failed_code=code,
+            previous_failure_messages=failure_memory.get('previous_failure_messages', []),
+            previous_failure_hints=failure_memory.get('previous_failure_hints', []),
+        )
 
     from config.config import Config
 

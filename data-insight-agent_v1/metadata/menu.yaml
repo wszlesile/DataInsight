@@ -11,7 +11,8 @@ menus:
   - code: os_data_insight_runtime
     nameDefault: 数据洞察智能体
     displayOrder: 1
-    url: /os/datainsight/data-insight-agent/
+    scope: runtime
+    url: /os/toolkit/data-insight-agent/
     operations:
       - code: switch_language
         nameDefault: 生成配置

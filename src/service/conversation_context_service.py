@@ -1,4 +1,5 @@
 ﻿from dataclasses import dataclass
+from dataclasses import field
 from datetime import datetime
 from typing import Any
 
@@ -81,6 +82,7 @@ class ConversationRunContext:
     active_datasource_snapshot: dict[str, Any]
     is_rerun: bool = False
     history_turn_limit: int | None = None
+    short_term_memory: dict[str, Any] = field(default_factory=dict)
 
 
 class ConversationContextService:
