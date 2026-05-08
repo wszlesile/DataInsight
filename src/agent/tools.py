@@ -37,6 +37,9 @@ TOOL_ERROR_STDIO_MAX_CHARS = int(os.environ.get('TOOL_ERROR_STDIO_MAX_CHARS', '8
 TOOL_ERROR_CODE_CONTEXT_MAX_CHARS = int(os.environ.get('TOOL_ERROR_CODE_CONTEXT_MAX_CHARS', '1800'))
 GENERATED_CODE_FILENAME = '<generated_analysis_code>'
 GENERATED_CODE_CONTEXT_RADIUS = 2
+FRONTEND_TOOL_RETRY_MESSAGE = '分析代码需要调整，正在反馈给大模型重新生成。'
+FRONTEND_TOOL_ERROR_MESSAGE = '分析代码执行报错，正在反馈给大模型重新修改生成。'
+FRONTEND_TOOL_TIMEOUT_MESSAGE = '分析代码执行时间较长，正在反馈给大模型优化后重试。'
 
 CHART_CONTRACT_ERROR_MARKERS = (
     'structured chart item',
@@ -2467,7 +2470,7 @@ def execute_python(
             stage='tool_retry',
             level='warning',
             tool='execute_python',
-            message=contract_retry.message,
+            message=FRONTEND_TOOL_RETRY_MESSAGE,
         )
         return _tool_error_message(
             tool_call_id=runtime.tool_call_id,
@@ -2537,7 +2540,7 @@ def execute_python(
             stage='tool_error',
             level='error',
             tool='execute_python',
-            message=error_message,
+            message=FRONTEND_TOOL_TIMEOUT_MESSAGE,
         )
         return _tool_error_message(
             tool_call_id=runtime.tool_call_id,
@@ -2582,7 +2585,7 @@ def execute_python(
             stage='tool_error',
             level='error',
             tool='execute_python',
-            message=error_message,
+            message=FRONTEND_TOOL_ERROR_MESSAGE,
         )
         return _tool_error_message(
             tool_call_id=runtime.tool_call_id,
@@ -2622,7 +2625,7 @@ def execute_python(
             stage='tool_error',
             level='error',
             tool='execute_python',
-            message=error_message,
+            message=FRONTEND_TOOL_ERROR_MESSAGE,
         )
         return _tool_error_message(
             tool_call_id=runtime.tool_call_id,
@@ -2676,7 +2679,7 @@ def execute_python(
             stage='tool_error',
             level='error',
             tool='execute_python',
-            message=f'代码执行失败（{error_type}）：{error_message}',
+            message=FRONTEND_TOOL_ERROR_MESSAGE,
         )
         return _tool_error_message(
             tool_call_id=runtime.tool_call_id,
@@ -2750,7 +2753,7 @@ def execute_python(
             stage='tool_retry',
             level='warning',
             tool='execute_python',
-            message=exec_result.message,
+            message=FRONTEND_TOOL_RETRY_MESSAGE,
         )
         return _tool_error_message(
             tool_call_id=runtime.tool_call_id,
@@ -2791,7 +2794,7 @@ def execute_python(
                 stage='tool_retry',
                 level='warning',
                 tool='execute_python',
-                message=contract_retry.message,
+                message=FRONTEND_TOOL_RETRY_MESSAGE,
             )
             return _tool_error_message(
                 tool_call_id=runtime.tool_call_id,
@@ -2849,7 +2852,7 @@ def execute_python(
         stage='tool_retry',
         level='warning',
         tool='execute_python',
-        message='生成的代码未按模板返回 result，正在请求模型修正。',
+        message=FRONTEND_TOOL_RETRY_MESSAGE,
     )
     return _tool_error_message(
         tool_call_id=runtime.tool_call_id,
