@@ -40,6 +40,8 @@ class CustomContext(BaseModel):
     namespace_id: int = 0
     conversation_id: int = 0
     turn_id: int = 0
+    user_query: str = ''
+    expected_time_range: dict[str, Any] = Field(default_factory=dict)
     auth_token: str = ''
     database_conn_info: dict[str, Any] = Field(default_factory=dict)
 

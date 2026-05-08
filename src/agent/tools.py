@@ -28,6 +28,8 @@ from dto import DatabaseConnInfo
 from utils import build_chart_document, build_chart_result, build_chart_suite, build_multi_metric_chart_result, logger, normalize_chart_result_item
 
 CURRENT_USERNAME = ContextVar('current_username', default='anonymous')
+CURRENT_EXPECTED_TIME_RANGE = ContextVar('current_expected_time_range', default={})
+CURRENT_TIME_RANGE_GUARD_ACTIVE = ContextVar('current_time_range_guard_active', default=False)
 
 TOOL_ERROR_CURRENT_CODE_MAX_CHARS = int(os.environ.get('TOOL_ERROR_CURRENT_CODE_MAX_CHARS', '3500'))
 TOOL_ERROR_TEXT_MAX_CHARS = int(os.environ.get('TOOL_ERROR_TEXT_MAX_CHARS', '1800'))
@@ -1179,6 +1181,19 @@ def _has_static_assignment(tree: ast.AST, name: str) -> bool:
     return False
 
 
+def _extract_static_assignment_literal(tree: ast.AST, name: str) -> Any:
+    for node in getattr(tree, 'body', []):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
+            continue
+        try:
+            return ast.literal_eval(node.value)
+        except Exception:
+            return None
+    return None
+
+
 def _called_function_names(tree: ast.AST) -> set[str]:
     names: set[str] = set()
     for node in ast.walk(tree):
@@ -1190,6 +1205,86 @@ def _called_function_names(tree: ast.AST) -> set[str]:
         elif isinstance(func, ast.Attribute):
             names.add(func.attr)
     return names
+
+
+def _date_text(value: Any) -> str:
+    text = str(value or '').strip()
+    match = re.search(r'\d{4}-\d{1,2}-\d{1,2}', text)
+    if not match:
+        return ''
+    try:
+        return datetime.strptime(match.group(0), '%Y-%m-%d').date().isoformat()
+    except ValueError:
+        return ''
+
+
+def _actual_time_range_matches_expected(actual_time_range: Any, expected_time_range: Any) -> bool:
+    if not isinstance(actual_time_range, dict) or not isinstance(expected_time_range, dict):
+        return False
+
+    expected_start = _date_text(expected_time_range.get('start'))
+    expected_end = _date_text(expected_time_range.get('end'))
+    expected_display_end = _date_text(expected_time_range.get('display_end'))
+    actual_start = _date_text(actual_time_range.get('start'))
+    actual_end = _date_text(actual_time_range.get('end'))
+
+    if not expected_start or not actual_start or actual_start != expected_start:
+        return False
+
+    accepted_ends = {item for item in (expected_end, expected_display_end) if item}
+    if accepted_ends and actual_end not in accepted_ends:
+        return False
+    return True
+
+
+def _build_explicit_time_range_drift_retry(
+    expected_time_range: dict[str, Any],
+    actual_time_range: Any,
+) -> RetryResult:
+    return request_retry(
+        retry_type="query_constraint_violation",
+        message=(
+            "当前 analysis 代码把用户问题中的明确时间范围改成了其他时间范围；"
+            "在本轮已出现无数据或探测反馈后，不能用数据覆盖范围替换用户原始时间范围。"
+        ),
+        diagnostics={
+            'expected_time_range': expected_time_range,
+            'actual_time_range': actual_time_range if isinstance(actual_time_range, dict) else {},
+        },
+        repair_instructions=[
+            "重新生成完整 analysis 代码，query_constraints.time_range 必须保持 expected_time_range。",
+            "不要使用探测到的数据覆盖范围、最接近一周、历史月份或代理时间段来替换用户问题中的时间范围。",
+            "如果 expected_time_range 内确实无数据，请生成无数据结论和建议报告；可以调用 save_analysis_result(...) 保存自然语言说明，但不要扩大时间范围继续分析。",
+        ],
+    )
+
+
+def _validate_explicit_time_range_guard(
+    code: str,
+    expected_time_range: dict[str, Any],
+    time_range_guard_active: bool,
+) -> RetryResult | None:
+    if not time_range_guard_active or not isinstance(expected_time_range, dict) or not expected_time_range:
+        return None
+
+    try:
+        tree = ast.parse(code or '')
+    except SyntaxError:
+        return None
+
+    execution_intent = _extract_static_string_assignment(tree, 'execution_intent')
+    if execution_intent != 'analysis':
+        return None
+
+    query_constraints = _extract_static_assignment_literal(tree, 'query_constraints')
+    if not isinstance(query_constraints, dict):
+        return None
+
+    actual_time_range = query_constraints.get('time_range')
+    if _actual_time_range_matches_expected(actual_time_range, expected_time_range):
+        return None
+
+    return _build_explicit_time_range_drift_retry(expected_time_range, actual_time_range)
 
 
 def _validate_generated_code_contract(code: str) -> RetryResult | None:
@@ -1300,6 +1395,18 @@ def validate_query_constraints(
                 'query_constraints 必须是可求值的 dict，并包含与当前问题相关的 time_range、target_filters、aggregation。',
                 'target_filters 中每个对象至少要包含 semantic_role、value、match_mode；match_mode 只能是 exact 或 fuzzy。',
             ],
+        )
+
+    expected_time_range = CURRENT_EXPECTED_TIME_RANGE.get()
+    if (
+        CURRENT_TIME_RANGE_GUARD_ACTIVE.get()
+        and isinstance(expected_time_range, dict)
+        and expected_time_range
+        and not _actual_time_range_matches_expected(query_constraints.get('time_range'), expected_time_range)
+    ):
+        return _build_explicit_time_range_drift_retry(
+            expected_time_range=expected_time_range,
+            actual_time_range=query_constraints.get('time_range'),
         )
 
     filter_fragments = [
@@ -1610,7 +1717,38 @@ def _find_chart_structure_dump_in_report(report_text: str) -> dict[str, Any] | N
     return None
 
 
-def _validate_structured_result_contract(exec_result: StructuredResult) -> RetryResult | None:
+def _is_expected_time_no_data_report(report_text: str, expected_time_range: dict[str, Any]) -> bool:
+    if not isinstance(expected_time_range, dict) or not expected_time_range:
+        return False
+    normalized_report = str(report_text or '').strip()
+    if not normalized_report:
+        return False
+
+    no_data_markers = (
+        '无数据',
+        '暂无',
+        '没有数据',
+        '未找到',
+        '未命中',
+        '没有返回任何数据',
+        '未返回任何数据',
+    )
+    if not any(marker in normalized_report for marker in no_data_markers):
+        return False
+
+    expected_start = _date_text(expected_time_range.get('start'))
+    expected_end = _date_text(expected_time_range.get('end'))
+    expected_display_end = _date_text(expected_time_range.get('display_end'))
+    accepted_ends = {item for item in (expected_end, expected_display_end) if item}
+    return bool(expected_start and expected_start in normalized_report and any(end in normalized_report for end in accepted_ends))
+
+
+def _validate_structured_result_contract(
+    exec_result: StructuredResult,
+    *,
+    allow_empty_artifact_no_data: bool = False,
+    expected_time_range: Optional[dict[str, Any]] = None,
+) -> RetryResult | None:
     report_text = (exec_result.analysis_report or '').strip()
     if not report_text:
         return request_retry(
@@ -1647,6 +1785,8 @@ def _validate_structured_result_contract(exec_result: StructuredResult) -> Retry
         )
 
     if not (exec_result.charts or exec_result.tables):
+        if allow_empty_artifact_no_data and _is_expected_time_no_data_report(report_text, expected_time_range or {}):
+            return None
         return request_retry(
             retry_type="missing_structured_artifact",
             message="当前代码只生成了分析报告，没有生成图表或结构化表格。",
@@ -1861,12 +2001,15 @@ def _serialize_runtime_user_context(runtime_context: CustomContext | None) -> di
     return {
         'token': getattr(runtime_context, 'auth_token', '') or '',
         'database_conn_info': dict(getattr(runtime_context, 'database_conn_info', {}) or {}),
+        'expected_time_range': dict(getattr(runtime_context, 'expected_time_range', {}) or {}),
     }
 
 
 def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -> None:
     """在子进程里恢复数据库访问所需的最小运行时上下文。"""
     payload = runtime_user_context or {}
+    CURRENT_EXPECTED_TIME_RANGE.set(dict(payload.get('expected_time_range') or {}))
+    CURRENT_TIME_RANGE_GUARD_ACTIVE.set(bool(payload.get('time_range_guard_active')))
     conn_info_payload = payload.get('database_conn_info') or {}
     if conn_info_payload:
         supos_kernel_api._database_conn_info = DatabaseConnInfo(
@@ -2146,6 +2289,52 @@ def _build_turn_failure_memory(turn_id: int, current_execution_id: int) -> dict[
         }
     finally:
         session.close()
+
+
+def _turn_has_prior_time_range_guard_signal(turn_id: int, current_execution_id: int) -> bool:
+    """Whether this turn already hit no-data/probe feedback before the current execution."""
+    if turn_id <= 0:
+        return False
+
+    from config.database import SessionLocal
+    from model import InsightNsExecution
+
+    session = SessionLocal()
+    try:
+        query = session.query(InsightNsExecution).filter(
+            InsightNsExecution.turn_id == turn_id,
+            InsightNsExecution.id != current_execution_id,
+            InsightNsExecution.is_deleted == 0,
+            InsightNsExecution.execution_status != 'success',
+        )
+        if current_execution_id > 0:
+            query = query.filter(InsightNsExecution.id < current_execution_id)
+
+        previous_failures = query.order_by(InsightNsExecution.created_at.desc()).limit(12).all()
+        for execution in previous_failures:
+            error_message = str(getattr(execution, 'error_message', '') or '').lower()
+            payload_text = str(getattr(execution, 'result_payload_json', '') or '')
+            if 'no_data_found' in error_message or 'probe_feedback' in error_message:
+                return True
+
+            try:
+                payload = json.loads(payload_text or '{}')
+            except Exception:
+                payload = {}
+            if not isinstance(payload, dict):
+                continue
+
+            signal_values = {
+                str(payload.get('retry_type') or ''),
+                str(payload.get('error_type') or ''),
+                str(payload.get('retry_reason_code') or ''),
+            }
+            if {'no_data_found', 'probe_feedback'} & signal_values:
+                return True
+    finally:
+        session.close()
+
+    return False
 
 
 def _build_repair_instructions(error_type: str) -> list[str]:
@@ -2446,7 +2635,18 @@ def execute_python(
         message='分析代码已提交到本地执行器。',
     )
 
+    expected_time_range = dict(getattr(runtime.context, 'expected_time_range', {}) or {})
+    time_range_guard_active = _turn_has_prior_time_range_guard_signal(
+        turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+        current_execution_id=execution_id,
+    )
     contract_retry = _validate_generated_code_contract(code)
+    if contract_retry is None:
+        contract_retry = _validate_explicit_time_range_guard(
+            code=code,
+            expected_time_range=expected_time_range,
+            time_range_guard_active=time_range_guard_active,
+        )
     if contract_retry is not None:
         retry_repair_instructions = contract_retry.repair_instructions or _build_repair_instructions(contract_retry.retry_type)
         failure_memory = _build_turn_failure_memory(
@@ -2492,6 +2692,7 @@ def execute_python(
     timeout_seconds = max(int(getattr(Config, 'PYTHON_EXEC_TIMEOUT_SECONDS', 90) or 90), 1)
     result_queue: mp.Queue = mp.Queue()
     runtime_user_context = _serialize_runtime_user_context(runtime.context)
+    runtime_user_context['time_range_guard_active'] = time_range_guard_active
     process = mp.Process(
         target=_execute_generated_code_worker,
         args=(code, getattr(runtime.context, 'username', 'anonymous'), runtime_user_context, result_queue),
@@ -2773,7 +2974,11 @@ def execute_python(
         )
 
     if isinstance(exec_result, StructuredResult):
-        contract_retry = _validate_structured_result_contract(exec_result)
+        contract_retry = _validate_structured_result_contract(
+            exec_result,
+            allow_empty_artifact_no_data=time_range_guard_active,
+            expected_time_range=expected_time_range,
+        )
         if contract_retry is not None:
             failure_memory = _build_turn_failure_memory(
                 turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),

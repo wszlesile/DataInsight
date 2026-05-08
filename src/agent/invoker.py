@@ -1,8 +1,11 @@
 import json
 import re
+from calendar import monthrange
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Iterator
+from zoneinfo import ZoneInfo
 
 from agent import CustomContext, get_data_insight_agent, get_input
 from agent.context_engineering_runtime import is_analysis_like_request
@@ -228,13 +231,185 @@ def _build_progress_event(event_type: str, **payload: Any) -> dict[str, Any]:
     return {'type': event_type, **payload}
 
 
+def _month_window(year: int, month: int) -> tuple[Any, Any]:
+    start = datetime(year, month, 1).date()
+    if month == 12:
+        end = datetime(year + 1, 1, 1).date()
+    else:
+        end = datetime(year, month + 1, 1).date()
+    return start, end
+
+
+def _format_expected_time_range(start: Any, end: Any, label: str) -> dict[str, Any]:
+    display_end = end - timedelta(days=1)
+    return {
+        'start': start.isoformat(),
+        'end': end.isoformat(),
+        'end_exclusive': True,
+        'display_end': display_end.isoformat(),
+        'source': label,
+    }
+
+
+def _build_expected_time_range_from_user_query(user_query: str) -> dict[str, Any]:
+    """Parse a small trusted time-range anchor from explicit user wording."""
+    text = str(user_query or '').strip()
+    if not text:
+        return {}
+
+    today = datetime.now(ZoneInfo('Asia/Shanghai')).date()
+    current_week_start = today - timedelta(days=today.weekday())
+
+    if '本周' in text:
+        return _format_expected_time_range(current_week_start, current_week_start + timedelta(days=7), '本周')
+    if '上周' in text:
+        start = current_week_start - timedelta(days=7)
+        return _format_expected_time_range(start, current_week_start, '上周')
+    if '今天' in text:
+        return _format_expected_time_range(today, today + timedelta(days=1), '今天')
+    if '昨天' in text:
+        start = today - timedelta(days=1)
+        return _format_expected_time_range(start, today, '昨天')
+    if '前天' in text:
+        start = today - timedelta(days=2)
+        return _format_expected_time_range(start, start + timedelta(days=1), '前天')
+    if '本月' in text:
+        start, end = _month_window(today.year, today.month)
+        return _format_expected_time_range(start, end, '本月')
+    if '上月' in text:
+        year = today.year if today.month > 1 else today.year - 1
+        month = today.month - 1 if today.month > 1 else 12
+        start, end = _month_window(year, month)
+        return _format_expected_time_range(start, end, '上月')
+    if '今年' in text:
+        start = datetime(today.year, 1, 1).date()
+        end = datetime(today.year + 1, 1, 1).date()
+        return _format_expected_time_range(start, end, '今年')
+    if '去年' in text:
+        start = datetime(today.year - 1, 1, 1).date()
+        end = datetime(today.year, 1, 1).date()
+        return _format_expected_time_range(start, end, '去年')
+
+    date_match = re.search(r'(?P<year>\d{4})[-/年](?P<month>\d{1,2})(?:[-/月](?P<day>\d{1,2}))?', text)
+    if date_match:
+        year = int(date_match.group('year'))
+        month = int(date_match.group('month'))
+        day_text = date_match.group('day')
+        if 1 <= month <= 12 and day_text:
+            day = int(day_text)
+            if 1 <= day <= monthrange(year, month)[1]:
+                start = datetime(year, month, day).date()
+                return _format_expected_time_range(start, start + timedelta(days=1), date_match.group(0))
+        if 1 <= month <= 12:
+            start, end = _month_window(year, month)
+            return _format_expected_time_range(start, end, date_match.group(0))
+
+    return {}
+
+
+def _date_text(value: Any) -> str:
+    text = str(value or '').strip()
+    match = re.search(r'\d{4}-\d{1,2}-\d{1,2}', text)
+    if not match:
+        return ''
+    try:
+        return datetime.strptime(match.group(0), '%Y-%m-%d').date().isoformat()
+    except ValueError:
+        return ''
+
+
+def _is_expected_time_no_data_report(user_query: str, analysis_report: str) -> bool:
+    expected_time_range = _build_expected_time_range_from_user_query(user_query)
+    if not expected_time_range:
+        return False
+    report_text = str(analysis_report or '').strip()
+    if not report_text:
+        return False
+
+    no_data_markers = (
+        '无数据',
+        '暂无',
+        '没有数据',
+        '未找到',
+        '未命中',
+        '没有返回任何数据',
+        '未返回任何数据',
+    )
+    if not any(marker in report_text for marker in no_data_markers):
+        return False
+
+    expected_start = _date_text(expected_time_range.get('start'))
+    expected_end = _date_text(expected_time_range.get('end'))
+    expected_display_end = _date_text(expected_time_range.get('display_end'))
+    accepted_ends = {item for item in (expected_end, expected_display_end) if item}
+    return bool(expected_start and expected_start in report_text and any(end in report_text for end in accepted_ends))
+
+
+def _is_expected_time_no_data_execution(
+    service: ConversationContextService,
+    runtime: ConversationRunContext,
+    user_message: str,
+) -> bool:
+    expected_time_range = _build_expected_time_range_from_user_query(user_message or getattr(runtime.turn, 'user_query', ''))
+    if not expected_time_range:
+        return False
+
+    executions = service.get_turn_executions(runtime.turn.id, started_at=runtime.turn.started_at)
+    if not executions:
+        return False
+
+    latest_execution = executions[-1]
+    if getattr(latest_execution, 'execution_status', '') == 'success':
+        return False
+    if _extract_execution_error_type(latest_execution) != 'no_data_found':
+        return False
+
+    error_message = (getattr(latest_execution, 'error_message', '') or '').strip()
+    return _is_expected_time_no_data_report(user_message, error_message)
+
+
+def _build_expected_time_no_data_report(
+    service: ConversationContextService,
+    runtime: ConversationRunContext,
+    user_message: str,
+    latest_message: str,
+    analysis_report: str,
+) -> str:
+    if _is_expected_time_no_data_report(user_message, analysis_report):
+        return analysis_report.strip()
+    if _is_expected_time_no_data_report(user_message, latest_message):
+        return latest_message.strip()
+
+    executions = service.get_turn_executions(runtime.turn.id, started_at=runtime.turn.started_at)
+    latest_error = ''
+    if executions:
+        latest_error = (getattr(executions[-1], 'error_message', '') or '').strip()
+
+    expected_time_range = _build_expected_time_range_from_user_query(user_message or getattr(runtime.turn, 'user_query', ''))
+    start = str(expected_time_range.get('start') or '').strip()
+    end = str(expected_time_range.get('display_end') or expected_time_range.get('end') or '').strip()
+    source = str(expected_time_range.get('source') or '').strip()
+    range_text = f'{source}（{start} 至 {end}）' if source and start and end else f'{start} 至 {end}'.strip(' 至')
+
+    lines = ['## 分析结果', '当前问题指定的时间范围内暂无可分析数据。']
+    if range_text:
+        lines.extend(['### 时间范围', range_text])
+    if latest_error:
+        lines.extend(['### 详情', latest_error])
+    lines.extend(['### 建议', '请确认该时间范围内的数据是否已经入库，或调整为有数据覆盖的时间范围后重新分析。'])
+    return '\n\n'.join(item for item in lines if item).strip()
+
+
 def _build_agent_context(agent_request: AgentRequest, runtime: ConversationRunContext) -> CustomContext:
     """构造 Agent 与工具层使用的运行上下文。"""
+    user_query = getattr(runtime.turn, 'user_query', '') or agent_request.user_message or ''
     return CustomContext(
         username=agent_request.username,
         namespace_id=runtime.conversation.insight_namespace_id,
         conversation_id=runtime.conversation.id,
         turn_id=runtime.turn.id,
+        user_query=user_query,
+        expected_time_range=_build_expected_time_range_from_user_query(user_query),
         auth_token=agent_request.auth_token or '',
         database_conn_info=dict(agent_request.database_conn_info or {}),
     )
@@ -1103,6 +1278,22 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 tables=tables,
             )
 
+            if (
+                analysis_flow_started
+                and not (analysis_report or charts or tables)
+                and _is_expected_time_no_data_execution(service, runtime, agent_request.user_message)
+            ):
+                analysis_report = _build_expected_time_no_data_report(
+                    service=service,
+                    runtime=runtime,
+                    user_message=agent_request.user_message,
+                    latest_message=assistant_message,
+                    analysis_report=analysis_report,
+                )
+                assistant_message = analysis_report
+                allow_report_only = True
+                break
+
             if raw_tool_call_detected and not (analysis_report or charts or tables):
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
@@ -1135,6 +1326,9 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
 
             if analysis_flow_started:
                 if analysis_report and (charts or tables):
+                    break
+                if analysis_report and _is_expected_time_no_data_report(agent_request.user_message, analysis_report):
+                    allow_report_only = True
                     break
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
@@ -1459,6 +1653,22 @@ def _stream_with_runtime(
                 tables=tables,
             )
 
+            if (
+                analysis_flow_started
+                and not (analysis_report or charts or tables)
+                and _is_expected_time_no_data_execution(service, runtime, agent_request.user_message)
+            ):
+                analysis_report = _build_expected_time_no_data_report(
+                    service=service,
+                    runtime=runtime,
+                    user_message=agent_request.user_message,
+                    latest_message=assistant_message,
+                    analysis_report=analysis_report,
+                )
+                assistant_message = analysis_report
+                allow_report_only = True
+                break
+
             if raw_tool_call_detected and not (analysis_report or charts or tables):
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
@@ -1491,6 +1701,9 @@ def _stream_with_runtime(
 
             if analysis_flow_started:
                 if analysis_report and (charts or tables):
+                    break
+                if analysis_report and _is_expected_time_no_data_report(agent_request.user_message, analysis_report):
+                    allow_report_only = True
                     break
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue

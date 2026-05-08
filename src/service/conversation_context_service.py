@@ -285,6 +285,13 @@ class ConversationContextService:
         conversation.last_message_at = _now()
         conversation.updated_at = _now()
 
+        self._sync_first_turn_execution_title(
+            conversation=conversation,
+            turn=turn,
+            latest_execution=latest_execution,
+            replace_existing_results=replace_existing_results,
+        )
+
         self.add_message(
             conversation=conversation,
             turn=turn,
@@ -350,6 +357,32 @@ class ConversationContextService:
             "charts": _attach_chart_artifact_refs(charts or [], chart_artifacts),
             "tables": tables or [],
         }
+
+    def _sync_first_turn_execution_title(
+        self,
+        conversation: InsightNsConversation,
+        turn: InsightNsTurn,
+        latest_execution: InsightNsExecution | None,
+        replace_existing_results: bool = False,
+    ) -> None:
+        """空会话首轮分析成功后，用会话名称同步最终执行记录标题。"""
+        if replace_existing_results:
+            return
+        if int(turn.turn_no or 0) != 1:
+            return
+        if latest_execution is None or latest_execution.execution_status != 'success':
+            return
+
+        if str(conversation.title or '').strip() == '新建会话':
+            analysis_title = str(latest_execution.title or '').strip()
+            conversation.title = analysis_title or build_conversation_title(turn.user_query)
+
+        conversation_title = str(conversation.title or '').strip()[:260]
+        if not conversation_title or latest_execution.title == conversation_title:
+            return
+
+        latest_execution.title = conversation_title
+        latest_execution.updated_at = _now()
 
     def fail_run(
         self,
