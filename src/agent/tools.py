@@ -971,7 +971,7 @@ def build_markdown_table(dataframe, columns: Optional[list[str]] = None, max_row
     def _stringify(value: Any) -> str:
         if isinstance(value, float):
             return f"{value:,.2f}".rstrip('0').rstrip('.')
-        return str(value)
+        return re.sub(r'\s+', ' ', str(value)).strip()
 
     headers = [str(column) for column in table_df.columns]
     header_line = "| " + " | ".join(headers) + " |"
