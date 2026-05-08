@@ -1680,3 +1680,67 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
    - `POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/rerun/stream`
 6. 导出 PDF：
    - `POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/export/pdf`
+
+---
+
+## 11. LLM 模型列表
+
+`GET /api/llm/models`
+
+用途：
+
+- 供前端获取平台 LLM 网关可用模型列表。
+- 后端内部调用 `{SUPOS_WEB}/os/llm-gateway/v1/models`。
+- 当前请求的 `Authorization` 会透传给平台接口。
+
+响应 `data` 为模型数组，后端会根据当前用户的模型选择补充 `selected` 字段：
+
+```json
+[
+  {
+    "id": "360GPT_S2_V9",
+    "object": "model",
+    "created": 1677649963,
+    "owned_by": "360",
+    "selected": true
+  }
+]
+```
+
+示例响应：
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": "360GPT_S2_V9",
+      "object": "model",
+      "created": 1677649963,
+      "owned_by": "360",
+      "selected": true
+    }
+  ],
+  "message": "操作成功",
+  "code": 200
+}
+```
+
+`PUT /api/llm/models/selected`
+
+用途：
+
+- 切换当前用户选择的 Agent 模型。
+- 请求体中的 `model_id` 必须来自 `GET /api/llm/models` 返回的模型 `id`。
+- 切换后模型选择写入数据库，并刷新当前用户认证上下文缓存。
+- Agent 实例按模型运行配置复用，多个用户选择同一个模型时复用同一个 Agent。
+
+请求体：
+
+```json
+{
+  "model_id": "MiniMax-M2.7-highspeed"
+}
+```
+
+响应 `data` 与 `GET /api/llm/models` 一致，返回带 `selected` 字段的模型数组。

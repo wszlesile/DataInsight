@@ -10,6 +10,26 @@
       </div>
 
       <div class="nav-actions">
+        <div class="model-switcher">
+          <span class="model-label">模型</span>
+          <el-select
+            v-model="selectedLlmModelId"
+            class="model-select"
+            size="small"
+            filterable
+            :loading="llmModelsLoading"
+            :disabled="llmModelsLoading || llmModels.length === 0"
+            placeholder="选择模型"
+            @change="onSelectLlmModel"
+          >
+            <el-option
+              v-for="model in llmModels"
+              :key="model.id"
+              :label="getLlmModelLabel(model)"
+              :value="model.id"
+            />
+          </el-select>
+        </div>
         <button class="nav-icon" type="button" @click="showHelp">?</button>
         <button class="nav-icon" type="button" @click="favoritesPanelVisible = true">
           ★
@@ -517,12 +537,14 @@ import {
   exportTurnPdf,
   getConversationHistory,
   getTurnDetail,
+  listLlmModels,
   listCollects,
   listConversations,
   listNamespaces,
   removeCollect,
   renameConversation,
   renameNamespace,
+  selectLlmModel,
   streamAgent,
   streamRerunTurn
 } from './api/agent.js'
@@ -554,6 +576,9 @@ const turnDetailLoading = ref(false)
 const turnDetail = ref(null)
 const previewArtifact = ref(null)
 const favoritesPanelVisible = ref(false)
+const llmModels = ref([])
+const llmModelsLoading = ref(false)
+const selectedLlmModelId = ref('')
 
 const quickPrompts = [
   '分析2024年Q4季度的销售趋势',
@@ -570,6 +595,10 @@ const activeSpaceName = computed(() =>
 )
 
 const visibleFavorites = computed(() => collects.value)
+
+const selectedLlmModel = computed(() =>
+  llmModels.value.find((item) => item.id === selectedLlmModelId.value) || null
+)
 
 const renderMarkdown = (content) => (content ? marked.parse(content) : '')
 const collectKey = (collectType, targetId) => `${collectType}:${targetId}`
@@ -1065,6 +1094,63 @@ const fetchCollects = async () => {
     if (response.data.success) collects.value = response.data.data || []
   } catch (error) {
     console.error('List collects error:', error)
+  }
+}
+
+const normalizeLlmModels = (items = []) =>
+  (Array.isArray(items) ? items : [])
+    .filter((item) => item && item.id)
+    .map((item) => ({
+      ...item,
+      id: String(item.id),
+      selected: Boolean(item.selected)
+    }))
+
+const getLlmModelLabel = (model) => {
+  const owner = model?.owned_by ? ` · ${model.owned_by}` : ''
+  return `${model?.id || '未知模型'}${owner}`
+}
+
+const applyLlmModels = (models) => {
+  llmModels.value = normalizeLlmModels(models)
+  selectedLlmModelId.value = llmModels.value.find((item) => item.selected)?.id || llmModels.value[0]?.id || ''
+}
+
+const fetchLlmModels = async () => {
+  llmModelsLoading.value = true
+  try {
+    const response = await listLlmModels()
+    if (response.data?.success) {
+      applyLlmModels(response.data.data || [])
+    } else {
+      ElMessage.error(response.data?.message || '加载模型列表失败')
+    }
+  } catch (error) {
+    console.error('List LLM models error:', error)
+    ElMessage.error(error?.response?.data?.message || '加载模型列表失败')
+  } finally {
+    llmModelsLoading.value = false
+  }
+}
+
+const onSelectLlmModel = async (modelId) => {
+  const previousModelId = llmModels.value.find((item) => item.selected)?.id || ''
+  if (!modelId || modelId === previousModelId) return
+
+  llmModelsLoading.value = true
+  try {
+    const response = await selectLlmModel(modelId)
+    if (!response.data?.success) {
+      throw new Error(response.data?.message || '切换模型失败')
+    }
+    applyLlmModels(response.data.data || [])
+    ElMessage.success(`已切换模型：${selectedLlmModel.value?.id || selectedLlmModelId.value}`)
+  } catch (error) {
+    console.error('Select LLM model error:', error)
+    ElMessage.error(error?.response?.data?.message || error?.message || '切换模型失败')
+    await fetchLlmModels()
+  } finally {
+    llmModelsLoading.value = false
   }
 }
 
@@ -1685,7 +1771,7 @@ const showKnowledgePlaceholder = () => {
 }
 
 onMounted(async () => {
-  await fetchSpaces()
+  await Promise.all([fetchLlmModels(), fetchSpaces()])
   if (spaces.value.length > 0) {
     await onSelectSpace(spaces.value[0])
     return
@@ -1708,6 +1794,11 @@ onMounted(async () => {
 .logo-title { font-size: 15px; font-weight: 700; }
 .logo-subtitle { margin-top: 2px; font-size: 11px; color: rgba(255, 255, 255, 0.64); }
 .nav-actions { display: flex; align-items: center; gap: 12px; }
+.model-switcher { height: 34px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border-radius: 12px; background: rgba(255, 255, 255, 0.08); }
+.model-label { font-size: 12px; color: rgba(255, 255, 255, 0.72); white-space: nowrap; }
+.model-select { width: 230px; }
+.model-switcher :deep(.el-select__wrapper) { min-height: 26px; border: none; box-shadow: none; background: rgba(255, 255, 255, 0.96); border-radius: 8px; }
+.model-switcher :deep(.el-select__selected-item) { max-width: 178px; font-size: 12px; color: #0f172a; }
 .nav-icon { position: relative; width: 34px; height: 34px; border: none; border-radius: 12px; background: rgba(255, 255, 255, 0.08); color: #fff; cursor: pointer; }
 .nav-icon:hover { background: rgba(255, 255, 255, 0.14); }
 .badge { position: absolute; top: -6px; right: -6px; min-width: 18px; height: 18px; padding: 0 6px; border-radius: 999px; background: #ef4444; display: inline-flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; }

@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Generic, TypeVar
@@ -18,7 +19,11 @@ from agent.context_engineering_runtime import (
 from agent.tools import execute_python
 from config import Config
 from utils import logger
-from utils.llm_model_factory import create_data_insight_model as _create_data_insight_model
+from utils.llm_model_factory import (
+    LlmRuntimeConfig,
+    create_data_insight_model as _create_data_insight_model,
+    create_runtime_config,
+)
 from utils.token_budget import describe_budget_split, estimate_message_tokens, estimate_messages_tokens
 
 MessageT = TypeVar("MessageT", bound=BaseMessage, covariant=True)
@@ -54,29 +59,48 @@ def load_system_prompt() -> str:
     return SYS_PROMPT_PATH.read_text(encoding='utf-8').strip()
 
 
-def create_data_insight_model():
+AGENT_CACHE_MAX_SIZE = 8
+_AGENT_CACHE: OrderedDict[str, Any] = OrderedDict()
+
+
+def create_data_insight_model(runtime_config: LlmRuntimeConfig | None = None):
     """创建当前配置的聊天模型，同时保持现有模型提供方契约不变。"""
-    return _create_data_insight_model()
+    return _create_data_insight_model(runtime_config)
 
 
-def create_data_insight_agent():
+def create_data_insight_agent(runtime_config: LlmRuntimeConfig | None = None):
     """创建数据洞察 Agent，并保持现有工具契约不变。"""
     return create_agent(
-        model=create_data_insight_model(),
+        model=create_data_insight_model(runtime_config),
         state_schema=CustomAgentState,
         context_schema=CustomContext,
         tools=[execute_python],
     )
 
 
-@lru_cache(maxsize=1)
-def get_data_insight_agent():
-    """Lazy-create the DataInsight Agent so provider failures happen inside request handling."""
+def clear_data_insight_agent_cache() -> None:
+    _AGENT_CACHE.clear()
+
+
+def get_data_insight_agent(runtime_config: LlmRuntimeConfig | None = None):
+    """Lazy-create and reuse DataInsight Agents by model runtime config."""
+    runtime_config = runtime_config or create_runtime_config()
+    cache_key = runtime_config.cache_key
+    cached = _AGENT_CACHE.get(cache_key)
+    if cached is not None:
+        _AGENT_CACHE.move_to_end(cache_key)
+        return cached
+
     try:
-        return create_data_insight_agent()
+        agent = create_data_insight_agent(runtime_config)
     except Exception as exc:
         logger.error("Agent 初始化失败: %s", exc, exc_info=True)
         raise
+    _AGENT_CACHE[cache_key] = agent
+    _AGENT_CACHE.move_to_end(cache_key)
+    while len(_AGENT_CACHE) > AGENT_CACHE_MAX_SIZE:
+        _AGENT_CACHE.popitem(last=False)
+    return agent
 
 
 def _merge_system_messages(*parts: BaseMessage | list[BaseMessage] | None) -> str:

@@ -1,5 +1,6 @@
 import json
 import socket
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -10,6 +11,8 @@ from langchain_qwq import ChatQwen
 from config import Config
 from utils.llm_error_utils import LLMProviderUnavailableError
 
+_CURRENT_SELECTED_MODEL_ID: ContextVar[str] = ContextVar('current_selected_llm_model_id', default='')
+
 
 @dataclass(frozen=True)
 class ModelProvider:
@@ -17,6 +20,20 @@ class ModelProvider:
     adapter: str
     aliases: tuple[str, ...]
     api_key_attr: str = 'API_KEY'
+
+
+@dataclass(frozen=True)
+class LlmRuntimeConfig:
+    provider: str
+    model_id: str
+    base_url: str
+    api_key: str
+    temperature: float
+    adapter: str
+
+    @property
+    def cache_key(self) -> str:
+        return f"{self.provider}|{self.model_id}|{self.base_url}|{self.temperature}"
 
 
 MODEL_PROVIDERS: tuple[ModelProvider, ...] = (
@@ -105,24 +122,51 @@ def _resolve_model_name(provider: ModelProvider, api_key: str, base_url: str) ->
     return Config.MODEL
 
 
-def create_data_insight_model():
-    """Create the currently configured chat model used by the insight agent."""
+def bind_selected_model_id(model_id: str) -> Token:
+    return _CURRENT_SELECTED_MODEL_ID.set((model_id or '').strip())
+
+
+def reset_selected_model_id(token: Token) -> None:
+    _CURRENT_SELECTED_MODEL_ID.reset(token)
+
+
+def create_runtime_config(selected_model_id: str = '') -> LlmRuntimeConfig:
+    """Resolve the chat model runtime config for the current request."""
     provider = resolve_model_provider(Config.LLM_PROVIDER)
     api_key = getattr(Config, provider.api_key_attr)
     base_url = _resolve_provider_base_url(provider)
-    model_name = _resolve_model_name(provider, api_key, base_url)
-    if provider.adapter == 'openai':
+    model_id = (
+        (selected_model_id or '').strip()
+        or _CURRENT_SELECTED_MODEL_ID.get()
+        or _resolve_model_name(provider, api_key, base_url)
+    )
+    return LlmRuntimeConfig(
+        provider=provider.name,
+        model_id=model_id,
+        base_url=base_url,
+        api_key=api_key,
+        temperature=Config.TEMPERATURE,
+        adapter=provider.adapter,
+    )
+
+
+def create_data_insight_model(runtime_config: LlmRuntimeConfig | None = None):
+    """Create the currently configured chat model used by the insight agent."""
+    runtime_config = runtime_config or create_runtime_config()
+    if runtime_config.adapter == 'openai':
         return ChatOpenAI(
-            model=model_name,
-            api_key=api_key,
-            base_url=base_url,
-            temperature=Config.TEMPERATURE,
+            model=runtime_config.model_id,
+            api_key=runtime_config.api_key,
+            base_url=runtime_config.base_url,
+            temperature=runtime_config.temperature,
         )
-    if provider.adapter == 'qwen':
+    if runtime_config.adapter == 'qwen':
         return ChatQwen(
-            model=model_name,
-            api_key=api_key,
-            base_url=base_url,
+            model=runtime_config.model_id,
+            api_key=runtime_config.api_key,
+            base_url=runtime_config.base_url,
         )
 
-    raise ValueError(f"Unsupported LLM adapter='{provider.adapter}' for provider '{provider.name}'")
+    raise ValueError(
+        f"Unsupported LLM adapter='{runtime_config.adapter}' for provider '{runtime_config.provider}'"
+    )

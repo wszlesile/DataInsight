@@ -51,6 +51,19 @@ class SuposKernelApi:
         response.raise_for_status()
         return response.json()
 
+    def fetch_llm_gateway_models(self, authorization: str) -> dict[str, Any]:
+        """Fetch available LLM models from the SUPOS LLM gateway."""
+        if not authorization:
+            raise ValueError("SUPOS authorization 不能为空")
+
+        url = f"{self.supos_web}/os/llm-gateway/v1/models"
+        headers = {
+            "Authorization": authorization,
+        }
+        response = requests.get(url, headers=headers, timeout=self.timeout)
+        response.raise_for_status()
+        return response.json()
+
     def get_database_conn_info(self, token: str | None = None) -> DatabaseConnInfo:
         """
         获取系统级数据库连接信息单例。

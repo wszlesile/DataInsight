@@ -42,6 +42,14 @@ export function invokeAgent(params) {
   return api.post('/agent/invoke', params)
 }
 
+export function listLlmModels() {
+  return api.get('/llm/models')
+}
+
+export function selectLlmModel(modelId) {
+  return api.put('/llm/models/selected', { model_id: modelId })
+}
+
 export function listNamespaces() {
   return api.get('/insight/namespaces')
 }

@@ -61,6 +61,10 @@ class UserContext:
     user_code: str
     # 当前认证 token。
     token: str
+    # 当前用户选择的 LLM provider。
+    selected_llm_provider: str = 'supos_llm_gateway'
+    # 当前用户选择的 LLM model id。
+    selected_llm_model_id: str = ''
     # 当前请求可见的数据库连接信息快照。
     database_conn_info: DatabaseConnInfo = field(default_factory=DatabaseConnInfo)
 

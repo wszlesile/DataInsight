@@ -14,6 +14,7 @@ from config.database import SessionLocal
 from service.conversation_context_service import ConversationContextService, ConversationRunContext
 from utils import logger
 from utils.llm_error_utils import get_user_facing_agent_error
+from utils.llm_model_factory import bind_selected_model_id, create_runtime_config, reset_selected_model_id
 
 THINK_BLOCK_PATTERN = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
 TOOL_CALL_BLOCK_PATTERN = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", flags=re.DOTALL)
@@ -66,7 +67,12 @@ class AgentRequest:
     conversation_id: str
     user_message: str
     auth_token: str = ''
+    selected_llm_model_id: str = ''
     database_conn_info: dict[str, Any] | None = None
+
+    @property
+    def database_context(self) -> dict[str, Any]:
+        return dict(self.database_conn_info or {})
 
 
 @dataclass
@@ -430,6 +436,10 @@ def _build_agent_input_with_runtime_instruction(
         history_turn_limit=runtime.history_turn_limit,
         datasource_snapshot_override=runtime.active_datasource_snapshot,
     )
+
+
+def _resolve_agent_runtime_config(agent_request: AgentRequest):
+    return create_runtime_config(selected_model_id=agent_request.selected_llm_model_id)
 
 
 def _is_regenerate_request(user_message: str) -> bool:
@@ -1188,6 +1198,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
         user_message=agent_request.user_message,
     )
 
+    selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)
     try:
         assistant_message = ''
         analysis_report = ''
@@ -1229,6 +1240,9 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 allow_report_only=allow_report_only,
             )
 
+        runtime_config = _resolve_agent_runtime_config(agent_request)
+        agent = get_data_insight_agent(runtime_config)
+
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
             runtime_instruction = ''
             if analysis_flow_started:
@@ -1248,7 +1262,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
             elif analysis_request_expected:
                 runtime_instruction = _build_analysis_start_instruction(agent_request.user_message)
 
-            agent_response = get_data_insight_agent().invoke(
+            agent_response = agent.invoke(
                 _build_agent_input_with_runtime_instruction(
                     agent_request=agent_request,
                     runtime=runtime,
@@ -1377,6 +1391,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
         )
         raise RuntimeError(user_error_message) from exc
     finally:
+        reset_selected_model_id(selected_model_token)
         session.close()
 
 
@@ -1486,6 +1501,9 @@ def _stream_with_runtime(
             )
             return
 
+        runtime_config = _resolve_agent_runtime_config(agent_request)
+        agent = get_data_insight_agent(runtime_config)
+
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
             raw_tool_call_detected = False
             runtime_instruction = ''
@@ -1523,7 +1541,7 @@ def _stream_with_runtime(
                     message='正在重新引导模型进入分析执行阶段。',
                 )
 
-            for stream_mode, chunk in get_data_insight_agent().stream(
+            for stream_mode, chunk in agent.stream(
                 _build_agent_input_with_runtime_instruction(
                     agent_request=agent_request,
                     runtime=runtime,
@@ -1790,9 +1808,11 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]
         user_message=agent_request.user_message,
     )
 
+    selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)
     try:
         yield from _stream_with_runtime(service, runtime, agent_request)
     finally:
+        reset_selected_model_id(selected_model_token)
         session.close()
 
 
@@ -1800,16 +1820,20 @@ def _build_rerun_agent_request(
     username: str,
     runtime: ConversationRunContext,
     auth_token: str = '',
+    selected_llm_model_id: str = '',
     database_conn_info: dict[str, Any] | None = None,
+    database_context: dict[str, Any] | None = None,
 ) -> AgentRequest:
     """构造刷新分析复用的 AgentRequest，并透传用户数据库连接信息。"""
+    database_payload = database_conn_info if database_conn_info is not None else database_context
     return AgentRequest(
         username=username,
         namespace_id=str(runtime.conversation.insight_namespace_id),
         conversation_id=str(runtime.conversation.id),
         user_message=runtime.turn.user_query,
         auth_token=auth_token or '',
-        database_conn_info=dict(database_conn_info or {}),
+        selected_llm_model_id=selected_llm_model_id or '',
+        database_conn_info=dict(database_payload or {}),
     )
 
 
@@ -1818,6 +1842,7 @@ def stream_rerun_turn(
     conversation_id: Any,
     turn_id: Any,
     auth_token: str = '',
+    selected_llm_model_id: str = '',
     database_conn_info: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """在同一轮次内重新执行一次分析，并把新结果回写到该轮。"""
@@ -1837,10 +1862,13 @@ def stream_rerun_turn(
         username=username,
         runtime=runtime,
         auth_token=auth_token,
+        selected_llm_model_id=selected_llm_model_id,
         database_conn_info=database_conn_info,
     )
 
+    selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)
     try:
         yield from _stream_with_runtime(service, runtime, agent_request)
     finally:
+        reset_selected_model_id(selected_model_token)
         session.close()

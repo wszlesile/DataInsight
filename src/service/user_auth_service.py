@@ -42,11 +42,13 @@ class UserAuthService:
                 result = response.json()
                 if result.get('code') == 100000000:
                     data = result.get('data', {})
-                    return UserContext.from_auth_response(
+                    user_context = UserContext.from_auth_response(
                         data,
                         token,
                         database_conn_info=supos_kernel_api.get_database_conn_info(token),
                     )
+                    self._attach_user_llm_selection(user_context)
+                    return user_context
 
                 logger.warning(
                     "认证失败: auth_summary=%s message=%s",
@@ -103,6 +105,28 @@ class UserAuthService:
         if not auth_header or self.cache_ttl_seconds <= 0:
             return
         self._context_cache[auth_header] = (time.time() + self.cache_ttl_seconds, user_context)
+
+    def invalidate_user_context(self, auth_header: str) -> None:
+        if auth_header:
+            self._context_cache.pop(auth_header, None)
+
+    def _attach_user_llm_selection(self, user_context: UserContext) -> None:
+        try:
+            from config.database import SessionLocal
+            from service.llm_model_service import DEFAULT_LLM_PROVIDER, LlmModelSelectionService
+
+            session = SessionLocal()
+            try:
+                service = LlmModelSelectionService(session)
+                user_context.selected_llm_provider = DEFAULT_LLM_PROVIDER
+                user_context.selected_llm_model_id = service.get_user_selected_model_id(
+                    user_context.username,
+                    DEFAULT_LLM_PROVIDER,
+                )
+            finally:
+                session.close()
+        except Exception:
+            logger.warning("加载用户 LLM 模型选择失败: username=%s", user_context.username, exc_info=True)
 
     @staticmethod
     def _describe_auth_header(auth_header: str) -> str:

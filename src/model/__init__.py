@@ -78,6 +78,34 @@ class InsightKnowledge(Base):
         }
 
 
+class InsightUserLlmConfig(Base):
+    __tablename__ = 'insight_user_llm_config'
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment='用户 LLM 配置主键')
+    username = Column(String(64), nullable=False, comment='用户名')
+    provider = Column(String(64), nullable=False, default='supos_llm_gateway', comment='LLM 提供方')
+    model_id = Column(String(128), nullable=False, default='', comment='模型 ID')
+    is_deleted = Column(Integer, nullable=False, default=0, comment='软删除标记')
+    created_at = Column(DateTime, default=_now, comment='创建时间')
+    updated_at = Column(DateTime, default=_now, onupdate=_now, comment='更新时间')
+
+    __table_args__ = (
+        Index('idx_user_llm_config_username_provider', 'username', 'provider'),
+        {'comment': '用户 LLM 模型选择配置表'},
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "username": self.username,
+            "provider": self.provider,
+            "model_id": self.model_id,
+            "is_deleted": self.is_deleted,
+            "created_at": _format(self.created_at),
+            "updated_at": _format(self.updated_at),
+        }
+
+
 class InsightNsRelKnowledge(Base):
     __tablename__ = 'insight_ns_rel_knowledge'
 

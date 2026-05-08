@@ -40,6 +40,7 @@ def _build_agent_request(data: dict):
         # 用户消息
         user_message=(data.get('user_message') or '').strip(),
         auth_token=getattr(user_context, 'token', '') or '',
+        selected_llm_model_id=getattr(user_context, 'selected_llm_model_id', '') or '',
         database_conn_info={
             'host': getattr(database_conn_info, 'host', '') or '',
             'port': getattr(database_conn_info, 'port', '') or '',

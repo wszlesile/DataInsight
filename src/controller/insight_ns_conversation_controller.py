@@ -33,11 +33,12 @@ class InsightNsConversationController(BaseController):
         user_context = get_current_user_context()
         return user_context.username if user_context else 'anonymous'
 
-    def _build_request_runtime_context(self) -> tuple[str, dict[str, Any]]:
+    def _build_request_runtime_context(self) -> tuple[str, str, dict[str, Any]]:
         user_context = get_current_user_context()
         database_conn_info = getattr(user_context, 'database_conn_info', None)
         return (
             getattr(user_context, 'token', '') or '',
+            getattr(user_context, 'selected_llm_model_id', '') or '',
             {
                 'host': getattr(database_conn_info, 'host', '') or '',
                 'port': getattr(database_conn_info, 'port', '') or '',
@@ -170,7 +171,7 @@ class InsightNsConversationController(BaseController):
         """在同一轮次内流式重跑分析，不新增新轮次。"""
         from agent.invoker import stream_rerun_turn
         username = self._get_username()
-        auth_token, database_conn_info = self._build_request_runtime_context()
+        auth_token, selected_llm_model_id, database_conn_info = self._build_request_runtime_context()
 
         def generate():
             for event in stream_rerun_turn(
@@ -178,6 +179,7 @@ class InsightNsConversationController(BaseController):
                 conversation_id=conversation_id,
                 turn_id=turn_id,
                 auth_token=auth_token,
+                selected_llm_model_id=selected_llm_model_id,
                 database_conn_info=database_conn_info,
             ):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
