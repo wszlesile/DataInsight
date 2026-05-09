@@ -1,5 +1,6 @@
 import os
 import re
+import json
 from dataclasses import dataclass
 from contextlib import contextmanager
 from pathlib import Path
@@ -50,6 +51,65 @@ class SuposKernelApi:
         response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
         response.raise_for_status()
         return response.json()
+
+    def fetch_license_detail(self, authorization: str, feature_id: int) -> dict[str, Any]:
+        """获取平台授权详情。"""
+        if not authorization:
+            raise ValueError("SUPOS authorization 不能为空")
+        if Config.PROFILE == 'local':
+            mock_payload = self._load_local_license_detail()
+            if mock_payload is not None:
+                return mock_payload
+
+        url = f"{self.supos_web}/os/open-api/license-manager/v1/detail"
+        headers = {
+            "Authorization": authorization,
+        }
+        response = requests.get(
+            url,
+            headers=headers,
+            params={"featureId": feature_id},
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _load_local_license_detail(self) -> dict[str, Any] | None:
+        payload = json.loads("""
+        {
+          "code": 0,
+          "message": "success",
+          "data": {
+            "sysInfo": {
+              "keyId": "190601572734986004",
+              "deadline": 253402271999000,
+              "expiredStatus": 0,
+              "customerName": "190601572734986004",
+              "customerCode": "630108182607239006",
+              "licenseOwner": "蓝卓数字科技有限公司"
+            },
+            "products": [
+              {
+                "id": 7000,
+                "name": "supOS",
+                "features": [
+                  {
+                    "id": 7121,
+                    "name": "数据洞察Agent",
+                    "deadline": 1778314079000,
+                    "expiredStatus": 0,
+                    "featureConfigMap": {}
+                  }
+                ],
+                "productConfigMap": {}
+              }
+            ]
+          }
+        }
+        """)
+        if not isinstance(payload, dict):
+            raise ValueError("本地平台授权 mock JSON 必须是对象")
+        return payload
 
     def get_database_conn_info(self, token: str | None = None) -> DatabaseConnInfo:
         """
@@ -132,7 +192,7 @@ class SuposKernelApi:
     def _initialize_database_conn_info(self, token: str) -> None:
         conn_info = DatabaseConnInfo()
         if Config.PROFILE == 'local':
-            conn_info.host = '192.168.237.14'
+            conn_info.host = '192.168.236.56'
             conn_info.port = '31432'
             conn_info.user = 'fedquery'
             conn_info.password = 'fedquery'
