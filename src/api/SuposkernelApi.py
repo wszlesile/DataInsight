@@ -96,8 +96,8 @@ class SuposKernelApi:
                   {
                     "id": 7121,
                     "name": "数据洞察Agent",
-                    "deadline": 1778314079000,
-                    "expiredStatus": 0,
+                    "deadline": 253402271999000,
+                    "expiredStatus": 1,
                     "featureConfigMap": {}
                   }
                 ],
