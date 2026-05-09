@@ -3,6 +3,12 @@ from uuid import uuid4
 from flask import g, jsonify, request
 
 from dto import UserContext
+from service.platform_license_service import (
+    LicenseExpiredError,
+    LicenseUnauthorizedError,
+    LicenseUnavailableError,
+    platform_license_service,
+)
 from service.user_auth_service import AuthError, user_auth_service
 from utils import logger
 
@@ -75,10 +81,23 @@ def init_auth_middleware(app):
                 }), 401
 
             try:
+                platform_license_service.ensure_agent_authorized(auth_header)
                 user_context: UserContext = user_auth_service.get_user_context(auth_header)
                 g.user_context = user_context
                 logger.info("用户认证成功: %s", user_context.username)
                 return None
+            except (LicenseUnauthorizedError, LicenseExpiredError) as exc:
+                logger.warning("平台授权校验失败: %s", exc)
+                return jsonify({
+                    'code': 403,
+                    'message': str(exc),
+                }), 403
+            except LicenseUnavailableError as exc:
+                logger.error("平台授权服务异常: %s", exc)
+                return jsonify({
+                    'code': 500,
+                    'message': str(exc),
+                }), 500
             except AuthError as exc:
                 logger.warning("用户认证失败: %s", exc)
                 return jsonify({

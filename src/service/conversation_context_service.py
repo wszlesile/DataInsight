@@ -487,15 +487,18 @@ class ConversationContextService:
         ).limit(limit_messages * 3).all()
 
         successful_turn_ids = self._get_successful_execution_turn_ids(conversation_id_int)
+        execution_turn_ids = self._get_execution_turn_ids(conversation_id_int)
         filtered_rows: list[InsightNsMessage] = []
         for row in rows:
             content = (row.content or '').strip()
             if row.role == 'assistant':
-                # 只有真正成功执行过分析任务的轮次，才把助手最终回答纳入历史重放。
-                # 这样可以避免“未真正执行、仅靠记忆复述”的回答继续污染后续上下文。
-                if row.turn_id not in successful_turn_ids:
+                if not content:
                     continue
                 if '<tool_call>' in content:
+                    continue
+                # 分析轮次只有真正成功执行过，才把助手最终回答纳入历史重放。
+                # 完全没有执行记录的轮次属于普通问答，保留其助手回复以维持 user/assistant 成对上下文。
+                if row.turn_id not in successful_turn_ids and row.turn_id in execution_turn_ids:
                     continue
             filtered_rows.append(row)
             if len(filtered_rows) >= limit_messages:
@@ -1333,6 +1336,14 @@ class ConversationContextService:
         rows = self.session.query(InsightNsExecution.turn_id).filter(
             InsightNsExecution.conversation_id == conversation_id,
             InsightNsExecution.execution_status == 'success',
+            InsightNsExecution.is_deleted == 0,
+        ).all()
+        return {to_int(row[0], 0) for row in rows if to_int(row[0], 0) > 0}
+
+    def _get_execution_turn_ids(self, conversation_id: int) -> set[int]:
+        """返回当前会话中曾进入过分析执行流程的轮次集合。"""
+        rows = self.session.query(InsightNsExecution.turn_id).filter(
+            InsightNsExecution.conversation_id == conversation_id,
             InsightNsExecution.is_deleted == 0,
         ).all()
         return {to_int(row[0], 0) for row in rows if to_int(row[0], 0) > 0}
