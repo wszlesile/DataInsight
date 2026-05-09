@@ -1683,7 +1683,9 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 
 ---
 
-## 11. LLM 模型列表
+## 11. LLM 模型接口
+
+### 11.1 获取 LLM 模型列表
 
 `GET /api/llm/models`
 
@@ -1691,7 +1693,7 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 
 - 供前端获取平台 LLM 网关可用模型列表。
 - 后端内部调用 `{SUPOS_WEB}/os/llm-gateway/v1/models`。
-- 当前请求的 `Authorization` 会透传给平台接口。
+- 平台接口鉴权优先使用服务端配置的 `SUPOS_DATAINSIGHT-SERVER_APPKEY`，未配置时回退使用当前请求的 `Authorization`。
 
 响应 `data` 为模型数组，后端会根据当前用户的模型选择补充 `selected` 字段：
 
@@ -1725,6 +1727,8 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
   "code": 200
 }
 ```
+
+### 11.2 切换当前 Agent 模型
 
 `PUT /api/llm/models/selected`
 
