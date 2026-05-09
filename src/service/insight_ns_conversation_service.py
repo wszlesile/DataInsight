@@ -1,16 +1,14 @@
+import base64
+import html
 import json
+import os
 import re
+import urllib.request
 from datetime import datetime
-from io import BytesIO
+from pathlib import Path
 from typing import Any
 
-from PIL import Image as PILImage
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import mm
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer
+from markdown_it import MarkdownIt
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
@@ -33,6 +31,21 @@ from utils import (
     render_chart_spec_to_png,
     to_int,
 )
+
+HTML = None
+WEASYPRINT_IMPORT_ERROR = None
+WEASYPRINT_DLL_DIRECTORY_HANDLES = []
+WEASYPRINT_DLL_DIRECTORIES = set()
+EMOJI_BASE_PATTERN = (
+    r'[\u2600-\u27bf\U0001f1e6-\U0001f1ff\U0001f300-\U0001f5ff'
+    r'\U0001f600-\U0001f64f\U0001f680-\U0001f6ff\U0001f700-\U0001f77f'
+    r'\U0001f780-\U0001f7ff\U0001f800-\U0001f8ff\U0001f900-\U0001faff]'
+)
+EMOJI_CLUSTER_RE = re.compile(
+    rf'{EMOJI_BASE_PATTERN}[\ufe0e\ufe0f]?(?:[\U0001f3fb-\U0001f3ff])?'
+    rf'(?:\u200d{EMOJI_BASE_PATTERN}[\ufe0e\ufe0f]?(?:[\U0001f3fb-\U0001f3ff])?)*'
+)
+TWEMOJI_BASE_URL = 'https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/svg'
 
 
 class InsightNsConversationService:
@@ -472,131 +485,279 @@ class InsightNsConversationService:
         chart_artifacts: list[dict[str, Any]],
         report_text: str,
     ) -> bytes:
-        """把图表与分析报告排版成 PDF 字节流。"""
-        self._ensure_pdf_font_registered()
-
-        buffer = BytesIO()
-        document = SimpleDocTemplate(
-            buffer,
-            pagesize=A4,
-            leftMargin=18 * mm,
-            rightMargin=18 * mm,
-            topMargin=16 * mm,
-            bottomMargin=16 * mm,
+        """Use an HTML/CSS print pipeline so Markdown styles survive PDF export."""
+        document_html = self._build_turn_pdf_html(
             title=title or '分析结果',
+            chart_artifacts=chart_artifacts,
+            report_text=report_text,
         )
-        styles = getSampleStyleSheet()
-        title_style = ParagraphStyle(
-            'InsightPdfTitle',
-            parent=styles['Title'],
-            fontName='STSong-Light',
-            fontSize=18,
-            leading=24,
-            spaceAfter=10,
-        )
-        section_style = ParagraphStyle(
-            'InsightPdfSection',
-            parent=styles['Heading2'],
-            fontName='STSong-Light',
-            fontSize=12,
-            leading=18,
-            spaceBefore=8,
-            spaceAfter=8,
-        )
-        body_style = ParagraphStyle(
-            'InsightPdfBody',
-            parent=styles['BodyText'],
-            fontName='STSong-Light',
-            fontSize=10.5,
-            leading=17,
-            spaceAfter=6,
-        )
+        html_renderer = self._get_weasyprint_html_class()
+        return html_renderer(string=document_html, base_url='.').write_pdf()
 
-        story = []
-        if title:
-            story.append(Paragraph(self._escape_pdf_text(title), title_style))
+    def _get_weasyprint_html_class(self):
+        global HTML, WEASYPRINT_IMPORT_ERROR
+        if HTML is not None:
+            return HTML
+        self._register_weasyprint_dll_directories()
+        try:
+            from weasyprint import HTML as weasyprint_html
+        except OSError as exc:
+            WEASYPRINT_IMPORT_ERROR = exc
+            raise RuntimeError(f"WeasyPrint is unavailable: {exc}") from exc
+        HTML = weasyprint_html
+        return HTML
 
-        for artifact in chart_artifacts:
-            chart_image = self._build_chart_pdf_image(artifact)
-            if chart_image is None:
+    def _register_weasyprint_dll_directories(self) -> None:
+        if os.name != 'nt' or not hasattr(os, 'add_dll_directory'):
+            return
+        candidate_dirs = []
+        configured = os.environ.get('WEASYPRINT_DLL_PATH', '')
+        if configured:
+            candidate_dirs.extend(path for path in configured.split(os.pathsep) if path)
+        candidate_dirs.extend([
+            r'D:\msys64\ucrt64\bin',
+            r'C:\msys64\ucrt64\bin',
+        ])
+        for dll_dir in candidate_dirs:
+            if not os.path.isdir(dll_dir):
                 continue
-            story.append(chart_image)
-            story.append(Spacer(1, 8))
+            normalized_dir = os.path.normcase(os.path.abspath(dll_dir))
+            if normalized_dir in WEASYPRINT_DLL_DIRECTORIES:
+                continue
+            handle = os.add_dll_directory(dll_dir)
+            WEASYPRINT_DLL_DIRECTORY_HANDLES.append(handle)
+            WEASYPRINT_DLL_DIRECTORIES.add(normalized_dir)
 
-        if report_text:
-            for block in self._markdown_to_pdf_blocks(report_text):
-                story.append(Paragraph(self._escape_pdf_text(block).replace('\n', '<br/>'), body_style))
-        else:
-            story.append(Paragraph('当前轮次暂无可导出的分析报告内容。', body_style))
+    def _build_turn_pdf_html(
+        self,
+        title: str,
+        chart_artifacts: list[dict[str, Any]],
+        report_text: str,
+    ) -> str:
+        report_html = self._markdown_to_html(report_text) if report_text else '<p class="empty-report">当前轮次暂无可导出的分析报告内容。</p>'
+        chart_html = self._chart_artifacts_to_html(chart_artifacts)
+        escaped_title = html.escape(title or '分析结果')
+        header_html = f"""<header class="report-header">
+      <h1>{escaped_title}</h1>
+    </header>""" if title else ''
+        return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>{escaped_title}</title>
+  <style>
+{self._pdf_print_css()}
+  </style>
+</head>
+<body>
+  <main class="report-page">
+    {header_html}
+    {chart_html}
+    <section class="markdown-body">
+      {report_html}
+    </section>
+  </main>
+</body>
+</html>"""
 
-        document.build(story)
-        return buffer.getvalue()
+    def _markdown_to_html(self, text: str) -> str:
+        md = MarkdownIt('commonmark', {'html': False, 'breaks': True}).enable('table')
+        return self._replace_emoji_with_images(md.render(text or ''))
 
-    def _build_chart_pdf_image(self, artifact: dict[str, Any]) -> Image | None:
+    def _replace_emoji_with_images(self, rendered_html: str) -> str:
+        def replace_match(match: re.Match[str]) -> str:
+            emoji_text = match.group(0)
+            data_uri = self._get_twemoji_data_uri(emoji_text)
+            if not data_uri:
+                return emoji_text
+            escaped_emoji = html.escape(emoji_text, quote=True)
+            return f'<img class="emoji" draggable="false" alt="{escaped_emoji}" src="{data_uri}">'
+
+        return EMOJI_CLUSTER_RE.sub(replace_match, rendered_html or '')
+
+    def _get_twemoji_data_uri(self, emoji_text: str) -> str:
+        emoji_key = self._twemoji_asset_key(emoji_text)
+        if not emoji_key:
+            return ''
+        cache_path = self._twemoji_cache_dir() / f'{emoji_key}.svg'
+        if not cache_path.exists():
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with urllib.request.urlopen(f'{TWEMOJI_BASE_URL}/{emoji_key}.svg', timeout=5) as response:
+                    cache_path.write_bytes(response.read())
+            except Exception as exc:
+                logger.warning("Twemoji 图标获取失败 emoji=%s key=%s error=%s", emoji_text, emoji_key, exc)
+                return ''
+        svg_bytes = cache_path.read_bytes()
+        return 'data:image/svg+xml;base64,' + base64.b64encode(svg_bytes).decode('ascii')
+
+    def _twemoji_asset_key(self, emoji_text: str) -> str:
+        codepoints = [
+            f'{ord(char):x}'
+            for char in emoji_text
+            if ord(char) not in (0xfe0e, 0xfe0f)
+        ]
+        return '-'.join(codepoints)
+
+    def _twemoji_cache_dir(self) -> Path:
+        return Path(os.environ.get('TEMP_DIR') or 'temp') / 'twemoji'
+
+    def _chart_artifacts_to_html(self, chart_artifacts: list[dict[str, Any]]) -> str:
+        chart_blocks = []
+        for artifact in chart_artifacts:
+            image_bytes = self._render_chart_artifact_png(artifact)
+            if image_bytes is None:
+                continue
+            title = html.escape(str(artifact.get('title') or '图表'))
+            data_uri = base64.b64encode(image_bytes).decode('ascii')
+            chart_blocks.append(
+                f"""<figure class="chart-block">
+  <figcaption>{title}</figcaption>
+  <img src="data:image/png;base64,{data_uri}" alt="{title}">
+</figure>"""
+            )
+        if not chart_blocks:
+            return ''
+        return '<section class="chart-section">\n' + '\n'.join(chart_blocks) + '\n</section>'
+
+    def _render_chart_artifact_png(self, artifact: dict[str, Any]) -> bytes | None:
         content_json = artifact.get('content_json', {})
         if not isinstance(content_json, dict):
             content_json = {}
-
-        image_bytes = None
         chart_spec = content_json.get('chart_spec')
         if isinstance(chart_spec, dict) and chart_spec:
             image_bytes = render_chart_spec_to_png(chart_spec)
-        if image_bytes is None:
-            logger.warning(
-                "PDF 图表渲染被跳过: artifact_id=%s title=%s has_chart_spec=%s",
-                artifact.get('id', 0),
-                artifact.get('title', ''),
-                bool(isinstance(chart_spec, dict) and chart_spec),
-            )
-            return None
-
-        pil_image = PILImage.open(BytesIO(image_bytes))
-        width, height = pil_image.size
-        max_width = A4[0] - 36 * mm
-        draw_width = min(float(width), max_width)
-        draw_height = draw_width * float(height) / float(width)
-        return Image(BytesIO(image_bytes), width=draw_width, height=draw_height)
-
-    def _markdown_to_pdf_blocks(self, text: str) -> list[str]:
-        normalized = (text or '').replace('\r\n', '\n').strip()
-        if not normalized:
-            return []
-        normalized = re.sub(r'```[\s\S]*?```', '', normalized)
-        normalized = re.sub(r'!\[([^\]]*)\]\([^)]+\)', r'\1', normalized)
-        normalized = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1 (\2)', normalized)
-        normalized = re.sub(r'(?m)^>\s?', '', normalized)
-        normalized = re.sub(r'(?m)^#{1,6}\s*', '', normalized)
-        normalized = re.sub(r'(?m)^-{3,}\s*$', '', normalized)
-        normalized = re.sub(r'\*\*(.*?)\*\*', r'\1', normalized)
-        normalized = re.sub(r'__(.*?)__', r'\1', normalized)
-        normalized = re.sub(r'(?<!\*)\*(?!\*)(.*?)\*(?<!\*)', r'\1', normalized)
-        normalized = re.sub(r'(?<!_)_(?!_)(.*?)_(?<!_)', r'\1', normalized)
-
-        blocks = []
-        for block in re.split(r'\n\s*\n', normalized):
-            cleaned = block.strip()
-            if not cleaned:
-                continue
-            lines = []
-            for line in cleaned.split('\n'):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                if stripped.startswith('|') and stripped.endswith('|'):
-                    stripped = ' '.join(part.strip() for part in stripped.strip('|').split('|') if part.strip())
-                lines.append(stripped)
-            if lines:
-                blocks.append('\n'.join(lines))
-        return blocks
-
-    def _escape_pdf_text(self, text: str) -> str:
-        return (
-            (text or '')
-            .replace('&', '&amp;')
-            .replace('<', '&lt;')
-            .replace('>', '&gt;')
+            if image_bytes is not None:
+                return image_bytes
+        logger.warning(
+            "PDF 图表渲染被跳过 artifact_id=%s title=%s has_chart_spec=%s",
+            artifact.get('id', 0),
+            artifact.get('title', ''),
+            bool(isinstance(chart_spec, dict) and chart_spec),
         )
+        return None
 
-    def _ensure_pdf_font_registered(self) -> None:
-        if 'STSong-Light' not in pdfmetrics.getRegisteredFontNames():
-            pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
+    def _pdf_print_css(self) -> str:
+        return """
+@page {
+  size: A4;
+  margin: 16mm 18mm;
+}
+html {
+  color: #0f172a;
+  font-family: "Microsoft YaHei", "Segoe UI Emoji", "Noto Color Emoji", "Noto Sans CJK SC", "Source Han Sans SC", sans-serif;
+  font-size: 14px;
+  line-height: 1.75;
+}
+body {
+  margin: 0;
+  background: #ffffff;
+}
+.report-page {
+  width: 100%;
+}
+.report-header {
+  margin: 0 0 12px;
+}
+.report-header h1 {
+  color: #0f172a;
+  margin: 0 0 12px;
+}
+.chart-section {
+  margin: 0 0 14px;
+}
+.chart-block {
+  break-inside: avoid;
+  margin: 0 0 14px;
+}
+.chart-block figcaption {
+  color: #0f172a;
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 12px;
+}
+.chart-block img {
+  display: block;
+  height: auto;
+  max-width: 100%;
+}
+.emoji {
+  display: inline-block;
+  height: 1.15em;
+  margin: 0 0.04em;
+  vertical-align: -0.18em;
+  width: 1.15em;
+}
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4 {
+  break-after: avoid;
+  font-weight: 700;
+  color: #0f172a;
+  margin: 0 0 12px;
+}
+.markdown-body h1 {
+  font-size: 2em;
+}
+.markdown-body h2 {
+  font-size: 1.5em;
+}
+.markdown-body h3 {
+  font-size: 1.17em;
+}
+.markdown-body h4 {
+  font-size: 1em;
+}
+.markdown-body p {
+  margin: 0 0 12px;
+}
+.markdown-body strong {
+  font-weight: 700;
+}
+.markdown-body ul,
+.markdown-body ol {
+  margin: 0 0 12px 20px;
+  padding: 0;
+}
+.markdown-body li {
+  margin: 3px 0;
+}
+.markdown-body blockquote {
+  margin: 0 0 12px;
+}
+.markdown-body code {
+  font-family: Consolas, "Liberation Mono", monospace;
+}
+.markdown-body pre {
+  font-family: Consolas, "Liberation Mono", monospace;
+  margin: 0 0 12px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.markdown-body pre code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+.markdown-body table {
+  border-collapse: collapse;
+  margin: 12px 0 16px;
+  table-layout: fixed;
+  width: 100%;
+}
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid #dbe3ef;
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+  word-break: break-word;
+}
+.markdown-body th {
+  font-weight: 700;
+}
+.empty-report {
+  color: #6b7280;
+}
+"""
