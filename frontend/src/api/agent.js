@@ -42,6 +42,14 @@ export function invokeAgent(params) {
   return api.post('/agent/invoke', params)
 }
 
+export function submitAgentTask(params) {
+  return api.post('/agent/tasks', params)
+}
+
+export function getAnalysisTask(taskId) {
+  return api.get(`/agent/tasks/${taskId}`)
+}
+
 export function listLlmModels() {
   return api.get('/llm/models')
 }
@@ -91,6 +99,10 @@ export function deleteConversation(conversationId) {
 
 export function getConversationHistory(conversationId) {
   return api.get(`/insight/conversations/${conversationId}/history`)
+}
+
+export function getRunningTurn(conversationId) {
+  return api.get(`/insight/conversations/${conversationId}/running-turn`)
 }
 
 export function getTurnDetail(conversationId, turnId) {
@@ -195,6 +207,19 @@ export function streamAgent(params, onMessage, onError, onDone) {
   return streamRequest(`${API_BASE_PATH}/agent/stream`, params, onMessage, onError, onDone)
 }
 
+export function streamTurnEvents(conversationId, turnId, onMessage, onError, onDone) {
+  return streamGetRequest(
+    `${API_BASE_PATH}/insight/conversations/${conversationId}/turns/${turnId}/stream`,
+    onMessage,
+    onError,
+    onDone
+  )
+}
+
+export function submitRerunTurnTask(conversationId, turnId) {
+  return api.post(`/insight/conversations/${conversationId}/turns/${turnId}/rerun/task`, {})
+}
+
 export function streamRerunTurn(conversationId, turnId, onMessage, onError, onDone) {
   return streamRequest(
     `${API_BASE_PATH}/insight/conversations/${conversationId}/turns/${turnId}/rerun/stream`,
@@ -219,6 +244,56 @@ function streamRequest(url, params, onMessage, onError, onDone) {
     method: 'POST',
     headers,
     body: JSON.stringify(params || {}),
+    signal: controller.signal
+  })
+    .then(async response => {
+      if (!response.ok) {
+        throw new Error(await extractStreamErrorMessage(response))
+      }
+      if (!response.body) {
+        throw new Error('流式响应为空，无法获取实时分析结果。')
+      }
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) {
+          if (buffer.trim()) {
+            parseEvents(buffer, onMessage)
+          }
+          if (onDone) onDone()
+          return
+        }
+
+        buffer += decoder.decode(value, { stream: true })
+        const segments = buffer.split('\n\n')
+        buffer = segments.pop() || ''
+        segments.forEach(segment => parseEvents(segment, onMessage))
+      }
+    })
+    .catch(error => {
+      if (error.name !== 'AbortError' && onError) {
+        onError(error)
+      }
+    })
+
+  return controller
+}
+
+function streamGetRequest(url, onMessage, onError, onDone) {
+  const controller = new AbortController()
+  const headers = {}
+  const authorization = getAuthorizationHeader()
+  if (authorization) {
+    headers.Authorization = authorization
+  }
+
+  fetch(url, {
+    method: 'GET',
+    headers,
     signal: controller.signal
   })
     .then(async response => {

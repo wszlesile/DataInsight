@@ -69,10 +69,6 @@ class SuposKernelApi:
         """获取平台授权详情。"""
         if not authorization:
             raise ValueError("SUPOS authorization 不能为空")
-        if Config.PROFILE == 'local':
-            mock_payload = self._load_local_license_detail()
-            if mock_payload is not None:
-                return mock_payload
 
         url = f"{self.supos_web}/os/open-api/license-manager/v1/detail"
         headers = {
@@ -110,7 +106,7 @@ class SuposKernelApi:
                     "id": 7121,
                     "name": "数据洞察Agent",
                     "deadline": 253402271999000,
-                    "expiredStatus": 1,
+                    "expiredStatus": 0,
                     "featureConfigMap": {}
                   }
                 ],

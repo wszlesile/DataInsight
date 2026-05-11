@@ -13,6 +13,7 @@ from config import Config
 from config.database import SessionLocal
 from service.conversation_context_service import ConversationContextService, ConversationRunContext
 from utils import logger
+from utils.datasource_utils import safe_json_loads
 from utils.llm_error_utils import get_user_facing_agent_error
 from utils.llm_model_factory import bind_selected_model_id, create_runtime_config, reset_selected_model_id
 
@@ -1864,6 +1865,54 @@ def stream_rerun_turn(
         auth_token=auth_token,
         selected_llm_model_id=selected_llm_model_id,
         database_conn_info=database_conn_info,
+    )
+
+    selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)
+    try:
+        yield from _stream_with_runtime(service, runtime, agent_request)
+    finally:
+        reset_selected_model_id(selected_model_token)
+        session.close()
+
+
+def stream_existing_turn_events(
+    agent_request: AgentRequest,
+    *,
+    turn_id: Any,
+    is_rerun: bool = False,
+) -> Iterator[dict[str, Any]]:
+    """执行已经创建好的轮次，并产出流式事件，供后台任务写入外部队列。"""
+    session = SessionLocal()
+    service = ConversationContextService(session)
+    turn_id_int = int(turn_id or 0)
+    conversation_id_int = int(agent_request.conversation_id or 0)
+    from model import InsightNsConversation, InsightNsTurn
+
+    conversation = session.query(InsightNsConversation).filter(
+        InsightNsConversation.id == conversation_id_int,
+        InsightNsConversation.is_deleted == 0,
+    ).first()
+    turn = session.query(InsightNsTurn).filter(
+        InsightNsTurn.id == turn_id_int,
+        InsightNsTurn.conversation_id == conversation_id_int,
+        InsightNsTurn.is_deleted == 0,
+    ).first()
+    if conversation is None or turn is None:
+        session.close()
+        raise ValueError('分析轮次不存在或已被删除')
+
+    active_snapshot = {
+        "namespace_id": conversation.insight_namespace_id,
+        "conversation_id": conversation.id,
+        "selected_datasource_ids": safe_json_loads(turn.selected_datasource_ids_json, []),
+        "selected_datasource_snapshot": safe_json_loads(turn.selected_datasource_snapshot_json, []),
+    }
+    runtime = ConversationRunContext(
+        conversation=conversation,
+        turn=turn,
+        active_datasource_snapshot=active_snapshot,
+        is_rerun=is_rerun,
+        history_turn_limit=max(turn.turn_no - 1, 0) if is_rerun else None,
     )
 
     selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)

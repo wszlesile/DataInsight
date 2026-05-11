@@ -545,8 +545,11 @@ import {
   renameConversation,
   renameNamespace,
   selectLlmModel,
-  streamAgent,
-  streamRerunTurn
+  submitAgentTask,
+  submitRerunTurnTask,
+  streamTurnEvents,
+  getAnalysisTask,
+  getRunningTurn
 } from './api/agent.js'
 
 marked.setOptions({ breaks: true, gfm: true })
@@ -567,6 +570,7 @@ const currentAssistantMessage = ref('')
 const currentDataSource = ref(null)
 const currentProgressItems = ref([])
 const currentStreamController = ref(null)
+const currentTaskId = ref('')
 const currentTurnId = ref(0)
 const currentRunMode = ref('new')
 const rerunSourceTurnId = ref(0)
@@ -1028,6 +1032,7 @@ const resetCurrentConversationState = () => {
   currentReport.value = ''
   currentAssistantMessage.value = ''
   currentProgressItems.value = []
+  currentTaskId.value = ''
   currentTurnId.value = 0
   currentRunMode.value = 'new'
   rerunSourceTurnId.value = 0
@@ -1059,6 +1064,44 @@ const stopCurrentStream = () => {
     currentStreamController.value.abort()
     currentStreamController.value = null
   }
+}
+
+const subscribeTurnStream = (conversationId, turnId) => {
+  currentStreamController.value = streamTurnEvents(
+    conversationId,
+    turnId,
+    handleStreamEvent,
+    handleStreamError,
+    handleStreamDone
+  )
+}
+
+const attachRunningTurn = (task) => {
+  if (!task?.conversation_id || !task?.turn_id) return false
+  activeConversationId.value = Number(task.conversation_id)
+  currentTaskId.value = task.task_id || ''
+  currentTurnId.value = Number(task.turn_id)
+  currentRunMode.value = task.task_type === 'rerun' ? 'rerun' : 'new'
+  currentQuestion.value = task.request?.user_message || currentQuestion.value || '正在分析中...'
+  loading.value = true
+  addProgressItem({
+    type: 'status',
+    level: 'info',
+    message: '检测到当前会话有正在进行的分析，正在重新订阅实时输出...'
+  })
+  subscribeTurnStream(task.conversation_id, task.turn_id)
+  return true
+}
+
+const resumeRunningTurnIfAny = async (conversationId) => {
+  if (!conversationId) return false
+  const response = await getRunningTurn(conversationId)
+  const runningTurn = response.data?.data
+  if (!runningTurn) {
+    loading.value = false
+    return false
+  }
+  return attachRunningTurn(runningTurn)
 }
 
 const mapHistoryItem = (item) => ({
@@ -1375,7 +1418,7 @@ const onExportAnalysisPdf = async ({ turnId }) => {
   }
 }
 
-const onRerunTurn = (item) => {
+const onRerunTurn = async (item) => {
   if (!activeConversationId.value || !item?.turnId) return
   stopCurrentStream()
   resetCurrentConversationState()
@@ -1393,13 +1436,19 @@ const onRerunTurn = (item) => {
   })
   scrollToBottom()
 
-  currentStreamController.value = streamRerunTurn(
-    activeConversationId.value,
-    item.turnId,
-    handleStreamEvent,
-    handleStreamError,
-    handleStreamDone
-  )
+  try {
+    const response = await submitRerunTurnTask(activeConversationId.value, item.turnId)
+    const task = response.data?.data
+    if (!response.data?.success || !task?.turn_id) {
+      throw new Error(response.data?.message || '提交刷新分析任务失败')
+    }
+    currentTaskId.value = task.task_id || ''
+    subscribeTurnStream(task.conversation_id, task.turn_id)
+  } catch (error) {
+    console.error('Submit rerun task error:', error)
+    ElMessage.error(error?.message || '提交刷新分析任务失败')
+    loading.value = false
+  }
 }
 
 const onRenameConversation = async (conversation) => {
@@ -1485,6 +1534,7 @@ const onSelectSpace = async (space) => {
   await Promise.all([fetchConversations(), fetchCollects()])
   if (conversations.value.length > 0) {
     await loadConversationHistory(conversations.value[0].id)
+    await resumeRunningTurnIfAny(conversations.value[0].id)
   }
 }
 
@@ -1498,6 +1548,7 @@ const onSelectConversation = async (conversation) => {
   turnDetail.value = null
   previewArtifact.value = null
   await loadConversationHistory(conversation.id)
+  await resumeRunningTurnIfAny(conversation.id)
 }
 
 const onNewConversation = async () => {
@@ -1661,20 +1712,20 @@ const onDataSourceChange = (dataSource) => {
 }
 
 const finalizeStreamRound = async () => {
-  const rerunConversationId = activeConversationId.value
-  const isRerun = currentRunMode.value === 'rerun'
+  const finishedConversationId = activeConversationId.value
   loading.value = false
   currentStreamController.value = null
   finalizeCurrentConversation()
   await Promise.all([fetchConversations(), fetchCollects()])
-  if (isRerun && rerunConversationId) {
-    await loadConversationHistory(rerunConversationId)
+  if (finishedConversationId) {
+    await loadConversationHistory(finishedConversationId)
   }
 }
 
 const handleStreamEvent = async (event) => {
   if (!event || typeof event !== 'object') return
   if (event.conversation_id) activeConversationId.value = Number(event.conversation_id)
+  if (event.task_id) currentTaskId.value = String(event.task_id)
   if (event.turn_id) currentTurnId.value = Number(event.turn_id)
 
   if (event.type === 'session') {
@@ -1715,6 +1766,21 @@ const handleStreamEvent = async (event) => {
 
 const handleStreamError = async (error) => {
   console.error('Agent stream error:', error)
+  if (currentTaskId.value) {
+    try {
+      const response = await getAnalysisTask(currentTaskId.value)
+      const task = response.data?.data
+      if (['queued', 'running'].includes(task?.status)) {
+        addProgressItem({ type: 'status', level: 'warning', message: '实时连接中断，正在尝试重新订阅...' })
+        subscribeTurnStream(task.conversation_id, task.turn_id)
+        return
+      }
+      await finalizeStreamRound()
+      return
+    } catch (taskError) {
+      console.error('Query task after stream error failed:', taskError)
+    }
+  }
   ElMessage.error(`请求失败: ${error.message || '未知错误'}`)
   addProgressItem({ type: 'error', level: 'error', message: '请求失败，无法获取实时分析结果。' })
   if (!currentReport.value) currentReport.value = '请求失败了。'
@@ -1731,7 +1797,7 @@ const handleStreamDone = async () => {
   await finalizeStreamRound()
 }
 
-const onSendMessage = (content) => {
+const onSendMessage = async (content) => {
   if (!content.trim()) return
   if (!activeNamespace.value) {
     ElMessage.warning('请先创建或选择一个洞察空间')
@@ -1745,17 +1811,26 @@ const onSendMessage = (content) => {
   addProgressItem({ type: 'status', level: 'info', message: '正在建立分析会话并加载上下文...' })
   scrollToBottom()
 
-  currentStreamController.value = streamAgent(
-    {
+  try {
+    const response = await submitAgentTask({
       namespace_id: activeNamespace.value,
       conversation_id: activeConversationId.value || '',
       user_message: content,
       datasource: currentDataSource.value
-    },
-    handleStreamEvent,
-    handleStreamError,
-    handleStreamDone
-  )
+    })
+    const task = response.data?.data
+    if (!response.data?.success || !task?.turn_id) {
+      throw new Error(response.data?.message || '提交分析任务失败')
+    }
+    activeConversationId.value = Number(task.conversation_id)
+    currentTaskId.value = task.task_id || ''
+    currentTurnId.value = Number(task.turn_id)
+    subscribeTurnStream(task.conversation_id, task.turn_id)
+  } catch (error) {
+    console.error('Submit analysis task error:', error)
+    ElMessage.error(error?.message || '提交分析任务失败')
+    loading.value = false
+  }
 }
 
 const useQuickPrompt = (prompt) => {

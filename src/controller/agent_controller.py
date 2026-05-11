@@ -4,7 +4,13 @@ from flask import Blueprint, Response, jsonify
 
 from controller.base_controller import BaseController
 from dto import get_current_user_context
+from service.analysis_task_runner import get_analysis_task_runner
+from service.analysis_task_service import AnalysisTaskService
+from service.conversation_context_service import ConversationContextService
+from config import Config
+from config.database import SessionLocal
 from utils.llm_error_utils import get_user_facing_agent_error
+from utils.redis_client import get_redis_client
 from utils.response import Result
 
 
@@ -14,6 +20,8 @@ def create_agent_controller() -> Blueprint:
 
     blueprint.route('/invoke', methods=['POST'])(controller.invoke)
     blueprint.route('/stream', methods=['POST'])(controller.stream_invoke)
+    blueprint.route('/tasks', methods=['POST'])(controller.create_task)
+    blueprint.route('/tasks/<task_id>', methods=['GET'])(controller.get_task)
     return blueprint
 
 
@@ -96,3 +104,73 @@ class AgentController(BaseController):
                 yield f"data: {json.dumps({'type': 'error', 'stage': 'error', 'level': 'error', 'message': f'Agent 执行失败: {get_user_facing_agent_error(exc)}'}, ensure_ascii=False)}\n\n"
 
         return Response(generate(), mimetype='text/event-stream')
+
+    def create_task(self):
+        """提交一次异步分析任务，返回可订阅的轮次信息。"""
+        data = self.get_json_data()
+        agent_request = _build_agent_request(data)
+        if not agent_request.user_message:
+            return self.error_response('user_message 不能为空')
+
+        session = SessionLocal()
+        try:
+            try:
+                get_redis_client().ping()
+            except Exception as exc:
+                return self.error_response(f'Redis 流式队列不可用: {get_user_facing_agent_error(exc)}')
+
+            task_service = AnalysisTaskService(session)
+            if task_service.count_active_tasks(agent_request.username) >= Config.ANALYSIS_TASK_MAX_ACTIVE_PER_USER:
+                return self.error_response('当前用户正在分析中的任务已达到上限，请等待已有任务完成后再提交', 429)
+            if agent_request.conversation_id and task_service.has_active_conversation_task(
+                agent_request.username,
+                agent_request.conversation_id,
+            ):
+                return self.error_response('当前会话已有分析任务正在执行，请等待完成后再继续提问', 409)
+
+            context_service = ConversationContextService(session)
+            runtime = context_service.start_run(
+                username=agent_request.username,
+                namespace_id=agent_request.namespace_id,
+                conversation_id=agent_request.conversation_id,
+                user_message=agent_request.user_message,
+            )
+            agent_request.conversation_id = str(runtime.conversation.id)
+            agent_request.namespace_id = str(runtime.conversation.insight_namespace_id)
+            task = task_service.create_task(
+                username=agent_request.username,
+                namespace_id=runtime.conversation.insight_namespace_id,
+                conversation_id=runtime.conversation.id,
+                turn_id=runtime.turn.id,
+                task_type='new_analysis',
+                request_payload={
+                    'namespace_id': runtime.conversation.insight_namespace_id,
+                    'conversation_id': runtime.conversation.id,
+                    'turn_id': runtime.turn.id,
+                    'user_message': agent_request.user_message,
+                },
+            )
+            session.commit()
+            get_analysis_task_runner().submit(
+                task_id=task.task_id,
+                agent_request=agent_request,
+                turn_id=runtime.turn.id,
+                is_rerun=False,
+            )
+            return jsonify(Result.success(data=task_service.serialize_task(task), message='分析任务已提交').to_dict())
+        except Exception as exc:
+            session.rollback()
+            return self.error_response(f'提交分析任务失败: {get_user_facing_agent_error(exc)}')
+        finally:
+            session.close()
+
+    def get_task(self, task_id: str):
+        session = SessionLocal()
+        try:
+            task_service = AnalysisTaskService(session)
+            task = task_service.get_task(task_id, username=_get_username())
+            if task is None:
+                return self.error_response('分析任务不存在', 404)
+            return jsonify(Result.success(data=task_service.serialize_task(task)).to_dict())
+        finally:
+            session.close()

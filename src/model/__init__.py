@@ -328,6 +328,56 @@ class InsightNsTurn(Base):
         }
 
 
+class InsightAnalysisTask(Base):
+    """后台分析任务状态表，负责跨进程/容器可见的任务生命周期。"""
+
+    __tablename__ = 'insight_analysis_task'
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment='任务主键')
+    task_id = Column(String(64), nullable=False, unique=True, comment='任务唯一 ID')
+    username = Column(String(64), nullable=False, comment='用户名称')
+    namespace_id = Column(Integer, nullable=False, default=0, comment='洞察空间 ID')
+    conversation_id = Column(Integer, nullable=False, comment='会话 ID')
+    turn_id = Column(Integer, nullable=False, comment='轮次 ID')
+    task_type = Column(String(32), nullable=False, default='new_analysis', comment='任务类型')
+    status = Column(String(32), nullable=False, default='queued', comment='任务状态')
+    request_json = Column(Text, nullable=False, default='{}', comment='任务请求快照 JSON')
+    worker_id = Column(String(128), nullable=False, default='', comment='执行 worker ID')
+    error_message = Column(Text, nullable=False, default='', comment='错误信息')
+    created_at = Column(DateTime, default=_now, comment='创建时间')
+    started_at = Column(DateTime, nullable=True, comment='开始时间')
+    finished_at = Column(DateTime, nullable=True, comment='结束时间')
+    updated_at = Column(DateTime, default=_now, onupdate=_now, comment='更新时间')
+    heartbeat_at = Column(DateTime, nullable=True, comment='任务心跳时间')
+
+    __table_args__ = (
+        Index('idx_analysis_task_user_status', 'username', 'status'),
+        Index('idx_analysis_task_conversation_status', 'conversation_id', 'status'),
+        Index('idx_analysis_task_turn', 'turn_id'),
+        {'comment': '后台分析任务表'},
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "username": self.username,
+            "namespace_id": self.namespace_id,
+            "conversation_id": self.conversation_id,
+            "turn_id": self.turn_id,
+            "task_type": self.task_type,
+            "status": self.status,
+            "request_json": self.request_json,
+            "worker_id": self.worker_id,
+            "error_message": self.error_message,
+            "created_at": _format(self.created_at),
+            "started_at": _format(self.started_at),
+            "finished_at": _format(self.finished_at),
+            "updated_at": _format(self.updated_at),
+            "heartbeat_at": _format(self.heartbeat_at),
+        }
+
+
 class InsightNsExecution(Base):
     """一条由大模型生成并执行的 Python 分析记录。"""
 
