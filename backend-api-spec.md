@@ -29,6 +29,7 @@
 例如：
 
 - `/api/agent/stream`
+- `/api/agent/tasks`
 - `/api/insight/namespaces`
 
 ### 1.2 普通 JSON 接口响应格式
@@ -1198,7 +1199,8 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 
 用途：
 
-- 聊天输入主链路
+- 旧版同步 SSE 分析链路
+- 当前主链路建议使用 `POST /api/agent/tasks` 提交任务，再使用轮次 SSE 接口订阅输出
 
 常见流事件：
 
@@ -1393,7 +1395,209 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 - `message`
   - 错误信息
 
-### 5.3 原轮次刷新分析
+### 5.3 提交异步分析任务
+
+`POST /api/agent/tasks`
+
+用途：
+
+- 聊天输入主链路的新接口
+- 只负责创建会话轮次并提交后台分析任务
+- 不直接返回 SSE 内容，前端拿到 `turn_id` 后再订阅该轮次的 SSE 输出
+
+请求体：
+
+```json
+{
+  "namespace_id": 7,
+  "conversation_id": 19,
+  "user_message": "分析2024年Q4季度的销售趋势"
+}
+```
+
+请求字段说明：
+
+- `namespace_id`
+  - 当前空间 ID
+- `conversation_id`
+  - 当前会话 ID
+  - 可为空；为空时后端会创建新会话
+- `user_message`
+  - 用户输入内容
+
+成功响应示例：
+
+```json
+{
+  "success": true,
+  "data": {
+    "task_id": "5d7e8dc66a1642dc98d7f114f7f92a2a",
+    "username": "admin",
+    "namespace_id": 7,
+    "conversation_id": 19,
+    "turn_id": 39,
+    "task_type": "new_analysis",
+    "status": "queued",
+    "request": {
+      "namespace_id": 7,
+      "conversation_id": 19,
+      "turn_id": 39,
+      "user_message": "分析2024年Q4季度的销售趋势"
+    },
+    "error_message": "",
+    "created_at": "2026-05-11T14:04:35.465959",
+    "started_at": null,
+    "finished_at": null
+  },
+  "message": "分析任务已提交",
+  "code": 200
+}
+```
+
+说明：
+
+- 同一用户默认最多同时存在 2 个未完成分析任务。
+- 同一会话同一时间只允许一个 `queued` 或 `running` 任务。
+- 如果 Redis 流式队列不可用，提交任务会失败，避免创建无法订阅输出的任务。
+
+常见失败：
+
+- `409`
+  - 当前会话已有分析任务正在执行
+- `429`
+  - 当前用户正在分析中的任务达到上限
+
+### 5.4 查询分析任务
+
+`GET /api/agent/tasks/{task_id}`
+
+用途：
+
+- 查询异步分析任务当前状态。
+- 前端 SSE 异常断开时，可用该接口确认任务是否仍在运行。
+
+成功响应 `data` 字段与 `POST /api/agent/tasks` 返回的任务对象一致。
+
+任务状态：
+
+- `queued`
+  - 已提交，等待后台线程执行
+- `running`
+  - 正在分析
+- `success`
+  - 分析完成
+- `failed`
+  - 分析失败
+
+### 5.5 查询当前会话运行中轮次
+
+`GET /api/insight/conversations/{conversation_id}/running-turn`
+
+用途：
+
+- 前端切换到某个会话窗口时调用。
+- 判断当前会话是否存在未结束的轮次。
+- 如果存在，前端应禁用输入框，并订阅该轮次 SSE 输出。
+
+存在运行中任务时响应示例：
+
+```json
+{
+  "success": true,
+  "data": {
+    "task_id": "5d7e8dc66a1642dc98d7f114f7f92a2a",
+    "username": "admin",
+    "namespace_id": 7,
+    "conversation_id": 19,
+    "turn_id": 39,
+    "task_type": "new_analysis",
+    "status": "running",
+    "request": {},
+    "error_message": "",
+    "created_at": "2026-05-11T14:04:35.465959",
+    "started_at": "2026-05-11T14:04:35.700000",
+    "finished_at": null
+  },
+  "message": "操作成功",
+  "code": 200
+}
+```
+
+不存在运行中任务时：
+
+```json
+{
+  "success": true,
+  "data": null,
+  "message": "操作成功",
+  "code": 200
+}
+```
+
+### 5.6 订阅轮次流式输出
+
+`GET /api/insight/conversations/{conversation_id}/turns/{turn_id}/stream`
+
+用途：
+
+- 订阅指定轮次的 SSE 输出。
+- SSE 内容来自 Redis List 临时队列，不再依赖提交任务时的 HTTP 连接。
+- 页面切换、重新进入会话时，只要该轮次任务仍未结束，前端可以重新连接该接口继续接收后续输出。
+
+请求方式：
+
+- `GET`
+- `Accept: text/event-stream`
+- 无请求体
+
+返回格式：
+
+- 与 `POST /api/agent/stream` 的 SSE 事件格式一致。
+- 常见事件仍为：
+  - `session`
+  - `status`
+  - `assistant`
+  - `result`
+  - `done`
+  - `error`
+
+说明：
+
+- Redis List 是临时输出队列，事件被消费后会从队列中移除。
+- 任务结束后，前端收到 `done` 或 `error` 应关闭当前 SSE 连接，并重新拉取会话历史。
+- 如果队列暂时没有事件，后端会保持 SSE 连接并输出 heartbeat。
+
+### 5.7 提交原轮次异步刷新分析任务
+
+`POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/rerun/task`
+
+用途：
+
+- 在原轮次上重新执行分析。
+- 不新增新轮次。
+- 不直接返回 SSE 内容，前端拿到任务信息后继续订阅：
+  - `GET /api/insight/conversations/{conversation_id}/turns/{turn_id}/stream`
+
+请求体：
+
+```json
+{}
+```
+
+成功响应 `data` 字段与 `POST /api/agent/tasks` 返回的任务对象一致，其中：
+
+- `task_type`
+  - 固定为 `rerun`
+- `turn_id`
+  - 仍为原轮次 ID
+
+说明：
+
+- 重跑前会清理该轮旧的 assistant 消息、执行记录和产物。
+- 成功后结果回写到同一个 `turn_id`。
+- 同样受用户任务并发上限和会话运行中任务限制。
+
+### 5.8 原轮次同步流式刷新分析
 
 `POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/rerun/stream`
 
@@ -1419,7 +1623,7 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 
 说明：
 
-- 当前前端“刷新分析”按钮走的就是这个接口
+- 这是旧版同步 SSE 刷新链路，当前主链路建议使用 `POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/rerun/task`
 - 重跑前会清理该轮旧的 assistant 消息、执行记录和产物
 - 成功后结果回写到同一个 `turn_id`
 
@@ -1608,6 +1812,11 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 
 - `invokeAgent`
 - `streamAgent`
+- `submitAgentTask`
+- `getAnalysisTask`
+- `getRunningTurn`
+- `streamTurnEvents`
+- `submitRerunTurnTask`
 - `streamRerunTurn`
 - `listNamespaces`
 - `createNamespace`
@@ -1640,7 +1849,9 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 1. 调 `GET /api/insight/namespaces`
 2. 进入默认空间后调 `GET /api/insight/conversations?namespace_id=...`
 3. 选中会话后调 `GET /api/insight/conversations/{conversation_id}/history`
-4. 同时调 `GET /api/insight/namespaces/{namespace_id}/datasources?insight_conversation_id=...`
+4. 调 `GET /api/insight/conversations/{conversation_id}/running-turn` 判断是否有未完成轮次
+5. 如果存在未完成轮次，前端暂停输入框并订阅 `GET /api/insight/conversations/{conversation_id}/turns/{turn_id}/stream`
+6. 同时调 `GET /api/insight/namespaces/{namespace_id}/datasources?insight_conversation_id=...`
 
 ### 10.2 空间数据源面板
 
@@ -1669,16 +1880,21 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 ### 10.3 聊天分析
 
 1. 输入消息：
-   - `POST /api/agent/stream`
-2. 历史结果展示：
+   - `POST /api/agent/tasks`
+2. 订阅当前轮次输出：
+   - `GET /api/insight/conversations/{conversation_id}/turns/{turn_id}/stream`
+3. SSE 结束后刷新历史结果：
    - `GET /api/insight/conversations/{conversation_id}/history`
-3. 查看详情：
+4. 切换会话窗口时判断是否存在运行中轮次：
+   - `GET /api/insight/conversations/{conversation_id}/running-turn`
+5. 查看详情：
    - `GET /api/insight/conversations/{conversation_id}/turns/{turn_id}`
-4. 删除会话：
+6. 删除会话：
    - `DELETE /api/insight/conversations/{conversation_id}`
-5. 刷新分析：
-   - `POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/rerun/stream`
-6. 导出 PDF：
+7. 刷新分析：
+   - `POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/rerun/task`
+   - 然后订阅 `GET /api/insight/conversations/{conversation_id}/turns/{turn_id}/stream`
+8. 导出 PDF：
    - `POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/export/pdf`
 
 ---

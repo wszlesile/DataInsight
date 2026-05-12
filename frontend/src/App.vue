@@ -1066,6 +1066,12 @@ const stopCurrentStream = () => {
   }
 }
 
+const removeHistoryTurn = (turnId) => {
+  const normalizedTurnId = Number(turnId || 0)
+  if (!normalizedTurnId) return
+  chatHistory.value = chatHistory.value.filter((item) => Number(item.turnId) !== normalizedTurnId)
+}
+
 const subscribeTurnStream = (conversationId, turnId) => {
   currentStreamController.value = streamTurnEvents(
     conversationId,
@@ -1083,6 +1089,7 @@ const attachRunningTurn = (task) => {
   currentTurnId.value = Number(task.turn_id)
   currentRunMode.value = task.task_type === 'rerun' ? 'rerun' : 'new'
   currentQuestion.value = task.request?.user_message || currentQuestion.value || '正在分析中...'
+  removeHistoryTurn(task.turn_id)
   loading.value = true
   addProgressItem({
     type: 'status',
@@ -1426,6 +1433,7 @@ const onRerunTurn = async (item) => {
   rerunSourceTurnId.value = item.turnId
   currentTurnId.value = item.turnId
   currentQuestion.value = item.question
+  removeHistoryTurn(item.turnId)
   currentReport.value = ''
   currentChartArtifactId.value = 0
   loading.value = true
