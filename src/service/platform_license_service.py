@@ -33,6 +33,9 @@ class LicenseCache:
     checked_at: int
 
 
+EXPIRED_STATUS_EXPIRED = 2
+
+
 class PlatformLicenseService:
     """Lightweight platform license cache and validator."""
 
@@ -70,9 +73,11 @@ class PlatformLicenseService:
         cache = self._cache
         if cache is None:
             return False
-        if cache.expired_status != 0 or cache.deadline <= now:
+        if now - cache.checked_at >= self.refresh_interval_ms:
+            return False
+        if self._is_license_expired(cache.expired_status, cache.deadline, now):
             raise LicenseExpiredError("数据洞察智能体授权已到期")
-        return now - cache.checked_at < self.refresh_interval_ms
+        return True
 
     def _refresh_cache(self, authorization: str, now: int) -> None:
         try:
@@ -88,7 +93,7 @@ class PlatformLicenseService:
         feature = self._extract_agent_feature(payload)
         deadline = self._extract_deadline(feature)
         expired_status = int(feature.get("expiredStatus") or 0)
-        if expired_status != 0 or deadline <= now:
+        if self._is_license_expired(expired_status, deadline, now):
             self._cache = LicenseCache(
                 deadline=deadline,
                 expired_status=expired_status,
@@ -101,6 +106,9 @@ class PlatformLicenseService:
             expired_status=expired_status,
             checked_at=now,
         )
+
+    def _is_license_expired(self, expired_status: int, deadline: int, now: int) -> bool:
+        return expired_status == EXPIRED_STATUS_EXPIRED or deadline <= now
 
     def _extract_agent_feature(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, dict):
