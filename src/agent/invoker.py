@@ -1111,7 +1111,7 @@ def _build_analysis_recovery_instruction(
         lines.extend([
             '本轮已出现图表产物契约错误。下一版必须把修复重点放在 charts 构造，不要重新发散数据查询逻辑。',
             '禁止继续使用 matplotlib、base64 图片、手写 chart_spec 或自造 chart_type/chart_kind 结构。',
-            '请使用 build_chart_result(...) 或 build_chart_suite(...) 生成 charts；如果无法生成图表，则至少用 tables 返回结构化汇总。',
+            '请使用 build_chart_result(...)、build_multi_metric_chart_result(...) 或 build_chart_suite(...) 生成 charts；异常值、分布和四分位数场景使用 chart_kind="boxplot"；如果无法生成图表，则至少用 tables 返回结构化汇总。',
         ])
     elif latest_error_type in {'data_source_not_found', 'data_source_unavailable'}:
         lines.extend([

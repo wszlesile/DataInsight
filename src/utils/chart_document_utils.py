@@ -6,7 +6,7 @@ from typing import Any
 from utils.chart_spec_utils import finalize_chart_spec
 
 
-SUPPORTED_CHART_KINDS = {"bar", "line", "pie", "scatter"}
+SUPPORTED_CHART_KINDS = {"bar", "line", "pie", "scatter", "boxplot"}
 DEFAULT_DOCUMENT_VERSION = "1.0"
 DEFAULT_TOP_N = 12
 BACKEND_LAYOUT_LOCK_KEY = "__layout_managed_by_backend"
@@ -40,9 +40,9 @@ def build_chart_document(
     x_name = _coalesce_field(x_field, category_field)
     y_name = _coalesce_field(y_field, value_field)
 
-    if chart_kind_value in {"bar", "line"}:
+    if chart_kind_value in {"bar", "line", "boxplot"}:
         if not category_name or not value_name:
-            raise ValueError("bar/line chart_document requires category_field and value_field.")
+            raise ValueError(f"{chart_kind_value} chart_document requires category_field and value_field.")
     elif chart_kind_value == "pie":
         if not category_name or not value_name:
             raise ValueError("pie chart_document requires category_field and value_field.")
@@ -470,6 +470,8 @@ def compile_chart_document(chart_document: Any) -> dict[str, Any]:
 
     if chart_kind in {"bar", "line", "scatter"}:
         return _compile_cartesian_chart(document)
+    if chart_kind == "boxplot":
+        return _compile_boxplot_chart(document)
     if chart_kind == "pie":
         return _compile_pie_chart(document)
     raise ValueError(f"Unsupported chart_kind: {chart_kind}")
@@ -505,6 +507,12 @@ def infer_chart_document_from_chart_spec(
         return document
     if chart_kind == "pie":
         return _infer_pie_document_from_spec(
+            chart_spec=chart_spec,
+            fallback_title=title_text,
+            fallback_description=fallback_description,
+        )
+    if chart_kind == "boxplot":
+        return _infer_boxplot_document_from_spec(
             chart_spec=chart_spec,
             fallback_title=title_text,
             fallback_description=fallback_description,
@@ -687,6 +695,58 @@ def _build_scatter_spec(document: dict[str, Any], rows: list[dict[str, Any]]) ->
     }
 
 
+def _compile_boxplot_chart(document: dict[str, Any]) -> dict[str, Any]:
+    encoding = document["encoding"]
+    rows = list(document["dataset"]["rows"])
+    category_field = encoding["category_field"]
+    value_field = encoding.get("value_field")
+    value_fields = list(encoding.get("value_fields") or [])
+
+    categories: list[str] = []
+    boxplot_data: list[list[float]] = []
+
+    if _is_boxplot_five_number_fields(value_fields):
+        for row in rows:
+            category = "" if row.get(category_field) is None else str(row.get(category_field))
+            values = [_coerce_number(row.get(field)) for field in value_fields[:5]]
+            categories.append(category)
+            boxplot_data.append(values)
+    else:
+        grouped_values: dict[str, list[float]] = defaultdict(list)
+        for row in rows:
+            category = "" if row.get(category_field) is None else str(row.get(category_field))
+            numeric_value = _coerce_number_or_none(row.get(value_field))
+            if numeric_value is None:
+                continue
+            grouped_values[category].append(numeric_value)
+
+        for category in _ordered_unique([
+            "" if row.get(category_field) is None else str(row.get(category_field))
+            for row in rows
+        ]):
+            values = grouped_values.get(str(category), [])
+            if not values:
+                continue
+            categories.append(str(category))
+            boxplot_data.append(_five_number_summary(values))
+
+    y_axis_name = "value" if _is_boxplot_five_number_fields(value_fields) else (value_field or "value")
+
+    return {
+        "title": {"text": document["title"]},
+        "tooltip": {"trigger": "item"},
+        "legend": {"show": False},
+        "grid": {"left": 56, "right": 32, "top": 64, "bottom": 56, "containLabel": True},
+        "xAxis": {"type": "category", "data": categories},
+        "yAxis": {"type": "value", "name": y_axis_name},
+        "series": [{
+            "type": "boxplot",
+            "name": document["title"] or value_field or "数值分布",
+            "data": boxplot_data,
+        }],
+    }
+
+
 def _compile_pie_chart(document: dict[str, Any]) -> dict[str, Any]:
     encoding = document["encoding"]
     transform = document["transform"]
@@ -741,12 +801,14 @@ def _validate_chart_document(document: dict[str, Any]) -> None:
     encoding = document["encoding"]
     value_fields = list(encoding.get("value_fields") or [])
 
-    if chart_kind in {"bar", "line", "pie"}:
+    if chart_kind in {"bar", "line", "pie", "boxplot"}:
         if not encoding.get("category_field") or (not encoding.get("value_field") and not value_fields):
             raise ValueError(f"{chart_kind} chart_document requires category_field and value_field.")
     if len(value_fields) > 1:
-        if chart_kind != "bar":
-            raise ValueError("multi-metric chart_document currently supports bar charts only.")
+        if chart_kind not in {"bar", "boxplot"}:
+            raise ValueError("multi-metric chart_document currently supports bar and boxplot charts only.")
+        if chart_kind == "boxplot" and not _is_boxplot_five_number_fields(value_fields):
+            raise ValueError("boxplot chart_document value_fields must contain five-number summary fields.")
         if encoding.get("series_field"):
             raise ValueError("multi-metric chart_document cannot be combined with series_field.")
     if chart_kind == "scatter":
@@ -881,6 +943,8 @@ def _normalize_chart_kind(value: Any) -> str:
         "column": "bar",
         "area": "line",
         "donut": "pie",
+        "box": "boxplot",
+        "box_plot": "boxplot",
     }
     chart_kind = aliases.get(chart_kind, chart_kind)
     if chart_kind not in SUPPORTED_CHART_KINDS:
@@ -984,6 +1048,36 @@ def _normalize_string_list(value: Any, *, dedupe: bool = True) -> list[str]:
             seen.add(text)
         normalized.append(text)
     return normalized
+
+
+def _is_boxplot_five_number_fields(value_fields: list[str]) -> bool:
+    return len(value_fields) >= 5
+
+
+def _five_number_summary(values: list[float]) -> list[float]:
+    sorted_values = sorted(float(value) for value in values)
+    return [
+        float(sorted_values[0]),
+        _quantile(sorted_values, 0.25),
+        _quantile(sorted_values, 0.5),
+        _quantile(sorted_values, 0.75),
+        float(sorted_values[-1]),
+    ]
+
+
+def _quantile(sorted_values: list[float], q: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+
+    position = (len(sorted_values) - 1) * q
+    lower_index = int(position)
+    upper_index = min(lower_index + 1, len(sorted_values) - 1)
+    weight = position - lower_index
+    lower_value = sorted_values[lower_index]
+    upper_value = sorted_values[upper_index]
+    return float(lower_value + (upper_value - lower_value) * weight)
 
 
 def mark_chart_spec_backend_managed(chart_spec: Any) -> dict[str, Any]:
@@ -1141,6 +1235,60 @@ def _infer_pie_document_from_spec(
         label_mode="hidden",
         merge_tail=True,
     )
+
+
+def _infer_boxplot_document_from_spec(
+    *,
+    chart_spec: dict[str, Any],
+    fallback_title: str,
+    fallback_description: str,
+) -> dict[str, Any] | None:
+    x_axis = _extract_first_mapping(chart_spec.get("xAxis"))
+    categories = x_axis.get("data") if isinstance(x_axis.get("data"), list) else []
+    categories = ["" if value is None else str(value) for value in categories]
+    series = next((item for item in (chart_spec.get("series") or []) if isinstance(item, dict)), None)
+    if not series:
+        return None
+
+    raw_data = series.get("data")
+    if not isinstance(raw_data, list) or not categories or len(raw_data) != len(categories):
+        return None
+
+    value_fields = ["min", "q1", "median", "q3", "max"]
+    rows: list[dict[str, Any]] = []
+    for category, item in zip(categories, raw_data):
+        values = item.get("value") if isinstance(item, dict) else item
+        if not isinstance(values, (list, tuple)) or len(values) < 5:
+            return None
+        numeric_values = [_coerce_number_or_none(value) for value in values[:5]]
+        if any(value is None for value in numeric_values):
+            return None
+        row = {"category": category}
+        for field, value in zip(value_fields, numeric_values):
+            row[field] = value
+        rows.append(row)
+
+    if not rows:
+        return None
+
+    return build_chart_document(
+        chart_kind="boxplot",
+        data=rows,
+        title=fallback_title,
+        description=fallback_description,
+        category_field="category",
+        value_field=value_fields[0],
+    ) | {
+        "encoding": {
+            "category_field": "category",
+            "value_field": value_fields[0],
+            "value_fields": value_fields,
+            "value_labels": [],
+            "series_field": None,
+            "x_field": "category",
+            "y_field": value_fields[0],
+        }
+    }
 
 
 def _extract_series_values(raw_data: Any, categories: list[str]) -> list[tuple[str, Any]]:

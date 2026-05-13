@@ -71,7 +71,7 @@
 每次分析完成后，输出一组分析结果：
 
 1. **图表 (Chart)**
-   - 使用 `pyecharts` 或其他兼容方式生成结构化图表结果
+   - 使用 `build_chart_result(...)`、`build_multi_metric_chart_result(...)` 或 `build_chart_suite(...)` 生成结构化图表结果
    - 支持的图表类型：折线图、柱状图、饼图、散点图、热力图等
    - 每轮分析可以生成一个或多个图表
    - 图表主结果应以结构化配置表达，而不是把导出文件当作分析产物本体
@@ -365,7 +365,7 @@ execution_intent = "probe"     # 数据探测
 
 1. **数据加载** - 使用上下文传入的加载工具函数加载数据
 2. **数据处理** - 使用 pandas 进行数据清洗、转换、聚合等
-3. **可视化** - 使用 pyecharts/matplotlib 生成图表
+3. **可视化** - 已支持的图表类型必须使用后端 chart helper 生成图表
 4. **构造结构化结果** - 默认生成一个或多个结构化图表，必要时附带结构化表格
 5. **保存分析结果或返回探测反馈** - `analysis` 代码调用 `save_analysis_result()`；`probe` 代码调用 `request_retry()`
 6. **按需复用通用辅助函数** - 当问题涉及相对日期、跨时区时间过滤、明细表输出、无数据重试、本地大文件加载或图表产物构造时，可以优先考虑复用 `get_day_range()`、`load_local_file_low_memory()`、`probe_distinct_values()`、`probe_text_candidates()`、`describe_time_coverage()`、`build_markdown_table()`、`build_chart_result()`、`build_multi_metric_chart_result()`、`build_chart_suite()`、`raise_no_data_error()`、`request_retry()` 等辅助函数；如果当前分析不需要这些能力，则不必使用
@@ -389,7 +389,7 @@ execution_intent = "probe"     # 数据探测
 17. **先识别查询结果的结构，再继续做图表和结论**：拿到 SQL 或 pandas 聚合结果后，先判断当前结果包含哪些分组维度、哪些指标列、哪些排序列；不要在未识别结果结构的情况下，直接生成总量、环比、TopN、图表或自然语言结论
 18. **后续处理必须保持结果粒度一致**：如果查询结果已经按多个维度聚合，后续表格、图表、总量、环比/同比、TopN 和自然语言结论都必须继续显式处理这些维度；不要把多维聚合结果直接当成更粗粒度的单序列、单总量或单结论结果使用。只有在存在明确业务依据时，才允许继续汇总到更粗粒度
 19. **排序语义不能丢失**：如果结果中某个字段具有明确顺序语义（如时间顺序、数值顺序、等级顺序、自然月份顺序），后续处理时必须保留排序键，不要只按展示文本重新排序。构造图表和表格时，应优先按原始排序列排序，再生成展示标签
-20. **图表优先使用后端 helper**：正式分析需要图表时，优先使用 `build_chart_result(...)`、`build_multi_metric_chart_result(...)` 或 `build_chart_suite(...)` 构造 `charts`；不要使用 matplotlib/base64 图片作为图表产物本体，不要手写裸 `chart_spec`，除非 helper 确实无法表达当前图表意图
+20. **图表必须使用后端 helper**：正式分析需要图表时，`bar`、`line`、`pie`、`scatter`、`boxplot` 必须使用 `build_chart_result(...)`、`build_multi_metric_chart_result(...)` 或 `build_chart_suite(...)` 构造 `charts`；不要使用 pyecharts/matplotlib/base64 或手写裸 `chart_spec` 绕过 helper。只有 helper 确实无法表达当前图表类型时，才允许退回原始 `chart_spec`
 21. **图表契约错误只修图表构造**：如果执行反馈提示 `chart_contract_error`、`chart_spec`、`chart_document`、`chart_kind`、`series`、`xAxis` 或 `yAxis` 问题，说明数据查询通常已经走到图表阶段；下一版应保留数据处理逻辑，改用 `build_chart_result(...)`、`build_multi_metric_chart_result(...)` 或 `build_chart_suite(...)`，不要误判成无数据，也不要只输出自然语言报告
 22. **本地大文件失败后必须切换低内存策略**：如果外部文件已经触发内存耗尽、`MemoryError` 或子进程被 OOM 终止，下一版代码必须改用 `load_local_file_low_memory()` 或等价的批处理方案，在批次内完成过滤和累计统计，不能继续整表读入 pandas
 
@@ -529,8 +529,8 @@ else:
     charts = [
         build_chart_result(
             title="月度指标趋势",
-            chart_type="bar",
-            dataframe=data,
+            chart_kind="bar",
+            data=data,
             category_field="year_month",
             value_field="total_dosage",
             description="展示当前约束下目标对象的月度指标结果。",
@@ -563,10 +563,7 @@ else:
 - 字段：月份(string), 产品名称(string), 销售额(元)(double), 销量(integer), 销售单价(double), 区域(string)
 
 ```python
-import json
 import pandas as pd
-from pyecharts import options as opts
-from pyecharts.charts import Line, Bar
 
 # === 数据加载 ===
 data = load_local_file(file_path=r"D:\PycharmProjects\DataInsight\xiaoshou.csv")
@@ -578,27 +575,18 @@ q4_data = data[data['月份'].isin(['10', '11', '12', '2024-10', '2024-11', '202
 # 按月份汇总销售额
 monthly_sales = q4_data.groupby('月份')['销售额(元)'].sum().reset_index()
 
-# === 可视化 ===
-chart = (
-    Line()
-    .add_xaxis(monthly_sales['月份'].tolist())
-    .add_yaxis("销售额(元)", monthly_sales['销售额(元)'].tolist())
-    .set_global_opts(
-        title_opts=opts.TitleOpts(title="2024年Q4销售趋势", subtitle="单位：元"),
-        xaxis_opts=opts.AxisOpts(name="月份"),
-        yaxis_opts=opts.AxisOpts(name="销售额"),
-    )
-)
-
 # === 构造结构化图表 ===
-chart_spec = json.loads(chart.dump_options_with_quotes())
 charts = [
-    {
-        "title": "2024年Q4销售趋势",
-        "chart_type": "echarts",
-        "description": "展示 2024 年 Q4 各月份销售额变化趋势。",
-        "chart_spec": chart_spec,
-    }
+    build_chart_result(
+        chart_kind="line",
+        data=monthly_sales,
+        title="2024年Q4销售趋势",
+        description="展示 2024 年 Q4 各月份销售额变化趋势。",
+        category_field="月份",
+        value_field="销售额(元)",
+        sort_field="月份",
+        sort_order="asc",
+    )
 ]
 
 # === 保存分析结果 ===
@@ -646,10 +634,7 @@ result = save_analysis_result(
 它们是可选的辅助能力，不是所有分析任务都必须调用的固定步骤。
 
 ```python
-import json
 import pandas as pd
-from pyecharts import options as opts
-from pyecharts.charts import Bar
 
 data_alarm = load_data_with_sql(sql="SELECT * FROM baojingjilubiao")
 data_alarm['start_timestamp'] = pd.to_datetime(data_alarm['start_timestamp'], utc=True)
@@ -663,25 +648,15 @@ detail_df = data_alarm[
 detail_df = detail_df.sort_values('start_timestamp')
 alarm_count = len(detail_df)
 
-chart = (
-    Bar()
-    .add_xaxis(["前天报警总数"])
-    .add_yaxis("报警数量", [alarm_count])
-    .set_global_opts(
-        title_opts=opts.TitleOpts(title="前天报警数量统计"),
-        xaxis_opts=opts.AxisOpts(name="时间范围"),
-        yaxis_opts=opts.AxisOpts(name="报警数量"),
-    )
-)
-
-chart_spec = json.loads(chart.dump_options_with_quotes())
 charts = [
-    {
-        "title": "前天报警数量统计",
-        "chart_type": "echarts",
-        "description": "展示前天报警总数。",
-        "chart_spec": chart_spec,
-    }
+    build_chart_result(
+        chart_kind="bar",
+        data=[{"时间范围": "前天报警总数", "报警数量": alarm_count}],
+        title="前天报警数量统计",
+        description="展示前天报警总数。",
+        category_field="时间范围",
+        value_field="报警数量",
+    )
 ]
 
 detail_table = build_markdown_table(
@@ -1352,7 +1327,7 @@ result = save_analysis_result(...)
 | 开发语言      | Python                                          |
 | Agent 框架  | LangChain                                       |
 | 数据处理      | pandas                                          |
-| 可视化       | pyecharts, matplotlib                           |
+| 可视化       | backend chart helpers                           |
 | 向量库       | ChromaDB (本地) / PGVector (生产)                   |
 | Embedding | sentence transformers（本地）BGE-M3, BGE-Rerank（生产） |
 | 关系型数据库    | SQLite (本地) / PostgreSQL (生产)                   |
@@ -1394,6 +1369,7 @@ result = save_analysis_result(...)
 - 趋势类：通常使用 `line`
 - 对比/排行类：通常使用 `bar`
 - 构成/占比类：通常使用 `pie`
+- 分布/异常值/四分位数类：通常使用 `boxplot`，不要为了箱线图退回到 pyecharts 手写 `chart_spec`
 
 多指标图表规则：
 
@@ -1481,9 +1457,25 @@ charts = build_chart_suite(
 - `chart_kind="bar"` 或 `"line"`：需要提供 `category_field` 和 `value_field`，可选 `series_field`
 - `chart_kind="pie"`：需要提供 `category_field` 和 `value_field`
 - `chart_kind="scatter"`：需要提供 `x_field` 和 `y_field`，可选 `series_field`
+- `chart_kind="boxplot"`：用于异常值、分布、四分位数和五数摘要场景；原始明细数据需提供 `category_field` 和 `value_field`，已汇总数据可用 `chart_document.encoding.value_fields=[min, Q1, median, Q3, max]`
 - `sort_field`、`sort_order`、`limit`、`top_n`、`orientation`、`stack`、`label_mode` 只表达图表意图，不负责具体布局
 - `build_multi_metric_chart_result(...)`：适用于同一个 `category_field` 下同时展示多个 `value_fields` 的柱状对比图；至少需要 2 个 `value_fields`
 - `build_chart_suite(...)`：适用于希望后端基于同一份汇总数据、围绕同一个 `value_field` 规划多张图表的场景；不适合直接表达多指标对比
+
+箱线图示例：
+
+```python
+charts = [
+    build_chart_result(
+        chart_kind="boxplot",
+        data=long_df,
+        title="关键指标分布",
+        description="按指标展示最小值、Q1、中位数、Q3、最大值",
+        category_field="指标",
+        value_field="数值",
+    )
+]
+```
 
 如果同一个图表可以通过 `build_chart_result(...)`、`build_multi_metric_chart_result(...)` 或 `build_chart_suite(...)` 表达，就不要再手写 pyecharts 的 option JSON。
 

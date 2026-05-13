@@ -84,6 +84,21 @@ REPORT_CHART_DUMP_FIELD_MARKERS = (
     'series',
 )
 REPORT_CHART_DUMP_SCAN_MAX_CHARS = 20000
+HELPER_CHART_FUNCTIONS = {
+    'build_chart_document',
+    'build_chart_result',
+    'build_chart_suite',
+    'build_multi_metric_chart_result',
+}
+HELPER_SUPPORTED_CHART_KINDS = {'bar', 'line', 'pie', 'scatter', 'boxplot'}
+SUPPORTED_PYECHARTS_CHART_CLASSES = {
+    'Bar': 'bar',
+    'Line': 'line',
+    'Pie': 'pie',
+    'Scatter': 'scatter',
+    'Boxplot': 'boxplot',
+    'BoxPlot': 'boxplot',
+}
 DATAFRAME_FIELD_EXPR_PATTERN = r"(?:[A-Za-z_]\w*\s*\[\s*['\"][^'\"]+['\"]\s*\])|(?:[A-Za-z_]\w*\.[A-Za-z_]\w*)"
 SQL_EXACT_FILTER_PATTERN = re.compile(
     r"(?P<field>(?:[\w]+\.)?[\w\"`]+)\s*=\s*'(?P<literal>[^']+)'",
@@ -1207,6 +1222,95 @@ def _called_function_names(tree: ast.AST) -> set[str]:
     return names
 
 
+def _extract_static_string_constant(node: ast.AST | None) -> str:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value.strip()
+    return ''
+
+
+def _extract_dict_string_key(key: ast.AST | None) -> str:
+    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+        return key.value.strip()
+    return ''
+
+
+def _collect_supported_chart_spec_kinds(tree: ast.AST) -> set[str]:
+    kinds: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        items = {
+            _extract_dict_string_key(key): value
+            for key, value in zip(node.keys, node.values)
+            if _extract_dict_string_key(key)
+        }
+        series_value = items.get('series')
+        if not isinstance(series_value, ast.List):
+            continue
+        for series_node in series_value.elts:
+            if not isinstance(series_node, ast.Dict):
+                continue
+            series_items = {
+                _extract_dict_string_key(key): value
+                for key, value in zip(series_node.keys, series_node.values)
+                if _extract_dict_string_key(key)
+            }
+            chart_kind = _extract_static_string_constant(series_items.get('type')).lower()
+            if chart_kind in HELPER_SUPPORTED_CHART_KINDS:
+                kinds.add(chart_kind)
+    return kinds
+
+
+def _collect_supported_pyecharts_chart_apis(tree: ast.AST, calls: set[str]) -> list[str]:
+    imported_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and str(node.module or '').startswith('pyecharts.charts'):
+            imported_names.update(alias.asname or alias.name for alias in node.names)
+
+    blocked_names = {
+        name
+        for name in set(calls) | imported_names
+        if name in SUPPORTED_PYECHARTS_CHART_CLASSES
+        and SUPPORTED_PYECHARTS_CHART_CLASSES[name] in HELPER_SUPPORTED_CHART_KINDS
+    }
+    return sorted(blocked_names)
+
+
+def _validate_helper_chart_usage_contract(tree: ast.AST, calls: set[str]) -> RetryResult | None:
+    if HELPER_CHART_FUNCTIONS & calls:
+        return None
+
+    blocked_chart_apis = _collect_supported_pyecharts_chart_apis(tree, calls)
+    supported_chart_spec_kinds = _collect_supported_chart_spec_kinds(tree)
+    uses_low_level_dump = bool({'dump_options', 'dump_options_with_quotes'} & calls)
+    has_chart_spec_assignment = _has_static_assignment(tree, 'chart_spec')
+
+    if not blocked_chart_apis and not supported_chart_spec_kinds:
+        return None
+
+    diagnostics = {
+        'blocked_chart_apis': blocked_chart_apis,
+        'supported_chart_spec_kinds': sorted(supported_chart_spec_kinds),
+        'uses_low_level_dump': uses_low_level_dump,
+        'has_chart_spec_assignment': has_chart_spec_assignment,
+        'helper_functions': sorted(HELPER_CHART_FUNCTIONS),
+        'helper_supported_chart_kinds': sorted(HELPER_SUPPORTED_CHART_KINDS),
+    }
+    return request_retry(
+        retry_type="chart_contract_error",
+        message=(
+            "当前 analysis 代码绕过了已支持的后端图表 helper，使用了 pyecharts 或手写 chart_spec "
+            "生成 helper 已覆盖的图表类型。"
+        ),
+        diagnostics=diagnostics,
+        repair_instructions=[
+            '当图表类型属于 bar、line、pie、scatter、boxplot 时，必须使用 build_chart_result(...)、build_multi_metric_chart_result(...) 或 build_chart_suite(...) 生成 charts。',
+            '异常值、分布和四分位数场景请用 build_chart_result(chart_kind="boxplot", data=..., category_field=..., value_field=...)。',
+            '只有 helper 无法表达的图表类型，才可以退回 pyecharts 或手写 chart_spec；不要为了已支持类型调用 dump_options_with_quotes()。',
+        ],
+    )
+
+
 def _date_text(value: Any) -> str:
     text = str(value or '').strip()
     match = re.search(r'\d{4}-\d{1,2}-\d{1,2}', text)
@@ -1348,6 +1452,10 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
                     '如果 validate_query_constraints(...) 返回 RetryResult，必须将其赋给 result 并结束当前尝试。',
                 ],
             )
+
+        helper_chart_retry = _validate_helper_chart_usage_contract(tree, calls)
+        if helper_chart_retry is not None:
+            return helper_chart_retry
 
     if execution_intent == 'probe':
         violations: list[str] = []
@@ -2412,7 +2520,7 @@ def _build_repair_instructions(error_type: str) -> list[str]:
         'chart_contract_error': [
             '当前失败是图表产物契约错误，不是数据查询失败；不要改成 no_data_found，也不要只输出自然语言报告。',
             '下一版禁止继续使用 matplotlib/base64 图片、手写 chart_spec 或自造 chart_type/chart_kind 结构。',
-            '必须优先用 build_chart_result(...)、build_multi_metric_chart_result(...) 或 build_chart_suite(...) 生成 charts；bar/line 需要 category_field 和 value_field，多指标柱图需要 category_field 和 value_fields，pie 需要 category_field 和 value_field，scatter 需要 x_field 和 y_field。',
+            '必须优先用 build_chart_result(...)、build_multi_metric_chart_result(...) 或 build_chart_suite(...) 生成 charts；bar/line 需要 category_field 和 value_field，多指标柱图需要 category_field 和 value_fields，pie 需要 category_field 和 value_field，scatter 需要 x_field 和 y_field，boxplot 用于异常值/分布/四分位数场景，需要 category_field 和 value_field。',
             'charts 应直接等于 helper 的返回结果，例如 charts = [build_chart_result(...)]、charts = [build_multi_metric_chart_result(...)] 或 charts = build_chart_suite(...)，然后调用 save_analysis_result(analysis_report=..., charts=charts, tables=...)。',
             '如果确实不适合生成图表，也必须用 tables 返回结构化汇总，不能让 charts 和 tables 同时为空。',
         ],

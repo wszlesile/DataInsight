@@ -102,6 +102,90 @@ class ChartDocumentUtilsTestCase(unittest.TestCase):
         self.assertLessEqual(len(pie_data), 6)
         self.assertEqual(pie_data[-1]["name"], "其他")
 
+    def test_build_chart_result_compiles_boxplot_from_raw_values(self) -> None:
+        chart_item = build_chart_result(
+            chart_kind="boxplot",
+            data=[
+                {"metric": "转速[rpm]", "value": 1000},
+                {"metric": "转速[rpm]", "value": 1200},
+                {"metric": "转速[rpm]", "value": 1400},
+                {"metric": "转速[rpm]", "value": 1600},
+                {"metric": "转速[rpm]", "value": 1800},
+                {"metric": "扭矩[Nm]", "value": 10},
+                {"metric": "扭矩[Nm]", "value": 20},
+                {"metric": "扭矩[Nm]", "value": 30},
+                {"metric": "扭矩[Nm]", "value": 40},
+                {"metric": "扭矩[Nm]", "value": 50},
+            ],
+            title="关键指标分布",
+            description="按指标展示五数摘要",
+            category_field="metric",
+            value_field="value",
+        )
+
+        normalized_item = normalize_chart_result_item(chart_item)
+        chart_spec = normalized_item["chart_spec"]
+
+        self.assertEqual(chart_spec["series"][0]["type"], "boxplot")
+        self.assertEqual(chart_spec["xAxis"]["data"], ["转速[rpm]", "扭矩[Nm]"])
+        self.assertEqual(chart_spec["series"][0]["data"][0], [1000.0, 1200.0, 1400.0, 1600.0, 1800.0])
+        self.assertTrue(chart_spec.get(BACKEND_LAYOUT_LOCK_KEY))
+
+    def test_compile_boxplot_document_uses_precomputed_five_number_summary(self) -> None:
+        chart_spec = compile_chart_document({
+            "chart_kind": "boxplot",
+            "title": "异常值分布",
+            "dataset": {
+                "columns": ["指标", "最小值", "Q1", "中位数", "Q3", "最大值"],
+                "rows": [
+                    {"指标": "转速[rpm]", "最小值": 1168, "Q1": 1423, "中位数": 1503, "Q3": 1612, "最大值": 2886},
+                    {"指标": "扭矩[Nm]", "最小值": 3.8, "Q1": 33.2, "中位数": 40.1, "Q3": 46.8, "最大值": 76.6},
+                ],
+            },
+            "encoding": {
+                "category_field": "指标",
+                "value_fields": ["最小值", "Q1", "中位数", "Q3", "最大值"],
+            },
+        })
+
+        self.assertEqual(chart_spec["series"][0]["type"], "boxplot")
+        self.assertEqual(chart_spec["xAxis"]["data"], ["转速[rpm]", "扭矩[Nm]"])
+        self.assertEqual(chart_spec["series"][0]["data"][1], [3.8, 33.2, 40.1, 46.8, 76.6])
+
+    def test_legacy_pyecharts_boxplot_spec_is_recompiled_to_helper_spec(self) -> None:
+        chart_item = {
+            "title": "Key Metric Boxplot",
+            "chart_type": "echarts",
+            "description": "Outlier check",
+            "chart_spec": {
+                "title": [{"text": "Key Metric Boxplot", "subtext": "Outlier check"}],
+                "legend": [{"data": ["Value Distribution"], "top": 36}],
+                "toolbox": {"show": True},
+                "xAxis": [{"type": "category", "data": ["Speed", "Torque"]}],
+                "yAxis": [{"type": "value"}],
+                "series": [{
+                    "type": "boxplot",
+                    "name": "Value Distribution",
+                    "data": [
+                        [1168, 1423, 1503, 1612, 2886],
+                        [3.8, 33.2, 40.1, 46.8, 76.6],
+                    ],
+                }],
+            },
+        }
+
+        normalized_item = normalize_chart_result_item(chart_item)
+        chart_spec = normalized_item["chart_spec"]
+
+        self.assertTrue(chart_spec.get(BACKEND_LAYOUT_LOCK_KEY))
+        self.assertEqual(chart_spec["series"][0]["type"], "boxplot")
+        self.assertEqual(chart_spec["xAxis"]["data"], ["Speed", "Torque"])
+        self.assertEqual(chart_spec["series"][0]["data"][0], [1168.0, 1423.0, 1503.0, 1612.0, 2886.0])
+        self.assertFalse(chart_spec["legend"].get("show", True))
+        self.assertNotIn("toolbox", chart_spec)
+        title = chart_spec["title"][0] if isinstance(chart_spec.get("title"), list) else chart_spec.get("title")
+        self.assertNotIn("subtext", title)
+
     def test_legacy_pyecharts_line_spec_is_recompiled_to_backend_managed_spec(self) -> None:
         chart_item = {
             "title": "2026年至今每月单位生产成本总和趋势",
