@@ -21,6 +21,7 @@ DEFAULT_CONVERSATION_ID = 0
 BIND_SOURCE_USER_SELECTED = 'user_selected'
 BIND_SOURCE_IMPORT_SELECTED = 'import_selected'
 BIND_SOURCE_SYSTEM_DEFAULT = 'system_default'
+UNS_TABLE_DATA_TYPES = {2}
 UNS_MAX_EXPANDED_FILES = Config.UNS_MAX_EXPANDED_FILES
 UNS_MAX_EXPAND_DEPTH = Config.UNS_MAX_EXPAND_DEPTH
 UNS_TREE_PAGE_SIZE = Config.UNS_TREE_PAGE_SIZE
@@ -509,6 +510,7 @@ class InsightNsRelDatasourceService:
                 "id": node_id,
                 "alias": str(node.get('alias') or '').strip(),
                 "name": str(node.get('name') or node.get('label') or node.get('pathName') or node_id).strip(),
+                "data_type": self._normalize_uns_data_type(node),
                 "uns_node_path": self._normalize_uns_node_id_list(
                     node.get('unsNodePath')
                     or node.get('uns_node_path')
@@ -535,6 +537,8 @@ class InsightNsRelDatasourceService:
         for node in selected_nodes:
             node_id = node["id"]
             if not node.get("is_folder"):
+                if not self._is_supported_uns_table_node(node):
+                    continue
                 if node_id not in seen_file_ids:
                     file_nodes.append(node)
                     seen_file_ids.add(node_id)
@@ -592,12 +596,15 @@ class InsightNsRelDatasourceService:
                     "alias": str(child.get('alias') or '').strip(),
                     "name": str(child.get('name') or child.get('pathName') or child_id).strip(),
                     "path": str(child.get('pathName') or child.get('path') or '').strip(),
+                    "data_type": self._normalize_uns_data_type(child),
                     "is_folder": bool(child.get('hasChildren'))
                     or int(child.get('countChildren') or 0) > 0
                     or int(child.get('type') if child.get('type') is not None else -1) == 0,
                 }
                 if child_node["is_folder"]:
                     stack.append((child_node, depth + 1))
+                    continue
+                if not self._is_supported_uns_table_node(child_node):
                     continue
 
                 files.append(child_node)
@@ -631,6 +638,21 @@ class InsightNsRelDatasourceService:
                 raise ValueError("UNS 文件夹分页过多，已停止展开")
 
         return rows
+
+    def _normalize_uns_data_type(self, node: dict[str, Any]) -> int | None:
+        raw_value = node.get('dataType')
+        if raw_value is None:
+            raw_value = node.get('data_type')
+        if raw_value is None:
+            return None
+        try:
+            return int(raw_value)
+        except (TypeError, ValueError):
+            return None
+
+    def _is_supported_uns_table_node(self, node: dict[str, Any]) -> bool:
+        data_type = node.get("data_type")
+        return data_type in UNS_TABLE_DATA_TYPES
 
     def _fetch_uns_details_in_parallel(
         self,
