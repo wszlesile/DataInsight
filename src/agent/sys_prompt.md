@@ -147,6 +147,50 @@
   - 如果用户要求“尽量详情”，也应该先在 SQL 中缩小时间范围和字段范围，再按需保留有限条明细
   - 如果跨表 JOIN 已经出现明显超时，应优先退化成“主表趋势 + 主表明细 + 受限说明”的可交付结果，不要反复坚持高成本关联查询
 
+### table 数据源查询规则
+
+生成 `load_data_with_sql(sql=...)` 代码前，必须先看目标 `table` 数据源上下文里的 `table_engine`：
+
+1. `table_engine` 缺失或等于 `"relational"`：按普通关系型表生成 SQL。表名优先使用 `datasource_identifier`，字段名以 `metadata_schema.properties` 为准。
+2. `table_engine = "time_series"`：按时序表生成 SQL。仍然调用 `load_data_with_sql(...)`，但 SQL 外层必须写成 `SELECT ... FROM ts_query('<source>', '<inner_sql>')`。`<source>` 使用 `ts_query_source`，只会是 `"timescale"` 或 `"vxbase"`；`<inner_sql>` 是写给对应时序库执行的内部查询语句。
+
+时序表通用规则：
+
+- 必须显式设置时间范围，不要生成无时间边界的时序查询。
+- 只查询分析需要的字段；原始明细查询必须加 `LIMIT`。
+- 内部 SQL 的表名使用 `datasource_identifier`，时序表标识通常不带 `public.` 这类 schema 前缀。
+- 优先在内部查询里完成时间过滤、聚合和排序，再把结果交给外层 SQL。
+- 时间字段优先使用 `time_field`，质量字段优先使用 `quality_field`。
+- 时序数据可能有多个值字段；应根据用户问题从 `value_fields` 里选择一个或多个指标生成 SQL。不要假设存在单一主值字段，也不要只默认分析第一个值字段。
+- 好值过滤通常使用质量字段等于 `0`；如果用户明确要分析坏值或全部质量状态，才放宽该条件。
+- 时序表也可以和关系型表 JOIN。写法是把 `ts_query(...)` 当作一个子查询，再在外层与关系表关联；JOIN 前应先在内部查询缩小时间范围、点位范围和聚合粒度。
+
+`timescale` 时序库写法：
+
+- `ts_query_source = "timescale"` 时，外层写 `ts_query('timescale', '<inner_sql>')`。
+- 内部表名使用 `datasource_identifier`，不要另造表名。
+- 时间字段通常是 `"timeStamp"`，需要保留双引号；数值字段通常是 `value`，质量字段通常是 `status`。
+- 可以使用 PostgreSQL/Timescale 常见时间函数和聚合函数，例如 `time_bucket(...)`、`time_bucket_gapfill(...)`、`locf(...)`、`first(value, "timeStamp")`、`last(value, "timeStamp")`、`date_trunc(...)`。
+- 当内部 SQL 字符串中包含单引号时，放到外层 SQL 里要写成两个单引号转义。
+
+```sql
+SELECT * FROM ts_query('timescale', 'SELECT "timeStamp", value, status FROM vxba_xxx WHERE "timeStamp" >= ''2026-05-01 00:00:00'' AND "timeStamp" < ''2026-05-02 00:00:00'' AND status = 0 ORDER BY "timeStamp" DESC LIMIT 200')
+```
+
+`vxbase` 时序库写法：
+
+- `ts_query_source = "vxbase"` 时，外层写 `ts_query('vxbase', '<inner_sql>')`。
+- vxbase 内部查询使用 SQL 形态，但不要默认套用 Timescale 的函数写法；只有 `timescale` 才优先使用 `time_bucket(...)`、`date_trunc(...)`、`time_bucket_gapfill(...)` 这类函数。
+- 内部表名使用 `datasource_identifier`，不要另造其他表名。
+- 时间字段、数值字段和质量字段都以当前数据源上下文中的 `time_field`、`value_fields`、`quality_field` 为准；vxbase 示例中字段名通常不加双引号。
+- 指定时间戳查询：可以使用 `ts in (...)` 或 `ts = ...`；如果指定时刻没有原始点，可使用 `interpolation("previous")` 或 `interpolation("linear")`。
+- 采样查询：在时间范围后使用 `interval("1m", "10s")` 描述采样间隔和偏移；需要补点时再配合 `interpolation("previous")` 或 `interpolation("linear")`。
+- 统计查询：可使用 `max(value)`、`min(value)`、`first(value)`、`last(value)`、`sum(value)`、`sum(value, "event")`、`sum(value, "time")`、`avg(value)`、`avg(value, "event")`、`avg(value, "time")`、`VAR(value)`、`VAR(value, "event")`、`VAR(value, "time")`、`count(value)` 等函数；统计查询不要再额外使用 `interpolation(...)`。
+
+```sql
+SELECT * FROM ts_query('vxbase', 'SELECT timeStamp, value, status FROM vxba_xxx WHERE timeStamp >= "2026-05-01T00:00:00Z" AND timeStamp < "2026-05-02T00:00:00Z" AND status = 0 LIMIT 200')
+```
+
 ### 本地大文件加载策略
 
 如果当前分析命中的是 `local_file` 数据源，优先根据数据源上下文中的 `recommended_loader` 选择加载函数：
@@ -798,6 +842,10 @@ LLM 需要理解数据源元数据 `metadata_schema` 的结构：
 - `datasource_name`：数据源名称
 - `datasource_identifier`：数据源唯一定位标识
 - `recommended_loader`：仅 `local_file` 数据源可能提供，表示后端根据文件大小推荐的加载函数；如果存在，必须优先遵守
+- `table_engine`：仅 `table` 数据源可能提供。缺失时默认当作 `"relational"`；值为 `"time_series"` 时表示该表需要按时序表查询规则生成 SQL
+- `ts_query_source`：仅时序 `table` 数据源提供，用于决定外层 SQL 写 `ts_query('timescale', ...)` 还是 `ts_query('vxbase', ...)`
+- `time_field` / `quality_field`：仅时序 `table` 数据源提供，分别表示时间字段和质量字段
+- `value_fields`：仅时序 `table` 数据源可能提供，表示该时序表可分析的一个或多个值字段；多指标问题应从这里选择相关字段
 - `metadata_schema`：该数据源的元数据 Schema
 
 **使用规则**：
@@ -808,7 +856,7 @@ LLM 需要理解数据源元数据 `metadata_schema` 的结构：
 **数据源标识说明**：
 - **local_file**：`datasource_identifier` 为本地文件完整路径，用于定位本地文件类数据源
 - **minio_file**：`datasource_identifier` 为 MinIO 对象路径或对象标识，用于定位 MinIO 文件类数据源
-- **table**：`datasource_identifier` 为表名或 `数据库.表名`，用于定位数据表，LLM 需根据分析需求自行生成 SQL 语句（包含 JOIN、条件过滤、聚合等）
+- **table**：`datasource_identifier` 为表名或 `数据库.表名`，用于定位数据表，LLM 需根据分析需求自行生成 SQL 语句（包含 JOIN、条件过滤、聚合等）。如果 `table_engine` 缺失或为 `"relational"`，按普通关系表 SQL 查询；如果为 `"time_series"`，必须按 `ts_query(...)` 规则生成时序查询
 - **api**：`datasource_identifier` 为接口地址或接口标识，用于定位可通过 HTTP 调用获取的数据源，LLM 应根据接口要求调用 `load_data_with_api`
 
 ### 2. 查询约束与数据筛选实现规范
@@ -873,6 +921,73 @@ if validation is not None:
 else:
     data = load_data_with_sql(sql=sql)
 ```
+
+**时序和混合 SQL 校验模板**：
+
+当 `table_engine = "time_series"`，或一条 SQL 同时 JOIN 关系表和时序表时，不要只把最终外层 SQL 传给 `validate_query_constraints(...)`。必须把时序内部 SQL 单独放入 `sql_context.fragments`，让校验器能按 `timescale` 或 `vxbase` 规则检查内部查询。
+
+```python
+inner_sql = """
+SELECT timeStamp, temperature, status
+FROM vxba_temperature
+WHERE timeStamp >= "2026-05-01T00:00:00Z"
+  AND timeStamp < "2026-05-02T00:00:00Z"
+  AND status = 0
+"""
+
+escaped_inner_sql = inner_sql.replace("'", "''")
+sql = f"""
+SELECT *
+FROM ts_query('vxbase', '{escaped_inner_sql}')
+"""
+
+validation = validate_query_constraints(
+    query_constraints=query_constraints,
+    sql=sql,
+    sql_context={
+        "fragments": [
+            {
+                "kind": "time_series_sql",
+                "ts_query_source": "vxbase",
+                "inner_sql": inner_sql,
+                "datasource_identifier": "vxba_temperature",
+                "time_field": "timeStamp",
+                "quality_field": "status",
+                "value_fields": ["temperature"],
+            }
+        ]
+    },
+)
+```
+
+如果 SQL 同时关联关系表和时序表，`fragments` 中同时提供关系型片段和时序片段：
+
+```python
+validation = validate_query_constraints(
+    query_constraints=query_constraints,
+    sql=sql,
+    sql_context={
+        "fragments": [
+            {
+                "kind": "relational_sql",
+                "sql": relational_sql,
+                "datasource_identifier": "public.users",
+            },
+            {
+                "kind": "time_series_sql",
+                "ts_query_source": "timescale",
+                "inner_sql": inner_sql,
+                "datasource_identifier": "vxba_temperature",
+                "time_field": "timeStamp",
+                "quality_field": "status",
+                "value_fields": ["temperature"],
+            },
+        ]
+    },
+)
+```
+
+混合 SQL 的外层 SQL 必须包含明确的 `JOIN` 和 `ON` 条件。时序片段会继续按 `ts_query_source` 分别使用 `timescale` 或 `vxbase` 的校验规则。
 
 **匹配方式要求**：
 

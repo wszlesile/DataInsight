@@ -25,7 +25,15 @@ from pydantic import BaseModel, Field
 from agent.context_engineering_runtime import CustomContext
 from api import supos_kernel_api
 from dto import DatabaseConnInfo
-from utils import build_chart_document, build_chart_result, build_chart_suite, build_multi_metric_chart_result, logger, normalize_chart_result_item
+from utils import (
+    build_chart_document,
+    build_chart_result,
+    build_chart_suite,
+    build_multi_metric_chart_result,
+    logger,
+    normalize_chart_result_item,
+    normalize_ts_query_source,
+)
 
 CURRENT_USERNAME = ContextVar('current_username', default='anonymous')
 CURRENT_EXPECTED_TIME_RANGE = ContextVar('current_expected_time_range', default={})
@@ -132,6 +140,9 @@ QUERY_CONSTRAINT_MATCH_MODES = {'exact', 'fuzzy'}
 QUERY_CONSTRAINT_GRAIN_PATTERNS = {
     'month': (
         re.compile(r"date_trunc\(\s*['\"]month['\"]", re.IGNORECASE),
+        re.compile(r"time_bucket\(\s*['\"][^'\"]*month", re.IGNORECASE),
+        re.compile(r"time_bucket_gapfill\(\s*['\"][^'\"]*month", re.IGNORECASE),
+        re.compile(r"interval\(\s*['\"][^'\"]*mo", re.IGNORECASE),
         re.compile(r"strftime\(\s*['\"]%Y-%m['\"]", re.IGNORECASE),
         re.compile(r"to_char\([^)]*['\"]YYYY-MM['\"]", re.IGNORECASE),
         re.compile(r"substr\([^)]*,\s*1\s*,\s*7\)", re.IGNORECASE),
@@ -144,6 +155,9 @@ QUERY_CONSTRAINT_GRAIN_PATTERNS = {
     ),
     'day': (
         re.compile(r"date_trunc\(\s*['\"]day['\"]", re.IGNORECASE),
+        re.compile(r"time_bucket\(\s*['\"][^'\"]*day", re.IGNORECASE),
+        re.compile(r"time_bucket_gapfill\(\s*['\"][^'\"]*day", re.IGNORECASE),
+        re.compile(r"interval\(\s*['\"][^'\"]*d", re.IGNORECASE),
         re.compile(r"strftime\(\s*['\"]%Y-%m-%d['\"]", re.IGNORECASE),
         re.compile(r"to_char\([^)]*['\"]YYYY-MM-DD['\"]", re.IGNORECASE),
         re.compile(r"\.dt\.date\b", re.IGNORECASE),
@@ -153,6 +167,9 @@ QUERY_CONSTRAINT_GRAIN_PATTERNS = {
     ),
     'year': (
         re.compile(r"date_trunc\(\s*['\"]year['\"]", re.IGNORECASE),
+        re.compile(r"time_bucket\(\s*['\"][^'\"]*year", re.IGNORECASE),
+        re.compile(r"time_bucket_gapfill\(\s*['\"][^'\"]*year", re.IGNORECASE),
+        re.compile(r"interval\(\s*['\"][^'\"]*y", re.IGNORECASE),
         re.compile(r"strftime\(\s*['\"]%Y['\"]", re.IGNORECASE),
         re.compile(r"to_char\([^)]*['\"]YYYY['\"]", re.IGNORECASE),
         re.compile(r"\.dt\.year\b", re.IGNORECASE),
@@ -162,9 +179,28 @@ QUERY_CONSTRAINT_GRAIN_PATTERNS = {
     ),
     'week': (
         re.compile(r"date_trunc\(\s*['\"]week['\"]", re.IGNORECASE),
+        re.compile(r"time_bucket\(\s*['\"][^'\"]*week", re.IGNORECASE),
+        re.compile(r"time_bucket_gapfill\(\s*['\"][^'\"]*week", re.IGNORECASE),
+        re.compile(r"interval\(\s*['\"][^'\"]*w", re.IGNORECASE),
         re.compile(r"\.dt\.isocalendar\(\)\.week", re.IGNORECASE),
         re.compile(r"\bweek\b", re.IGNORECASE),
         re.compile(r"周"),
+    ),
+    'hour': (
+        re.compile(r"date_trunc\(\s*['\"]hour['\"]", re.IGNORECASE),
+        re.compile(r"time_bucket\(\s*['\"][^'\"]*hour", re.IGNORECASE),
+        re.compile(r"time_bucket_gapfill\(\s*['\"][^'\"]*hour", re.IGNORECASE),
+        re.compile(r"interval\(\s*['\"][^'\"]*h", re.IGNORECASE),
+        re.compile(r"\bhour\b", re.IGNORECASE),
+        re.compile(r"小时"),
+    ),
+    'minute': (
+        re.compile(r"date_trunc\(\s*['\"]minute['\"]", re.IGNORECASE),
+        re.compile(r"time_bucket\(\s*['\"][^'\"]*min", re.IGNORECASE),
+        re.compile(r"time_bucket_gapfill\(\s*['\"][^'\"]*min", re.IGNORECASE),
+        re.compile(r"interval\(\s*['\"][^'\"]*m", re.IGNORECASE),
+        re.compile(r"\bminute\b", re.IGNORECASE),
+        re.compile(r"分钟"),
     ),
 }
 
@@ -500,6 +536,149 @@ def _check_aggregation_constraint(query_constraints: dict[str, Any], code: str) 
             'violated_constraint': 'aggregation',
             'aggregation': aggregation,
         },
+    )
+
+
+def _sql_context_fragments(sql_context: Any) -> list[dict[str, Any]]:
+    if not isinstance(sql_context, dict):
+        return []
+    fragments = sql_context.get('fragments')
+    if isinstance(fragments, list):
+        return [item for item in fragments if isinstance(item, dict)]
+
+    if str(sql_context.get('inner_sql') or '').strip():
+        return [{
+            'kind': 'time_series_sql',
+            'name': sql_context.get('name') or 'time_series',
+            'ts_query_source': sql_context.get('ts_query_source'),
+            'inner_sql': sql_context.get('inner_sql'),
+            'datasource_identifier': sql_context.get('datasource_identifier'),
+            'time_field': sql_context.get('time_field'),
+            'quality_field': sql_context.get('quality_field'),
+            'value_fields': sql_context.get('value_fields'),
+        }]
+    return []
+
+
+def _fragment_text(fragment: dict[str, Any]) -> str:
+    return '\n'.join(
+        str(fragment.get(key) or '').strip()
+        for key in ('sql', 'inner_sql', 'filter_expression')
+        if str(fragment.get(key) or '').strip()
+    )
+
+
+def _validate_relational_fragment(query_constraints: dict[str, Any], fragment: dict[str, Any]) -> list[dict[str, Any]]:
+    code = _fragment_text(fragment)
+    issues: list[dict[str, Any]] = []
+    for checker in (_check_target_filter_constraints,):
+        issue = checker(query_constraints, code)
+        if issue is not None:
+            issue.setdefault('diagnostics', {})['fragment'] = {
+                'kind': fragment.get('kind') or 'relational_sql',
+                'name': fragment.get('name') or '',
+            }
+            issues.append(issue)
+    return issues
+
+
+def _validate_timescale_fragment(query_constraints: dict[str, Any], fragment: dict[str, Any]) -> list[dict[str, Any]]:
+    code = _fragment_text(fragment)
+    issues = _validate_relational_fragment(query_constraints, {**fragment, 'sql': code})
+    return issues
+
+
+def _validate_vxbase_fragment(query_constraints: dict[str, Any], fragment: dict[str, Any]) -> list[dict[str, Any]]:
+    code = _fragment_text(fragment)
+    issues = _validate_relational_fragment(query_constraints, {**fragment, 'sql': code})
+
+    if re.search(r"\b(max|min|first|last|sum|avg|var|count)\s*\(", code, re.IGNORECASE) and re.search(
+        r"\binterpolation\s*\(",
+        code,
+        re.IGNORECASE,
+    ):
+        issues.append(_build_query_constraint_error(
+            'query_constraint_violation',
+            'vxbase 统计聚合查询不要同时使用 interpolation(...)。',
+            diagnostics={
+                'violated_constraint': 'time_series_sql',
+                'ts_query_source': 'vxbase',
+            },
+        ))
+    return issues
+
+
+def _validate_time_series_fragment(query_constraints: dict[str, Any], fragment: dict[str, Any]) -> list[dict[str, Any]]:
+    source = normalize_ts_query_source(fragment.get('ts_query_source'))
+    code = _fragment_text(fragment)
+    issues: list[dict[str, Any]] = []
+    if not source:
+        issues.append(_build_query_constraint_error(
+            'query_constraint_violation',
+            '时序 SQL 片段缺少 ts_query_source，无法判断应按 timescale 还是 vxbase 规则校验。',
+            diagnostics={'fragment': fragment},
+        ))
+        return issues
+    if source == 'timescale':
+        issues.extend(_validate_timescale_fragment(query_constraints, fragment))
+    elif source == 'vxbase':
+        issues.extend(_validate_vxbase_fragment(query_constraints, fragment))
+
+    datasource_identifier = str(fragment.get('datasource_identifier') or '').strip()
+    if datasource_identifier and datasource_identifier not in code:
+        issues.append(_build_query_constraint_error(
+            'query_constraint_violation',
+            '时序 SQL 内部查询没有使用当前数据源的 datasource_identifier。',
+            diagnostics={
+                'violated_constraint': 'time_series_datasource_identifier',
+                'datasource_identifier': datasource_identifier,
+                'ts_query_source': source,
+            },
+        ))
+    return issues
+
+
+def _validate_sql_context_fragments(
+    query_constraints: dict[str, Any],
+    sql: str,
+    sql_context: Any,
+) -> tuple[list[dict[str, Any]], str, str]:
+    fragments = _sql_context_fragments(sql_context)
+    if not fragments:
+        return [], '', ''
+
+    filter_fragments = [str(sql or '').strip()]
+    aggregation_fragments = [str(sql or '').strip()]
+    issues: list[dict[str, Any]] = []
+    has_relational = False
+    has_time_series = False
+
+    for fragment in fragments:
+        kind = str(fragment.get('kind') or '').strip().lower()
+        text = _fragment_text(fragment)
+        if text:
+            filter_fragments.append(text)
+            aggregation_fragments.append(text)
+        if kind == 'time_series_sql':
+            has_time_series = True
+            issues.extend(_validate_time_series_fragment(query_constraints, fragment))
+        elif kind == 'relational_sql':
+            has_relational = True
+            issues.extend(_validate_relational_fragment(query_constraints, fragment))
+
+    if has_relational and has_time_series:
+        outer_sql = str(sql or '')
+        if not re.search(r"\bjoin\b", outer_sql, re.IGNORECASE) or not re.search(r"\bon\b", outer_sql, re.IGNORECASE):
+            issues.append(_build_query_constraint_error(
+                'query_constraint_violation',
+                '混合关系型与时序查询时，外层 SQL 需要包含明确的 JOIN 和 ON 条件。',
+                diagnostics={'violated_constraint': 'mixed_join'},
+            ))
+
+    return (
+        issues,
+        '\n'.join(fragment for fragment in filter_fragments if fragment),
+        '\n'.join(fragment for fragment in aggregation_fragments if fragment),
     )
 
 
@@ -1491,6 +1670,7 @@ def validate_query_constraints(
     sql: str = '',
     filter_expressions: Optional[list[str]] = None,
     aggregation_hints: Optional[list[str]] = None,
+    sql_context: Optional[dict[str, Any]] = None,
 ) -> RetryResult | None:
     """Validate analysis-stage query constraints against SQL / pandas filtering implementations."""
     schema_errors = _validate_query_constraints_schema(query_constraints)
@@ -1517,13 +1697,33 @@ def validate_query_constraints(
             actual_time_range=query_constraints.get('time_range'),
         )
 
+    fragment_issues, context_filter_code, context_aggregation_code = _validate_sql_context_fragments(
+        query_constraints=query_constraints,
+        sql=sql,
+        sql_context=sql_context,
+    )
+    if fragment_issues:
+        issue = fragment_issues[0]
+        return request_retry(
+            retry_type=str(issue.get('error_type') or 'query_constraint_violation'),
+            message=str(issue.get('error_message') or '当前 SQL 片段没有满足 query_constraints 声明的查询约束。'),
+            diagnostics=issue.get('diagnostics') if isinstance(issue.get('diagnostics'), dict) else {},
+            repair_instructions=[
+                '保持 query_constraints 不变，按数据源片段分别修正关系型 SQL 与时序 inner_sql。',
+                '时序 SQL 应把 inner_sql 放入 sql_context.fragments，并带上 ts_query_source、datasource_identifier、time_field、quality_field 和 value_fields。',
+                '混合关系型与时序查询时，外层 SQL 应保留明确 JOIN 和 ON 条件。',
+            ],
+        )
+
     filter_fragments = [
         str(sql or '').strip(),
+        context_filter_code,
         *[str(item or '').strip() for item in (filter_expressions or [])],
     ]
     filter_code = '\n'.join(fragment for fragment in filter_fragments if fragment)
     aggregation_fragments = [
         filter_code,
+        context_aggregation_code,
         *[str(item or '').strip() for item in (aggregation_hints or [])],
     ]
     aggregation_code = '\n'.join(fragment for fragment in aggregation_fragments if fragment)
@@ -2126,6 +2326,7 @@ def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -
             user=str(conn_info_payload.get('user') or ''),
             password=str(conn_info_payload.get('password') or ''),
             lake_rds_database_name=str(conn_info_payload.get('lake_rds_database_name') or ''),
+            ts_query_source=str(conn_info_payload.get('ts_query_source') or ''),
         )
         supos_kernel_api._database_pool = None
         return

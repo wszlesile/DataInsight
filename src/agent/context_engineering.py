@@ -9,6 +9,7 @@ from config.database import SessionLocal
 from model import InsightDatasource, InsightNsConversation, InsightNsExecution, InsightNsRelDatasource
 from service.conversation_context_service import ConversationContextService
 from utils.datasource_utils import (
+    build_table_runtime_metadata,
     extract_datasource_identifier,
     extract_datasource_schema,
     normalize_datasource_type,
@@ -43,13 +44,17 @@ class CustomContext(BaseModel):
 def _build_datasource_payload_item(datasource: InsightDatasource) -> dict[str, Any]:
     """把数据源实体转换成 Prompt 约定的 JSON 结构。"""
     config_json = safe_json_loads(datasource.datasource_config_json, {})
-    return {
+    datasource_type = normalize_datasource_type(datasource.datasource_type)
+    payload = {
         "datasource_id": datasource.id,
-        "datasource_type": normalize_datasource_type(datasource.datasource_type),
+        "datasource_type": datasource_type,
         "datasource_name": datasource.datasource_name,
         "datasource_identifier": extract_datasource_identifier(datasource, config_json),
         "metadata_schema": extract_datasource_schema(datasource, config_json),
     }
+    if datasource_type == "table":
+        payload.update(build_table_runtime_metadata(config_json))
+    return payload
 
 
 def _build_execution_context_item(execution: InsightNsExecution, include_code: bool = False) -> dict[str, Any]:
@@ -385,13 +390,16 @@ def get_memory_messages(
 def _build_datasource_payload_item(datasource: InsightDatasource) -> dict[str, Any]:
     """把数据源实体转换成 Prompt 约定的 JSON 结构。"""
     config_json = safe_json_loads(datasource.datasource_config_json, {})
+    datasource_type = normalize_datasource_type(datasource.datasource_type)
     payload = {
         "datasource_id": datasource.id,
-        "datasource_type": normalize_datasource_type(datasource.datasource_type),
+        "datasource_type": datasource_type,
         "datasource_name": datasource.datasource_name,
         "datasource_identifier": extract_datasource_identifier(datasource, config_json),
         "metadata_schema": extract_datasource_schema(datasource, config_json),
     }
+    if datasource_type == "table":
+        payload.update(build_table_runtime_metadata(config_json))
     sheet_name = str(config_json.get("sheet_name") or "").strip()
     if sheet_name:
         payload["sheet_name"] = sheet_name

@@ -146,6 +146,12 @@ class InsightNamespaceController(BaseController):
 
         session = SessionLocal()
         try:
+            ts_query_source = ''
+            if user_context:
+                ts_query_source = (
+                    user_context.database_conn_info.ts_query_source
+                    or supos_kernel_api.ensure_ts_query_source(user_context.token)
+                )
             service = InsightNsRelDatasourceService(session)
             result = service.import_uns_nodes_to_namespace(
                 insight_namespace_id=namespace_id,
@@ -153,6 +159,7 @@ class InsightNamespaceController(BaseController):
                 nodes=nodes,
                 authorization=user_context.token if user_context else '',
                 lake_rds_database_name=user_context.database_conn_info.lake_rds_database_name if user_context else '',
+                ts_query_source=ts_query_source,
             )
             if result['success']:
                 return jsonify(Result.success(data=result['data'], message=result['message']).to_dict())

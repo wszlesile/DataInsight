@@ -14,14 +14,23 @@ from sqlalchemy.orm import Session
 
 from dto import DataSourceSchema, PropertySchema
 from model import InsightDatasource, InsightNsConversation, InsightNsRelDatasource, InsightNsUnsSelection
-from utils import dump_json, normalize_datasource_type, safe_json_loads
+from utils import (
+    TABLE_ENGINE_RELATIONAL,
+    TABLE_ENGINE_TIME_SERIES,
+    dump_json,
+    normalize_datasource_type,
+    normalize_ts_query_source,
+    safe_json_loads,
+)
 
 SHARED_UNS_NAMESPACE_ID = 0
 DEFAULT_CONVERSATION_ID = 0
 BIND_SOURCE_USER_SELECTED = 'user_selected'
 BIND_SOURCE_IMPORT_SELECTED = 'import_selected'
 BIND_SOURCE_SYSTEM_DEFAULT = 'system_default'
-UNS_TABLE_DATA_TYPES = {2}
+UNS_TIME_SERIES_DATA_TYPE = 1
+UNS_RELATIONAL_TABLE_DATA_TYPE = 2
+UNS_TABLE_DATA_TYPES = {UNS_TIME_SERIES_DATA_TYPE, UNS_RELATIONAL_TABLE_DATA_TYPE}
 UNS_MAX_EXPANDED_FILES = Config.UNS_MAX_EXPANDED_FILES
 UNS_MAX_EXPAND_DEPTH = Config.UNS_MAX_EXPAND_DEPTH
 UNS_TREE_PAGE_SIZE = Config.UNS_TREE_PAGE_SIZE
@@ -136,62 +145,6 @@ class InsightNsRelDatasourceService:
         self.session.commit()
         return {"success": True, "message": "数据源已绑定到当前会话", "data": self._to_dict(relation, datasource)}
 
-    def upload_file_datasource_to_namespace(
-        self,
-        insight_namespace_id: int,
-        upload_file: FileStorage,
-        upload_dir: str,
-    ) -> dict[str, Any]:
-        """
-        上传文件并在空间下创建数据源。
-
-        该方法只负责空间级资源创建，不会自动把数据源绑定到任何会话。
-        """
-        if insight_namespace_id <= 0:
-            return {"success": False, "message": "空间不存在"}
-        if upload_file is None or not upload_file.filename:
-            return {"success": False, "message": "请选择要上传的文件"}
-
-        original_filename = Path(upload_file.filename).name
-        suffix = Path(original_filename).suffix.lower()
-        if suffix not in {'.csv', '.xls', '.xlsx'}:
-            return {"success": False, "message": "仅支持上传 csv、xls、xlsx 文件"}
-
-        upload_dir_path = Path(upload_dir)
-        upload_dir_path.mkdir(parents=True, exist_ok=True)
-        stored_filename = f"{uuid4().hex}{suffix}"
-        stored_path = upload_dir_path / stored_filename
-        upload_file.save(str(stored_path))
-
-        datasource_name = self._build_unique_datasource_name(
-            insight_namespace_id=insight_namespace_id,
-            base_name=Path(original_filename).stem or f"外部数据源_{uuid4().hex[:6]}",
-        )
-        try:
-            datasource_schema = self._build_file_datasource_schema(stored_path, datasource_name)
-        except ValueError as exc:
-            if stored_path.exists():
-                stored_path.unlink(missing_ok=True)
-            return {"success": False, "message": str(exc)}
-        datasource_config_json = dump_json({
-            "file_path": str(stored_path).replace('\\', '/'),
-            "original_filename": original_filename,
-            "stored_filename": stored_filename,
-            "file_extension": suffix.lstrip('.'),
-        })
-        knowledge_tag = f"upload_{uuid4().hex[:16]}"
-
-        datasource = self._get_or_create_datasource(
-            insight_namespace_id=insight_namespace_id,
-            datasource_type='local_file',
-            datasource_name=datasource_name,
-            knowledge_tag=knowledge_tag,
-            datasource_schema=datasource_schema,
-            datasource_config_json=datasource_config_json,
-        )
-        self.session.commit()
-        return {"success": True, "message": "文件上传成功", "data": self._datasource_to_dict(datasource)}
-
     def update_namespace_datasource_description(
         self,
         insight_namespace_id: int,
@@ -233,6 +186,7 @@ class InsightNsRelDatasourceService:
         nodes: list[dict[str, Any]] | None = None,
         authorization: str = '',
         lake_rds_database_name: str = '',
+        ts_query_source: str = '',
     ) -> dict[str, Any]:
         """
         将选中的 UNS 节点转换为共享 table 数据源，并绑定到当前会话。
@@ -247,6 +201,7 @@ class InsightNsRelDatasourceService:
             return {"success": False, "message": "当前会话不存在或不属于该空间"}
 
         normalized_nodes = self._normalize_uns_nodes(nodes)
+        normalized_ts_query_source = normalize_ts_query_source(ts_query_source)
 
         try:
             with _uns_import_slot():
@@ -273,6 +228,31 @@ class InsightNsRelDatasourceService:
                             "data": {
                                 "imported": [],
                                 "failed": expand_result["failed"],
+                                "selections": self.list_uns_selections(insight_conversation_id),
+                            },
+                        }
+
+                    expanded_file_nodes = expand_result["file_nodes"]
+                    node_type_by_id = {
+                        str(node.get("id") or "").strip(): node.get("data_type")
+                        for node in expanded_file_nodes
+                        if str(node.get("id") or "").strip()
+                    }
+                    if any(data_type == UNS_TIME_SERIES_DATA_TYPE for data_type in node_type_by_id.values()) \
+                            and not normalized_ts_query_source:
+                        return {
+                            "success": False,
+                            "message": "当前平台时序数据库类型尚未初始化，无法导入时序 UNS 节点",
+                            "data": {
+                                "imported": [],
+                                "failed": [
+                                    {
+                                        "id": node_id,
+                                        "message": "缺少平台时序数据库类型",
+                                    }
+                                    for node_id, data_type in node_type_by_id.items()
+                                    if data_type == UNS_TIME_SERIES_DATA_TYPE
+                                ],
                                 "selections": self.list_uns_selections(insight_conversation_id),
                             },
                         }
@@ -340,9 +320,12 @@ class InsightNsRelDatasourceService:
                             }
 
                         for result in detail_results:
+                            node_id = str(result.get("id") or (result.get("detail") or {}).get("id") or "").strip()
                             datasource = self._upsert_uns_table_datasource(
                                 detail=result["detail"],
                                 lake_rds_database_name=lake_rds_database_name,
+                                uns_data_type=node_type_by_id.get(node_id),
+                                ts_query_source=normalized_ts_query_source,
                             )
                             self._bind_datasource(
                                 insight_namespace_id=SHARED_UNS_NAMESPACE_ID,
@@ -692,6 +675,8 @@ class InsightNsRelDatasourceService:
         self,
         detail: dict[str, Any],
         lake_rds_database_name: str,
+        uns_data_type: int | None = None,
+        ts_query_source: str = '',
     ) -> InsightDatasource:
         uns_node_id = str(detail.get('id') or '').strip()
         if not uns_node_id:
@@ -720,15 +705,85 @@ class InsightNsRelDatasourceService:
             datasource.datasource_name = datasource_name
             datasource.uns_node_id = uns_node_id
 
-        datasource.datasource_schema = self._build_uns_datasource_schema(detail, datasource.datasource_name)
-        datasource.datasource_config_json = dump_json({
+        data_type = (
+            self._normalize_uns_data_type({'data_type': uns_data_type})
+            if uns_data_type is not None
+            else self._normalize_uns_data_type(detail)
+        )
+        if data_type == UNS_TIME_SERIES_DATA_TYPE:
+            datasource.datasource_schema = self._build_uns_time_series_datasource_schema(
+                detail,
+                datasource.datasource_name,
+                ts_query_source=ts_query_source,
+            )
+            datasource.datasource_config_json = dump_json(
+                self._build_time_series_table_config(
+                    detail=detail,
+                    alias=alias,
+                    lake_rds_database_name=lake_rds_database_name,
+                    ts_query_source=ts_query_source,
+                )
+            )
+        else:
+            datasource.datasource_schema = self._build_uns_datasource_schema(detail, datasource.datasource_name)
+            datasource.datasource_config_json = dump_json({
+                "database_name": lake_rds_database_name,
+                "table_name": f"public.{alias}",
+                "uns_alias": alias,
+                "uns_data_type": UNS_RELATIONAL_TABLE_DATA_TYPE,
+                "table_engine": TABLE_ENGINE_RELATIONAL,
+                "uns_path": detail.get('path') or '',
+                "uns_path_name": detail.get('pathName') or detail.get('name') or '',
+            })
+        return datasource
+
+    def _build_time_series_table_config(
+        self,
+        *,
+        detail: dict[str, Any],
+        alias: str,
+        lake_rds_database_name: str,
+        ts_query_source: str,
+    ) -> dict[str, Any]:
+        normalized_ts_query_source = normalize_ts_query_source(ts_query_source)
+        time_field = 'timeStamp'
+        value_fields = self._extract_time_series_value_fields(
+            detail,
+            excluded_fields={'timeStamp', 'status'},
+        )
+        payload = {
             "database_name": lake_rds_database_name,
-            "table_name": f"public.{alias}",
+            "table_name": alias,
             "uns_alias": alias,
+            "uns_data_type": UNS_TIME_SERIES_DATA_TYPE,
+            "table_engine": TABLE_ENGINE_TIME_SERIES,
+            "ts_query_source": normalized_ts_query_source,
+            "time_field": time_field,
+            "value_fields": value_fields or ["value"],
+            "quality_field": "status",
             "uns_path": detail.get('path') or '',
             "uns_path_name": detail.get('pathName') or detail.get('name') or '',
-        })
-        return datasource
+        }
+        return payload
+
+    def _extract_time_series_value_fields(
+        self,
+        detail: dict[str, Any],
+        excluded_fields: set[str],
+    ) -> list[str]:
+        excluded = {str(item or '').strip().lower() for item in excluded_fields if str(item or '').strip()}
+        value_fields: list[str] = []
+        seen: set[str] = set()
+        for field in detail.get('fields') or []:
+            field_name = str(field.get('name') or '').strip()
+            if not field_name:
+                continue
+            normalized = field_name.lower()
+            if normalized in excluded or normalized in seen:
+                continue
+            value_fields.append(field_name)
+            seen.add(normalized)
+        return value_fields
 
     def _find_uns_datasource_by_node_id(
         self,
@@ -1057,6 +1112,53 @@ class InsightNsRelDatasourceService:
         )
         return dump_json(schema.model_dump())
 
+    def _build_uns_time_series_datasource_schema(
+        self,
+        detail: dict[str, Any],
+        datasource_name: str,
+        ts_query_source: str,
+    ) -> str:
+        normalized_ts_query_source = normalize_ts_query_source(ts_query_source)
+        base_payload = safe_json_loads(self._build_uns_datasource_schema(detail, datasource_name), {})
+        properties = dict(base_payload.get('properties') or {})
+        required = list(base_payload.get('required') or [])
+
+        def add_property(name: str, type_name: str, description: str) -> None:
+            if not name or name in properties:
+                return
+            properties[name] = PropertySchema(
+                type=type_name,
+                description=description,
+                example=None,
+            ).model_dump()
+            if name not in required:
+                required.append(name)
+
+        if normalized_ts_query_source == 'timescale':
+            description = (
+                f"时序数据源“{detail.get('name') or datasource_name}”，ts_query_source 为 timescale。"
+                "查询时应通过 ts_query('timescale', '<内部 SQL>') 访问。"
+            )
+        else:
+            description = (
+                f"时序数据源“{detail.get('name') or datasource_name}”，ts_query_source 为 vxbase。"
+                "查询时应通过 ts_query('vxbase', '<内部 SQL>') 访问。"
+            )
+        add_property('timeStamp', 'string', '时序数据时间字段')
+        add_property('status', 'integer', '时序数据质量码，通常 0 表示好值')
+
+        schema = DataSourceSchema(
+            name=datasource_name,
+            description=description,
+            properties={
+                key: value if isinstance(value, PropertySchema) else PropertySchema(**value)
+                for key, value in properties.items()
+                if isinstance(value, (dict, PropertySchema))
+            },
+            required=required,
+        )
+        return dump_json(schema.model_dump())
+
     def _read_file_preview(self, file_path: Path) -> pd.DataFrame:
         """按文件类型读取预览数据；异常会转换成可直接返回给前端的错误。"""
         try:
@@ -1190,28 +1292,6 @@ class InsightNsRelDatasourceService:
             "bind_source": rel.bind_source,
             "created_at": rel.created_at.isoformat() if rel.created_at else None,
             "updated_at": rel.updated_at.isoformat() if rel.updated_at else None,
-        }
-
-    def _datasource_to_dict(
-        self,
-        datasource: InsightDatasource,
-        checked: bool = False,
-        insight_conversation_id: int = 0,
-    ) -> dict[str, Any]:
-        return {
-            "id": datasource.id,
-            "datasource_id": datasource.id,
-            "insight_namespace_id": datasource.insight_namespace_id,
-            "insight_conversation_id": insight_conversation_id,
-            "datasource_type": datasource.datasource_type,
-            "datasource_name": datasource.datasource_name,
-            "knowledge_tag": datasource.knowledge_tag,
-            "uns_node_id": datasource.uns_node_id,
-            "datasource_schema": datasource.datasource_schema,
-            "datasource_config_json": datasource.datasource_config_json,
-            "checked": checked,
-            "created_at": datasource.created_at.isoformat() if datasource.created_at else None,
-            "updated_at": datasource.updated_at.isoformat() if datasource.updated_at else None,
         }
 
     def upload_file_datasource_to_namespace(

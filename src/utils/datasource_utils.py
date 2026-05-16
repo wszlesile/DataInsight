@@ -11,6 +11,11 @@ DATASOURCE_TYPE_MAPPING = {
     'api': 'api',
 }
 
+TABLE_ENGINE_RELATIONAL = 'relational'
+TABLE_ENGINE_TIME_SERIES = 'time_series'
+TABLE_ENGINE_VALUES = {TABLE_ENGINE_RELATIONAL, TABLE_ENGINE_TIME_SERIES}
+TIME_SERIES_BACKEND_VALUES = {'timescale', 'vxbase'}
+
 
 def safe_json_loads(value: Any, fallback: Any) -> Any:
     """安全反序列化 JSON，同时兼容直接传入 dict/list 的情况。"""
@@ -67,6 +72,58 @@ def normalize_datasource_type(datasource_type: Any) -> str:
     return DATASOURCE_TYPE_MAPPING.get(str(datasource_type or '').strip().lower(), 'unknown')
 
 
+def resolve_table_engine(config_json: dict[str, Any] | None) -> str:
+    """Resolve table sub-type; old table configs default to relational."""
+    if not isinstance(config_json, dict):
+        return TABLE_ENGINE_RELATIONAL
+    value = str(config_json.get('table_engine') or '').strip().lower()
+    if value in TABLE_ENGINE_VALUES:
+        return value
+    return TABLE_ENGINE_RELATIONAL
+
+
+def normalize_ts_query_source(value: Any) -> str:
+    normalized = str(value or '').strip().lower()
+    return normalized if normalized in TIME_SERIES_BACKEND_VALUES else ''
+
+
+def _normalize_string_list(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        candidates = value
+    elif value:
+        candidates = [value]
+    else:
+        candidates = []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        text = str(item or '').strip()
+        if not text or text in seen:
+            continue
+        normalized.append(text)
+        seen.add(text)
+    return normalized
+
+
+def build_table_runtime_metadata(config_json: dict[str, Any] | None) -> dict[str, Any]:
+    """Build prompt-safe metadata for table datasources with backwards compatibility."""
+    config = config_json if isinstance(config_json, dict) else {}
+    table_engine = resolve_table_engine(config)
+    payload: dict[str, Any] = {
+        'table_engine': table_engine,
+    }
+    if table_engine == TABLE_ENGINE_TIME_SERIES:
+        backend = normalize_ts_query_source(config.get('ts_query_source'))
+        value_fields = _normalize_string_list(config.get('value_fields') or [])
+        payload.update({
+            'ts_query_source': backend,
+            'time_field': str(config.get('time_field') or '').strip(),
+            'value_fields': value_fields,
+            'quality_field': str(config.get('quality_field') or 'status').strip(),
+        })
+    return {key: value for key, value in payload.items() if value != ''}
+
+
 def extract_datasource_identifier(datasource: Any, config_json: dict[str, Any]) -> str:
     """提取用于 Prompt 注入的数据源定位标识。"""
     datasource_type = normalize_datasource_type(getattr(datasource, 'datasource_type', ''))
@@ -89,6 +146,13 @@ def extract_datasource_identifier(datasource: Any, config_json: dict[str, Any]) 
         )
 
     if datasource_type == 'table':
+        if resolve_table_engine(config_json) == TABLE_ENGINE_TIME_SERIES:
+            return (
+                config_json.get('uns_alias')
+                or config_json.get('table_name')
+                or config_json.get('identify')
+                or getattr(datasource, 'datasource_name', '')
+            )
         return (
             config_json.get('table_name')
             or config_json.get('identify')

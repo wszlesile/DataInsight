@@ -55,6 +55,7 @@ class InsightNsConversationController(BaseController):
                 'user': getattr(database_conn_info, 'user', '') or '',
                 'password': getattr(database_conn_info, 'password', '') or '',
                 'lake_rds_database_name': getattr(database_conn_info, 'lake_rds_database_name', '') or '',
+                'ts_query_source': getattr(database_conn_info, 'ts_query_source', '') or '',
             } if database_conn_info else {},
         )
 

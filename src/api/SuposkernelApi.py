@@ -13,7 +13,7 @@ from sqlalchemy.pool import QueuePool
 
 from config.config import Config
 from dto import DatabaseConnInfo
-from utils import logger
+from utils import logger, normalize_ts_query_source
 
 KERNEL_TOKEN_PATH = Path("/var/run/secrets/supos.com/serviceaccount/token")
 
@@ -127,15 +127,18 @@ class SuposKernelApi:
         第一次在拿到用户 token 后初始化；后续所有用户上下文都复用同一个实例。
         """
         if self._database_conn_info.is_ready():
+            if token and not self._database_conn_info.ts_query_source:
+                self.ensure_ts_query_source(token)
             return self._database_conn_info
         if not token:
             return self._database_conn_info
 
         with self._database_conn_info_lock:
-            if self._database_conn_info.is_ready():
-                return self._database_conn_info
-            self._initialize_database_conn_info(token)
-            return self._database_conn_info
+            if not self._database_conn_info.is_ready():
+                self._initialize_database_conn_info(token)
+        if not self._database_conn_info.ts_query_source:
+            self.ensure_ts_query_source(token)
+        return self._database_conn_info
 
     def get_database_pool(self, token: str | None = None) -> QueuePool | None:
         """
@@ -206,12 +209,58 @@ class SuposKernelApi:
             conn_info.user = 'fedquery'
             conn_info.password = 'fedquery'
             conn_info.lake_rds_database_name = 'fqe_uns'
+            conn_info.ts_query_source = normalize_ts_query_source(
+                os.environ.get('SUPOS_TS_QUERY_SOURCE', '')
+            )
         else:
             self._fill_kernel_database_conn_info(token, conn_info)
             conn_info.lake_rds_database_name = 'fqe_uns'#self._fetch_lake_rds_database_name(token)
+            conn_info.ts_query_source = self.fetch_ts_query_source(token)
 
         self._database_conn_info = conn_info
         self._database_pool = None
+
+    def ensure_ts_query_source(self, token: str) -> str:
+        """补齐当前 ts_query source；数据库连接已初始化但 source 为空时可重复调用。"""
+        if not token:
+            return self._database_conn_info.ts_query_source
+        current = normalize_ts_query_source(self._database_conn_info.ts_query_source)
+        if current:
+            return current
+        ts_query_source = normalize_ts_query_source(
+            os.environ.get('SUPOS_TS_QUERY_SOURCE', '')
+        ) or self.fetch_ts_query_source(token)
+        if ts_query_source:
+            with self._database_conn_info_lock:
+                self._database_conn_info.ts_query_source = ts_query_source
+        return ts_query_source
+
+    def fetch_ts_query_source(self, token: str) -> str:
+        """Return current ts_query source: timescale, vxbase, or empty."""
+        if not token:
+            return ''
+        url = f"{self.supos_web}/os/inter-api/lake-manager/v1/resource"
+        headers = {"Authorization": token}
+        params = {
+            "pageNo": 1,
+            "pageSize": 20,
+            "catalog": "ts",
+            "isDeleted": "false",
+        }
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=self.timeout)
+            response.raise_for_status()
+            payload = response.json()
+            rows = ((payload.get("data") or {}).get("list") or [])
+            for row in rows:
+                ts_query_source = normalize_ts_query_source((row or {}).get("id"))
+                if ts_query_source:
+                    return ts_query_source
+        except requests.RequestException:
+            logger.warn("[SuposKernel] 获取时序数据库类型失败", exc_info=True)
+        except ValueError:
+            logger.warn("[SuposKernel] 解析时序数据库类型响应失败", exc_info=True)
+        return ''
 
     def _fill_kernel_database_conn_info(self, token: str, conn_info: DatabaseConnInfo) -> None:
         url = f"{self.supos_web}/apis/ns/v1/supbase-ds/SQL/fedquery/fedquery_system"

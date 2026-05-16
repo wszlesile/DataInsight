@@ -11,6 +11,7 @@ from model import InsightDatasource, InsightNsConversation, InsightNsExecution, 
 from service.conversation_context_service import ConversationContextService
 from utils.context_compression import clip_text
 from utils.datasource_utils import (
+    build_table_runtime_metadata,
     extract_datasource_identifier,
     extract_datasource_schema,
     normalize_datasource_type,
@@ -121,6 +122,8 @@ def _build_datasource_payload_item(datasource: InsightDatasource) -> dict[str, A
             config_json,
             Config.LOCAL_FILE_LOW_MEMORY_THRESHOLD_BYTES,
         )
+    if datasource_type == "table":
+        payload.update(build_table_runtime_metadata(config_json))
     sheet_name = str(config_json.get("sheet_name") or "").strip()
     if sheet_name:
         payload["sheet_name"] = sheet_name
