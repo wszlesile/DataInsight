@@ -55,6 +55,7 @@ class Config:
     # 应用配置
     APP_NAME = "DataInsight App"
     VERSION = "1.0.0"
+    SCHEMA_VERSION = os.environ.get('DATA_INSIGHT_SCHEMA_VERSION', '1.1.0')
 
     # 用户系统配置
     USER_AUTH_ENDPOINT = '/os/inter-api/auth/v1/current-user/sessionInfo'

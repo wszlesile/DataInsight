@@ -419,6 +419,7 @@ def _build_agent_context(agent_request: AgentRequest, runtime: ConversationRunCo
         expected_time_range=_build_expected_time_range_from_user_query(user_query),
         auth_token=agent_request.auth_token or '',
         database_conn_info=dict(agent_request.database_conn_info or {}),
+        active_datasource_snapshot=dict(runtime.active_datasource_snapshot or {}),
     )
 
 

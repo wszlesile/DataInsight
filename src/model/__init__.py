@@ -295,6 +295,7 @@ class InsightNsTurn(Base):
     user_query = Column(Text, nullable=False, comment='本轮用户问题')
     selected_datasource_ids_json = Column(Text, nullable=False, default='[]', comment='本轮选中的数据源 ID 列表 JSON')
     selected_datasource_snapshot_json = Column(Text, nullable=False, default='[]', comment='本轮数据源快照 JSON')
+    used_datasource_ids_json = Column(Text, nullable=False, default='[]', comment='本轮最终成功分析实际使用的数据源 ID 列表 JSON')
     final_answer = Column(Text, nullable=False, default='', comment='本轮最终回答')
     status = Column(String(32), nullable=False, default='running', comment='轮次状态')
     error_message = Column(Text, nullable=False, default='', comment='轮次错误信息')
@@ -318,6 +319,8 @@ class InsightNsTurn(Base):
             "selected_datasource_snapshot_json": self.selected_datasource_snapshot_json,
             "selected_datasource_ids": _safe_json_loads(self.selected_datasource_ids_json, []),
             "selected_datasource_snapshot": _safe_json_loads(self.selected_datasource_snapshot_json, []),
+            "used_datasource_ids_json": self.used_datasource_ids_json,
+            "used_datasource_ids": _safe_json_loads(self.used_datasource_ids_json, []),
             "final_answer": self.final_answer,
             "status": self.status,
             "error_message": self.error_message,
@@ -390,6 +393,7 @@ class InsightNsExecution(Base):
     title = Column(String(260), nullable=False, default='', comment='执行任务标题')
     description = Column(Text, nullable=False, default='', comment='执行任务描述')
     generated_code = Column(Text, nullable=False, default='', comment='大模型生成的 Python 代码')
+    used_datasource_ids_json = Column(Text, nullable=False, default='[]', comment='本次执行实际使用的数据源 ID 列表 JSON')
     execution_status = Column(String(32), nullable=False, default='running', comment='执行状态')
     analysis_report = Column(Text, nullable=False, default='', comment='分析报告内容')
     result_payload_json = Column(Text, nullable=False, default='{}', comment='结构化执行结果 JSON')
@@ -417,6 +421,8 @@ class InsightNsExecution(Base):
             "title": self.title,
             "description": self.description,
             "generated_code": self.generated_code,
+            "used_datasource_ids_json": self.used_datasource_ids_json,
+            "used_datasource_ids": _safe_json_loads(self.used_datasource_ids_json, []),
             "execution_status": self.execution_status,
             "analysis_report": self.analysis_report,
             "result_payload_json": self.result_payload_json,

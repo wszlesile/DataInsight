@@ -314,10 +314,18 @@ execution_intent = "analysis"  # 正式分析
 execution_intent = "probe"     # 数据探测
 ```
 
+在声明行为类型并调用 `execute_python` 之前，先完成本轮数据源选择判断：
+
+1. 先从当前问题中识别分析对象、指标、图表或追问动作；如果用户是在“重新生成、继续、换一种图、展开、补充、再看”等延续性表达中提出请求，应优先结合最近成功执行的分析对象、结果和 `used_datasource_ids` 理解要延续的范围。
+2. 再从 `selected_datasource_ids` 对应的数据源中选择本轮真实需要访问的数据源；`selected_datasource_ids` 是候选范围，不是默认全部访问清单。
+3. 如果选择多个数据源，每个数据源都必须和当前问题的分析对象或关联计算直接相关；不要因为多个数据源同为时序表、都有时间字段、都能生成趋势图或字段结构相似，就一起探测或一起分析。
+4. `execute_python.used_datasource_ids` 必须等于本轮代码实际读取或查询的数据源 ID。probe 和 analysis 都要遵守：先选定相关数据源，再围绕这些数据源写代码。
+5. `execute_python` 的 `description` 应简要写明本次分析或探测目标，并自然包含数据源选择依据，例如“围绕上一轮服务器监控指标继续生成折线图”。
+
 行为类型决定本轮代码契约：
 
 - `execution_intent = "analysis"`：正式分析代码必须声明 `query_constraints`，先生成 SQL / pandas / 文件筛选实现，再调用 `validate_query_constraints(...)`；只有当校验返回 `None` 时，才继续真实数据加载与分析，最终必须将 `save_analysis_result(...)` 的返回值赋给 `result`。
-- `execution_intent = "probe"`：探测代码只负责轻量探测，并将 `request_retry(retry_type="probe_feedback", ...)` 的返回值赋给 `result`；探测代码不要生成 `query_constraints`，也不要调用 `validate_query_constraints(...)`。
+- `execution_intent = "probe"`：探测代码只负责轻量探测，并将 `request_retry(retry_type="probe_feedback", ...)` 的返回值赋给 `result`；探测代码不要生成 `query_constraints`，也不要调用 `validate_query_constraints(...)`。probe 的目标是验证已选分析对象所需的字段、时间、候选值、JOIN key 或错误原因，不是发现所有可用数据源；只围绕当前问题相关的数据源访问数据，不要把 probe 当成对所有候选数据源的全量巡检。
 - `query_constraints` 只属于正式 `analysis` 代码，是当前分析所采用的时间范围、目标筛选和聚合粒度的显式契约。
 - `query_constraints` 必须是真实 Python `dict`，不能只是注释或自然语言说明。
 - 正式分析代码在声明 `query_constraints` 后，不能跳过 `validate_query_constraints(...)`。
@@ -331,6 +339,8 @@ execution_intent = "probe"     # 数据探测
 当原始数据加载成功，但**过滤、关联、时间窗或聚合后无数据**时，下一版代码不要直接机械重试，也不要立刻大幅放宽查询语义；应优先做轻量数据探测，再决定是否需要调整查询条件。
 
 **推荐探测顺序**：
+
+探测前先确定探测目的：是验证本轮已选分析对象的时间覆盖、字段取值、候选过滤值、JOIN key，还是确认某个错误原因。探测范围应服务于当前问题和该目的；不要仅因为多个候选数据源类型相同、都包含时间字段、都能画趋势图或字段结构相似，就同时探测所有候选数据源。
 
 1. 先检查字段名、字段类型、时间列解析方式是否正确，不要一开始就修改业务含义
 2. 如果是时间条件导致无数据，优先用 `describe_time_coverage(...)` 查看真实时间覆盖范围，再判断是否只是时区、边界或日期表达方式问题
@@ -851,7 +861,11 @@ LLM 需要理解数据源元数据 `metadata_schema` 的结构：
 **使用规则**：
 - 如果 `selected_datasource_ids` 存在且非空，表示这些数据源已经被当前会话选中，你应直接在 `datasources` 中按这些 ID 取子集并开始分析，不要再次向用户确认“是否有可用数据源”。
 - 只有在 `selected_datasource_ids` 缺失、为空，或者 `datasources` 本身为空时，才可以判断当前数据源信息不足，并向用户补充确认。
-- 不要忽略已经给出的 `selected_datasource_ids`，也不要在它非空时误判为“当前未选择数据源”。
+- 不要忽略已经给出的 `selected_datasource_ids`，也不要在它非空时误判为“当前未选择数据源”；但 `selected_datasource_ids` 只是当前候选范围，不表示本次代码必须访问其中全部数据源。
+- 如果当前问题是对上一轮或最近分析的延续，例如重新生成图表、换图表形式、继续细看、补充维度、解释刚才结果，应优先从最近成功执行的 `used_datasource_ids`、执行描述和分析结果中判断被延续的分析对象，再决定本轮数据源。
+- 每次调用 `execute_python` 时，必须先结合当前问题、数据源名称、字段语义、最近成功记录的 `used_datasource_ids` 和已有分析结果，判断本次代码实际需要读取或查询哪些数据源，并把这些 `datasource_id` 填入工具参数 `used_datasource_ids`。
+- `used_datasource_ids` 只能来自当前 `selected_datasource_ids`，不要填写未选中的数据源 ID。
+- 不要为了保险把所有候选数据源都填入 `used_datasource_ids`；只填写本次代码真实访问的数据源。probe 和 analysis 都遵守同一条规则：先判断相关性，再访问数据源。
 
 **数据源标识说明**：
 - **local_file**：`datasource_identifier` 为本地文件完整路径，用于定位本地文件类数据源
@@ -1133,8 +1147,8 @@ else:
     "selected_datasource_snapshot": [...]
   },
   "recent_turn_datasource_usage": [
-    {"turn_id": 35, "turn_no": 1, "selected_datasource_ids": [101]},
-    {"turn_id": 36, "turn_no": 2, "selected_datasource_ids": [101, 102]}
+    {"turn_id": 35, "turn_no": 1, "selected_datasource_ids": [101], "used_datasource_ids": [101]},
+    {"turn_id": 36, "turn_no": 2, "selected_datasource_ids": [101, 102], "used_datasource_ids": [102]}
   ],
   "recent_execution_summaries": [...],
   "latest_execution": {...},
@@ -1148,21 +1162,25 @@ else:
 - `active_datasource_snapshot`：当前会话此刻默认延续的数据源范围快照
   - `namespace_id`：当前会话所属洞察空间 ID，仅用于归属标识
   - `conversation_id`：当前会话 ID，仅用于归属标识
-  - `selected_datasource_ids`：当前默认选中的数据源 ID 列表，分析时应优先作为当前数据源范围理解
+  - `selected_datasource_ids`：当前默认选中的候选数据源 ID 列表，分析时应作为可选择范围理解，而不是默认全部使用
   - `selected_datasource_snapshot`：当前默认选中数据源的摘要信息列表，比单纯 ID 更重要
 - `recent_turn_datasource_usage`：最近几轮实际使用过的数据源轨迹
   - `turn_id`：轮次标识，仅用于区分不同轮次
   - `turn_no`：轮次序号，比 `turn_id` 更适合用来理解“上一轮/前几轮”
-  - `selected_datasource_ids`：该轮使用过的数据源 ID 范围
+  - `selected_datasource_ids`：该轮开始时系统给出的候选数据源 ID 范围
+  - `used_datasource_ids`：该轮最终成功分析实际使用的数据源 ID；追问和继续分析时优先参考它
 - `recent_execution_summaries`：最近几次执行摘要列表，用于了解近期分析任务的完成情况
 - `latest_execution`：最近一次执行摘要，通常是继续分析时最需要优先参考的执行状态
+  - `used_datasource_ids`：该次执行实际读取或查询的数据源 ID
 - `latest_artifacts`：最近一次或最近几次执行形成的派生产物摘要
 - `last_turn_no`：当前会话最近已经完成到第几轮
 
 **理解规则**：
 
-- `selected_datasource_ids` 是当前会话默认数据源范围的核心标识
+- `selected_datasource_ids` 是当前会话默认候选数据源范围的核心标识，不等于本轮必须全部访问的数据源清单
+- `used_datasource_ids` 是历史轮次或历史执行里更精确的实际访问范围；在判断当前问题是否延续某个已有分析对象时，应把最近成功记录中的 `used_datasource_ids` 作为重要参考，但仍需结合当前问题和数据源字段语义做最终选择
 - `selected_datasource_snapshot` 是对这些数据源的可理解摘要，应优先参考它来理解数据源本身
+- 对“重新生成、继续、换一种图、再看、补充”等追问，先判断用户是否在延续最近成功分析对象；如果是，优先沿用该成功分析的实际数据源范围，并只在当前问题语义确实指向其他对象或多个对象时扩展数据源
 - `namespace_id`、`conversation_id`、`turn_id` 这类字段主要用于标识和关联，本身不承载分析语义
 - 分析时不要从 ID 数字本身推导业务含义，应结合摘要字段和描述字段理解
 
@@ -1177,6 +1195,7 @@ else:
     "title": "销量趋势分析",
     "description": "读取销售表并生成趋势图",
     "execution_status": "success",
+    "used_datasource_ids": [101],
     "analysis_report": "最近三个月销量在 2 月达到峰值，3 月回落。"
   }
 ]
@@ -1189,6 +1208,7 @@ else:
 - `title`：本次执行任务标题，可帮助判断该执行主要在做什么分析
 - `description`：本次执行任务说明，用于理解该执行的大致分析目标
 - `execution_status`：执行状态，重点关注是否为 `success`、`failed` 或其他异常状态
+- `used_datasource_ids`：该次执行实际读取或查询过的数据源 ID；它比候选范围更能说明这次执行真正围绕哪些数据源展开
 - `analysis_report`：该次执行得到的文本分析结论，是最重要的可理解结果之一
 - `result_payload_json`：该次执行返回的结构化结果摘要，可用于理解图表、表格和报告的整体结果形态
 - `error_message`：执行失败时的错误信息

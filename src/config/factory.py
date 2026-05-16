@@ -5,6 +5,7 @@ from flask import Flask, abort, send_from_directory
 
 from config.config import Config
 from config.database import init_db
+from config.schema_migrations import run_schema_migrations
 from controller.agent_controller import create_agent_controller
 from controller.insight_namespace_controller import create_insight_namespace_controller
 from controller.insight_ns_conversation_controller import create_insight_ns_conversation_controller
@@ -35,6 +36,7 @@ def create_app(config_class=Config) -> Flask:
     app.config.from_object(config_class)
 
     init_db()
+    run_schema_migrations()
     _init_components()
     _register_routes(app)
 

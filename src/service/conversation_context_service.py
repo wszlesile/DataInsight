@@ -278,6 +278,10 @@ class ConversationContextService:
 
         final_answer = (analysis_report or assistant_message or '').strip()
         turn.final_answer = final_answer
+        if latest_execution is not None:
+            turn.used_datasource_ids_json = getattr(latest_execution, 'used_datasource_ids_json', '') or '[]'
+        else:
+            turn.used_datasource_ids_json = '[]'
         turn.status = 'success'
         turn.error_message = ''
         turn.finished_at = _now()
@@ -304,6 +308,7 @@ class ConversationContextService:
                 "analysis_report": analysis_report or '',
                 "charts": charts or [],
                 "tables": tables or [],
+                "used_datasource_ids": safe_json_loads(turn.used_datasource_ids_json, []),
             },
         )
 
@@ -1158,6 +1163,7 @@ class ConversationContextService:
             payloads.append({
                 "turn_id": turn.id,
                 "turn_no": turn.turn_no,
+                "used_datasource_ids": safe_json_loads(getattr(turn, 'used_datasource_ids_json', ''), []),
                 "question": question,
                 "answer": answer if turn.id in successful_turn_ids and '<tool_call>' not in answer else '',
             })
@@ -1215,6 +1221,7 @@ class ConversationContextService:
                 "turn_id": turn.id,
                 "turn_no": turn.turn_no,
                 "selected_datasource_ids": safe_json_loads(turn.selected_datasource_ids_json, []),
+                "used_datasource_ids": safe_json_loads(getattr(turn, 'used_datasource_ids_json', ''), []),
             }
             for turn in turns
         ]
@@ -1262,6 +1269,7 @@ class ConversationContextService:
             "title": execution.title,
             "description": execution.description,
             "execution_status": execution.execution_status,
+            "used_datasource_ids": safe_json_loads(getattr(execution, 'used_datasource_ids_json', ''), []),
             "analysis_report_preview": clip_text(
                 execution.analysis_report or '',
                 Config.CONTEXT_COMPRESSION_EXECUTION_PREVIEW_CHARS,

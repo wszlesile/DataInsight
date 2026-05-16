@@ -39,6 +39,7 @@ class CustomContext(BaseModel):
     turn_id: int = 0
     auth_token: str = ''
     database_conn_info: dict[str, Any] = Field(default_factory=dict)
+    active_datasource_snapshot: dict[str, Any] = Field(default_factory=dict)
 
 
 def _build_datasource_payload_item(datasource: InsightDatasource) -> dict[str, Any]:
@@ -65,6 +66,7 @@ def _build_execution_context_item(execution: InsightNsExecution, include_code: b
         "title": execution.title,
         "description": execution.description,
         "execution_status": execution.execution_status,
+        "used_datasource_ids": safe_json_loads(getattr(execution, 'used_datasource_ids_json', ''), []),
         "analysis_report": execution.analysis_report,
         "error_message": execution.error_message,
         "execution_seconds": execution.execution_seconds,
@@ -111,6 +113,7 @@ def _build_success_fact_execution_summary(item: dict[str, Any]) -> dict[str, Any
         "title": item.get("title", ""),
         "description": item.get("description", ""),
         "execution_status": item.get("execution_status", ""),
+        "used_datasource_ids": item.get("used_datasource_ids", []),
         "analysis_report_preview": item.get("analysis_report_preview", ""),
         "chart_count": item.get("chart_count", 0),
         "table_count": item.get("table_count", 0),
@@ -247,7 +250,10 @@ def get_datasource_message(
     ]
     if selected_ids:
         instruction_lines.append(
-            f"- `selected_datasource_ids` 当前为 {selected_ids}，表示这些数据源已经被当前会话选中，可直接用于本轮分析，不需要再次向用户确认数据源。"
+            f"- `selected_datasource_ids` 当前为 {selected_ids}，表示这些数据源是当前会话已选候选范围，可从中选择本轮真正相关的数据源，不需要再次向用户确认数据源，也不表示必须全部访问。"
+        )
+        instruction_lines.append(
+            "- 调用 `execute_python` 前，应结合当前问题、数据源名称与字段语义、最近成功执行的 `used_datasource_ids` 和已有分析结果，判断本轮实际访问的数据源，并准确填写 `used_datasource_ids`。"
         )
     else:
         instruction_lines.append(
@@ -459,7 +465,10 @@ def get_datasource_message(
     ]
     if selected_ids:
         instruction_lines.append(
-            f"- `selected_datasource_ids` 当前为 {selected_ids}，表示这些数据源已经被当前会话选中，可直接用于本轮分析，不需要再次向用户确认数据源。"
+            f"- `selected_datasource_ids` 当前为 {selected_ids}，表示这些数据源是当前会话已选候选范围，可从中选择本轮真正相关的数据源，不需要再次向用户确认数据源，也不表示必须全部访问。"
+        )
+        instruction_lines.append(
+            "- 调用 `execute_python` 前，应结合当前问题、数据源名称与字段语义、最近成功执行的 `used_datasource_ids` 和已有分析结果，判断本轮实际访问的数据源，并准确填写 `used_datasource_ids`。"
         )
     else:
         instruction_lines.append(

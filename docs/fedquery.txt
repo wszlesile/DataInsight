@@ -1,0 +1,268 @@
+联邦查询 SQL 编写指导说明
+本文档提供联邦查询 SQL 编写的标准实践与示例, 以方便用户使用。
+
+📘 目录
+表路径命名规范
+关系库查询语法示例
+Timescale 查询示例
+vxbase时序库查询示例
+跨不同类型数据库查询
+性能注意事项
+1. 表路径命名规范
+在联邦查询中，必须使用完整的三段式路径：
+
+database.schema.table
+database：目标数据库名称
+schema：目标数据库中的 schema（如 PostgreSQL 默认为 public）
+table：具体的表名
+说明：以上三段式路径主要用于关系库（如 PostgreSQL/MySQL）。时序库（vxbase、timescale）已统一通过 ts_query 函数查询，不再要求在外层 SQL 指定 database.schema.table。
+
+示例：
+
+SELECT * FROM fqe_postgres.public.users;
+2. 关系库查询语法示例
+✅ 单库单表查询
+SELECT id, name
+FROM fqe_postgres.public.users
+WHERE active = true;
+✅ 同库多表联表查询
+SELECT
+    u.id AS user_id,
+    u.name AS user_name,
+    o.id AS order_id,
+    o.total_amount
+FROM fqe_postgres.public.users u
+JOIN fqe_postgres.public.orders o
+    ON u.id = o.user_id
+WHERE o.status = 'completed';
+✅ 跨库联表查询
+SELECT
+    u.name AS user_name,
+    p.name AS product_name,
+    oi.quantity
+FROM fqe_pg1.public.users u
+JOIN fqe_pg2.public.order_items oi ON u.id = oi.user_id
+JOIN fqe_pg2.public.products p ON oi.product_id = p.id
+WHERE u.active = true;
+3. Timescale 查询示例
+Timescale 时序查询统一使用 ts_query('timescale', '<内部 SQL>')，不再要求在外层 SQL 指定 database 和 schema。
+
+数据源标识：固定为 'timescale'
+table：需要到“工业元”模型查看指定位号对应的模型别名（例如 vxba_160ac955691a2857cbf7a4dff2e5a4c0）
+✅ 指定位号模型别名查询示例
+SELECT *
+FROM ts_query(
+    'timescale',
+    'SELECT
+        "timeStamp",
+        value,
+        status
+     FROM vxba_160ac955691a2857cbf7a4dff2e5a4c0
+     WHERE "timeStamp" >= ''2026-05-07T00:00:00Z''
+       AND "timeStamp" <  ''2026-05-07T01:00:00Z''
+     ORDER BY "timeStamp" DESC
+     LIMIT 100'
+);
+说明：
+
+如果你要查其它位号，请将表名替换为该位号在“工业元”模型中的模型别名
+建议始终加时间范围与 LIMIT，避免扫描过大数据集
+✅ 官方常见用法 1：按时间桶聚合（time_bucket）
+SELECT *
+FROM ts_query(
+    'timescale',
+    'SELECT
+        time_bucket(''5 minutes'', "timeStamp") AS bucket,
+        avg(value) AS avg_value,
+        min(value) AS min_value,
+        max(value) AS max_value
+     FROM vxba_160ac955691a2857cbf7a4dff2e5a4c0
+     WHERE "timeStamp" >= ''2026-05-07T00:00:00Z''
+       AND "timeStamp" <  ''2026-05-07T02:00:00Z''
+     GROUP BY bucket
+     ORDER BY bucket'
+);
+适用场景：按固定时间粒度做趋势分析（分钟级、小时级）。
+
+✅ 官方常见用法 2：时间桶补齐 + 前值填充（time_bucket_gapfill + locf）
+SELECT *
+FROM ts_query(
+    'timescale',
+    'SELECT
+        time_bucket_gapfill(''1 minute'', "timeStamp") AS bucket,
+        locf(avg(value)) AS value_filled
+     FROM vxba_160ac955691a2857cbf7a4dff2e5a4c0
+     WHERE "timeStamp" >= ''2026-05-07T00:00:00Z''
+       AND "timeStamp" <  ''2026-05-07T01:00:00Z''
+     GROUP BY bucket
+     ORDER BY bucket'
+);
+适用场景：画时序曲线时需要补齐空档点，避免图表断线。
+
+✅ 官方常见用法 3：每个时间桶取首末值（first / last）
+SELECT *
+FROM ts_query(
+    'timescale',
+    'SELECT
+        time_bucket(''15 minutes'', "timeStamp") AS bucket,
+        first(value, "timeStamp") AS first_value,
+        last(value, "timeStamp") AS last_value
+     FROM vxba_160ac955691a2857cbf7a4dff2e5a4c0
+     WHERE "timeStamp" >= ''2026-05-07T00:00:00Z''
+       AND "timeStamp" <  ''2026-05-07T03:00:00Z''
+     GROUP BY bucket
+     ORDER BY bucket'
+);
+适用场景：做区间首值/末值对比（如班次、小时段）。
+
+✅ 官方常见用法 4：最近一条记录（Last Point）
+SELECT *
+FROM ts_query(
+    'timescale',
+    'SELECT
+        "timeStamp",
+        value,
+        status
+     FROM vxba_160ac955691a2857cbf7a4dff2e5a4c0
+     ORDER BY "timeStamp" DESC
+     LIMIT 1'
+);
+适用场景：实时看某个位号当前最新值。
+
+✅ 官方常见用法 5：按天统计（带过滤）
+SELECT *
+FROM ts_query(
+    'timescale',
+    'SELECT
+        date_trunc(''day'', "timeStamp") AS day,
+        count(*) AS point_count,
+        avg(value) AS day_avg_value
+     FROM vxba_160ac955691a2857cbf7a4dff2e5a4c0
+     WHERE "timeStamp" >= ''2026-05-01T00:00:00Z''
+       AND "timeStamp" <  ''2026-06-01T00:00:00Z''
+       AND status = 0
+     GROUP BY day
+     ORDER BY day'
+);
+适用场景：日报、月报类统计，且仅统计好值（status = 0）。
+
+更多用法请参考官方手册：Timescale 文档。
+
+4. vxbase时序库查询示例
+✅ 数据查询示例
+SELECT *
+FROM ts_query(
+    'vxbase',
+    'SELECT * FROM ... WHERE ...'
+);
+说明：
+
+涉及到 vxbase 的数据查询，推荐统一使用 ts_query('vxbase', '<内部 SQL>')。目前提供以下不同场景的历史数据查询：原始数据查询、指定时间戳查询、采样查询、统计查询。具体语法及说明可参见对应的示例。
+
+兼容性说明：历史 vxbase_query(...) 写法仍兼容可用，建议新脚本和新文档统一迁移到 ts_query。
+
+参数说明：
+
+数据库名称：当前系统只存在一个 vxbase，固定为 'vxbase'
+过滤条件：从 vxbase 查询数据的 SQL 条件，支持字段过滤、时间范围、点位范围等
+✅ 原始数据查询
+单位号查询
+SELECT *
+FROM ts_query(
+	'vxbase',
+	'SELECT
+		name, ts, value, status
+	 FROM tag
+	 WHERE ts >= "2025-08-10T00:00:00Z" AND ts <= "2025-08-10T01:00:00Z"
+	 LIMIT 100 OFFSET 10');
+批量位号查询
+SELECT *
+FROM ts_query(
+	'vxbase',
+	'SELECT
+		name, ts, value, status
+	 FROM table
+	 WHERE ts >= "2025-08-10T00:00:00Z" AND ts <= "2025-08-10T01:00:00Z"
+	 AND name in("tag1", "tag2")
+	 LIMIT 100 OFFSET 10');
+参数说明：
+
+常规可选列： 适用于vxbase的SQL语法 name：位号别名； ts：数据时间。用于指定查询时间范围，以及查询结果中的数据时间，使用ISO8601标准； value：位号的数据属性，普通位号的value、结构化的自定义类型如p1、p2等； status：数据的质量码，0表示好值。
+tag: 指定位号别名，仅支持单个（下同）
+table: 内置类型表（下同） * hisData_boolean：查询结果统一为bool，支持bool、整型、浮点型的位号； * hisData_integer：查询结果统一为整型，支持bool、整型、浮点型的位号； * hisData_float：查询结果统一为浮点型，支持bool、整型、浮点型的位号； * hisData_text：查询结果统一为文本，支持支持bool、整型、浮点型、字符串型位号； * hisData_blob：查询结果统一为blob，支持blob、lblob类型的位号。 *
+查询时间范围：通过指定ts的范围进行确定。 当仅指定ts大于某个时间时，默认ts小于等于客户端当前时间； 当仅指定ts小于某个时间时，默认向前查询最多20000个数据，不限定开始时间。
+limit/offset：对本次sql语句结果进行偏移取指定数量结果。 支持两种语法：limit 100,10 或者 limit 100 offset 10； 实际结果数量小于limit时，则按实际返回； 实际结果大于limit时，按照返回结果的顺序，结合limit和offset进行偏移取值。
+✅ 指定时间戳查询
+SELECT *
+FROM ts_query(
+	'vxbase',
+   'SELECT *
+    FROM tag
+    WHERE ts in ("2025-08-10T00:00:00Z", "2025-08-10T00:10:00Z","2025-08-10T10:00:00Z")
+    interpolation("linear")');
+参数说明：批量位号查询可参见原始数据查询的语法
+
+时间戳 指定时间戳查询是一种特殊的采样查询，通过给定特定的时间戳来获取该点的采样值； 除示例中ts in的表达式，还可以用通过ts = "2025-08-10T00:00:00Z"来查询。
+tag: 指定位号别名，仅支持单个。
+插值策略 此类查询可以通过指定interpolation来计算指定时刻没有数据时，使用前值还是线性拟合计算； 当前支持previous和linear两种； 默认未指定时使用previous。
+✅ 采样查询
+ SELECT *
+ FROM ts_query(
+ 	'vxbase',
+	'SELECT *
+	 FROM tag
+	 WHERE ts >= "2025-08-10T00:00:00Z" AND ts < "2025-08-10T00:10:00Z"
+	 interval("1m", "10s")
+	 interpolation("linear")');
+参数说明：批量位号查询可参见原始数据查询的语法
+
+时间戳 除指定ts在一个确定的范围内之外，当仅指定ts大于某个时间时，默认ts小于客户端当前时间； 当仅指定ts小于某个时间时，默认查询20000个数据。
+tag: 指定位号别名，仅支持单个。
+采样间隔 interval用以描述采样点之间的间隔，以及时间窗口偏移；后者目前不支持； 对于指定开始、结束时间的查询，最后两个点可能不足间隔。
+✅ 统计查询
+ SELECT *
+ FROM ts_query(
+ 	'vxbase',
+	'SELECT name, ts, quality, max(value)
+	 FROM tag
+	 WHERE ts >= "2025-08-10T00:00:00Z" AND ts < "2025-08-10T00:10:00Z"
+	 interval("1m", "10s")
+	 interpolation("linear")');
+参数说明：批量位号查询可参见原始数据查询的语法
+
+统计方法 max: 最大值 min: 最小值 first: 第一个值 last: 最后一个值 sum: sum(value)或者sum(value, "event"): 求和 sum(value, "time"): 积分值 avg: avg(value)或者avg(value, "event"): 算术平均值 avg(value, "time"): 积分平均值 VAR: VAR(value)或者VAR(value, "event"): 离散方差 VAR(value, "time"): 连续方差 count:计数，区间内有多少个数据
+时间戳 除指定ts在一个确定的范围内之外，当仅指定ts大于某个时间时，默认ts小于客户端当前时间； 当仅指定ts小于某个时间时，默认查询20000个数据。
+tag: 指定位号别名，仅支持单个。
+采样间隔 interval用以描述采样点之间的间隔； 对于指定开始、结束时间的查询，最后两个点可能不足间隔。
+interpolation 插值策略，由于方法本身可指定previous/linear，因此当前版本中，请不要再统计查询中使用interpolation字段。
+5. 跨不同类型数据库查询
+联邦查询支持跨不同类型的数据源进行查询（如 PostgreSQL 与 vxbase），可以将 vxbase 查询结果作为子查询或临时表参与联表操作。
+
+✅ PostgreSQL 与 vxbase 联表查询示例
+SELECT
+    u.id AS user_id,
+    u.name AS user_name,
+    t.ts,
+    t.value
+FROM fqe_postgres.public.users u
+JOIN (
+    SELECT *
+    FROM ts_query(
+        'vxbase',
+        'SELECT * FROM "sim/simTAG0" WHERE ts >= ''2025-06-15 00:00:00'''
+    )
+) t
+ON u.tag_name = t.name
+WHERE u.active = true;
+说明：
+
+ts_query('vxbase', ...) 返回的表结构应与目标字段对应（如包含 name, ts, value 等）
+可以通过字段（如 tag_name）与关系库表建立连接
+⚠️ 注意：ts_query/vxbase_query 都属于运行时函数，无法参与复杂嵌套或多层子查询优化，建议限制数据量。
+
+6. 性能注意事项
+⛔ 避免 SELECT *：尽量指定字段，减少传输负载
+✅ 使用 WHERE 限制数据量
+✅ 使用 LIMIT 进行分页或截断
+✅ 可在外部数据库建立索引提升性能
+✅ 优化联表顺序，尽量将小表放左边做驱动表

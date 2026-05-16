@@ -1883,6 +1883,10 @@ class ExePythonCodeInput(BaseModel):
     code: str = Field(description="待执行的 Python 代码")
     title: str = Field(description="本次代码执行任务的简短标题")
     description: str = Field(description="本次代码执行任务的详细说明")
+    used_datasource_ids: list[int] = Field(
+        default_factory=list,
+        description="本次代码实际读取或查询的数据源 datasource_id 列表，analysis 和 probe 都必须先根据当前问题和历史上下文判断相关数据源后准确填写，只能从当前选中的候选数据源 ID 中选择，不要把所有候选数据源都填入。",
+    )
 
 
 def _serialize_exec_result(exec_result: Any) -> dict[str, Any]:
@@ -2211,6 +2215,7 @@ def _create_execution_record(
     code: str,
     title: str,
     description: str,
+    used_datasource_ids: list[int] | None = None,
 ) -> int:
     """在生成代码真正执行前，先创建一条执行记录。"""
     from config.database import SessionLocal
@@ -2225,6 +2230,7 @@ def _create_execution_record(
             title=(title or '')[:255],
             description=description or '',
             generated_code=code or '',
+            used_datasource_ids_json=json.dumps(used_datasource_ids or [], ensure_ascii=False),
             execution_status='running',
         )
         session.add(execution)
@@ -2245,6 +2251,7 @@ def _update_execution_record(
     stderr_text: str = '',
     execution_seconds: int = 0,
     error_message: str = '',
+    used_datasource_ids: list[int] | None = None,
 ) -> None:
     """在成功、失败或结果不合法后，回写执行记录。"""
     if execution_id <= 0:
@@ -2269,11 +2276,80 @@ def _update_execution_record(
         execution.stderr_text = stderr_text or ''
         execution.execution_seconds = int(execution_seconds or 0)
         execution.error_message = error_message or ''
+        if used_datasource_ids is not None:
+            execution.used_datasource_ids_json = json.dumps(used_datasource_ids, ensure_ascii=False)
         execution.updated_at = datetime.now()
         execution.finished_at = datetime.now()
         session.commit()
     finally:
         session.close()
+
+
+def _normalize_used_datasource_ids(value: Any) -> list[int]:
+    """Normalize tool-declared datasource ids while preserving order."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        value = [value]
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for item in value:
+        try:
+            datasource_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if datasource_id <= 0 or datasource_id in seen:
+            continue
+        seen.add(datasource_id)
+        normalized.append(datasource_id)
+    return normalized
+
+
+def _get_runtime_selected_datasource_ids(context: CustomContext) -> list[int]:
+    snapshot = getattr(context, 'active_datasource_snapshot', {}) or {}
+    if not isinstance(snapshot, dict):
+        return []
+    return _normalize_used_datasource_ids(snapshot.get('selected_datasource_ids'))
+
+
+def _validate_tool_used_datasource_ids(
+    *,
+    context: CustomContext,
+    used_datasource_ids: list[int],
+) -> RetryResult | None:
+    selected_ids = _get_runtime_selected_datasource_ids(context)
+    if not selected_ids:
+        return None
+    if not used_datasource_ids:
+        return request_retry(
+            retry_type="contract_error",
+            message="execute_python 调用缺少 used_datasource_ids，无法记录本次实际使用的数据源。",
+            diagnostics={
+                "selected_datasource_ids": selected_ids,
+                "used_datasource_ids": used_datasource_ids,
+            },
+            repair_instructions=[
+                "从 active_datasource_snapshot.selected_datasource_snapshot 中选择本次代码实际读取或查询的数据源。",
+                "重新调用 execute_python，并把所选 datasource_id 填入 used_datasource_ids。",
+                "不要把所有候选数据源都填入 used_datasource_ids，只填本次代码实际访问的数据源。",
+            ],
+        )
+    invalid_ids = [item for item in used_datasource_ids if item not in set(selected_ids)]
+    if invalid_ids:
+        return request_retry(
+            retry_type="contract_error",
+            message="execute_python.used_datasource_ids 包含当前会话未选中的数据源 ID。",
+            diagnostics={
+                "selected_datasource_ids": selected_ids,
+                "used_datasource_ids": used_datasource_ids,
+                "invalid_used_datasource_ids": invalid_ids,
+            },
+            repair_instructions=[
+                "used_datasource_ids 只能从当前 active_datasource_snapshot.selected_datasource_ids 中选择。",
+                "根据用户问题和历史上下文选择本次代码实际访问的数据源后重新调用 execute_python。",
+            ],
+        )
+    return None
 
 
 def _build_execution_namespace() -> dict[str, Any]:
@@ -2898,6 +2974,7 @@ def execute_python(
     code: str,
     title: str = '',
     description: str = "",
+    used_datasource_ids: list[int] | None = None,
 ) -> Optional[ToolMessage]:
     """
     执行模型生成的 Python 分析代码。
@@ -2908,6 +2985,7 @@ def execute_python(
     """
     emit = _get_stream_emitter()
     start_time = time.time()
+    normalized_used_datasource_ids = _normalize_used_datasource_ids(used_datasource_ids)
     execution_id = _create_execution_record(
         conversation_id=int(getattr(runtime.context, 'conversation_id', 0) or 0),
         turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
@@ -2915,6 +2993,7 @@ def execute_python(
         code=code,
         title=title,
         description=description,
+        used_datasource_ids=normalized_used_datasource_ids,
     )
     execution_log_context = {
         'username': getattr(runtime.context, 'username', 'anonymous'),
@@ -2949,7 +3028,12 @@ def execute_python(
         turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
         current_execution_id=execution_id,
     )
-    contract_retry = _validate_generated_code_contract(code)
+    contract_retry = _validate_tool_used_datasource_ids(
+        context=runtime.context,
+        used_datasource_ids=normalized_used_datasource_ids,
+    )
+    if contract_retry is None:
+        contract_retry = _validate_generated_code_contract(code)
     if contract_retry is None:
         contract_retry = _validate_explicit_time_range_guard(
             code=code,
@@ -2971,6 +3055,7 @@ def execute_python(
             stderr_text='',
             execution_seconds=int((time.time() - start_time) * 1000),
             error_message=contract_retry.message,
+            used_datasource_ids=normalized_used_datasource_ids,
         )
         with logger.context(**execution_log_context):
             logger.warning(contract_retry.message)
