@@ -489,11 +489,14 @@ class InsightNsRelDatasourceService:
             is_folder = bool(node.get('isFolder') or node.get('is_folder'))
             if not is_folder:
                 is_folder = bool(node.get('hasChildren')) or count_children > 0
+            data_type = self._normalize_uns_data_type(node)
+            if data_type is None and not is_folder:
+                data_type = 2
             normalized.append({
                 "id": node_id,
                 "alias": str(node.get('alias') or '').strip(),
                 "name": str(node.get('name') or node.get('label') or node.get('pathName') or node_id).strip(),
-                "data_type": self._normalize_uns_data_type(node),
+                "data_type": data_type,
                 "uns_node_path": self._normalize_uns_node_id_list(
                     node.get('unsNodePath')
                     or node.get('uns_node_path')
