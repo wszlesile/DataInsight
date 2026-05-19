@@ -394,6 +394,7 @@ class SuposKernelApi:
         page_size: int = 100,
         keyword: str = '',
         search_type: int = 1,
+        data_type: Any = None,
     ) -> dict[str, Any]:
         """查询 UNS 树节点列表。"""
         if not authorization:
@@ -409,6 +410,8 @@ class SuposKernelApi:
             "keyword": keyword or '',
             "searchType": int(search_type or 1),
         }
+        if data_type is not None:
+            payload["dataType"] = data_type if isinstance(data_type, list) else [data_type]
         response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
         response.raise_for_status()
         data = response.json()

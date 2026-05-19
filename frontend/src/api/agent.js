@@ -170,7 +170,10 @@ export function updateNamespaceDatasourceDescription(namespaceId, datasourceId, 
   })
 }
 
+export const UNS_TREE_DATA_TYPE_FILTER = [1, 2]
+
 export function fetchUnsTreeNodes(namespaceId, parentId = '0', options = {}) {
+  const dataType = options.dataType ?? options.dataTypes ?? UNS_TREE_DATA_TYPE_FILTER
   return api.post(
     `/insight/namespaces/${namespaceId}/uns/tree`,
     {
@@ -178,7 +181,8 @@ export function fetchUnsTreeNodes(namespaceId, parentId = '0', options = {}) {
       pageNo: 1,
       pageSize: 100,
       keyword: options.keyword || '',
-      searchType: 1
+      searchType: 1,
+      dataType: Array.isArray(dataType) ? [...dataType] : dataType
     }
   )
 }

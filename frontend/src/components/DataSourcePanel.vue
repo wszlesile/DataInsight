@@ -257,11 +257,20 @@ const isUnsFolderNode = (node) => {
   return Boolean(node?.hasChildren) || Number(node?.countChildren || 0) > 0 || Number(node?.type) === 0
 }
 
+const normalizeUnsDataType = (node, isFolder = false) => {
+  if (isFolder) return ''
+  const rawValue = node?.dataType ?? node?.data_type
+  if (rawValue === undefined || rawValue === null || rawValue === '') return ''
+  const numericValue = Number(rawValue)
+  return Number.isFinite(numericValue) ? numericValue : rawValue
+}
+
 const mapUnsNode = (node) => {
   const isFolder = isUnsFolderNode(node)
   const countChildren = Number(node.countChildren || 0)
   const hasChildren = Boolean(node.hasChildren)
   const canExpand = isFolder && (hasChildren || countChildren > 0)
+  const dataType = normalizeUnsDataType(node, isFolder)
   return {
     id: String(node.id || node.alias || ''),
     alias: node.alias || '',
@@ -273,6 +282,7 @@ const mapUnsNode = (node) => {
     countChildren,
     type: Number(node.type ?? -1),
     pathType: Number(node.pathType ?? -1),
+    dataType,
     raw: node,
     isFolder,
     disabled: isFolder && !canExpand,
@@ -457,6 +467,7 @@ const toUnsNodePayload = (node) => ({
   countChildren: Number(node?.countChildren || 0),
   type: Number(node?.type ?? -1),
   pathType: Number(node?.pathType ?? -1),
+  dataType: normalizeUnsDataType(node, Boolean(node?.isFolder)),
   isFolder: Boolean(node?.isFolder),
 })
 

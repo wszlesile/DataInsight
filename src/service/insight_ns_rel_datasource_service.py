@@ -490,8 +490,6 @@ class InsightNsRelDatasourceService:
             if not is_folder:
                 is_folder = bool(node.get('hasChildren')) or count_children > 0
             data_type = self._normalize_uns_data_type(node)
-            if data_type is None and not is_folder:
-                data_type = 2
             normalized.append({
                 "id": node_id,
                 "alias": str(node.get('alias') or '').strip(),
@@ -523,7 +521,20 @@ class InsightNsRelDatasourceService:
         for node in selected_nodes:
             node_id = node["id"]
             if not node.get("is_folder"):
+                data_type = node.get("data_type")
+                if data_type is None:
+                    failed.append({
+                        "id": node_id,
+                        "name": node.get("name", ""),
+                        "message": "UNS 节点缺少 dataType，无法判断数据源类型",
+                    })
+                    continue
                 if not self._is_supported_uns_table_node(node):
+                    failed.append({
+                        "id": node_id,
+                        "name": node.get("name", ""),
+                        "message": f"暂不支持导入 dataType={data_type} 的 UNS 节点",
+                    })
                     continue
                 if node_id not in seen_file_ids:
                     file_nodes.append(node)
@@ -612,6 +623,7 @@ class InsightNsRelDatasourceService:
                 page_size=UNS_TREE_PAGE_SIZE,
                 keyword='',
                 search_type=1,
+                data_type=sorted(UNS_TABLE_DATA_TYPES),
             )
             page_rows = payload.get("data") or []
             rows.extend(page_rows)
@@ -1063,26 +1075,6 @@ class InsightNsRelDatasourceService:
         ).count()
         return count + 1
 
-    def _build_file_datasource_schema(self, file_path: Path, datasource_name: str) -> str:
-        """读取上传文件前几行数据，并推断元数据 Schema。"""
-        dataframe = self._read_file_preview(file_path)
-
-        properties: dict[str, PropertySchema] = {}
-        for column in dataframe.columns:
-            series = dataframe[column]
-            properties[str(column)] = PropertySchema(
-                type=self._infer_schema_type(series),
-                description=f"文件字段“{column}”",
-                example=self._extract_example_value(series),
-            )
-
-        schema = DataSourceSchema(
-            name=datasource_name,
-            description=f"用户上传的 {file_path.suffix.lstrip('.').upper()} 文件",
-            properties=properties,
-            required=[str(column) for column in dataframe.columns],
-        )
-        return dump_json(schema.model_dump())
 
     def _build_uns_datasource_schema(self, detail: dict[str, Any], datasource_name: str) -> str:
         definition = detail.get('fields') or []
@@ -1162,22 +1154,6 @@ class InsightNsRelDatasourceService:
         )
         return dump_json(schema.model_dump())
 
-    def _read_file_preview(self, file_path: Path) -> pd.DataFrame:
-        """按文件类型读取预览数据；异常会转换成可直接返回给前端的错误。"""
-        try:
-            if file_path.suffix.lower() == '.csv':
-                return self._read_csv_preview(file_path)
-            if file_path.suffix.lower() == '.xlsx':
-                return pd.read_excel(file_path, nrows=50, engine='openpyxl')
-            if file_path.suffix.lower() == '.xls':
-                return pd.read_excel(file_path, nrows=50, engine='xlrd')
-            raise ValueError(f'暂不支持解析 {file_path.suffix} 文件')
-        except ImportError as exc:
-            raise ValueError(f'文件解析依赖缺失：{exc}') from exc
-        except ValueError:
-            raise
-        except Exception as exc:
-            raise ValueError(f'文件解析失败：{exc}') from exc
 
     def _read_csv_preview(self, file_path: Path) -> pd.DataFrame:
         """优先自动尝试常见 CSV 编码，减少编码差异导致的上传失败。"""
@@ -1279,23 +1255,6 @@ class InsightNsRelDatasourceService:
         self.session.flush()
         return datasource
 
-    def _to_dict(self, rel: InsightNsRelDatasource, datasource: InsightDatasource) -> dict[str, Any]:
-        return {
-            "id": rel.id,
-            "insight_namespace_id": rel.insight_namespace_id,
-            "insight_conversation_id": rel.insight_conversation_id,
-            "datasource_id": datasource.id,
-            "datasource_type": datasource.datasource_type,
-            "datasource_name": datasource.datasource_name,
-            "knowledge_tag": datasource.knowledge_tag,
-            "uns_node_id": datasource.uns_node_id,
-            "datasource_schema": datasource.datasource_schema,
-            "datasource_config_json": datasource.datasource_config_json,
-            "sort_no": rel.sort_no,
-            "bind_source": rel.bind_source,
-            "created_at": rel.created_at.isoformat() if rel.created_at else None,
-            "updated_at": rel.updated_at.isoformat() if rel.updated_at else None,
-        }
 
     def upload_file_datasource_to_namespace(
         self,

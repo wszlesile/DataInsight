@@ -88,6 +88,9 @@ class InsightNamespaceController(BaseController):
         _ = namespace_id
         user_context = get_current_user_context()
         data = self.get_json_data()
+        data_type = data.get('dataType')
+        if data_type is None:
+            data_type = data.get('dataTypes')
 
         try:
             result = supos_kernel_api.fetch_uns_tree_nodes(
@@ -97,6 +100,7 @@ class InsightNamespaceController(BaseController):
                 page_size=data.get('pageSize', 100),
                 keyword=data.get('keyword', ''),
                 search_type=data.get('searchType', 1),
+                data_type=data_type,
             )
             return jsonify(Result.success(data=result).to_dict())
         except Exception as exc:
