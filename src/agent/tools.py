@@ -48,7 +48,7 @@ TOOL_ERROR_CODE_CONTEXT_MAX_CHARS = int(os.environ.get('TOOL_ERROR_CODE_CONTEXT_
 GENERATED_CODE_FILENAME = '<generated_analysis_code>'
 GENERATED_CODE_CONTEXT_RADIUS = 2
 FRONTEND_TOOL_RETRY_MESSAGE = '分析代码需要调整，正在反馈给大模型重新生成。'
-FRONTEND_TOOL_ERROR_MESSAGE = '分析代码执行报错，正在反馈给大模型重新修改生成。'
+FRONTEND_TOOL_ERROR_MESSAGE = '分析代码需要调整，正在反馈给大模型重新修改生成。'
 FRONTEND_TOOL_TIMEOUT_MESSAGE = '分析代码执行时间较长，正在反馈给大模型优化后重试。'
 
 CHART_CONTRACT_ERROR_MARKERS = (
