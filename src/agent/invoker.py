@@ -482,7 +482,54 @@ def _build_regenerate_instruction(
     )
 
 
-def _build_rerun_instruction(runtime: ConversationRunContext) -> str:
+def _rerun_has_prior_analysis_result(
+    service: ConversationContextService,
+    runtime: ConversationRunContext,
+) -> bool:
+    """判断被刷新的原轮次是否已有真实分析执行或产物。"""
+    if not runtime.is_rerun:
+        return False
+
+    from model import InsightNsArtifact, InsightNsExecution
+
+    started_at = getattr(runtime.turn, 'started_at', None)
+    execution_query = service.session.query(InsightNsExecution.id).filter(
+        InsightNsExecution.conversation_id == runtime.conversation.id,
+        InsightNsExecution.turn_id == runtime.turn.id,
+        InsightNsExecution.is_deleted == 0,
+    )
+    if started_at is not None:
+        execution_query = execution_query.filter(InsightNsExecution.created_at < started_at)
+    if execution_query.first() is not None:
+        return True
+
+    artifact_query = service.session.query(InsightNsArtifact.id).filter(
+        InsightNsArtifact.conversation_id == runtime.conversation.id,
+        InsightNsArtifact.turn_id == runtime.turn.id,
+        InsightNsArtifact.is_deleted == 0,
+    )
+    if started_at is not None:
+        artifact_query = artifact_query.filter(InsightNsArtifact.created_at < started_at)
+    return artifact_query.first() is not None
+
+
+def _should_require_rerun_analysis_execution(
+    service: ConversationContextService,
+    runtime: ConversationRunContext,
+    analysis_flow_started: bool,
+) -> bool:
+    """刷新时只有存在分析链路证据，才强制必须完成 execute_python 产物闭环。"""
+    if not runtime.is_rerun:
+        return False
+    if analysis_flow_started:
+        return True
+    return _rerun_has_prior_analysis_result(service, runtime)
+
+
+def _build_rerun_instruction(
+    service: ConversationContextService,
+    runtime: ConversationRunContext,
+) -> str:
     """
     为“分析刷新/原轮次重跑”补一条首轮运行时指令。
 
@@ -491,6 +538,13 @@ def _build_rerun_instruction(runtime: ConversationRunContext) -> str:
     """
     if not runtime.is_rerun:
         return ''
+
+    if not _rerun_has_prior_analysis_result(service, runtime):
+        return (
+            '当前操作是“刷新回复”，需要基于本轮原始问题重新生成回答。'
+            '请根据本轮原始问题自行判断是否需要调用工具；'
+            '如果只是问候、闲聊、概念解释或普通问答，可以直接用自然语言回答并结束。'
+        )
 
     return (
         '当前操作是“刷新分析”，需要在同一轮内重新执行这条分析请求。'
@@ -1254,7 +1308,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                     round_index=round_index,
                 )
             elif runtime.is_rerun:
-                runtime_instruction = _build_rerun_instruction(runtime)
+                runtime_instruction = _build_rerun_instruction(service, runtime)
             elif round_index == 0:
                 runtime_instruction = _build_regenerate_instruction(
                     service=service,
@@ -1351,12 +1405,12 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 _ensure_analysis_result_ready(analysis_report=analysis_report, charts=charts, tables=tables)
                 break
 
-            if runtime.is_rerun:
+            if _should_require_rerun_analysis_execution(service, runtime, analysis_flow_started):
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
                 raise ValueError('刷新分析未重新执行代码，已保留本轮原有分析结果，请重试。')
 
-            if analysis_request_expected:
+            if analysis_request_expected and not runtime.is_rerun:
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
                 raise ValueError('本轮未进入分析执行阶段，未生成分析图表或分析报告，请重试。')
@@ -1525,7 +1579,7 @@ def _stream_with_runtime(
                     message='本轮分析尚未完成，正在根据最近执行错误继续修正代码。',
                 )
             elif runtime.is_rerun:
-                runtime_instruction = _build_rerun_instruction(runtime)
+                runtime_instruction = _build_rerun_instruction(service, runtime)
             elif round_index == 0:
                 runtime_instruction = _build_regenerate_instruction(
                     service=service,
@@ -1730,12 +1784,12 @@ def _stream_with_runtime(
                 _ensure_analysis_result_ready(analysis_report=analysis_report, charts=charts, tables=tables)
                 break
 
-            if runtime.is_rerun:
+            if _should_require_rerun_analysis_execution(service, runtime, analysis_flow_started):
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
                 raise ValueError('刷新分析未重新执行代码，已保留本轮原有分析结果，请重试。')
 
-            if analysis_request_expected:
+            if analysis_request_expected and not runtime.is_rerun:
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
                 raise ValueError('本轮未进入分析执行阶段，未生成分析图表或分析报告，请重试。')
