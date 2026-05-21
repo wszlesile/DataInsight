@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from agent import CustomContext, get_data_insight_agent, get_input
 from agent.context_engineering_runtime import is_analysis_like_request
 from config import Config
@@ -23,6 +25,9 @@ UNEXPECTED_KWARG_PATTERN = re.compile(
     r"(?P<owner>[A-Za-z_][A-Za-z0-9_]*)\.__init__\(\) got an unexpected keyword argument '(?P<arg>[^']+)'"
 )
 MISSING_DEP_PATTERN = re.compile(r"No module named '(?P<module>[^']+)'")
+RELATIVE_SHORT_TIME_PATTERN = re.compile(
+    r"(近|最近|过去)\s*(?P<amount>\d+)\s*(?P<unit>分钟|分|小时|时|h|H|min|mins|minute|minutes)"
+)
 ANALYSIS_EXPLICIT_TIME_PATTERN = re.compile(
     r"(今天|昨天|前天|本周|上周|本月|上月|今年|去年|近\s*\d+\s*[天日周月年]|"
     r"\d{4}[-/年]\d{1,2}([-/月]\d{1,2})?|\d{1,2}月\d{1,2}日)"
@@ -34,6 +39,12 @@ RETRY_ERROR_MAX_CHARS = 700
 RETRY_HINT_MAX_CHARS = 500
 RETRY_FAILED_CODE_MAX_CHARS = 5000
 RETRY_RECOVERY_INSTRUCTION_MAX_CHARS = 14000
+PROBE_NO_DATA_MEMORY_LIMIT = 3
+PROBE_NO_DATA_ERROR_TYPES = {'probe_feedback', 'no_data_found'}
+TIME_SERIES_EMPTY_SOURCE_ERROR_MARKERS = (
+    'unknown tag',
+    'no results',
+)
 CHART_CONTRACT_ERROR_MARKERS = (
     'chart_contract_error',
     'structured chart item',
@@ -168,17 +179,21 @@ def _load_latest_execution_result(
     execute_python 成功后只向模型返回轻量摘要，
     真正完整的 charts/tables 结果以 execution.result_payload_json 为准。
     """
-    latest_execution = service.get_latest_execution(
-        runtime.turn.id,
-        started_at=runtime.turn.started_at,
-    )
-    if latest_execution is None or latest_execution.execution_status != 'success':
-        return '', [], []
-
+    session = SessionLocal()
     try:
-        payload = json.loads(latest_execution.result_payload_json or '{}')
-    except Exception:
-        return '', [], []
+        latest_execution = ConversationContextService(session).get_latest_execution(
+            runtime.turn.id,
+            started_at=runtime.turn.started_at,
+        )
+        if latest_execution is None or latest_execution.execution_status != 'success':
+            return '', [], []
+
+        try:
+            payload = json.loads(latest_execution.result_payload_json or '{}')
+        except Exception:
+            return '', [], []
+    finally:
+        session.close()
 
     if not isinstance(payload, dict):
         return '', [], []
@@ -258,11 +273,38 @@ def _format_expected_time_range(start: Any, end: Any, label: str) -> dict[str, A
     }
 
 
+def _format_relative_short_time_range(amount: int, unit: str, label: str) -> dict[str, Any]:
+    now = datetime.now(ZoneInfo('Asia/Shanghai')).replace(microsecond=0)
+    normalized_unit = str(unit or '').strip()
+    delta = timedelta(hours=amount) if normalized_unit in {'小时', '时', 'h', 'H'} else timedelta(minutes=amount)
+    start = now - delta
+    return {
+        'start': start.isoformat(),
+        'end': now.isoformat(),
+        'end_exclusive': False,
+        'display_end': now.isoformat(),
+        'source': label,
+        'relative_window': True,
+        'amount': amount,
+        'unit': normalized_unit,
+    }
+
+
 def _build_expected_time_range_from_user_query(user_query: str) -> dict[str, Any]:
     """Parse a small trusted time-range anchor from explicit user wording."""
     text = str(user_query or '').strip()
     if not text:
         return {}
+
+    relative_match = RELATIVE_SHORT_TIME_PATTERN.search(text)
+    if relative_match:
+        amount = int(relative_match.group('amount'))
+        if amount > 0:
+            return _format_relative_short_time_range(
+                amount=amount,
+                unit=relative_match.group('unit'),
+                label=relative_match.group(0),
+            )
 
     today = datetime.now(ZoneInfo('Asia/Shanghai')).date()
     current_week_start = today - timedelta(days=today.weekday())
@@ -345,6 +387,9 @@ def _is_expected_time_no_data_report(user_query: str, analysis_report: str) -> b
     if not any(marker in report_text for marker in no_data_markers):
         return False
 
+    if expected_time_range.get('relative_window'):
+        return True
+
     expected_start = _date_text(expected_time_range.get('start'))
     expected_end = _date_text(expected_time_range.get('end'))
     expected_display_end = _date_text(expected_time_range.get('display_end'))
@@ -361,17 +406,26 @@ def _is_expected_time_no_data_execution(
     if not expected_time_range:
         return False
 
-    executions = service.get_turn_executions(runtime.turn.id, started_at=runtime.turn.started_at)
-    if not executions:
-        return False
+    session = SessionLocal()
+    try:
+        executions = ConversationContextService(session).get_turn_executions(
+            runtime.turn.id,
+            started_at=runtime.turn.started_at,
+        )
+        if not executions:
+            return False
+        latest_execution = executions[-1]
+    finally:
+        session.close()
 
-    latest_execution = executions[-1]
     if getattr(latest_execution, 'execution_status', '') == 'success':
         return False
     if _extract_execution_error_type(latest_execution) != 'no_data_found':
         return False
 
     error_message = (getattr(latest_execution, 'error_message', '') or '').strip()
+    if expected_time_range.get('relative_window'):
+        return bool(error_message)
     return _is_expected_time_no_data_report(user_message, error_message)
 
 
@@ -387,10 +441,17 @@ def _build_expected_time_no_data_report(
     if _is_expected_time_no_data_report(user_message, latest_message):
         return latest_message.strip()
 
-    executions = service.get_turn_executions(runtime.turn.id, started_at=runtime.turn.started_at)
     latest_error = ''
-    if executions:
-        latest_error = (getattr(executions[-1], 'error_message', '') or '').strip()
+    session = SessionLocal()
+    try:
+        executions = ConversationContextService(session).get_turn_executions(
+            runtime.turn.id,
+            started_at=runtime.turn.started_at,
+        )
+        if executions:
+            latest_error = (getattr(executions[-1], 'error_message', '') or '').strip()
+    finally:
+        session.close()
 
     expected_time_range = _build_expected_time_range_from_user_query(user_message or getattr(runtime.turn, 'user_query', ''))
     start = str(expected_time_range.get('start') or '').strip()
@@ -586,7 +647,7 @@ def _get_too_many_datasource_policy(runtime: ConversationRunContext) -> dict[str
     ]
     count = len(selected_ids) if selected_ids else len(selected_items)
     try:
-        limit = max(int(getattr(Config, 'DATASOURCE_CONTEXT_MAX_COUNT', 10) or 0), 0)
+        limit = max(int(getattr(Config, 'DATASOURCE_CONTEXT_MAX_COUNT', 30) or 0), 0)
     except (TypeError, ValueError):
         limit = 0
     if count <= 0 or limit <= 0 or count <= limit:
@@ -658,6 +719,107 @@ def _finalize_run(
     )
 
 
+def _has_latest_execution(runtime: ConversationRunContext) -> bool:
+    session = SessionLocal()
+    try:
+        return ConversationContextService(session).get_latest_execution(
+            runtime.turn.id,
+            started_at=runtime.turn.started_at,
+        ) is not None
+    finally:
+        session.close()
+
+
+def _open_fresh_persistence_context(
+    runtime: ConversationRunContext,
+) -> tuple[Any, ConversationContextService, ConversationRunContext]:
+    """Reload the turn with a new DB session before final persistence."""
+    from model import InsightNsConversation, InsightNsTurn
+
+    session = SessionLocal()
+    conversation = session.query(InsightNsConversation).filter(
+        InsightNsConversation.id == runtime.conversation.id,
+        InsightNsConversation.is_deleted == 0,
+    ).first()
+    turn = session.query(InsightNsTurn).filter(
+        InsightNsTurn.id == runtime.turn.id,
+        InsightNsTurn.conversation_id == runtime.conversation.id,
+        InsightNsTurn.is_deleted == 0,
+    ).first()
+    if conversation is None or turn is None:
+        session.close()
+        raise ValueError('分析轮次不存在或已被删除')
+
+    active_snapshot = dict(runtime.active_datasource_snapshot or {})
+    if not active_snapshot:
+        active_snapshot = {
+            "namespace_id": conversation.insight_namespace_id,
+            "conversation_id": conversation.id,
+            "selected_datasource_ids": safe_json_loads(turn.selected_datasource_ids_json, []),
+            "selected_datasource_snapshot": safe_json_loads(turn.selected_datasource_snapshot_json, []),
+        }
+    fresh_runtime = ConversationRunContext(
+        conversation=conversation,
+        turn=turn,
+        active_datasource_snapshot=active_snapshot,
+        is_rerun=runtime.is_rerun,
+        history_turn_limit=runtime.history_turn_limit,
+    )
+    return session, ConversationContextService(session), fresh_runtime
+
+
+def _finalize_run_with_fresh_session(
+    runtime: ConversationRunContext,
+    username: str,
+    user_message: str,
+    analysis_flow_started: bool,
+    assistant_message: str,
+    analysis_report: str,
+    charts: list[dict[str, Any]],
+    tables: list[dict[str, Any]],
+    allow_report_only: bool = False,
+) -> AgentResponse:
+    session, service, fresh_runtime = _open_fresh_persistence_context(runtime)
+    try:
+        return _finalize_run(
+            service=service,
+            runtime=fresh_runtime,
+            username=username,
+            user_message=user_message,
+            analysis_flow_started=analysis_flow_started,
+            assistant_message=assistant_message,
+            analysis_report=analysis_report,
+            charts=charts,
+            tables=tables,
+            allow_report_only=allow_report_only,
+        )
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def _fail_run_with_fresh_session(
+    runtime: ConversationRunContext,
+    error_message: str,
+    preserve_existing_results: bool = False,
+) -> None:
+    session, service, fresh_runtime = _open_fresh_persistence_context(runtime)
+    try:
+        service.fail_run(
+            fresh_runtime.conversation.id,
+            fresh_runtime.turn.id,
+            error_message,
+            preserve_existing_results=preserve_existing_results,
+        )
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
 def _build_empty_response_error(user_message: str, analysis_flow_started: bool) -> str:
     """按请求类型生成更准确的兜底错误。"""
     if analysis_flow_started:
@@ -727,13 +889,34 @@ def _get_selected_datasource_names(runtime: ConversationRunContext) -> list[str]
     return names
 
 
+def _load_turn_executions_fresh(runtime: ConversationRunContext) -> list[Any]:
+    """Load execution history with a short-lived session to avoid stale long-running connections."""
+    session = SessionLocal()
+    try:
+        return ConversationContextService(session).get_turn_executions(
+            runtime.turn.id,
+            started_at=runtime.turn.started_at,
+        )
+    except SQLAlchemyError:
+        session.rollback()
+        logger.warning(
+            "读取轮次执行历史失败，跳过本次恢复提示上下文: conversation_id=%s turn_id=%s",
+            getattr(runtime.conversation, 'id', ''),
+            getattr(runtime.turn, 'id', ''),
+            exc_info=True,
+        )
+        return []
+    finally:
+        session.close()
+
+
 def _build_failure_reason_reply(
     service: ConversationContextService,
     runtime: ConversationRunContext,
     user_message: str,
 ) -> str:
     """当最后没有自然语言回复时，构造一条简短的失败原因说明。"""
-    executions = service.get_turn_executions(runtime.turn.id, started_at=runtime.turn.started_at)
+    executions = _load_turn_executions_fresh(runtime)
     latest_errors = [
         (getattr(execution, 'error_message', '') or '').strip()
         for execution in executions
@@ -784,7 +967,7 @@ def _did_enter_analysis_flow(
 
     这里不再额外请求模型做意图分流，只依据本轮是否出现过工具执行痕迹来判断。
     """
-    if service.get_latest_execution(runtime.turn.id, started_at=runtime.turn.started_at) is not None:
+    if _has_latest_execution(runtime):
         return True
     if raw_tool_call_detected:
         return True
@@ -871,6 +1054,13 @@ def _build_failed_pattern_hints(executions: list[Any]) -> list[str]:
                 hints.append(hint)
             continue
 
+        if _execution_has_time_series_empty_source_error(execution):
+            hint = '已有时序数据源返回 unknown tag/no results：该数据源本轮视为无可分析数据，应从后续独立数据源分析中剔除；如果还有其他数据源，继续分析其他数据源。'
+            if hint not in seen:
+                seen.add(hint)
+                hints.append(hint)
+            continue
+
         unexpected_kwarg_match = UNEXPECTED_KWARG_PATTERN.search(error_message)
         if unexpected_kwarg_match:
             owner = unexpected_kwarg_match.group('owner')
@@ -921,10 +1111,23 @@ def _extract_execution_payload(execution: Any) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _execution_has_time_series_empty_source_error(execution: Any) -> bool:
+    error_message = (getattr(execution, 'error_message', '') or '').lower()
+    payload = _extract_execution_payload(execution)
+    payload_text = json.dumps(payload, ensure_ascii=False).lower() if payload else ''
+    return any(
+        marker in error_message or marker in payload_text
+        for marker in TIME_SERIES_EMPTY_SOURCE_ERROR_MARKERS
+    )
+
+
 def _extract_execution_error_type(execution: Any) -> str:
     """从执行记录中提取结构化错误类型，旧数据回退到错误文本启发式识别。"""
     payload = _extract_execution_payload(execution)
     if payload:
+        payload_text = json.dumps(payload, ensure_ascii=False).lower()
+        if any(marker in payload_text for marker in TIME_SERIES_EMPTY_SOURCE_ERROR_MARKERS):
+            return 'no_data_found'
         error_type = str(payload.get('error_type') or '').strip()
         if error_type:
             return error_type
@@ -944,6 +1147,8 @@ def _extract_execution_error_type(execution: Any) -> str:
         return 'data_source_not_found'
     if any(marker in lowered for marker in ('no_data_found', 'no data found')):
         return 'no_data_found'
+    if any(marker in lowered for marker in TIME_SERIES_EMPTY_SOURCE_ERROR_MARKERS):
+        return 'no_data_found'
     if any(marker in error_message for marker in ('未命中可分析数据', '筛选结果为空', '过滤后无数据', '关联后无数据')):
         return 'no_data_found'
     if _is_chart_contract_error_text(error_message):
@@ -952,7 +1157,11 @@ def _extract_execution_error_type(execution: Any) -> str:
 
 
 def _user_query_has_explicit_time_range(user_query: str) -> bool:
-    return bool(ANALYSIS_EXPLICIT_TIME_PATTERN.search(str(user_query or '')))
+    text = str(user_query or '')
+    return bool(
+        ANALYSIS_EXPLICIT_TIME_PATTERN.search(text)
+        or RELATIVE_SHORT_TIME_PATTERN.search(text)
+    )
 
 
 def _ensure_explicit_time_range_guard_memory(
@@ -991,8 +1200,24 @@ def _update_short_term_memory_from_tool_payload(runtime: ConversationRunContext,
         or payload.get('retry_reason_code')
         or ''
     ).strip()
-    if error_type in {'no_data_found', 'probe_feedback'}:
+    if error_type in PROBE_NO_DATA_ERROR_TYPES:
         _ensure_explicit_time_range_guard_memory(runtime, source_error_type=error_type)
+        short_term_memory = getattr(runtime, 'short_term_memory', None)
+        if not isinstance(short_term_memory, dict):
+            short_term_memory = {}
+            setattr(runtime, 'short_term_memory', short_term_memory)
+        probe_no_data_memory = short_term_memory.get('probe_no_data_retry')
+        if not isinstance(probe_no_data_memory, dict):
+            probe_no_data_memory = {
+                'count': 0,
+                'last_error_type': '',
+                'limit': PROBE_NO_DATA_MEMORY_LIMIT,
+            }
+        probe_no_data_memory['count'] = int(probe_no_data_memory.get('count') or 0) + 1
+        probe_no_data_memory['last_error_type'] = error_type
+        probe_no_data_memory['limit'] = PROBE_NO_DATA_MEMORY_LIMIT
+        probe_no_data_memory['limit_reached'] = probe_no_data_memory['count'] >= PROBE_NO_DATA_MEMORY_LIMIT
+        short_term_memory['probe_no_data_retry'] = probe_no_data_memory
 
 
 def _update_short_term_memory_from_messages(runtime: ConversationRunContext, messages: list[Any]) -> None:
@@ -1069,10 +1294,7 @@ def _build_analysis_recovery_instruction(
     round_index: int,
 ) -> str:
     """为同一轮分析构造后续修复回合的运行时指令。"""
-    executions = service.get_turn_executions(
-        runtime.turn.id,
-        started_at=runtime.turn.started_at,
-    )
+    executions = _load_turn_executions_fresh(runtime)
     failed_errors = [
         execution.error_message.strip()
         for execution in executions
@@ -1119,6 +1341,15 @@ def _build_analysis_recovery_instruction(
             '本轮短期记忆：用户问题里有明确时间范围，且本轮已经出现过无数据或探测反馈。',
             '后续所有 analysis 代码必须保持用户原始时间范围对应的 query_constraints.time_range；不能改成 diagnostics、探测 SQL 或数据库实际数据覆盖范围。',
             '如果目标时间范围内仍无数据，应返回无数据反馈或无数据结论，不要为了生成成功结果而改查其他时间范围。',
+        ])
+    probe_no_data_memory = getattr(runtime, 'short_term_memory', {}).get('probe_no_data_retry', {})
+    if isinstance(probe_no_data_memory, dict) and probe_no_data_memory.get('limit_reached'):
+        count = int(probe_no_data_memory.get('count') or 0)
+        limit = int(probe_no_data_memory.get('limit') or PROBE_NO_DATA_MEMORY_LIMIT)
+        lines.extend([
+            f'本轮已经连续出现 {count} 次 probe_feedback/no_data_found 反馈，已达到上限 {limit} 次。',
+            '下一步不要继续生成 probe 代码，不要继续猜测时序查询语法、字段名或表名，也不要扩大到其他数据源。',
+            '请直接切换为 execution_intent = "analysis"，保持用户原始问题和原始时间范围，调用 save_analysis_result(...) 以“无数据或数据源暂不可分析”的结论收口；如已探测过多个数据源，应在表格中列出已尝试的数据源和失败原因。',
         ])
     if latest_errors:
         lines.append('最近的执行错误如下：')
@@ -1175,6 +1406,10 @@ def _build_analysis_recovery_instruction(
             '只能原样使用当前数据源上下文提供的文件路径、表名或接口地址；如果已原样使用仍不可访问，应调用 request_retry(retry_type="data_source_unavailable", message=..., diagnostics=..., repair_instructions=...) 返回结构化反馈，或让本轮失败结束，不要伪装成空数据分析。',
         ])
     elif latest_error_type == 'no_data_found':
+        if any(_execution_has_time_series_empty_source_error(execution) for execution in executions):
+            lines.append(
+                '本轮已有时序数据源返回 unknown tag/no results：这些数据源视为当前没有可分析数据或尚未初始化。下一版应把这些数据源从独立分析范围中剔除，继续分析其他仍可查询的数据源；只有所有相关数据源都无数据时，才输出整体无数据结论。'
+            )
         lines.append(
             '最近失败属于 no_data_found：请优先检查时间过滤是否命中数据、过滤后数据集是否为空、关联结果是否为空；如果探测后仍为空，应调用 raise_no_data_error(...) 把“无数据”返回给 execute_python，而不是继续误改字段名或图表参数。'
         )
@@ -1267,8 +1502,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
         if _should_finish_without_datasource(runtime, agent_request.user_message):
             assistant_message = NO_DATASOURCE_ANALYSIS_REPLY
             allow_report_only = True
-            return _finalize_run(
-                service=service,
+            return _finalize_run_with_fresh_session(
                 runtime=runtime,
                 username=agent_request.username,
                 user_message=agent_request.user_message,
@@ -1283,8 +1517,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
         if _should_finish_with_too_many_datasources(runtime, agent_request.user_message):
             assistant_message = _build_too_many_datasources_reply(runtime)
             allow_report_only = True
-            return _finalize_run(
-                service=service,
+            return _finalize_run_with_fresh_session(
                 runtime=runtime,
                 username=agent_request.username,
                 user_message=agent_request.user_message,
@@ -1348,22 +1581,6 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 tables=tables,
             )
 
-            if (
-                analysis_flow_started
-                and not (analysis_report or charts or tables)
-                and _is_expected_time_no_data_execution(service, runtime, agent_request.user_message)
-            ):
-                analysis_report = _build_expected_time_no_data_report(
-                    service=service,
-                    runtime=runtime,
-                    user_message=agent_request.user_message,
-                    latest_message=assistant_message,
-                    analysis_report=analysis_report,
-                )
-                assistant_message = analysis_report
-                allow_report_only = True
-                break
-
             if raw_tool_call_detected and not (analysis_report or charts or tables):
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
@@ -1417,8 +1634,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
 
             break
 
-        return _finalize_run(
-            service=service,
+        return _finalize_run_with_fresh_session(
             runtime=runtime,
             username=agent_request.username,
             user_message=agent_request.user_message,
@@ -1439,9 +1655,8 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
             exc,
             exc_info=True,
         )
-        service.fail_run(
-            runtime.conversation.id,
-            runtime.turn.id,
+        _fail_run_with_fresh_session(
+            runtime,
             user_error_message,
             preserve_existing_results=runtime.is_rerun,
         )
@@ -1509,8 +1724,7 @@ def _stream_with_runtime(
                 stage='no_datasource',
                 message=assistant_message,
             )
-            _finalize_run(
-                service=service,
+            _finalize_run_with_fresh_session(
                 runtime=runtime,
                 username=agent_request.username,
                 user_message=agent_request.user_message,
@@ -1538,8 +1752,7 @@ def _stream_with_runtime(
                 stage='too_many_datasources',
                 message=assistant_message,
             )
-            _finalize_run(
-                service=service,
+            _finalize_run_with_fresh_session(
                 runtime=runtime,
                 username=agent_request.username,
                 user_message=agent_request.user_message,
@@ -1727,22 +1940,6 @@ def _stream_with_runtime(
                 tables=tables,
             )
 
-            if (
-                analysis_flow_started
-                and not (analysis_report or charts or tables)
-                and _is_expected_time_no_data_execution(service, runtime, agent_request.user_message)
-            ):
-                analysis_report = _build_expected_time_no_data_report(
-                    service=service,
-                    runtime=runtime,
-                    user_message=agent_request.user_message,
-                    latest_message=assistant_message,
-                    analysis_report=analysis_report,
-                )
-                assistant_message = analysis_report
-                allow_report_only = True
-                break
-
             if raw_tool_call_detected and not (analysis_report or charts or tables):
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
@@ -1796,8 +1993,7 @@ def _stream_with_runtime(
 
             break
 
-        response = _finalize_run(
-            service=service,
+        response = _finalize_run_with_fresh_session(
             runtime=runtime,
             username=agent_request.username,
             user_message=agent_request.user_message,
@@ -1835,9 +2031,8 @@ def _stream_with_runtime(
             exc,
             exc_info=True,
         )
-        service.fail_run(
-            runtime.conversation.id,
-            runtime.turn.id,
+        _fail_run_with_fresh_session(
+            runtime,
             user_error_message,
             preserve_existing_results=runtime.is_rerun,
         )

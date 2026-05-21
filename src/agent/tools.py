@@ -45,6 +45,8 @@ TOOL_ERROR_PREVIOUS_ITEM_MAX_CHARS = int(os.environ.get('TOOL_ERROR_PREVIOUS_ITE
 TOOL_ERROR_INSTRUCTION_MAX_CHARS = int(os.environ.get('TOOL_ERROR_INSTRUCTION_MAX_CHARS', '700'))
 TOOL_ERROR_STDIO_MAX_CHARS = int(os.environ.get('TOOL_ERROR_STDIO_MAX_CHARS', '800'))
 TOOL_ERROR_CODE_CONTEXT_MAX_CHARS = int(os.environ.get('TOOL_ERROR_CODE_CONTEXT_MAX_CHARS', '1800'))
+PROBE_NO_DATA_RETRY_LIMIT = max(int(os.environ.get('PROBE_NO_DATA_RETRY_LIMIT', '3') or 3), 1)
+PROBE_NO_DATA_RETRY_TYPES = {'probe_feedback', 'no_data_found'}
 GENERATED_CODE_FILENAME = '<generated_analysis_code>'
 GENERATED_CODE_CONTEXT_RADIUS = 2
 FRONTEND_TOOL_RETRY_MESSAGE = '分析代码需要调整，正在反馈给大模型重新生成。'
@@ -62,6 +64,13 @@ CHART_CONTRACT_ERROR_MARKERS = (
     'xaxis',
     'yaxis',
     'series',
+)
+TIME_SERIES_UTC_Z_LITERAL_PATTERN = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b"
+)
+TIME_SERIES_EMPTY_SOURCE_ERROR_MARKERS = (
+    'unknown tag',
+    'no results',
 )
 REPORT_CHART_DUMP_OBJECT_MARKERS = (
     "{'version':",
@@ -91,6 +100,11 @@ REPORT_CHART_DUMP_FIELD_MARKERS = (
     'yaxis',
     'series',
 )
+
+
+def _is_time_series_empty_source_error(error_message: str) -> bool:
+    lowered = (error_message or '').lower()
+    return any(marker in lowered for marker in TIME_SERIES_EMPTY_SOURCE_ERROR_MARKERS)
 REPORT_CHART_DUMP_SCAN_MAX_CHARS = 20000
 HELPER_CHART_FUNCTIONS = {
     'build_chart_document',
@@ -588,9 +602,49 @@ def _validate_timescale_fragment(query_constraints: dict[str, Any], fragment: di
     return issues
 
 
+def _extract_vxbase_inner_where_forbidden_fields(code: str) -> list[str]:
+    match = re.search(
+        r"\bwhere\b(?P<where>.*?)(?:\blimit\b|\binterval\s*\(|\binterpolation\s*\(|\bgroup\s+by\b|\border\s+by\b|$)",
+        code,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return []
+
+    where_clause = re.sub(r"'[^']*'|\"[^\"]*\"", " ", match.group('where') or '')
+    fields: list[str] = []
+    seen: set[str] = set()
+    patterns = [
+        r'"(?P<field>[^"]+)"\s*(?:=|<>|!=|>=|<=|>|<|\bin\b|\blike\b|\bis\b)',
+        r'\b(?P<field>[A-Za-z_][A-Za-z0-9_]*)\b\s*(?:=|<>|!=|>=|<=|>|<|\bin\b|\blike\b|\bis\b)',
+    ]
+    ignored = {'ts', 'and', 'or', 'not'}
+    for pattern in patterns:
+        for item in re.finditer(pattern, where_clause, re.IGNORECASE):
+            field = str(item.group('field') or '').strip()
+            normalized = field.lower()
+            if not field or normalized in ignored or normalized in seen:
+                continue
+            seen.add(normalized)
+            fields.append(field)
+    return fields
+
+
 def _validate_vxbase_fragment(query_constraints: dict[str, Any], fragment: dict[str, Any]) -> list[dict[str, Any]]:
     code = _fragment_text(fragment)
-    issues = _validate_relational_fragment(query_constraints, {**fragment, 'sql': code})
+    issues: list[dict[str, Any]] = []
+
+    forbidden_fields = _extract_vxbase_inner_where_forbidden_fields(code)
+    if forbidden_fields:
+        issues.append(_build_query_constraint_error(
+            'query_constraint_violation',
+            'vxbase 内部 SQL 的 WHERE 只支持 ts 时间过滤；其他字段过滤需要放到 ts_query(...) 外层 SQL。',
+            diagnostics={
+                'violated_constraint': 'vxbase_inner_where_filter',
+                'ts_query_source': 'vxbase',
+                'forbidden_fields': forbidden_fields,
+            },
+        ))
 
     if re.search(r"\b(max|min|first|last|sum|avg|var|count)\s*\(", code, re.IGNORECASE) and re.search(
         r"\binterpolation\s*\(",
@@ -623,6 +677,18 @@ def _validate_time_series_fragment(query_constraints: dict[str, Any], fragment: 
         issues.extend(_validate_timescale_fragment(query_constraints, fragment))
     elif source == 'vxbase':
         issues.extend(_validate_vxbase_fragment(query_constraints, fragment))
+
+    if TIME_SERIES_UTC_Z_LITERAL_PATTERN.search(code):
+        issues.append(_build_query_constraint_error(
+            'query_constraint_violation',
+            '时序 SQL 的时间字面量需要带业务时区偏移，例如 +08:00；不要使用以 Z 结尾的 UTC 时间字面量。',
+            diagnostics={
+                'violated_constraint': 'time_series_timezone',
+                'ts_query_source': source,
+                'timezone': 'Asia/Shanghai',
+                'expected_offset': '+08:00',
+            },
+        ))
 
     datasource_identifier = str(fragment.get('datasource_identifier') or '').strip()
     if datasource_identifier and datasource_identifier not in code:
@@ -1885,7 +1951,7 @@ class ExePythonCodeInput(BaseModel):
     description: str = Field(description="本次代码执行任务的详细说明")
     used_datasource_ids: list[int] = Field(
         default_factory=list,
-        description="本次代码实际读取或查询的数据源 datasource_id 列表，analysis 和 probe 都必须先根据当前问题和历史上下文判断相关数据源后准确填写，只能从当前选中的候选数据源 ID 中选择，不要把所有候选数据源都填入。",
+        description="本次代码实际读取或查询的数据源 datasource_id 列表。analysis 和 probe 都必须先根据当前问题、历史上下文和数据源语义判断相关数据源后准确填写，只能从当前选中的候选数据源 ID 中选择，不要把所有候选数据源都填入。最终 analysis_report、charts、tables 中声称已分析、已覆盖或展示状态的数据源必须与这里声明的实际访问范围一致。",
     )
 
 
@@ -2048,6 +2114,9 @@ def _is_expected_time_no_data_report(report_text: str, expected_time_range: dict
     if not any(marker in normalized_report for marker in no_data_markers):
         return False
 
+    if expected_time_range.get('relative_window'):
+        return True
+
     expected_start = _date_text(expected_time_range.get('start'))
     expected_end = _date_text(expected_time_range.get('end'))
     expected_display_end = _date_text(expected_time_range.get('display_end'))
@@ -2055,11 +2124,190 @@ def _is_expected_time_no_data_report(report_text: str, expected_time_range: dict
     return bool(expected_start and expected_start in normalized_report and any(end in normalized_report for end in accepted_ends))
 
 
+NO_DATA_RESULT_MARKERS = (
+    '无数据',
+    '暂无',
+    '没有数据',
+    '未命中',
+    '未返回',
+    'unknown tag',
+    'no results',
+)
+NO_DATA_STATUS_CHART_MARKERS = (
+    '无数据',
+    '暂无数据',
+    'unknown tag',
+    'no results',
+    '数据状态',
+    '查询状态',
+    '失败原因',
+)
+
+
+def _result_to_scan_text(exec_result: StructuredResult) -> str:
+    payload = {
+        'analysis_report': exec_result.analysis_report or '',
+        'charts': exec_result.charts or [],
+        'tables': exec_result.tables or [],
+    }
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _is_no_data_like_report(report_text: str) -> bool:
+    normalized = str(report_text or '').lower()
+    return any(marker.lower() in normalized for marker in NO_DATA_RESULT_MARKERS)
+
+
+def _chart_point_count(chart: dict[str, Any]) -> int:
+    if not isinstance(chart, dict):
+        return 0
+    chart_spec = chart.get('chart_spec') or {}
+    if not isinstance(chart_spec, dict):
+        return 0
+    series_items = chart_spec.get('series') or []
+    if isinstance(series_items, dict):
+        series_items = [series_items]
+    if not isinstance(series_items, list):
+        return 0
+    total = 0
+    for series in series_items:
+        if not isinstance(series, dict):
+            continue
+        data_items = series.get('data') or []
+        if isinstance(data_items, list):
+            total += len(data_items)
+    return total
+
+
+def _find_no_data_status_charts(charts: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    suspicious: list[dict[str, Any]] = []
+    for index, chart in enumerate(charts or []):
+        if not isinstance(chart, dict):
+            continue
+        chart_text = json.dumps(chart, ensure_ascii=False, default=str).lower()
+        matched_markers = [
+            marker for marker in NO_DATA_STATUS_CHART_MARKERS
+            if marker.lower() in chart_text
+        ]
+        if not matched_markers:
+            continue
+        suspicious.append({
+            'chart_index': index,
+            'chart_title': str(chart.get('title') or ''),
+            'chart_type': str(chart.get('chart_type') or ''),
+            'matched_markers': matched_markers[:5],
+            'point_count': _chart_point_count(chart),
+        })
+        if len(suspicious) >= 5:
+            break
+    return suspicious
+
+
+def _get_runtime_selected_datasource_snapshot(context: CustomContext) -> list[dict[str, Any]]:
+    snapshot = getattr(context, 'active_datasource_snapshot', {}) or {}
+    if not isinstance(snapshot, dict):
+        return []
+    rows = snapshot.get('selected_datasource_snapshot') or []
+    if rows:
+        return [item for item in rows if isinstance(item, dict)]
+
+    selected_ids = _normalize_used_datasource_ids(snapshot.get('selected_datasource_ids'))
+    conversation_id = int(getattr(context, 'conversation_id', 0) or 0)
+    if not selected_ids or conversation_id <= 0:
+        return []
+
+    from config.database import SessionLocal
+    from service.conversation_context_service import ConversationContextService
+
+    session = SessionLocal()
+    try:
+        return ConversationContextService(session)._build_turn_datasource_snapshot(
+            conversation_id=conversation_id,
+            datasource_ids=selected_ids,
+        )
+    finally:
+        session.close()
+
+
+def _datasource_mention_tokens(item: dict[str, Any]) -> list[str]:
+    raw_values = [
+        item.get('datasource_name'),
+        item.get('datasource_identifier'),
+        item.get('table_name'),
+        item.get('uns_alias'),
+    ]
+    config = item.get('config') if isinstance(item.get('config'), dict) else {}
+    raw_values.extend([
+        config.get('table_name'),
+        config.get('uns_alias'),
+    ])
+
+    tokens: list[str] = []
+    for value in raw_values:
+        text = str(value or '').strip()
+        if not text:
+            continue
+        candidates = {text}
+        for sep in ('/', '\\', '.', ':'):
+            if sep in text:
+                tail = text.rstrip('/\\').split(sep)[-1].strip()
+                if tail:
+                    candidates.add(tail)
+        if '_' in text:
+            parts = [part for part in text.split('_') if part]
+            if len(parts) >= 2:
+                candidates.add('_'.join(parts[-2:]))
+            if len(parts) >= 3:
+                candidates.add('_'.join(parts[-3:]))
+        for candidate in candidates:
+            candidate = candidate.strip()
+            if len(candidate) >= 4 and candidate not in tokens:
+                tokens.append(candidate)
+    return tokens
+
+
+def _find_untracked_datasource_mentions(
+    exec_result: StructuredResult,
+    *,
+    used_datasource_ids: list[int] | None,
+    selected_datasource_snapshot: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    if not used_datasource_ids or not selected_datasource_snapshot:
+        return []
+    used_id_set = {int(item) for item in used_datasource_ids}
+    result_text = _result_to_scan_text(exec_result)
+    mentions: list[dict[str, Any]] = []
+    for item in selected_datasource_snapshot:
+        try:
+            datasource_id = int(item.get('datasource_id') or item.get('id') or 0)
+        except (TypeError, ValueError):
+            continue
+        if datasource_id <= 0 or datasource_id in used_id_set:
+            continue
+        matched_tokens = [
+            token for token in _datasource_mention_tokens(item)
+            if token and token in result_text
+        ]
+        if not matched_tokens:
+            continue
+        mentions.append({
+            'datasource_id': datasource_id,
+            'datasource_name': item.get('datasource_name'),
+            'datasource_identifier': item.get('datasource_identifier'),
+            'matched_tokens': matched_tokens[:5],
+        })
+        if len(mentions) >= 10:
+            break
+    return mentions
+
+
 def _validate_structured_result_contract(
     exec_result: StructuredResult,
     *,
     allow_empty_artifact_no_data: bool = False,
     expected_time_range: Optional[dict[str, Any]] = None,
+    used_datasource_ids: list[int] | None = None,
+    selected_datasource_snapshot: list[dict[str, Any]] | None = None,
 ) -> RetryResult | None:
     report_text = (exec_result.analysis_report or '').strip()
     if not report_text:
@@ -2096,6 +2344,29 @@ def _validate_structured_result_contract(
             analysis_report=report_text,
         )
 
+    untracked_mentions = _find_untracked_datasource_mentions(
+        exec_result,
+        used_datasource_ids=used_datasource_ids,
+        selected_datasource_snapshot=selected_datasource_snapshot,
+    )
+    if untracked_mentions:
+        return request_retry(
+            retry_type="result_contract_error",
+            message="当前结果提到了未在 used_datasource_ids 中声明的数据源，无法确认这些数据源被本轮代码实际查询或读取。",
+            diagnostics={
+                "analysis_report_preview": report_text[:800],
+                "used_datasource_ids": used_datasource_ids or [],
+                "untracked_datasource_mentions": untracked_mentions,
+            },
+            repair_instructions=[
+                "下一版代码必须让 used_datasource_ids、实际查询代码、analysis_report、charts 和 tables 保持一致。",
+                "如果某个数据源已经被实际查询或探测，请把它的 datasource_id 加入 used_datasource_ids。",
+                "如果某个数据源没有被实际查询或探测，不要在最终报告、表格或图表中声称分析了它，也不要展示它的数据覆盖状态。",
+                "数据源展示名称必须使用上下文里的 datasource_name，不要从表名、点位名或标识中裁剪、改写出新名称。",
+            ],
+            analysis_report=report_text,
+        )
+
     if not (exec_result.charts or exec_result.tables):
         if allow_empty_artifact_no_data and _is_expected_time_no_data_report(report_text, expected_time_range or {}):
             return None
@@ -2112,6 +2383,25 @@ def _validate_structured_result_contract(
                 "至少补充一个 charts 或 tables 结构化产物。",
                 "趋势、对比、TopN 等场景优先生成 charts；单指标或明细汇总可以生成 tables。",
                 "不要把自然语言报告直接作为最终结果结束。",
+            ],
+            analysis_report=report_text,
+        )
+
+    no_data_status_charts = _find_no_data_status_charts(exec_result.charts)
+    if no_data_status_charts and _is_no_data_like_report(report_text):
+        return request_retry(
+            retry_type="chart_contract_error",
+            message="当前结果是无数据或数据源暂不可分析结论，但生成了无数据状态/数量类伪图表。",
+            diagnostics={
+                "analysis_report_preview": report_text[:800],
+                "chart_count": len(exec_result.charts or []),
+                "table_count": len(exec_result.tables or []),
+                "no_data_status_charts": no_data_status_charts,
+            },
+            repair_instructions=[
+                "无数据场景不要生成“无数据数量”“查询状态”这类图表，charts 应置空。",
+                "如需说明每个已查询数据源的状态，请使用 tables 展示 datasource_name、查询口径和失败/无数据原因。",
+                "只有实际查询到可用于趋势、对比、分布或排名的数据行时，才生成对应图表。",
             ],
             analysis_report=report_text,
         )
@@ -2531,6 +2821,8 @@ def _classify_execution_error(error: Exception | None, error_message: str) -> st
         return 'resource_exhausted'
     if _is_chart_contract_error_message(error_message):
         return 'chart_contract_error'
+    if _is_time_series_empty_source_error(error_message):
+        return 'no_data_found'
     if 'got an unexpected keyword argument' in lowered:
         return 'library_api_signature_mismatch'
     if 'invalid comparison' in lowered or ('datetime' in lowered and 'timestamp' in lowered):
@@ -2598,6 +2890,12 @@ def _extract_error_signature(error_type: str, error_message: str) -> dict[str, A
         return signature
 
     if error_type == 'no_data_found':
+        if _is_time_series_empty_source_error(error_message):
+            signature.update({
+                'signature_type': 'time_series_empty_source',
+                'empty_source_reason': 'unknown_tag_or_no_results',
+            })
+            return signature
         signature['signature_type'] = 'no_data_found'
         return signature
 
@@ -2659,6 +2957,8 @@ def _build_turn_failure_memory(turn_id: int, current_execution_id: int) -> dict[
                 hint = '之前已经出现时间或数据类型比较不兼容问题，请先统一类型后再过滤。'
             elif signature_type == 'resource_exhausted':
                 hint = '之前已经出现内存或资源耗尽问题，请优先改用 load_local_file_low_memory(...) 分批读取，并在批次内完成过滤、聚合或累计统计。'
+            elif signature_type == 'time_series_empty_source':
+                hint = '之前已有时序数据源返回 unknown tag/no results：该数据源本轮视为无可分析数据，应从后续独立数据源分析中剔除；如果还有其他数据源，继续分析其他数据源。'
             elif signature_type == 'no_data_found':
                 hint = '之前已经出现“筛选/关联后无数据”，请优先检查 SQL、时间范围、筛选条件或 JOIN 条件，不要继续输出空图表。'
             else:
@@ -2722,6 +3022,87 @@ def _turn_has_prior_time_range_guard_signal(turn_id: int, current_execution_id: 
     return False
 
 
+def _extract_probe_no_data_signal(execution: Any) -> str:
+    payload_text = str(getattr(execution, 'result_payload_json', '') or '')
+    try:
+        payload = json.loads(payload_text or '{}')
+    except Exception:
+        payload = {}
+    if isinstance(payload, dict):
+        for key in ('retry_type', 'error_type', 'retry_reason_code'):
+            value = str(payload.get(key) or '').strip()
+            if value in PROBE_NO_DATA_RETRY_TYPES:
+                return value
+
+    error_message = str(getattr(execution, 'error_message', '') or '')
+    classified = _classify_execution_error(None, error_message)
+    if classified in PROBE_NO_DATA_RETRY_TYPES:
+        return classified
+    lowered = error_message.lower()
+    for signal in PROBE_NO_DATA_RETRY_TYPES:
+        if signal in lowered:
+            return signal
+    return ''
+
+
+def _count_probe_no_data_failures(turn_id: int, current_execution_id: int) -> int:
+    if turn_id <= 0:
+        return 0
+
+    from config.database import SessionLocal
+    from model import InsightNsExecution
+
+    session = SessionLocal()
+    try:
+        query = session.query(InsightNsExecution).filter(
+            InsightNsExecution.turn_id == turn_id,
+            InsightNsExecution.is_deleted == 0,
+            InsightNsExecution.execution_status != 'success',
+        )
+        if current_execution_id > 0:
+            query = query.filter(InsightNsExecution.id <= current_execution_id)
+        executions = query.order_by(InsightNsExecution.created_at.asc()).all()
+        return sum(1 for execution in executions if _extract_probe_no_data_signal(execution))
+    finally:
+        session.close()
+
+
+def _apply_probe_no_data_retry_limit(
+    *,
+    turn_id: int,
+    current_execution_id: int,
+    error_type: str,
+    repair_instructions: list[str],
+    diagnostics: dict[str, Any] | None = None,
+) -> tuple[list[str], dict[str, Any] | None]:
+    if error_type not in PROBE_NO_DATA_RETRY_TYPES:
+        return repair_instructions, diagnostics
+
+    count = _count_probe_no_data_failures(turn_id=turn_id, current_execution_id=current_execution_id)
+    if count < PROBE_NO_DATA_RETRY_LIMIT:
+        limit_diagnostics = dict(diagnostics or {})
+        limit_diagnostics.update({
+            'probe_no_data_retry_count': count,
+            'probe_no_data_retry_limit': PROBE_NO_DATA_RETRY_LIMIT,
+            'probe_no_data_limit_reached': False,
+        })
+        return repair_instructions, limit_diagnostics
+
+    limit_diagnostics = dict(diagnostics or {})
+    limit_diagnostics.update({
+        'probe_no_data_retry_count': count,
+        'probe_no_data_retry_limit': PROBE_NO_DATA_RETRY_LIMIT,
+        'probe_no_data_limit_reached': True,
+    })
+    limit_instructions = [
+        f'本轮 probe_feedback/no_data_found 已达到 {count}/{PROBE_NO_DATA_RETRY_LIMIT} 次上限。',
+        '不要再生成 probe 代码，不要继续猜测时序查询语法、字段名或表名，也不要继续扩大查询到其他数据源。',
+        '下一次必须切换为 execution_intent = "analysis"，保持用户原始问题和原始时间范围，调用 save_analysis_result(...) 以无数据或数据源暂不可分析的结论收口。',
+        '如果已经尝试过多个数据源，请至少返回一个表格汇总已尝试的数据源、使用的查询口径和失败原因；used_datasource_ids 填写实际尝试过的数据源 ID。',
+    ]
+    return [*limit_instructions, *repair_instructions], limit_diagnostics
+
+
 def _build_repair_instructions(error_type: str) -> list[str]:
     """根据错误类型生成定向修复建议。"""
     common_instructions = [
@@ -2760,6 +3141,8 @@ def _build_repair_instructions(error_type: str) -> list[str]:
             '如果目标时间窗口没有命中数据，不要输出空图表或直接调用 save_empty_analysis_result() 收口；应调用 raise_no_data_error(reason=..., detail_lines=[...]) 把信息返回给上层重试。',
         ],
         'no_data_found': [
+            '如果错误信息里包含 unknown tag 或 no results，表示当前时序数据源在时序库中没有可查询的数据或尚未初始化；将该数据源从本轮分析中剔除。如果用户问题涉及多个互相独立的数据源，继续分析其他数据源；只有所有相关数据源都无数据时，才以整体无数据收口。',
+            '如果错误信息里包含 unknown tag 或 no results，表示当前时序数据源在时序库中没有可查询的数据或尚未初始化；按无数据处理，不要继续猜测表名、点位名或语法变体。',
             '请先复核 SQL、时间范围、筛选条件、JOIN 条件或聚合口径是否过严，再生成下一版完整代码。',
             '如果用户问题里有明确时间范围，必须保持原始 query_constraints.time_range 不变；探测得到的数据覆盖范围只能用于解释无数据原因，不能替换成正式分析的时间范围。',
             '在数据加载、过滤、关联、聚合完成后，必须先检查 DataFrame 是否为空；只要为空，就调用 raise_no_data_error(reason=..., detail_lines=[...])，不要继续生成空图表或空结果产物。',
@@ -3247,8 +3630,9 @@ def execute_python(
         repair_instructions = worker_payload.get('repair_instructions') or _build_repair_instructions(error_type)
         error_signature = worker_payload.get('error_signature') or _extract_error_signature(error_type, error_message)
         code_error_context = worker_payload.get('code_error_context') if isinstance(worker_payload.get('code_error_context'), dict) else {}
+        turn_id = int(getattr(runtime.context, 'turn_id', 0) or 0)
         failure_memory = _build_turn_failure_memory(
-            turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+            turn_id=turn_id,
             current_execution_id=execution_id,
         )
         _update_execution_record(
@@ -3267,6 +3651,12 @@ def execute_python(
             execution_seconds=int((time.time() - start_time) * 1000),
             error_message=error_message,
         )
+        repair_instructions, limit_diagnostics = _apply_probe_no_data_retry_limit(
+            turn_id=turn_id,
+            current_execution_id=execution_id,
+            error_type=error_type,
+            repair_instructions=repair_instructions,
+        )
         with logger.context(**execution_log_context):
             logger.error(f"代码执行失败（{error_type}）：{error_message}")
         emit(
@@ -3282,6 +3672,7 @@ def execute_python(
             error_message=error_message,
             repair_instructions=repair_instructions,
             error_signature=error_signature,
+            diagnostics=limit_diagnostics,
             code_error_context=code_error_context,
             current_failed_code=code,
             previous_failure_messages=failure_memory.get('previous_failure_messages', []),
@@ -3329,8 +3720,9 @@ def execute_python(
     if isinstance(exec_result, RetryResult):
         retry_error_signature = _build_retry_error_signature(exec_result)
         retry_repair_instructions = exec_result.repair_instructions or _build_repair_instructions(exec_result.retry_type)
+        turn_id = int(getattr(runtime.context, 'turn_id', 0) or 0)
         failure_memory = _build_turn_failure_memory(
-            turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+            turn_id=turn_id,
             current_execution_id=execution_id,
         )
         _update_execution_record(
@@ -3342,6 +3734,13 @@ def execute_python(
             stderr_text=stderr_text,
             execution_seconds=execution_seconds,
             error_message=exec_result.message,
+        )
+        retry_repair_instructions, retry_diagnostics = _apply_probe_no_data_retry_limit(
+            turn_id=turn_id,
+            current_execution_id=execution_id,
+            error_type=exec_result.retry_type,
+            repair_instructions=retry_repair_instructions,
+            diagnostics=exec_result.diagnostics,
         )
         emit(
             'status',
@@ -3358,7 +3757,7 @@ def execute_python(
             error_signature=retry_error_signature,
             feedback_kind='retryable_feedback',
             retry_reason_code=exec_result.retry_type,
-            diagnostics=exec_result.diagnostics,
+            diagnostics=retry_diagnostics,
             analysis_report=exec_result.analysis_report,
             current_failed_code=code,
             previous_failure_messages=failure_memory.get('previous_failure_messages', []),
@@ -3372,6 +3771,8 @@ def execute_python(
             exec_result,
             allow_empty_artifact_no_data=time_range_guard_active,
             expected_time_range=expected_time_range,
+            used_datasource_ids=normalized_used_datasource_ids,
+            selected_datasource_snapshot=_get_runtime_selected_datasource_snapshot(runtime.context),
         )
         if contract_retry is not None:
             failure_memory = _build_turn_failure_memory(

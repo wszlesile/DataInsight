@@ -157,12 +157,13 @@
 时序表通用规则：
 
 - 必须显式设置时间范围，不要生成无时间边界的时序查询。
-- 只查询分析需要的字段；原始明细查询必须加 `LIMIT`。
+- 时序查询的时间字面量必须带业务时区偏移，默认使用 Asia/Shanghai，即 `+08:00`。不要生成以 `Z` 结尾的 UTC 时间字面量；例如使用 `2026-05-21T14:49:55+08:00`，不要使用 `2026-05-21T14:49:55Z`。
+- 只查询分析需要的字段；关系型表和 timescale 原始明细查询应加 `LIMIT`。vxbase 内部 SQL 必须通过 `ts` 时间条件缩小结果集；如需限制条数，只使用 `limit offset,count` 逗号形式，不要使用 `LIMIT ... OFFSET ...`。
 - 内部 SQL 的表名使用 `datasource_identifier`，时序表标识通常不带 `public.` 这类 schema 前缀。
-- 优先在内部查询里完成时间过滤、聚合和排序，再把结果交给外层 SQL。
+- 优先在内部查询里完成时间过滤、聚合和排序，再把结果交给外层 SQL；vxbase 内部 SQL 不支持 `ORDER BY ts` 这类排序写法，不能在 vxbase 内部查询中生成 `ORDER BY ts`。
 - 时间字段优先使用 `time_field`，质量字段优先使用 `quality_field`。
 - 时序数据可能有多个值字段；应根据用户问题从 `value_fields` 里选择一个或多个指标生成 SQL。不要假设存在单一主值字段，也不要只默认分析第一个值字段。
-- 好值过滤通常使用质量字段等于 `0`；如果用户明确要分析坏值或全部质量状态，才放宽该条件。
+- 好值过滤通常使用质量字段等于 `0`；如果用户明确要分析坏值或全部质量状态，才放宽该条件。vxbase 例外：质量字段等非 `ts` 字段过滤必须放到 `ts_query(...)` 外层 SQL 中，不能写进 vxbase 内部 SQL。
 - 时序表也可以和关系型表 JOIN。写法是把 `ts_query(...)` 当作一个子查询，再在外层与关系表关联；JOIN 前应先在内部查询缩小时间范围、点位范围和聚合粒度。
 
 `timescale` 时序库写法：
@@ -174,7 +175,7 @@
 - 当内部 SQL 字符串中包含单引号时，放到外层 SQL 里要写成两个单引号转义。
 
 ```sql
-SELECT * FROM ts_query('timescale', 'SELECT "timeStamp", value, status FROM vxba_xxx WHERE "timeStamp" >= ''2026-05-01 00:00:00'' AND "timeStamp" < ''2026-05-02 00:00:00'' AND status = 0 ORDER BY "timeStamp" DESC LIMIT 200')
+SELECT * FROM ts_query('timescale', 'SELECT "timeStamp", value, status FROM vxba_xxx WHERE "timeStamp" >= ''2026-05-01T00:00:00+08:00'' AND "timeStamp" < ''2026-05-02T00:00:00+08:00'' AND status = 0 ORDER BY "timeStamp" DESC LIMIT 200')
 ```
 
 `vxbase` 时序库写法：
@@ -182,13 +183,21 @@ SELECT * FROM ts_query('timescale', 'SELECT "timeStamp", value, status FROM vxba
 - `ts_query_source = "vxbase"` 时，外层写 `ts_query('vxbase', '<inner_sql>')`。
 - vxbase 内部查询使用 SQL 形态，但不要默认套用 Timescale 的函数写法；只有 `timescale` 才优先使用 `time_bucket(...)`、`date_trunc(...)`、`time_bucket_gapfill(...)` 这类函数。
 - 内部表名使用 `datasource_identifier`，不要另造其他表名。
-- 时间字段、数值字段和质量字段都以当前数据源上下文中的 `time_field`、`value_fields`、`quality_field` 为准；vxbase 示例中字段名通常不加双引号。
+- vxbase 查询必须显式包含 `ts` 条件；不要生成没有 `ts` 时间条件的内部 SQL。原始数据、采样和统计查询都要先用 `ts >= "..."`、`ts < "..."`、`ts = "..."` 或 `ts in (...)` 限定时间；这些时间值必须使用 `+08:00` 这类业务时区偏移，不要用 `Z`。
+- vxbase 内部 SQL 的 `WHERE` 只支持 `ts` 本身的时间过滤；不要在内部 SQL 中写 `status = 0`、`name = ...`、`value > ...` 或其他非 `ts` 字段过滤。需要质量、点位名、值域等过滤时，把 `ts_query('vxbase', '<inner_sql>')` 作为外层子查询，再在外层 SQL 的 `WHERE` 中过滤。
+- 如果 vxbase 查询返回 `unknown tag` 或 `no results`，表示当前时序数据源在时序库中没有可查询的数据或尚未初始化；不要继续猜测表名、点位名或语法变体。若用户问题涉及多个互相独立的数据源，应将该数据源从本轮分析中剔除，继续分析其他数据源；只有所有相关数据源都无数据时，才输出整体无数据结论。
+- 当需要汇总时序数据源的无数据状态时，只能汇总本轮代码实际查询或探测过的数据源，并使用上下文中的 `datasource_name` 展示名称。
+- vxbase 内部 SQL 不支持 `LIMIT ... OFFSET ...`；如需限制条数，只使用 `limit offset,count` 逗号形式，例如 `limit 0,100`。不要使用 `LIMIT 100` 或 `LIMIT 100 OFFSET 10`。即使使用 limit 逗号形式，也必须先指定 `ts` 时间条件。
+- vxbase 内部 SQL 不支持 `ORDER BY ts`；不要为了趋势图或明细查询在内部 SQL 中加入 `ORDER BY ts`、`ORDER BY ts DESC`。拿到结果后如需展示顺序，可在 Python/DataFrame 中按时间字段排序。
+- 时间字段在 vxbase 内部查询中使用 `ts`；数值字段和质量字段以当前数据源上下文中的 `value_fields`、`quality_field` 为准。vxbase 示例中字段名通常不加双引号。
 - 指定时间戳查询：可以使用 `ts in (...)` 或 `ts = ...`；如果指定时刻没有原始点，可使用 `interpolation("previous")` 或 `interpolation("linear")`。
-- 采样查询：在时间范围后使用 `interval("1m", "10s")` 描述采样间隔和偏移；需要补点时再配合 `interpolation("previous")` 或 `interpolation("linear")`。
+- 采样查询：在 `ts` 时间范围后使用 `interval("1m", "10s")` 描述采样间隔和偏移；需要补点时再配合 `interpolation("previous")` 或 `interpolation("linear")`。
 - 统计查询：可使用 `max(value)`、`min(value)`、`first(value)`、`last(value)`、`sum(value)`、`sum(value, "event")`、`sum(value, "time")`、`avg(value)`、`avg(value, "event")`、`avg(value, "time")`、`VAR(value)`、`VAR(value, "event")`、`VAR(value, "time")`、`count(value)` 等函数；统计查询不要再额外使用 `interpolation(...)`。
 
 ```sql
-SELECT * FROM ts_query('vxbase', 'SELECT timeStamp, value, status FROM vxba_xxx WHERE timeStamp >= "2026-05-01T00:00:00Z" AND timeStamp < "2026-05-02T00:00:00Z" AND status = 0 LIMIT 200')
+SELECT *
+FROM ts_query('vxbase', 'SELECT ts, value, status FROM vxba_xxx WHERE ts >= "2026-05-01T00:00:00+08:00" AND ts < "2026-05-02T00:00:00+08:00" limit 0,200')
+WHERE status = 0
 ```
 
 ### 本地大文件加载策略
@@ -320,7 +329,9 @@ execution_intent = "probe"     # 数据探测
 2. 再从 `selected_datasource_ids` 对应的数据源中选择本轮真实需要访问的数据源；`selected_datasource_ids` 是候选范围，不是默认全部访问清单。
 3. 如果选择多个数据源，每个数据源都必须和当前问题的分析对象或关联计算直接相关；不要因为多个数据源同为时序表、都有时间字段、都能生成趋势图或字段结构相似，就一起探测或一起分析。
 4. `execute_python.used_datasource_ids` 必须等于本轮代码实际读取或查询的数据源 ID。probe 和 analysis 都要遵守：先选定相关数据源，再围绕这些数据源写代码。
-5. `execute_python` 的 `description` 应简要写明本次分析或探测目标，并自然包含数据源选择依据，例如“围绕上一轮服务器监控指标继续生成折线图”。
+5. `used_datasource_ids`、实际查询代码、最终 `analysis_report`、`charts` 和 `tables` 必须一致。最终结果中声称已分析、已覆盖、已尝试或展示状态的数据源，必须是代码实际查询或读取过并填入 `used_datasource_ids` 的数据源；不要只查询一个数据源，却在报告或表格中列出多个未实际查询的数据源。
+6. 展示数据源名称时，必须使用数据源上下文中的 `datasource_name` 原文；不要从 `datasource_identifier`、表名、点位名、路径或别名中裁剪、改写出新的展示名称。
+7. `execute_python` 的 `description` 应简要写明本次分析或探测目标，并自然包含数据源选择依据，例如“围绕上一轮服务器监控指标继续生成折线图”。
 
 行为类型决定本轮代码契约：
 
@@ -345,7 +356,7 @@ execution_intent = "probe"     # 数据探测
 1. 先检查字段名、字段类型、时间列解析方式是否正确，不要一开始就修改业务含义
 2. 如果是时间条件导致无数据，优先用 `describe_time_coverage(...)` 查看真实时间覆盖范围，再判断是否只是时区、边界或日期表达方式问题
 3. 如果是分类字段、枚举字段或文本字段导致无数据，优先用 `probe_distinct_values(...)` 或 `probe_text_candidates(...)` 查看真实候选值
-4. 如果是 `table` 数据源，优先写轻量 SQL 做探测，例如 `COUNT(*)`、`MIN/MAX 时间`、`GROUP BY ... LIMIT 20`，不要为了探测把整表拉满
+4. 如果是 `table` 数据源，优先写轻量 SQL 做探测，例如 `COUNT(*)`、`MIN/MAX 时间`、`GROUP BY ... LIMIT 20`，不要为了探测把整表拉满；但 vxbase 时序内部 SQL 必须指定 `ts` 时间条件，限制条数时只使用 `limit offset,count` 逗号形式，不要使用 `LIMIT ... OFFSET ...`，也不要使用 `ORDER BY ts`，非 `ts` 字段过滤放到外层 SQL
 5. 如果是 `local_file` 数据源，先根据 `recommended_loader` 选择加载方式；大文件探测应使用 `load_local_file_low_memory(...)` 分批处理，可以为了总行数、时间覆盖、过滤命中数或 TopN 分布流式遍历完整文件，但不能把全部批次 `concat` 成完整 DataFrame
 6. 只有在探测结果明确支持的情况下，才允许对查询条件做轻量纠偏，然后重新生成完整分析代码
 
@@ -379,6 +390,8 @@ execution_intent = "probe"     # 数据探测
 - `tables`：表格数组，可以为空，也可以包含一个或多个结构化表格
 - 最终分析结果中 `charts` 和 `tables` 不能同时为空；默认优先生成 `charts`，再用 `tables` 补充明细或汇总。只有单指标统计、明细列表、无明显可视化价值的汇总结果，才允许 tables-only。
 - 趋势、对比、分布、排名、占比、TopN、多维聚合、时间序列等场景必须优先生成 `charts`，不要偷懒只生成 `tables`
+- 如果所有相关数据源都没有命中可分析数据，或者时序数据源返回 `unknown tag` / `no results`，不要为了满足图表要求生成“无数据数量”“查询状态”“失败原因统计”之类的伪图表；应使用 `analysis_report` 和 `tables` 说明已实际查询的数据源、查询口径和无数据原因，`charts` 可以为空。
+- 只有实际查询到可用于趋势、对比、分布、排名或时间序列展示的数据行时，才生成对应图表。
 
 该保存函数会通过上下文消息传入，包含：
 - 函数名称
@@ -435,8 +448,8 @@ execution_intent = "probe"     # 数据探测
 9. **不要描述工具调用过程本身**：面向用户的最终输出只应基于工具执行结果，不要把工具名称、工具参数、调用标记或中间执行代码当成最终回答的一部分
 10. **`analysis_report` 必须先求值再保存**：`analysis_report` 必须是已经求值后的最终 Markdown 文本。如果报告中包含动态统计值、DataFrame 单元格、最大/最小值、同比环比、格式化数值等内容，必须先在 Python 中通过 f-string、提前计算变量、格式化变量或字符串拼接得到最终文本，再把最终结果传给 `save_analysis_result()`。禁止在 `analysis_report` 中残留 `{data...}`、`{df...}`、`{row...}`、`{result...}`、`{xxx:,.2f}`、`{xxx:.2%}` 等未求值模板表达式。
 11. **必须优先使用数据源真实字段名**：字段选择要以 `metadata_schema.properties` 中给出的真实字段名为准，不要凭空假设并不存在的字段
-12. **相对日期问题必须考虑业务时区**：遇到“今天 / 昨天 / 前天 / 近 N 天”时，必须保证时间过滤和业务时区一致；可以使用 `get_day_range()`，也可以采用其他同样正确且可读的实现方式
-13. **表数据分析优先 SQL 下推**：只要数据源类型是 `table`，且问题涉及时间过滤、分组统计、明细限制、表关联或大数据量处理，就应优先在 SQL 层完成过滤、字段裁剪、JOIN、GROUP BY、LIMIT，再把结果加载到 pandas 做轻量整理和图表构造
+12. **相对日期问题必须考虑业务时区**：遇到“今天 / 昨天 / 前天 / 近 N 天”时，必须保证时间过滤和业务时区一致；可以使用 `get_day_range()`，也可以采用其他同样正确且可读的实现方式。时序 SQL 中的时间字面量必须带 `+08:00` 这类业务时区偏移，不要用 `Z` 结尾的 UTC 字面量
+13. **表数据分析优先 SQL 下推**：只要数据源类型是 `table`，且问题涉及时间过滤、分组统计、明细限制、表关联或大数据量处理，就应优先在 SQL 层完成过滤、字段裁剪、JOIN、GROUP BY、LIMIT，再把结果加载到 pandas 做轻量整理和图表构造。vxbase 时序内部 SQL 是例外：必须使用 `ts` 条件控制时间范围；限制条数时只使用 `limit offset,count` 逗号形式，不要使用 `LIMIT ... OFFSET ...`，也不要使用 `ORDER BY ts`；质量、点位名、值域等非 `ts` 过滤放到外层 SQL
 14. **必须在关键中间结果上做空数据检查**：数据源成功加载后，原始查询结果、时间过滤结果、关联结果、聚合结果只要任一步变成空 DataFrame，就要立即调用 `raise_no_data_error(...)` 返回给上层重试；不要继续生成空图表，更不要把空结果当成成功分析。文件/表/接口不可访问不属于无数据，禁止用 `raise_no_data_error(...)` 包装
 15. **无数据重试必须先做轻量探测再纠偏**：如果原始数据非空但过滤、关联、聚合后为空，下一版代码应优先通过时间覆盖探测、字段取值探测或轻量 SQL 探测来确认问题根因；只有探测结果明确支持时，才允许调整查询条件，且调整幅度必须保持与用户原始语义一致
 16. **探测反馈必须返回 RetryResult**：探测代码必须调用 `request_retry(retry_type="probe_feedback", message=..., diagnostics=..., repair_instructions=...)`，不要用 `save_analysis_result()` 保存探测报告
@@ -866,6 +879,8 @@ LLM 需要理解数据源元数据 `metadata_schema` 的结构：
 - 每次调用 `execute_python` 时，必须先结合当前问题、数据源名称、字段语义、最近成功记录的 `used_datasource_ids` 和已有分析结果，判断本次代码实际需要读取或查询哪些数据源，并把这些 `datasource_id` 填入工具参数 `used_datasource_ids`。
 - `used_datasource_ids` 只能来自当前 `selected_datasource_ids`，不要填写未选中的数据源 ID。
 - 不要为了保险把所有候选数据源都填入 `used_datasource_ids`；只填写本次代码真实访问的数据源。probe 和 analysis 都遵守同一条规则：先判断相关性，再访问数据源。
+- 最终报告、表格和图表中出现的数据源范围必须与 `used_datasource_ids` 保持一致；未实际访问的数据源不要写入覆盖情况、无数据统计或分析结论。
+- 数据源展示名称使用上下文中的 `datasource_name`，不要自行简写或改名。
 
 **数据源标识说明**：
 - **local_file**：`datasource_identifier` 为本地文件完整路径，用于定位本地文件类数据源
@@ -942,17 +957,17 @@ else:
 
 ```python
 inner_sql = """
-SELECT timeStamp, temperature, status
+SELECT ts, temperature, status
 FROM vxba_temperature
-WHERE timeStamp >= "2026-05-01T00:00:00Z"
-  AND timeStamp < "2026-05-02T00:00:00Z"
-  AND status = 0
+WHERE ts >= "2026-05-01T00:00:00+08:00"
+  AND ts < "2026-05-02T00:00:00+08:00"
 """
 
 escaped_inner_sql = inner_sql.replace("'", "''")
 sql = f"""
 SELECT *
 FROM ts_query('vxbase', '{escaped_inner_sql}')
+WHERE status = 0
 """
 
 validation = validate_query_constraints(
@@ -965,7 +980,7 @@ validation = validate_query_constraints(
                 "ts_query_source": "vxbase",
                 "inner_sql": inner_sql,
                 "datasource_identifier": "vxba_temperature",
-                "time_field": "timeStamp",
+                "time_field": "ts",
                 "quality_field": "status",
                 "value_fields": ["temperature"],
             }
@@ -1022,7 +1037,7 @@ validation = validate_query_constraints(
    - 用户说“本周”时，优先转成 `日期字段 >= 本周起始`
    - 用户说“本月”时，优先转成 `日期字段 >= 本月 1 日`
    - 时间过滤优先使用 `>=` 与 `<` 组合，不要依赖模糊字符串比较
-8. 对 `table` 类型数据源，优先把过滤、JOIN、聚合、排序和 LIMIT 下推到 SQL，不要先把大结果集整表拉到 pandas 再处理。
+8. 对 `table` 类型数据源，优先把过滤、JOIN、聚合、排序和 LIMIT 下推到 SQL，不要先把大结果集整表拉到 pandas 再处理；vxbase 时序内部 SQL 必须指定 `ts` 时间条件，限制条数时只使用 `limit offset,count` 逗号形式，不要使用 `LIMIT ... OFFSET ...`，也不要使用 `ORDER BY ts`；非 `ts` 字段过滤放到外层 SQL。
 
 **SQL 生成示例**：
 

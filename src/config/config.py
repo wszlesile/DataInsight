@@ -128,7 +128,7 @@ class Config:
     CONTEXT_COMPRESSION_ARTIFACT_SUMMARY_CHARS = int(
         os.environ.get('CONTEXT_COMPRESSION_ARTIFACT_SUMMARY_CHARS', 500)
     )
-    DATASOURCE_CONTEXT_MAX_COUNT = int(os.environ.get('DATASOURCE_CONTEXT_MAX_COUNT', 10))
+    DATASOURCE_CONTEXT_MAX_COUNT = int(os.environ.get('DATASOURCE_CONTEXT_MAX_COUNT', 30))
 
     @classmethod
     def get(cls, key: str, default: Any = None) -> Any:
