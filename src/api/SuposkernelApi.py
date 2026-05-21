@@ -253,7 +253,7 @@ class SuposKernelApi:
             payload = response.json()
             rows = ((payload.get("data") or {}).get("list") or [])
             for row in rows:
-                ts_query_source = normalize_ts_query_source((row or {}).get("id"))
+                ts_query_source = normalize_ts_query_source((row or {}).get("subCatalog"))
                 if ts_query_source:
                     return ts_query_source
         except requests.RequestException:
