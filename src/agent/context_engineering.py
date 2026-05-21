@@ -28,6 +28,14 @@ FOLLOWUP_ANALYSIS_KEYWORDS = (
     "继续上一个", "继续上一轮", "修复一下", "重试", "重新生成", "继续分析",
     "continue", "previous", "last result", "same logic",
 )
+CHART_FOLLOWUP_ACTION_KEYWORDS = (
+    "分开", "分别", "单独", "各自", "每个", "一张", "拆开", "拆分", "分图",
+    "合并", "换成", "改成", "重新生成", "重画", "再生成",
+)
+CHART_FOLLOWUP_TARGET_KEYWORDS = (
+    "图表", "图", "趋势图", "折线图", "柱状图", "饼图", "曲线", "可视化",
+    "chart", "charts", "graph", "plot",
+)
 
 
 class CustomContext(BaseModel):
@@ -88,6 +96,11 @@ def classify_analysis_context_mode(user_message: str) -> str:
     lower_text = text.lower()
     if any(keyword in text for keyword in FOLLOWUP_ANALYSIS_KEYWORDS) or any(
         keyword in lower_text for keyword in FOLLOWUP_ANALYSIS_KEYWORDS
+    ):
+        return 'followup'
+    if len(text) <= 40 and any(keyword in text for keyword in CHART_FOLLOWUP_ACTION_KEYWORDS) and (
+        any(keyword in text for keyword in CHART_FOLLOWUP_TARGET_KEYWORDS)
+        or any(keyword in lower_text for keyword in CHART_FOLLOWUP_TARGET_KEYWORDS)
     ):
         return 'followup'
     if ANALYSIS_SIGNAL_PATTERN.search(text):
