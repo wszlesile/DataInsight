@@ -42,6 +42,7 @@ ROLE_TO_TYPE = {
     'assistant': 2,
     'tool': 3,
 }
+AUTO_TITLE_PLACEHOLDERS = {'新建会话', '默认会话'}
 
 TERMINAL_EXECUTION_STATUSES = ('success', 'failed')
 
@@ -371,17 +372,20 @@ class ConversationContextService:
         latest_execution: InsightNsExecution | None,
         replace_existing_results: bool = False,
     ) -> None:
-        """空会话首轮分析成功后，用会话名称同步最终执行记录标题。"""
+        """空会话首轮成功后，同步会话标题，并在有执行记录时同步执行标题。"""
         if replace_existing_results:
             return
         if int(turn.turn_no or 0) != 1:
             return
+
+        if str(conversation.title or '').strip() in AUTO_TITLE_PLACEHOLDERS:
+            analysis_title = ''
+            if latest_execution is not None and latest_execution.execution_status == 'success':
+                analysis_title = str(latest_execution.title or '').strip()
+            conversation.title = analysis_title or build_conversation_title(turn.user_query)
+
         if latest_execution is None or latest_execution.execution_status != 'success':
             return
-
-        if str(conversation.title or '').strip() == '新建会话':
-            analysis_title = str(latest_execution.title or '').strip()
-            conversation.title = analysis_title or build_conversation_title(turn.user_query)
 
         conversation_title = str(conversation.title or '').strip()[:260]
         if not conversation_title or latest_execution.title == conversation_title:
