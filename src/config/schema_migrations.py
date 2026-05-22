@@ -7,7 +7,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from config.config import Config
-from config.database import engine
+from config.database import POSTGRES_SCHEMA_LOCK_KEY, db_type, engine
 from utils import logger
 
 
@@ -132,6 +132,8 @@ def run_schema_migrations() -> None:
         return
 
     with engine.begin() as connection:
+        if db_type == "postgresql":
+            connection.execute(text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": POSTGRES_SCHEMA_LOCK_KEY})
         _ensure_version_table(connection)
         current_version = _get_current_version(connection)
         migration_files = _iter_migration_files(current_version, target_version)

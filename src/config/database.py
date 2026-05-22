@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.engine import URL
 from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.sql import text
 
 from config.config import Config
 
@@ -50,6 +51,7 @@ else:
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+POSTGRES_SCHEMA_LOCK_KEY = 827364219
 
 
 def get_session():
@@ -67,4 +69,10 @@ def init_db():
     当前项目不再在启动阶段承载历史 SQLite 迁移或补丁式修表逻辑，
     数据库结构升级应通过显式的迁移方案处理，而不是在这里隐式改表。
     """
+    if db_type == 'postgresql':
+        with engine.begin() as connection:
+            connection.execute(text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": POSTGRES_SCHEMA_LOCK_KEY})
+            Base.metadata.create_all(bind=connection)
+        return
+
     Base.metadata.create_all(bind=engine)

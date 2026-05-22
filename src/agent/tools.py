@@ -630,9 +630,59 @@ def _extract_vxbase_inner_where_forbidden_fields(code: str) -> list[str]:
     return fields
 
 
+def _extract_vxbase_select_projection(code: str) -> str | None:
+    match = re.search(
+        r"\bselect\b(?P<projection>.*?)\bfrom\b",
+        code,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return None
+    projection = " ".join(str(match.group('projection') or '').split())
+    if not projection or projection == '*':
+        return None
+    if re.search(r"\b(max|min|first|last|sum|avg|var|count)\s*\(", projection, re.IGNORECASE):
+        return None
+    return projection
+
+
+def _extract_vxbase_limit_issue(code: str) -> str | None:
+    comma_limit = re.search(r"\blimit\s+\d+\s*,\s*\d+\b", code, re.IGNORECASE)
+    if comma_limit:
+        return comma_limit.group(0)
+    offset_limit = re.search(r"\blimit\s+\d+\s+offset\s+\d+\b", code, re.IGNORECASE)
+    if offset_limit:
+        return offset_limit.group(0)
+    return None
+
+
 def _validate_vxbase_fragment(query_constraints: dict[str, Any], fragment: dict[str, Any]) -> list[dict[str, Any]]:
     code = _fragment_text(fragment)
     issues: list[dict[str, Any]] = []
+
+    projection = _extract_vxbase_select_projection(code)
+    if projection:
+        issues.append(_build_query_constraint_error(
+            'query_constraint_violation',
+            'vxbase 原始数据、趋势图和探测查询的内部 SQL 应使用 SELECT *，不要显式指定返回列。',
+            diagnostics={
+                'violated_constraint': 'vxbase_inner_select_projection',
+                'ts_query_source': 'vxbase',
+                'projection': projection,
+            },
+        ))
+
+    limit_issue = _extract_vxbase_limit_issue(code)
+    if limit_issue:
+        issues.append(_build_query_constraint_error(
+            'query_constraint_violation',
+            'vxbase 内部 SQL 限制条数时只使用 limit N，不要使用 limit offset,count 或 LIMIT ... OFFSET ...。',
+            diagnostics={
+                'violated_constraint': 'vxbase_inner_limit_syntax',
+                'ts_query_source': 'vxbase',
+                'limit_syntax': limit_issue,
+            },
+        ))
 
     forbidden_fields = _extract_vxbase_inner_where_forbidden_fields(code)
     if forbidden_fields:
