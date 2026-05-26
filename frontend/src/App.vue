@@ -141,7 +141,7 @@
                 </div>
               </div>
 
-              <div v-if="getDisplayCharts(item).length || item.report" class="chat-message ai">
+              <div v-if="getDisplayCharts(item).length || getDisplayTables(item).length || item.report" class="chat-message ai">
                 <div class="message-avatar ai">AI</div>
                 <div class="message-body">
                   <div class="result-card answer-card">
@@ -199,6 +199,37 @@
                       </div>
                     </div>
 
+                    <div v-if="getDisplayTables(item).length" class="answer-table-list">
+                      <div
+                        v-for="(table, tableIndex) in getDisplayTables(item)"
+                        :key="`${item.turnId}-table-${table.id || tableIndex}`"
+                        class="answer-table-card"
+                      >
+                        <div class="answer-table-title">{{ table.title || `表格 ${tableIndex + 1}` }}</div>
+                        <div v-if="table.description || table.summary_text" class="answer-table-desc">
+                          {{ table.description || table.summary_text }}
+                        </div>
+                        <div class="answer-table-scroll">
+                          <table class="answer-table">
+                            <thead>
+                              <tr>
+                                <th v-for="column in getTableColumns(table)" :key="column.field">
+                                  {{ column.title || column.field }}
+                                </th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              <tr v-for="(row, rowIndex) in getTableRows(table)" :key="rowIndex">
+                                <td v-for="column in getTableColumns(table)" :key="`${rowIndex}-${column.field}`">
+                                  {{ formatTableCell(row[column.field]) }}
+                                </td>
+                              </tr>
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    </div>
+
                     <div
                       v-if="item.report"
                       class="message-bubble ai report-text answer-report"
@@ -235,7 +266,7 @@
                 </div>
               </div>
 
-              <div v-if="currentCharts.length || currentReport" class="chat-message ai">
+              <div v-if="currentCharts.length || currentTables.length || currentReport" class="chat-message ai">
                 <div class="message-avatar ai">AI</div>
                 <div class="message-body">
                   <div class="result-card answer-card">
@@ -300,6 +331,36 @@
                         class="answer-chart"
                       >
                         <ChartDisplay :chart-spec="chart.chartSpec" />
+                      </div>
+                    </div>
+                    <div v-if="currentTables.length" class="answer-table-list">
+                      <div
+                        v-for="(table, tableIndex) in currentTables"
+                        :key="`${currentTurnId}-table-${table.id || tableIndex}`"
+                        class="answer-table-card"
+                      >
+                        <div class="answer-table-title">{{ table.title || `表格 ${tableIndex + 1}` }}</div>
+                        <div v-if="table.description || table.summary_text" class="answer-table-desc">
+                          {{ table.description || table.summary_text }}
+                        </div>
+                        <div class="answer-table-scroll">
+                          <table class="answer-table">
+                            <thead>
+                              <tr>
+                                <th v-for="column in getTableColumns(table)" :key="column.field">
+                                  {{ column.title || column.field }}
+                                </th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              <tr v-for="(row, rowIndex) in getTableRows(table)" :key="rowIndex">
+                                <td v-for="column in getTableColumns(table)" :key="`${rowIndex}-${column.field}`">
+                                  {{ formatTableCell(row[column.field]) }}
+                                </td>
+                              </tr>
+                            </tbody>
+                          </table>
+                        </div>
                       </div>
                     </div>
                     <div
@@ -883,8 +944,42 @@ const normalizeCharts = (charts = []) => {
 }
 
 const getDisplayCharts = (item) => item?.charts || []
+const getDisplayTables = (item) => Array.isArray(item?.tables) ? item.tables : []
 const getPrimaryChart = (item) => getDisplayCharts(item)[0] || null
 const artifactChartSpec = (artifact) => sanitizeChartSpec(artifact?.content_json?.chart_spec || null)
+
+const getTableColumns = (table) => {
+  if (Array.isArray(table?.columns) && table.columns.length > 0) {
+    return table.columns
+      .map((column) => {
+        if (typeof column === 'string') return { field: column, title: column }
+        const field = column?.field || column?.key || column?.name || column?.title
+        if (!field) return null
+        return {
+          ...column,
+          field,
+          title: column?.title || column?.label || column?.name || field
+        }
+      })
+      .filter(Boolean)
+  }
+  const firstRow = Array.isArray(table?.rows)
+    ? table.rows.find((row) => row && typeof row === 'object' && !Array.isArray(row))
+    : null
+  return firstRow
+    ? Object.keys(firstRow).map((field) => ({ field, title: field }))
+    : []
+}
+
+const getTableRows = (table) => Array.isArray(table?.rows) ? table.rows : []
+
+const formatTableCell = (value) => {
+  if (value === null || value === undefined) return ''
+  if (typeof value === 'number') return formatChartNumber(value)
+  if (typeof value === 'boolean') return value ? 'true' : 'false'
+  if (typeof value === 'object') return JSON.stringify(value)
+  return String(value)
+}
 
 const favoriteTypeLabel = (collect) => {
   if (collect.collect_type === 'turn') return '整体结果'

@@ -157,25 +157,31 @@
 时序表通用规则：
 
 - 必须显式设置时间范围，不要生成无时间边界的时序查询。
+- `query_constraints.time_range` 中声明的开始和结束时间必须体现在 `ts_query(...)` 的内部 SQL 中；不要先全量读取时序表，再在 pandas 中过滤时间。
 - 时序查询的时间字面量必须带业务时区偏移，默认使用 Asia/Shanghai，即 `+08:00`。不要生成以 `Z` 结尾的 UTC 时间字面量；例如使用 `2026-05-21T14:49:55+08:00`，不要使用 `2026-05-21T14:49:55Z`。
 - 只查询分析需要的字段；关系型表和 timescale 原始明细查询应加 `LIMIT`。vxbase 内部 SQL 必须通过 `ts` 时间条件缩小结果集；原始数据、趋势图和探测查询的内部 SQL 使用 `SELECT *`，如需限制条数只使用 `limit N`，不要使用 `limit offset,count` 或 `LIMIT ... OFFSET ...`。
-- 内部 SQL 的表名使用 `datasource_identifier`，时序表标识通常不带 `public.` 这类 schema 前缀。
+- 内部 SQL 的表名使用 `datasource_identifier`，时序表标识通常不带 `public.` 这类 schema 前缀。timescale 标识如果包含大写字母、`$` 或其他特殊字符，必须用双引号按原样引用，例如 `"__Do_xxx"`、`"_0_I_xxx"`、`"$xxx"`；不要把这类标识写成未加引号的表名。
 - 优先在内部查询里完成时间过滤、聚合和排序，再把结果交给外层 SQL；vxbase 内部 SQL 不支持 `ORDER BY ts` 这类排序写法，不能在 vxbase 内部查询中生成 `ORDER BY ts`。
 - 时间字段优先使用 `time_field`，质量字段优先使用 `quality_field`。
 - 时序数据可能有多个值字段；应根据用户问题从 `value_fields` 里选择一个或多个指标生成 SQL。不要假设存在单一主值字段，也不要只默认分析第一个值字段。
-- 好值过滤通常使用质量字段等于 `0`；如果用户明确要分析坏值或全部质量状态，才放宽该条件。vxbase 例外：质量字段等非 `ts` 字段过滤必须放到 `ts_query(...)` 外层 SQL 中，不能写进 vxbase 内部 SQL。
+- 好值过滤通常使用质量字段等于 `0`；如果用户明确要分析坏值或全部质量状态，才放宽该条件。`timescale` 的质量字段过滤写在内部 SQL 中，例如 `AND status = 0`；`vxbase` 例外，质量字段等非 `ts` 字段过滤必须放到 `ts_query(...)` 外层 SQL 中，不能写进 vxbase 内部 SQL。
 - 时序表也可以和关系型表 JOIN。写法是把 `ts_query(...)` 当作一个子查询，再在外层与关系表关联；JOIN 前应先在内部查询缩小时间范围、点位范围和聚合粒度。
 
 `timescale` 时序库写法：
 
 - `ts_query_source = "timescale"` 时，外层写 `ts_query('timescale', '<inner_sql>')`。
 - 内部表名使用 `datasource_identifier`，不要另造表名。
+- 如果 `datasource_identifier` 不是纯小写 SQL 标识符，内部 SQL 的 `FROM` 后必须使用双引号引用它，保留原始大小写和特殊字符。
+- 批量循环查询多个 timescale 数据源时，不要直接拼 `FROM {identifier}`；应先定义并使用 `quote_identifier(identifier)`，确保每个数据源都按自身标识正确引用。
 - 时间字段通常是 `"timeStamp"`，需要保留双引号；数值字段通常是 `value`，质量字段通常是 `status`。
+- timescale 的字段过滤、质量过滤、排序和聚合都优先写进内部 SQL。不要把 `status = 0` 放到 `ts_query('timescale', ...)` 外层；如果外层需要继续过滤，内部 SQL 必须先 `SELECT` 出该字段。
+- 原始趋势查询的常用内部 SQL 形态是：`SELECT "timeStamp", value, status FROM "<datasource_identifier>" WHERE "timeStamp" >= '<start+08:00>' AND "timeStamp" < '<end+08:00>' AND status = 0 ORDER BY "timeStamp" ASC`。
 - 可以使用 PostgreSQL/Timescale 常见时间函数和聚合函数，例如 `time_bucket(...)`、`time_bucket_gapfill(...)`、`locf(...)`、`first(value, "timeStamp")`、`last(value, "timeStamp")`、`date_trunc(...)`。
 - 当内部 SQL 字符串中包含单引号时，放到外层 SQL 里要写成两个单引号转义。
+- 推荐先构造 `inner_sql`，再执行 `escaped_inner_sql = inner_sql.replace("'", "''")`，最后用 `escaped_inner_sql` 拼接外层 `ts_query(...)`。不要把包含时间字面量单引号的 `inner_sql` 原样拼进外层 SQL。
 
 ```sql
-SELECT * FROM ts_query('timescale', 'SELECT "timeStamp", value, status FROM vxba_xxx WHERE "timeStamp" >= ''2026-05-01T00:00:00+08:00'' AND "timeStamp" < ''2026-05-02T00:00:00+08:00'' AND status = 0 ORDER BY "timeStamp" DESC LIMIT 200')
+SELECT * FROM ts_query('timescale', 'SELECT "timeStamp", value, status FROM "__Do_xxx" WHERE "timeStamp" >= ''2026-05-01T00:00:00+08:00'' AND "timeStamp" < ''2026-05-02T00:00:00+08:00'' AND status = 0 ORDER BY "timeStamp" ASC LIMIT 200')
 ```
 
 `vxbase` 时序库写法：
@@ -328,15 +334,18 @@ execution_intent = "probe"     # 数据探测
 
 1. 先从当前问题中识别分析对象、指标、图表或追问动作；如果用户是在“重新生成、继续、换一种图、展开、补充、再看”等延续性表达中提出请求，应优先结合最近成功执行的分析对象、结果和 `used_datasource_ids` 理解要延续的范围。
 2. 再从 `selected_datasource_ids` 对应的数据源中选择本轮真实需要访问的数据源；`selected_datasource_ids` 是候选范围，不是默认全部访问清单。
-3. 如果选择多个数据源，每个数据源都必须和当前问题的分析对象或关联计算直接相关；不要因为多个数据源同为时序表、都有时间字段、都能生成趋势图或字段结构相似，就一起探测或一起分析。
-4. `execute_python.used_datasource_ids` 必须等于本轮代码实际读取或查询的数据源 ID。probe 和 analysis 都要遵守：先选定相关数据源，再围绕这些数据源写代码。
-5. `used_datasource_ids`、实际查询代码、最终 `analysis_report`、`charts` 和 `tables` 必须一致。最终结果中声称已分析、已覆盖、已尝试或展示状态的数据源，必须是代码实际查询或读取过并填入 `used_datasource_ids` 的数据源；不要只查询一个数据源，却在报告或表格中列出多个未实际查询的数据源。
-6. 展示数据源名称时，必须使用数据源上下文中的 `datasource_name` 原文；不要从 `datasource_identifier`、表名、点位名、路径或别名中裁剪、改写出新的展示名称。
-7. `execute_python` 的 `description` 应简要写明本次分析或探测目标，并自然包含数据源选择依据，例如“围绕上一轮服务器监控指标继续生成折线图”。
+3. 如果用户用“数据源”“这些数据源”“已选数据源”等整体表达发起分析，且没有进一步限定某个名称、类型或指标，则当前选中的同类数据源都应视为本轮候选分析对象；不要只凭数值类型名称、图表便利性或示例列表静默缩小范围。
+4. 如果选择多个数据源，每个数据源都必须和当前问题的分析对象或关联计算直接相关；不要因为多个数据源同为时序表、都有时间字段、都能生成趋势图或字段结构相似，就在用户并未表达整体分析意图时一起探测或一起分析。
+5. 对多个时序数据源做趋势分析时，不要把 `integer`、`double`、`float`、`int32` 等数值字段人为拆成不同相关性等级；它们都可作为数值趋势指标。`boolean` 类型可以按 0/1 展示状态变化。`string` 类型默认不生成折线趋势图，也不要临时构造“变化频率”“编码值”等派生指标来画图；除非用户明确要求分析文本/枚举值变化、状态迁移或频次分布，否则 string 时序数据源只在表格或报告中说明最新值、不同取值数量、样例值等摘要信息。
+6. `execute_python.used_datasource_ids` 必须等于本轮代码实际读取或查询的数据源 ID。probe 和 analysis 都要遵守：先选定相关数据源，再围绕这些数据源写代码。
+7. `used_datasource_ids`、实际查询代码、最终 `analysis_report`、`charts` 和 `tables` 必须一致。最终结果中声称已分析、已覆盖、已尝试或展示状态的数据源，必须是代码实际查询或读取过并填入 `used_datasource_ids` 的数据源；不要只查询一个数据源，却在报告或表格中列出多个未实际查询的数据源。
+8. 如果本轮只分析了 `selected_datasource_ids` 的一部分，最终报告必须说明选择依据和未分析数据源的处理方式；不要让用户误以为“数据源趋势”已经覆盖全部已选数据源。
+9. 展示数据源名称时，必须使用数据源上下文中的 `datasource_name` 原文；不要从 `datasource_identifier`、表名、点位名、路径或别名中裁剪、改写出新的展示名称。
+10. `execute_python` 的 `description` 应简要写明本次分析或探测目标，并自然包含数据源选择依据，例如“围绕上一轮服务器监控指标继续生成折线图”。
 
 行为类型决定本轮代码契约：
 
-- `execution_intent = "analysis"`：正式分析代码必须声明 `query_constraints`，先生成 SQL / pandas / 文件筛选实现，再调用 `validate_query_constraints(...)`；只有当校验返回 `None` 时，才继续真实数据加载与分析，最终必须将 `save_analysis_result(...)` 的返回值赋给 `result`。
+- `execution_intent = "analysis"`：正式分析代码必须声明 `query_constraints`，先生成 SQL / pandas / 文件筛选实现，再调用 `validate_query_constraints(...)`；只有当校验返回 `None` 时，才继续真实数据加载与分析，最终必须将 `save_analysis_result(...)` 的返回值赋给 `result`。禁止先调用 `load_data_with_sql(...)` 执行 SQL，再补做 `validate_query_constraints(...)`。
 - `execution_intent = "probe"`：探测代码只负责轻量探测，并将 `request_retry(retry_type="probe_feedback", ...)` 的返回值赋给 `result`；探测代码不要生成 `query_constraints`，也不要调用 `validate_query_constraints(...)`。probe 的目标是验证已选分析对象所需的字段、时间、候选值、JOIN key 或错误原因，不是发现所有可用数据源；只围绕当前问题相关的数据源访问数据，不要把 probe 当成对所有候选数据源的全量巡检。
 - `query_constraints` 只属于正式 `analysis` 代码，是当前分析所采用的时间范围、目标筛选和聚合粒度的显式契约。
 - `query_constraints` 必须是真实 Python `dict`，不能只是注释或自然语言说明。
@@ -345,6 +354,36 @@ execution_intent = "probe"     # 数据探测
 - 探测代码不能调用 `save_analysis_result(...)`，也不能把探测结果包装成最终分析报告。
 - 探测代码同样要遵守本地文件的 `recommended_loader`。
 - 最终正式分析仍应优先生成 `charts`，必要时再补充 `tables`。
+
+正式 `analysis` 代码优先使用下面的固定骨架；不要省略其中任何一段，也不要先执行数据加载再补校验：
+
+```python
+execution_intent = "analysis"
+
+query_constraints = {...}
+
+# 先构造 sql / filter_expressions / sql_context.fragments
+validation = validate_query_constraints(
+    query_constraints=query_constraints,
+    sql=sql,
+    sql_context=sql_context,
+    aggregation_hints=[...],
+)
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql(sql=sql)
+    # 仅当查询成功返回空结果时，才按无数据处理
+    if data is None or data.empty:
+        raise_no_data_error(...)
+
+    # 构造 charts / tables / analysis_report
+    result = save_analysis_result(
+        analysis_report=analysis_report,
+        charts=charts,
+        tables=tables,
+    )
+```
 
 ### 无数据重试时的数据探测与纠偏规范
 
@@ -391,8 +430,11 @@ execution_intent = "probe"     # 数据探测
 - `tables`：表格数组，可以为空，也可以包含一个或多个结构化表格
 - 最终分析结果中 `charts` 和 `tables` 不能同时为空；默认优先生成 `charts`，再用 `tables` 补充明细或汇总。只有单指标统计、明细列表、无明显可视化价值的汇总结果，才允许 tables-only。
 - 趋势、对比、分布、排名、占比、TopN、多维聚合、时间序列等场景必须优先生成 `charts`，不要偷懒只生成 `tables`
-- 如果所有相关数据源都没有命中可分析数据，或者时序数据源返回 `unknown tag` / `no results`，不要为了满足图表要求生成“无数据数量”“查询状态”“失败原因统计”之类的伪图表；应使用 `analysis_report` 和 `tables` 说明已实际查询的数据源、查询口径和无数据原因，`charts` 可以为空。
+- 当多个已选数据源分别代表不同 `datasource_id` / `datasource_name`，且问题没有要求 JOIN、关联计算、同图对比或合并展示时，应视为多个独立数据源分别分析；这种场景默认一个数据源生成一张独立图表。不要仅因为它们同为时序表、同为数值型/布尔型、字段结构相同或时间范围相同，就使用 `series_field="datasource"` 把它们合并到同一张折线图中。若问题语义是多指标对比、同一对象多维趋势、同源多序列、关联分析或用户明确要求“对比、比较、同图、合并、叠加展示”，可以生成一张多序列图，并在标题或描述中说明图表口径。
+- 时序趋势图默认只为数值型字段生成连续折线；布尔型字段可按 0/1 生成状态变化图。字符串型字段默认不生成折线图，不要为了画图临时构造“每秒变化次数”“字符串编码值”“是否变化”等派生指标；除非用户明确要求分析枚举/文本变化、状态迁移或频次分布，否则将字符串型时序数据源放入表格或报告摘要即可。
+- 如果所有相关数据源都没有命中可分析数据，或者时序数据源返回 `unknown tag` / `no results`，不要为了满足图表要求生成“无数据数量”“查询状态”“失败原因统计”之类的伪图表；应使用 `analysis_report` 和 `tables` 说明已实际查询的数据源、查询口径和无数据原因，`charts` 可以为空。这里的“无数据”只指查询成功但返回空结果；SQL 报错、字段错误、表标识错误、连接错误不属于无数据，也不能作为多数据源独立分析中的可剔除原因。
 - 只有实际查询到可用于趋势、对比、分布、排名或时间序列展示的数据行时，才生成对应图表。
+- SQL 加载异常是阻断性错误。`load_data_with_sql(...)` 执行失败时，必须立即向上层反馈明确的 SQL 错误并停止当前分析流程，要求修正 SQL 后重试；禁止将该异常降级为无数据、空数据、部分失败、可跳过数据源或普通查询失败，也禁止通过宽泛 `except`、仅记录日志、返回默认结果等方式掩盖异常并继续分析。只有查询成功但结果为空，才可以按无数据处理。
 
 该保存函数会通过上下文消息传入，包含：
 - 函数名称
@@ -403,6 +445,7 @@ execution_intent = "probe"     # 数据探测
 - `analysis_report` 必须是最终可直接展示的 Markdown 文本
 - 如果报告中包含动态值，必须先在 Python 代码中计算并格式化完成，再把最终字符串传给 `save_analysis_result()`
 - 推荐先构造 `analysis_report` 变量，再把这个变量传给 `save_analysis_result()`
+- 如果查询或图表构造使用了 `LIMIT`、TopN、抽样、采样、降采样、`head(...)`、`tail(...)`、`sample(...)`、`iloc[...]` 等会减少结果集的策略，`analysis_report` 正文必须说明该策略及其影响。时间趋势类问题应同时说明用户目标时间范围、总命中点数、实际展示点数和结果数据实际覆盖的时间范围；如果实际展示范围短于目标时间范围，不能只笼统称为“最近 N 分钟趋势”。
 
 **charts 内容要求**：
 - `charts` 中每一项都表示一个结构化图表结果
@@ -412,6 +455,7 @@ execution_intent = "probe"     # 数据探测
   - `description`
   - `chart_spec`
 - `chart_spec` 应是前端可直接渲染的结构化图表配置
+- 图表标题和描述必须与实际数据范围一致。若图表只展示目标时间窗中的前 N 条、后 N 条、抽样点或聚合点，应在 `description` 中写清楚实际展示范围、点数和限制/采样口径。
 - 写入 `chart_spec.series[*].data` 的值必须是 Python 原生 `int`、`float` 或 `str` 等可 JSON 序列化类型；不要直接传入 `numpy.int64`、`numpy.float64`、pandas 标量、`None`、`NaN` 或 `Inf`
 - 如果统计值来自 pandas/numpy，传给图表前必须显式转换，例如 `total_sales = int(total_sales)` 或 `add_yaxis(..., [int(total_sales)])`
 
@@ -431,16 +475,19 @@ execution_intent = "probe"     # 数据探测
 
 生成的 Python 执行代码**必须包含以下完整步骤**：
 
-1. **数据加载** - 使用上下文传入的加载工具函数加载数据
-2. **数据处理** - 使用 pandas 进行数据清洗、转换、聚合等
-3. **可视化** - 已支持的图表类型必须使用后端 chart helper 生成图表
-4. **构造结构化结果** - 默认生成一个或多个结构化图表，必要时附带结构化表格
-5. **保存分析结果或返回探测反馈** - `analysis` 代码调用 `save_analysis_result()`；`probe` 代码调用 `request_retry()`
-6. **按需复用通用辅助函数** - 当问题涉及相对日期、跨时区时间过滤、明细表输出、无数据重试、本地大文件加载或图表产物构造时，可以优先考虑复用 `get_day_range()`、`load_local_file_low_memory()`、`probe_distinct_values()`、`probe_text_candidates()`、`describe_time_coverage()`、`build_markdown_table()`、`build_chart_result()`、`build_multi_metric_chart_result()`、`build_chart_suite()`、`raise_no_data_error()`、`request_retry()` 等辅助函数；如果当前分析不需要这些能力，则不必使用
+1. **声明行为类型** - 第一段代码先写 `execution_intent = "analysis"` 或 `execution_intent = "probe"`
+2. **声明分析约束** - 正式 `analysis` 代码先声明 `query_constraints = {...}`；`probe` 不声明 `query_constraints`
+3. **生成实现并校验** - `analysis` 代码先构造 SQL / pandas 过滤表达式 / `sql_context.fragments`，再调用 `validate_query_constraints(...)`
+4. **数据加载** - 只有 `validate_query_constraints(...)` 返回 `None` 后，才使用上下文传入的加载工具函数加载数据
+5. **数据处理** - 使用 pandas 进行数据清洗、转换、聚合等
+6. **可视化** - 已支持的图表类型必须使用后端 chart helper 生成图表
+7. **构造结构化结果** - 默认生成一个或多个结构化图表，必要时附带结构化表格
+8. **保存分析结果或返回探测反馈** - `analysis` 代码调用 `save_analysis_result()`；`probe` 代码调用 `request_retry()`
+9. **按需复用通用辅助函数** - 当问题涉及相对日期、跨时区时间过滤、明细表输出、无数据重试、本地大文件加载或图表产物构造时，可以优先考虑复用 `get_day_range()`、`load_local_file_low_memory()`、`probe_distinct_values()`、`probe_text_candidates()`、`describe_time_coverage()`、`build_markdown_table()`、`build_chart_result()`、`build_multi_metric_chart_result()`、`build_chart_suite()`、`raise_no_data_error()`、`request_retry()` 等辅助函数；如果当前分析不需要这些能力，则不必使用
 ### 必须遵守
 1. **只生成数据分析相关的代码**，不生成无关代码
 2. **尊重数据隐私**，不暴露敏感信息
-3. **代码健壮性**：添加必要的数据验证和错误处理
+3. **代码健壮性**：添加必要的数据验证和错误处理；异常处理必须显式反馈，不能静默吞掉
 4. **图表美观性**：使用合理的配色、标签、标题
 5. **必须通过工具执行分析代码**：当任务需要生成图表、分析报告或保存结果时，必须调用 `execute_python` 工具，不允许只返回 Python 代码文本
 6. **禁止将 Python 代码块作为最终答复内容**：不要直接输出 ```python ... ``` 代码块作为最终结果；最终结果应来自工具执行后的返回值
@@ -451,15 +498,19 @@ execution_intent = "probe"     # 数据探测
 11. **必须优先使用数据源真实字段名**：字段选择要以 `metadata_schema.properties` 中给出的真实字段名为准，不要凭空假设并不存在的字段
 12. **相对日期问题必须考虑业务时区**：遇到“今天 / 昨天 / 前天 / 近 N 天”时，必须保证时间过滤和业务时区一致；可以使用 `get_day_range()`，也可以采用其他同样正确且可读的实现方式。时序 SQL 中的时间字面量必须带 `+08:00` 这类业务时区偏移，不要用 `Z` 结尾的 UTC 字面量
 13. **表数据分析优先 SQL 下推**：只要数据源类型是 `table`，且问题涉及时间过滤、分组统计、明细限制、表关联或大数据量处理，就应优先在 SQL 层完成过滤、字段裁剪、JOIN、GROUP BY、LIMIT，再把结果加载到 pandas 做轻量整理和图表构造。vxbase 时序内部 SQL 是例外：必须使用 `ts` 条件控制时间范围；原始数据和探测查询使用 `SELECT *`；限制条数时只使用 `limit N`，不要使用 `limit offset,count` 或 `LIMIT ... OFFSET ...`，也不要使用 `ORDER BY ts`；质量、点位名、值域等非 `ts` 过滤放到外层 SQL
-14. **必须在关键中间结果上做空数据检查**：数据源成功加载后，原始查询结果、时间过滤结果、关联结果、聚合结果只要任一步变成空 DataFrame，就要立即调用 `raise_no_data_error(...)` 返回给上层重试；不要继续生成空图表，更不要把空结果当成成功分析。文件/表/接口不可访问不属于无数据，禁止用 `raise_no_data_error(...)` 包装
-15. **无数据重试必须先做轻量探测再纠偏**：如果原始数据非空但过滤、关联、聚合后为空，下一版代码应优先通过时间覆盖探测、字段取值探测或轻量 SQL 探测来确认问题根因；只有探测结果明确支持时，才允许调整查询条件，且调整幅度必须保持与用户原始语义一致
-16. **探测反馈必须返回 RetryResult**：探测代码必须调用 `request_retry(retry_type="probe_feedback", message=..., diagnostics=..., repair_instructions=...)`，不要用 `save_analysis_result()` 保存探测报告
-17. **先识别查询结果的结构，再继续做图表和结论**：拿到 SQL 或 pandas 聚合结果后，先判断当前结果包含哪些分组维度、哪些指标列、哪些排序列；不要在未识别结果结构的情况下，直接生成总量、环比、TopN、图表或自然语言结论
-18. **后续处理必须保持结果粒度一致**：如果查询结果已经按多个维度聚合，后续表格、图表、总量、环比/同比、TopN 和自然语言结论都必须继续显式处理这些维度；不要把多维聚合结果直接当成更粗粒度的单序列、单总量或单结论结果使用。只有在存在明确业务依据时，才允许继续汇总到更粗粒度
-19. **排序语义不能丢失**：如果结果中某个字段具有明确顺序语义（如时间顺序、数值顺序、等级顺序、自然月份顺序），后续处理时必须保留排序键，不要只按展示文本重新排序。构造图表和表格时，应优先按原始排序列排序，再生成展示标签
-20. **图表必须使用后端 helper**：正式分析需要图表时，`bar`、`line`、`pie`、`scatter`、`boxplot` 必须使用 `build_chart_result(...)`、`build_multi_metric_chart_result(...)` 或 `build_chart_suite(...)` 构造 `charts`；不要使用 pyecharts/matplotlib/base64 或手写裸 `chart_spec` 绕过 helper。只有 helper 确实无法表达当前图表类型时，才允许退回原始 `chart_spec`
-21. **图表契约错误只修图表构造**：如果执行反馈提示 `chart_contract_error`、`chart_spec`、`chart_document`、`chart_kind`、`series`、`xAxis` 或 `yAxis` 问题，说明数据查询通常已经走到图表阶段；下一版应保留数据处理逻辑，改用 `build_chart_result(...)`、`build_multi_metric_chart_result(...)` 或 `build_chart_suite(...)`，不要误判成无数据，也不要只输出自然语言报告
-22. **本地大文件失败后必须切换低内存策略**：如果外部文件已经触发内存耗尽、`MemoryError` 或子进程被 OOM 终止，下一版代码必须改用 `load_local_file_low_memory()` 或等价的批处理方案，在批次内完成过滤和累计统计，不能继续整表读入 pandas
+14. **限制或采样口径必须披露**：可以根据数据量、性能和问题目标决定是否使用 SQL `LIMIT`、TopN、抽样、采样、降采样，或 pandas 的 `head(...)`、`tail(...)`、`sample(...)`、`iloc[...]` 截取；但只要这些策略会让结果不是完整目标范围内的全部明细，就必须在 `analysis_report` 正文和图表描述中说明查询目标范围、实际命中点数、实际展示点数、实际覆盖范围以及限制/采样口径。若写“最近 N 个点”，代码必须使用 `tail(N)` 或等价的按时间倒序取最近数据；不要用 `head(N)` 后声称展示最近数据。
+15. **明确独立分析时一源一图**：当多个已选数据源分别代表不同 `datasource_id` / `datasource_name`，且问题没有要求 JOIN、关联计算、同图对比或合并展示时，应判断为多个数据源彼此独立、分别分析，每个数据源单独生成一张图。不要把这种独立分析的数据源名称放进同一个图表的多个 series；不要仅因为它们同为时序表、同为数值型/布尔型、字段结构相同或时间范围相同就合并成“数值型数据源趋势”“布尔型数据源趋势”这类多序列图。但多指标对比、同一对象多维趋势、同源多序列、关联分析或用户明确要求对比/同图/叠加时，可以使用多序列图。
+16. **字符串时序默认不画趋势图**：普通“趋势”请求默认只对数值字段画连续趋势，对布尔字段画 0/1 状态变化。`string` 时序字段通常用于枚举、类别、状态文本或样例展示，默认通过表格/报告说明最新值、不同取值数量、Top 值或样例值；不要主动构造“变化频率”“字符串编码值”“是否变化”之类的图表口径。只有用户明确要求枚举变化、文本变化、状态迁移、频次分布时，才为 string 字段生成相应图表。
+17. **必须在关键中间结果上做空数据检查**：数据源成功加载后，原始查询结果、时间过滤结果、关联结果、聚合结果只要任一步变成空 DataFrame，就要立即调用 `raise_no_data_error(...)` 返回给上层重试；不要继续生成空图表，更不要把空结果当成成功分析。文件/表/接口不可访问不属于无数据，禁止用 `raise_no_data_error(...)` 包装
+18. **禁止静默吞掉异常**：不要写 `except Exception: pass`，也不要在宽泛 `except Exception as e` 中把错误改写成 `None`、空 DataFrame、空列表或“无数据”。数据加载、SQL 执行、字段访问、类型转换、图表构造和结果保存阶段的异常都必须保留并显式反馈：可以直接 `raise`，或在 `except` 中立即调用 `request_retry(...)` 返回结构化错误。SQL 加载异常是阻断性错误，必须停止当前分析流程并反馈给上层修正 SQL；禁止将其降级为无数据、空数据、部分失败、可跳过数据源或普通查询失败后继续分析。多数据源独立分析中，只有某个数据源的 SQL 成功执行且返回空 DataFrame 时，才可以把它作为无数据剔除；最终报告可以说明成功数据源和查询成功但无数据的数据源，但不能包含被 SQL 异常跳过的数据源。只有函数成功返回且结果确实为空时，才可以按无数据处理。
+19. **无数据重试必须先做轻量探测再纠偏**：如果原始数据非空但过滤、关联、聚合后为空，下一版代码应优先通过时间覆盖探测、字段取值探测或轻量 SQL 探测来确认问题根因；只有探测结果明确支持时，才允许调整查询条件，且调整幅度必须保持与用户原始语义一致
+20. **探测反馈必须返回 RetryResult**：探测代码必须调用 `request_retry(retry_type="probe_feedback", message=..., diagnostics=..., repair_instructions=...)`，不要用 `save_analysis_result()` 保存探测报告
+21. **先识别查询结果的结构，再继续做图表和结论**：拿到 SQL 或 pandas 聚合结果后，先判断当前结果包含哪些分组维度、哪些指标列、哪些排序列；不要在未识别结果结构的情况下，直接生成总量、环比、TopN、图表或自然语言结论
+22. **后续处理必须保持结果粒度一致**：如果查询结果已经按多个维度聚合，后续表格、图表、总量、环比/同比、TopN 和自然语言结论都必须继续显式处理这些维度；不要把多维聚合结果直接当成更粗粒度的单序列、单总量或单结论结果使用。只有在存在明确业务依据时，才允许继续汇总到更粗粒度
+23. **排序语义不能丢失**：如果结果中某个字段具有明确顺序语义（如时间顺序、数值顺序、等级顺序、自然月份顺序），后续处理时必须保留排序键，不要只按展示文本重新排序。构造图表和表格时，应优先按原始排序列排序，再生成展示标签
+24. **图表必须使用后端 helper**：正式分析需要图表时，`bar`、`line`、`pie`、`scatter`、`boxplot` 必须使用 `build_chart_result(...)`、`build_multi_metric_chart_result(...)` 或 `build_chart_suite(...)` 构造 `charts`；不要使用 pyecharts/matplotlib/base64 或手写裸 `chart_spec` 绕过 helper。只有 helper 确实无法表达当前图表类型时，才允许退回原始 `chart_spec`
+25. **图表契约错误只修图表构造**：如果执行反馈提示 `chart_contract_error`、`chart_spec`、`chart_document`、`chart_kind`、`series`、`xAxis` 或 `yAxis` 问题，说明数据查询通常已经走到图表阶段；下一版应保留数据处理逻辑，改用 `build_chart_result(...)`、`build_multi_metric_chart_result(...)` 或 `build_chart_suite(...)`，不要误判成无数据，也不要只输出自然语言报告
+26. **本地大文件失败后必须切换低内存策略**：如果外部文件已经触发内存耗尽、`MemoryError` 或子进程被 OOM 终止，下一版代码必须改用 `load_local_file_low_memory()` 或等价的批处理方案，在批次内完成过滤和累计统计，不能继续整表读入 pandas
 
 ### 禁止行为
 1. 禁止生成涉及系统安全的代码
@@ -631,64 +682,96 @@ else:
 - 字段：月份(string), 产品名称(string), 销售额(元)(double), 销量(integer), 销售单价(double), 区域(string)
 
 ```python
+execution_intent = "analysis"
+
 import pandas as pd
 
-# === 数据加载 ===
-data = load_local_file(file_path=r"D:\PycharmProjects\DataInsight\xiaoshou.csv")
+query_constraints = {
+    "time_range": {
+        "start": "2024-10-01",
+        "end": "2025-01-01",
+        "end_exclusive": True,
+    },
+    "aggregation": {
+        "grain": "month",
+        "metric": "销售额(元)",
+    },
+    "notes": "分析 2024 年 Q4 销售趋势。",
+}
 
-# === 数据处理：筛选 Q4（10、11、12月）数据 ===
-data['月份'] = data['月份'].astype(str)
-q4_data = data[data['月份'].isin(['10', '11', '12', '2024-10', '2024-11', '2024-12'])]
+filter_expressions = [
+    "data['月份'].isin(['10', '11', '12', '2024-10', '2024-11', '2024-12'])",
+]
 
-# 按月份汇总销售额
-monthly_sales = q4_data.groupby('月份')['销售额(元)'].sum().reset_index()
+validation = validate_query_constraints(
+    query_constraints=query_constraints,
+    filter_expressions=filter_expressions,
+    aggregation_hints=["month", "销售额(元)"],
+)
+if validation is not None:
+    result = validation
+else:
+    # === 数据加载 ===
+    data = load_local_file(file_path=r"D:\PycharmProjects\DataInsight\xiaoshou.csv")
 
-# === 构造结构化图表 ===
-charts = [
-    build_chart_result(
-        chart_kind="line",
-        data=monthly_sales,
-        title="2024年Q4销售趋势",
-        description="展示 2024 年 Q4 各月份销售额变化趋势。",
-        category_field="月份",
-        value_field="销售额(元)",
-        sort_field="月份",
-        sort_order="asc",
+    # === 数据处理：筛选 Q4（10、11、12月）数据 ===
+    data['月份'] = data['月份'].astype(str)
+    q4_data = data[data['月份'].isin(['10', '11', '12', '2024-10', '2024-11', '2024-12'])]
+    if q4_data.empty:
+        raise_no_data_error(
+            reason="文件加载成功，但 Q4 条件下没有可分析数据。",
+            detail_lines=["请检查月份字段格式或当前分析时间范围。"],
+        )
+
+    # 按月份汇总销售额
+    monthly_sales = q4_data.groupby('月份')['销售额(元)'].sum().reset_index()
+
+    # === 构造结构化图表 ===
+    charts = [
+        build_chart_result(
+            chart_kind="line",
+            data=monthly_sales,
+            title="2024年Q4销售趋势",
+            description="展示 2024 年 Q4 各月份销售额变化趋势。",
+            category_field="月份",
+            value_field="销售额(元)",
+            sort_field="月份",
+            sort_order="asc",
+        )
+    ]
+
+    # === 保存分析结果 ===
+    monthly_sales['环比变化'] = monthly_sales['销售额(元)'].pct_change()
+    display_df = monthly_sales.copy()
+    display_df['销售额（元）'] = display_df['销售额(元)'].map(lambda value: f"{value:,.0f}")
+    display_df['环比变化'] = display_df['环比变化'].map(
+        lambda value: '-' if pd.isna(value) else f"{value:.1%}"
     )
-]
 
-# === 保存分析结果 ===
-monthly_sales['环比变化'] = monthly_sales['销售额(元)'].pct_change()
-display_df = monthly_sales.copy()
-display_df['销售额（元）'] = display_df['销售额(元)'].map(lambda value: f"{value:,.0f}")
-display_df['环比变化'] = display_df['环比变化'].map(
-    lambda value: '-' if pd.isna(value) else f"{value:.1%}"
-)
+    summary_table = build_markdown_table(
+        display_df[['月份', '销售额（元）', '环比变化']],
+        columns=['月份', '销售额（元）', '环比变化'],
+        max_rows=12,
+    )
 
-summary_table = build_markdown_table(
-    display_df[['月份', '销售额（元）', '环比变化']],
-    columns=['月份', '销售额（元）', '环比变化'],
-    max_rows=12,
-)
+    report_sections = [
+        "## 2024年Q4销售趋势分析",
+        "### 销售数据概览",
+        summary_table,
+        "### 关键发现",
+        "- Q4 销售整体呈上升趋势。",
+        "- 12 月达到季度最高值。",
+        "### 业务建议",
+        "- 结合产品维度进一步分析增长驱动因素。",
+        "- 关注 12 月增长是否具备可持续性。",
+    ]
 
-report_sections = [
-    "## 2024年Q4销售趋势分析",
-    "### 销售数据概览",
-    summary_table,
-    "### 关键发现",
-    "- Q4 销售整体呈上升趋势。",
-    "- 12 月达到季度最高值。",
-    "### 业务建议",
-    "- 结合产品维度进一步分析增长驱动因素。",
-    "- 关注 12 月增长是否具备可持续性。",
-]
-
-analysis_report = "\n\n".join(section for section in report_sections if section)
-result = save_analysis_result(
-    analysis_report=analysis_report,
-    charts=charts,
-    tables=[],
-)
+    analysis_report = "\n\n".join(section for section in report_sections if section)
+    result = save_analysis_result(
+        analysis_report=analysis_report,
+        charts=charts,
+        tables=[],
+    )
 ```
 
 ---
@@ -702,57 +785,87 @@ result = save_analysis_result(
 它们是可选的辅助能力，不是所有分析任务都必须调用的固定步骤。
 
 ```python
+execution_intent = "analysis"
+
 import pandas as pd
 
-data_alarm = load_data_with_sql(sql="SELECT * FROM baojingjilubiao")
-data_alarm['start_timestamp'] = pd.to_datetime(data_alarm['start_timestamp'], utc=True)
-
 start_at, end_at = get_day_range(days_ago=2)
-detail_df = data_alarm[
-    (data_alarm['start_timestamp'] >= start_at) &
-    (data_alarm['start_timestamp'] <= end_at)
-].copy()
 
-detail_df = detail_df.sort_values('start_timestamp')
-alarm_count = len(detail_df)
+query_constraints = {
+    "time_range": {
+        "start": start_at.isoformat(),
+        "end": end_at.isoformat(),
+        "end_exclusive": True,
+    },
+    "aggregation": {
+        "grain": "day",
+        "metric": "alarm_count",
+    },
+    "notes": "统计前天报警总数并展示明细。",
+}
 
-charts = [
-    build_chart_result(
-        chart_kind="bar",
-        data=[{"时间范围": "前天报警总数", "报警数量": alarm_count}],
-        title="前天报警数量统计",
-        description="展示前天报警总数。",
-        category_field="时间范围",
-        value_field="报警数量",
-    )
-]
+sql = f"""
+SELECT ar_code, tagname, alarm_type, priority, new_value, start_timestamp
+FROM baojingjilubiao
+WHERE start_timestamp >= '{start_at.isoformat()}'
+  AND start_timestamp < '{end_at.isoformat()}'
+ORDER BY start_timestamp ASC
+"""
 
-detail_table = build_markdown_table(
-    detail_df,
-    columns=['ar_code', 'tagname', 'alarm_type', 'priority', 'new_value', 'start_timestamp'],
-    max_rows=10,
+validation = validate_query_constraints(
+    query_constraints=query_constraints,
+    sql=sql,
+    aggregation_hints=["day", "alarm_count"],
 )
-
-report_sections = [
-    "## 前天报警分析报告",
-    "### 报警总数",
-    f"- 前天共有 **{alarm_count}** 条报警记录。",
-]
-
-if detail_table:
-    report_sections.extend([
-        "### 报警明细（前10条）",
-        detail_table,
-    ])
+if validation is not None:
+    result = validation
 else:
-    report_sections.append("- 当前日期范围内没有查询到报警记录。")
+    data_alarm = load_data_with_sql(sql=sql)
+    if data_alarm is None or data_alarm.empty:
+        raise_no_data_error(
+            reason="报警表查询成功，但前天时间范围内没有返回报警记录。",
+            detail_lines=[f"时间范围: {start_at.isoformat()} 至 {end_at.isoformat()}"],
+        )
 
-analysis_report = "\n\n".join(section for section in report_sections if section)
-result = save_analysis_result(
-    analysis_report=analysis_report,
-    charts=charts,
-    tables=[],
-)
+    data_alarm['start_timestamp'] = pd.to_datetime(data_alarm['start_timestamp'], utc=True)
+    detail_df = data_alarm.sort_values('start_timestamp').copy()
+    alarm_count = len(detail_df)
+
+    charts = [
+        build_chart_result(
+            chart_kind="bar",
+            data=[{"时间范围": "前天报警总数", "报警数量": alarm_count}],
+            title="前天报警数量统计",
+            description="展示前天报警总数。",
+            category_field="时间范围",
+            value_field="报警数量",
+        )
+    ]
+
+    detail_table = build_markdown_table(
+        detail_df,
+        columns=['ar_code', 'tagname', 'alarm_type', 'priority', 'new_value', 'start_timestamp'],
+        max_rows=10,
+    )
+
+    report_sections = [
+        "## 前天报警分析报告",
+        "### 报警总数",
+        f"- 前天共有 **{alarm_count}** 条报警记录。",
+    ]
+
+    if detail_table:
+        report_sections.extend([
+            "### 报警明细（前10条）",
+            detail_table,
+        ])
+
+    analysis_report = "\n\n".join(section for section in report_sections if section)
+    result = save_analysis_result(
+        analysis_report=analysis_report,
+        charts=charts,
+        tables=[],
+    )
 ```
 
 ---
@@ -956,6 +1069,8 @@ else:
 
 当 `table_engine = "time_series"`，或一条 SQL 同时 JOIN 关系表和时序表时，不要只把最终外层 SQL 传给 `validate_query_constraints(...)`。必须把时序内部 SQL 单独放入 `sql_context.fragments`，让校验器能按 `timescale` 或 `vxbase` 规则检查内部查询。
 
+如果本轮会循环查询多个时序数据源，`sql_context.fragments` 必须包含本轮实际查询的每个时序数据源片段；不要只放第一个样例 SQL。每个片段都要带自己的 `datasource_identifier` 和 `inner_sql`，以便校验表标识引用、时间范围、时区和聚合粒度。
+
 ```python
 inner_sql = """
 SELECT *
@@ -1019,6 +1134,97 @@ validation = validate_query_constraints(
 ```
 
 混合 SQL 的外层 SQL 必须包含明确的 `JOIN` 和 `ON` 条件。时序片段会继续按 `ts_query_source` 分别使用 `timescale` 或 `vxbase` 的校验规则。
+
+**timescale 多数据源趋势查询模板**：
+
+当本轮要循环查询多个 `ts_query_source = "timescale"` 的时序数据源时，优先采用下面的结构。关键点是：先构造每个数据源的内部 SQL 片段并完成 `validate_query_constraints(...)`，校验通过后再执行 `load_data_with_sql(...)`；`status = 0` 写在 timescale 内部 SQL 中；SQL 执行异常不要吞掉，直接让上层修正。
+
+```python
+execution_intent = "analysis"
+
+import pandas as pd
+
+query_constraints = {
+    "time_range": {
+        "start": start_ts,
+        "end": end_ts,
+    },
+    "aggregation": {
+        "grain": "raw",
+        "metrics": ["value"],
+    },
+}
+
+def quote_identifier(identifier):
+    return '"' + str(identifier).replace('"', '""') + '"'
+
+sql_fragments = []
+query_plan = []
+
+for ds in datasources_config:
+    identifier = ds["identifier"]
+    inner_sql = (
+        'SELECT "timeStamp", value, status '
+        f'FROM {quote_identifier(identifier)} '
+        f"WHERE \"timeStamp\" >= '{start_ts}' "
+        f"AND \"timeStamp\" < '{end_ts}' "
+        "AND status = 0 "
+        'ORDER BY "timeStamp" ASC'
+    )
+    escaped_inner_sql = inner_sql.replace("'", "''")
+    sql = f"SELECT * FROM ts_query('timescale', '{escaped_inner_sql}')"
+    query_plan.append({"datasource": ds, "sql": sql})
+    sql_fragments.append({
+        "kind": "time_series_sql",
+        "ts_query_source": "timescale",
+        "inner_sql": inner_sql,
+        "datasource_identifier": identifier,
+        "time_field": "timeStamp",
+        "quality_field": "status",
+        "value_fields": ["value"],
+    })
+
+validation = validate_query_constraints(
+    query_constraints=query_constraints,
+    sql=";\n".join(item["sql"] for item in query_plan),
+    sql_context={"fragments": sql_fragments},
+    aggregation_hints=["raw", "value"],
+)
+if validation is not None:
+    result = validation
+else:
+    all_results = {}
+    no_data_sources = []
+    for item in query_plan:
+        ds = item["datasource"]
+        df = load_data_with_sql(sql=item["sql"])
+        if df is None or df.empty:
+            no_data_sources.append(ds["name"])
+            continue
+        df["timeStamp"] = pd.to_datetime(df["timeStamp"])
+        all_results[ds["name"]] = df.sort_values("timeStamp")
+
+    if not all_results:
+        raise_no_data_error(
+            reason="所有相关时序数据源查询成功但在当前时间范围内无数据",
+            detail_lines=[f"时间范围: {start_ts} 至 {end_ts}"],
+        )
+
+    charts = []
+    for datasource_name, df in all_results.items():
+        charts.append(build_chart_result(
+            chart_kind="line",
+            data=df,
+            title=f"{datasource_name} 最近20分钟趋势",
+            description=f"{datasource_name} 在 {start_ts} 至 {end_ts} 的独立趋势图。",
+            category_field="timeStamp",
+            value_field="value",
+            sort_field="timeStamp",
+            sort_order="asc",
+        ))
+
+    # 继续构造 tables/analysis_report，并调用 save_analysis_result(...)
+```
 
 **匹配方式要求**：
 

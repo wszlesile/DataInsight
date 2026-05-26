@@ -38,6 +38,63 @@ function formatChartNumber(value) {
   })
 }
 
+function parseTemporalValue(value) {
+  if (value === null || value === undefined || value === '') return null
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const date = new Date(value)
+    return Number.isNaN(date.getTime()) ? null : date
+  }
+  const text = String(value).trim()
+  if (!text) return null
+  const date = new Date(text)
+  return Number.isNaN(date.getTime()) ? null : date
+}
+
+function isTemporalValue(value) {
+  return parseTemporalValue(value) !== null
+}
+
+function isTemporalCategoryAxis(axis, categoryData = []) {
+  const axisName = String(axis?.name || '').toLowerCase()
+  if (/(time|date|timestamp|时间|日期)/.test(axisName)) return true
+  const sample = categoryData.filter((item) => item !== null && item !== undefined && item !== '').slice(0, 8)
+  return sample.length > 0 && sample.every(isTemporalValue)
+}
+
+function hasMultipleTemporalDays(values = []) {
+  const days = new Set()
+  values.forEach((value) => {
+    const date = parseTemporalValue(value)
+    if (!date) return
+    days.add(`${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`)
+  })
+  return days.size > 1
+}
+
+function padDatePart(value) {
+  return String(value).padStart(2, '0')
+}
+
+function formatTemporalValue(value, mode = 'axis', options = {}) {
+  const date = parseTemporalValue(value)
+  if (!date) return value ?? ''
+
+  const month = padDatePart(date.getMonth() + 1)
+  const day = padDatePart(date.getDate())
+  const hour = padDatePart(date.getHours())
+  const minute = padDatePart(date.getMinutes())
+  const second = padDatePart(date.getSeconds())
+
+  if (mode === 'tooltip') {
+    return `${date.getFullYear()}-${month}-${day} ${hour}:${minute}:${second}`
+  }
+  if (options.showDate) {
+    return `${month}-${day} ${hour}:${minute}`
+  }
+  return `${hour}:${minute}:${second}`
+}
+
 function sanitizeChartSpec(chartSpec) {
   if (!chartSpec || typeof chartSpec !== 'object') return null
   const normalized = JSON.parse(JSON.stringify(chartSpec))
@@ -51,6 +108,7 @@ function sanitizeChartSpec(chartSpec) {
   normalized.animationDelayUpdate = 0
 
   if (backendManaged) {
+    applyAxisDisplayRules(normalized)
     applyTooltipDisplayRules(normalized)
     return normalized
   }
@@ -144,8 +202,15 @@ function applyAxisDisplayRules(normalized) {
       const categoryData = Array.isArray(axis.data) ? axis.data : []
       const maxLabelLength = categoryData.reduce((max, item) => Math.max(max, String(item ?? '').length), 0)
       if (axis.type === 'category') {
+        if (isTemporalCategoryAxis(axis, categoryData)) {
+          const showDate = hasMultipleTemporalDays(categoryData)
+          axis.axisLabel.formatter = (value) => formatTemporalValue(value, 'axis', { showDate })
+          axis.axisLabel.rotate = axis.axisLabel.rotate ?? 0
+          axis.axisLabel.width = axis.axisLabel.width || (showDate ? 90 : 72)
+          axis.axisLabel.overflow = 'break'
+        }
         if (categoryData.length > 8 || maxLabelLength > 8) {
-          axis.axisLabel.rotate = axis.axisLabel.rotate || (maxLabelLength > 14 ? 45 : 30)
+          axis.axisLabel.rotate = axis.axisLabel.rotate ?? (maxLabelLength > 14 ? 45 : 30)
         }
         if (categoryData.length > 16) {
           const intervalStep = Math.max(Math.ceil(categoryData.length / 8) - 1, 0)
@@ -210,15 +275,22 @@ function applyTooltipDisplayRules(normalized) {
   if (typeof normalized.tooltip.formatter !== 'function') {
     normalized.tooltip.formatter = (params) => {
       const rows = Array.isArray(params) ? params : [params]
-      return rows
+      const axisValue = rows.find(Boolean)?.axisValue ?? rows.find(Boolean)?.name
+      const axisHeader = isTemporalValue(axisValue)
+        ? `<div style="margin-bottom:4px;font-weight:600;">${formatTemporalValue(axisValue, 'tooltip')}</div>`
+        : (axisValue !== undefined && axisValue !== null && axisValue !== ''
+          ? `<div style="margin-bottom:4px;font-weight:600;">${axisValue}</div>`
+          : '')
+      const body = rows
         .filter(Boolean)
         .map((item) => {
           const marker = item.marker || ''
-          const seriesName = item.seriesName || item.name || ''
+          const seriesName = item.seriesName || ''
           const rawValue = Array.isArray(item.value) ? item.value[item.value.length - 1] : item.value
           return `${marker}${seriesName}: ${formatChartNumber(rawValue)}`
         })
         .join('<br/>')
+      return `${axisHeader}${body}`
     }
   }
 }

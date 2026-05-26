@@ -1,6 +1,8 @@
 import json
+import math
 import re
 from collections import defaultdict
+from datetime import date, datetime, time
 from typing import Any
 
 from utils.chart_spec_utils import finalize_chart_spec
@@ -24,7 +26,7 @@ def build_chart_document(
     x_field: str | None = None,
     y_field: str | None = None,
     sort_field: str | None = None,
-    sort_order: str = "desc",
+    sort_order: str = "",
     limit: int | None = None,
     orientation: str = "auto",
     label_mode: str = "auto",
@@ -65,7 +67,7 @@ def build_chart_document(
         },
         "transform": {
             "sort_field": str(sort_field or "").strip() or None,
-            "sort_order": "asc" if str(sort_order or "").lower() == "asc" else "desc",
+            "sort_order": "asc" if str(sort_order or ("asc" if chart_kind_value == "line" else "desc")).lower() == "asc" else "desc",
             "limit": _to_positive_int(limit),
             "top_n": _to_positive_int(top_n),
         },
@@ -91,7 +93,7 @@ def build_chart_result(
     x_field: str | None = None,
     y_field: str | None = None,
     sort_field: str | None = None,
-    sort_order: str = "desc",
+    sort_order: str = "",
     limit: int | None = None,
     orientation: str = "auto",
     label_mode: str = "auto",
@@ -136,7 +138,7 @@ def build_multi_metric_chart_result(
     value_labels: list[str] | tuple[str, ...] | None = None,
     chart_kind: str = "bar",
     sort_field: str | None = None,
-    sort_order: str = "desc",
+    sort_order: str = "",
     limit: int | None = None,
     orientation: str = "auto",
     label_mode: str = "hidden",
@@ -205,7 +207,7 @@ def build_chart_suite(
     value_field: str,
     series_field: str | None = None,
     sort_field: str | None = None,
-    sort_order: str = "desc",
+    sort_order: str = "",
     limit: int | None = None,
     top_n: int | None = None,
     include_line: bool | None = None,
@@ -418,7 +420,8 @@ def normalize_chart_document(
         document.get("y_field"),
         value_field,
     )
-    default_sort_field = value_fields[0] if len(value_fields) > 1 else value_field
+    default_sort_field = category_field if chart_kind == "line" else value_fields[0] if len(value_fields) > 1 else value_field
+    default_sort_order = "asc" if chart_kind == "line" else "desc"
 
     normalized = {
         "version": str(document.get("version") or DEFAULT_DOCUMENT_VERSION),
@@ -442,7 +445,7 @@ def normalize_chart_document(
                 document.get("sort_field"),
                 default_sort_field,
             ),
-            "sort_order": "asc" if str(transform.get("sort_order") or document.get("sort_order") or "").lower() == "asc" else "desc",
+            "sort_order": "asc" if str(transform.get("sort_order") or document.get("sort_order") or default_sort_order).lower() == "asc" else "desc",
             "limit": _to_positive_int(transform.get("limit") or document.get("limit")),
             "top_n": _to_positive_int(transform.get("top_n") or document.get("top_n")),
         },
@@ -879,8 +882,26 @@ def _normalize_row(row: dict[str, Any], columns: list[str]) -> dict[str, Any]:
     normalized = {}
     for column in columns:
         value = row.get(column)
-        normalized[column] = value.item() if hasattr(value, "item") else value
+        normalized[column] = _normalize_cell_value(value)
     return normalized
+
+
+def _normalize_cell_value(value: Any) -> Any:
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if hasattr(value, "isoformat") and value.__class__.__name__ in {"Timestamp", "NaTType"}:
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return None
+    return value
 
 
 def _sort_rows(rows: list[dict[str, Any]], sort_field: str | None, sort_order: str | None) -> list[dict[str, Any]]:

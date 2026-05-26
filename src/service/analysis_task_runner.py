@@ -79,6 +79,19 @@ class AnalysisTaskRunner:
             final_status = "failed"
             error_message = str(exc)
             logger.error("后台分析任务执行失败: task_id=%s error=%s", task_id, exc, exc_info=True)
+            if self._recover_successful_turn_if_possible(
+                task_id=task_id,
+                agent_request=agent_request,
+                turn_id=turn_id,
+                is_rerun=is_rerun,
+            ):
+                if queue is not None:
+                    queue.push_event(turn_id, {
+                        "type": "done",
+                        "task_id": task_id,
+                        "turn_id": turn_id,
+                    })
+                return
             if queue is not None:
                 self._publish_error(queue, turn_id, task_id, error_message)
             self._fail_turn_if_possible(session, agent_request, turn_id, error_message)
@@ -126,6 +139,71 @@ class AnalysisTaskRunner:
             )
         except Exception:
             logger.warning("标记分析轮次失败时出错: turn_id=%s", turn_id, exc_info=True)
+
+    def _recover_successful_turn_if_possible(
+        self,
+        *,
+        task_id: str,
+        agent_request: AgentRequest,
+        turn_id: int,
+        is_rerun: bool,
+    ) -> bool:
+        recovery_session = SessionLocal()
+        try:
+            from service.conversation_context_service import ConversationContextService
+            from model import InsightNsTurn
+
+            service = ConversationContextService(recovery_session)
+            turn = recovery_session.query(InsightNsTurn).filter(
+                InsightNsTurn.id == int(turn_id or 0),
+                InsightNsTurn.conversation_id == int(agent_request.conversation_id or 0),
+                InsightNsTurn.is_deleted == 0,
+            ).first()
+            if turn is not None and turn.status == 'success' and (turn.final_answer or '').strip():
+                AnalysisTaskService(recovery_session).mark_finished(task_id, status="success", error_message="")
+                recovery_session.commit()
+                return True
+
+            latest_execution = service.get_latest_execution(int(turn_id or 0))
+            if latest_execution is None or latest_execution.execution_status != 'success':
+                return False
+            try:
+                payload = json.loads(latest_execution.result_payload_json or '{}')
+            except Exception:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+
+            analysis_report = str(payload.get('analysis_report') or latest_execution.analysis_report or '').strip()
+            charts = payload.get('charts') if isinstance(payload.get('charts'), list) else []
+            tables = payload.get('tables') if isinstance(payload.get('tables'), list) else []
+            if not analysis_report and not charts and not tables:
+                return False
+
+            service.complete_run(
+                conversation_id=int(agent_request.conversation_id or 0),
+                turn_id=int(turn_id or 0),
+                assistant_message='',
+                analysis_report=analysis_report,
+                charts=charts,
+                tables=tables,
+                replace_existing_results=bool(is_rerun),
+            )
+            AnalysisTaskService(recovery_session).mark_finished(task_id, status="success", error_message="")
+            recovery_session.commit()
+            logger.info(
+                "已从最新成功执行记录恢复分析轮次: task_id=%s turn_id=%s execution_id=%s",
+                task_id,
+                turn_id,
+                latest_execution.id,
+            )
+            return True
+        except Exception:
+            recovery_session.rollback()
+            logger.warning("从最新成功执行记录恢复分析轮次失败: task_id=%s turn_id=%s", task_id, turn_id, exc_info=True)
+            return False
+        finally:
+            recovery_session.close()
 
 
 _runner: AnalysisTaskRunner | None = None

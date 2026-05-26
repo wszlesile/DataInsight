@@ -49,8 +49,8 @@ PROBE_NO_DATA_RETRY_LIMIT = max(int(os.environ.get('PROBE_NO_DATA_RETRY_LIMIT', 
 PROBE_NO_DATA_RETRY_TYPES = {'probe_feedback', 'no_data_found'}
 GENERATED_CODE_FILENAME = '<generated_analysis_code>'
 GENERATED_CODE_CONTEXT_RADIUS = 2
-FRONTEND_TOOL_RETRY_MESSAGE = '分析代码需要调整，正在反馈给大模型重新生成。'
-FRONTEND_TOOL_ERROR_MESSAGE = '分析代码需要调整，正在反馈给大模型重新修改生成。'
+FRONTEND_TOOL_RETRY_MESSAGE = '分析代码规范需要调整，正在反馈给大模型重新生成。'
+FRONTEND_TOOL_ERROR_MESSAGE = '分析代码逻辑需要调整，正在反馈给大模型重新生成。'
 FRONTEND_TOOL_TIMEOUT_MESSAGE = '分析代码执行时间较长，正在反馈给大模型优化后重试。'
 
 CHART_CONTRACT_ERROR_MARKERS = (
@@ -475,9 +475,9 @@ def _check_time_range_constraint(query_constraints: dict[str, Any], code: str) -
         return None
 
     missing_parts = []
-    if start and start not in code:
+    if start and not _time_range_part_present(code, start):
         missing_parts.append('start')
-    if end and end not in code:
+    if end and not _time_range_part_present(code, end):
         missing_parts.append('end')
     if not missing_parts:
         return None
@@ -596,9 +596,42 @@ def _validate_relational_fragment(query_constraints: dict[str, Any], fragment: d
     return issues
 
 
+def _quote_sql_identifier(identifier: str) -> str:
+    return '"' + str(identifier or '').replace('"', '""') + '"'
+
+
+def _identifier_requires_quotes(identifier: str) -> bool:
+    text = str(identifier or '').strip()
+    if not text:
+        return False
+    return not bool(re.fullmatch(r'[a-z_][a-z0-9_]*', text))
+
+
+def _validate_timescale_identifier_quoting(fragment: dict[str, Any], code: str) -> dict[str, Any] | None:
+    datasource_identifier = str(fragment.get('datasource_identifier') or '').strip()
+    if not datasource_identifier or not _identifier_requires_quotes(datasource_identifier):
+        return None
+    quoted_identifier = _quote_sql_identifier(datasource_identifier)
+    if quoted_identifier in code:
+        return None
+    return _build_query_constraint_error(
+        'query_constraint_violation',
+        'timescale 内部 SQL 中的 datasource_identifier 包含大写字母、$ 或其他特殊字符时，必须使用双引号按原样引用。',
+        diagnostics={
+            'violated_constraint': 'timescale_identifier_quoting',
+            'ts_query_source': 'timescale',
+            'datasource_identifier': datasource_identifier,
+            'expected_identifier': quoted_identifier,
+        },
+    )
+
+
 def _validate_timescale_fragment(query_constraints: dict[str, Any], fragment: dict[str, Any]) -> list[dict[str, Any]]:
     code = _fragment_text(fragment)
     issues = _validate_relational_fragment(query_constraints, {**fragment, 'sql': code})
+    identifier_issue = _validate_timescale_identifier_quoting(fragment, code)
+    if identifier_issue is not None:
+        issues.append(identifier_issue)
     return issues
 
 
@@ -712,6 +745,57 @@ def _validate_vxbase_fragment(query_constraints: dict[str, Any], fragment: dict[
     return issues
 
 
+def _time_range_literal_candidates(value: Any) -> set[str]:
+    text = str(value or '').strip()
+    if not text:
+        return set()
+
+    candidates = {text}
+    if ' ' in text and 'T' not in text:
+        candidates.add(text.replace(' ', 'T'))
+        if re.fullmatch(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}', text):
+            candidates.add(text.replace(' ', 'T') + '+08:00')
+    if text.endswith('+08:00'):
+        candidates.add(text[:-6])
+    if text.endswith('Z'):
+        candidates.add(text[:-1])
+    return {item for item in candidates if item}
+
+
+def _time_range_part_present(code: str, value: Any) -> bool:
+    candidates = _time_range_literal_candidates(value)
+    if not candidates:
+        return True
+    return any(candidate in code for candidate in candidates)
+
+
+def _check_time_series_inner_time_range(query_constraints: dict[str, Any], code: str, source: str) -> dict[str, Any] | None:
+    time_range = query_constraints.get('time_range')
+    if not isinstance(time_range, dict):
+        return None
+
+    start = time_range.get('start')
+    end = time_range.get('end')
+    missing_parts: list[str] = []
+    if start and not _time_range_part_present(code, start):
+        missing_parts.append('start')
+    if end and not _time_range_part_present(code, end):
+        missing_parts.append('end')
+    if not missing_parts:
+        return None
+
+    return _build_query_constraint_error(
+        'query_constraint_violation',
+        '时序查询必须在 ts_query(...) 的内部 SQL 中体现 query_constraints.time_range，不能先全量读取时序表再用 pandas 过滤时间。',
+        diagnostics={
+            'violated_constraint': 'time_series_inner_time_range',
+            'ts_query_source': source,
+            'time_range': time_range,
+            'missing_parts': missing_parts,
+        },
+    )
+
+
 def _validate_time_series_fragment(query_constraints: dict[str, Any], fragment: dict[str, Any]) -> list[dict[str, Any]]:
     source = normalize_ts_query_source(fragment.get('ts_query_source'))
     code = _fragment_text(fragment)
@@ -727,6 +811,10 @@ def _validate_time_series_fragment(query_constraints: dict[str, Any], fragment: 
         issues.extend(_validate_timescale_fragment(query_constraints, fragment))
     elif source == 'vxbase':
         issues.extend(_validate_vxbase_fragment(query_constraints, fragment))
+
+    time_range_issue = _check_time_series_inner_time_range(query_constraints, code, source)
+    if time_range_issue is not None:
+        issues.append(time_range_issue)
 
     if TIME_SERIES_UTC_Z_LITERAL_PATTERN.search(code):
         issues.append(_build_query_constraint_error(
@@ -752,6 +840,28 @@ def _validate_time_series_fragment(query_constraints: dict[str, Any], fragment: 
             },
         ))
     return issues
+
+
+def _find_malformed_ts_query_literal(sql: str) -> dict[str, Any] | None:
+    text = str(sql or '')
+    for match in re.finditer(r"\bts_query\s*\(\s*'(?P<source>[^']+)'\s*,\s*'", text, re.IGNORECASE):
+        index = match.end()
+        while index < len(text):
+            char = text[index]
+            if char == "'":
+                if index + 1 < len(text) and text[index + 1] == "'":
+                    index += 2
+                    continue
+                tail = text[index + 1:].lstrip()
+                if tail.startswith(')'):
+                    break
+                return {
+                    'ts_query_source': match.group('source'),
+                    'position': index,
+                    'near': text[index:index + 120],
+                }
+            index += 1
+    return None
 
 
 def _validate_sql_context_fragments(
@@ -1504,6 +1614,44 @@ def _extract_static_assignment_literal(tree: ast.AST, name: str) -> Any:
     return None
 
 
+def _extract_validate_query_constraints_literal(tree: ast.AST) -> Any:
+    """Return an inline literal passed as validate_query_constraints(query_constraints={...})."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Name) or func.id != 'validate_query_constraints':
+            continue
+        for keyword in node.keywords or []:
+            if keyword.arg != 'query_constraints':
+                continue
+            try:
+                return ast.literal_eval(keyword.value)
+            except Exception:
+                return None
+    return None
+
+
+def _has_validate_query_constraints_argument(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Name) or func.id != 'validate_query_constraints':
+            continue
+        for keyword in node.keywords or []:
+            if keyword.arg == 'query_constraints':
+                return True
+    return False
+
+
+def _extract_query_constraints_literal(tree: ast.AST) -> Any:
+    assigned = _extract_static_assignment_literal(tree, 'query_constraints')
+    if isinstance(assigned, dict):
+        return assigned
+    return _extract_validate_query_constraints_literal(tree)
+
+
 def _called_function_names(tree: ast.AST) -> set[str]:
     names: set[str] = set()
     for node in ast.walk(tree):
@@ -1515,6 +1663,294 @@ def _called_function_names(tree: ast.AST) -> set[str]:
         elif isinstance(func, ast.Attribute):
             names.add(func.attr)
     return names
+
+
+def _call_line_numbers(tree: ast.AST, function_name: str) -> list[int]:
+    lines: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        matched = False
+        if isinstance(func, ast.Name) and func.id == function_name:
+            matched = True
+        elif isinstance(func, ast.Attribute) and func.attr == function_name:
+            matched = True
+        if matched:
+            line_no = getattr(node, 'lineno', None)
+            if isinstance(line_no, int):
+                lines.append(line_no)
+    return sorted(lines)
+
+
+def _validate_analysis_sql_validation_order(tree: ast.AST) -> RetryResult | None:
+    validate_lines = _call_line_numbers(tree, 'validate_query_constraints')
+    load_lines = _call_line_numbers(tree, 'load_data_with_sql')
+    if not validate_lines or not load_lines:
+        return None
+    first_validate_line = min(validate_lines)
+    first_load_line = min(load_lines)
+    if first_validate_line < first_load_line:
+        return None
+    return request_retry(
+        retry_type="contract_error",
+        message="正式 analysis 代码必须先调用 validate_query_constraints(...) 校验 SQL，再调用 load_data_with_sql(...) 执行查询。",
+        diagnostics={
+            'violated_contract': 'validate_query_constraints_before_sql_load',
+            'first_validate_query_constraints_line': first_validate_line,
+            'first_load_data_with_sql_line': first_load_line,
+        },
+        repair_instructions=[
+            "先完整构造 query_constraints、SQL 和 sql_context.fragments，再调用 validate_query_constraints(...)。",
+            "只有 validate_query_constraints(...) 返回 None 时，才可以进入 load_data_with_sql(...) 数据加载。",
+            "不要先执行 SQL 再补做 validate_query_constraints(...)；这样会让错误 SQL 先进入执行链路。",
+        ],
+    )
+
+
+def _node_calls_function(node: ast.AST, function_name: str) -> bool:
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
+            continue
+        func = child.func
+        if isinstance(func, ast.Name) and func.id == function_name:
+            return True
+        if isinstance(func, ast.Attribute) and func.attr == function_name:
+            return True
+    return False
+
+
+def _handler_is_broad_exception(handler: ast.ExceptHandler) -> bool:
+    if handler.type is None:
+        return True
+    if isinstance(handler.type, ast.Name):
+        return handler.type.id in {'Exception', 'BaseException'}
+    if isinstance(handler.type, ast.Tuple):
+        return any(
+            isinstance(item, ast.Name) and item.id in {'Exception', 'BaseException'}
+            for item in handler.type.elts
+        )
+    return False
+
+
+def _handler_references_exception(handler: ast.ExceptHandler) -> bool:
+    exception_name = str(handler.name or '').strip()
+    if not exception_name:
+        return False
+    for child in ast.walk(ast.Module(body=handler.body, type_ignores=[])):
+        if isinstance(child, ast.Name) and child.id == exception_name:
+            return True
+    return False
+
+
+def _handler_assigns_none(handler: ast.ExceptHandler) -> bool:
+    for child in ast.walk(ast.Module(body=handler.body, type_ignores=[])):
+        if isinstance(child, ast.Assign) and isinstance(child.value, ast.Constant) and child.value.value is None:
+            return True
+        if isinstance(child, ast.AnnAssign) and isinstance(child.value, ast.Constant) and child.value.value is None:
+            return True
+    return False
+
+
+def _handler_has_pass_only(handler: ast.ExceptHandler) -> bool:
+    meaningful_nodes = [
+        node
+        for node in handler.body
+        if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str))
+    ]
+    return not meaningful_nodes or all(isinstance(node, ast.Pass) for node in meaningful_nodes)
+
+
+def _handler_records_query_failure(handler: ast.ExceptHandler) -> bool:
+    for child in ast.walk(ast.Module(body=handler.body, type_ignores=[])):
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) and child.func.attr in {'append', 'extend', 'update'}:
+            return True
+        if isinstance(child, ast.Assign):
+            if isinstance(child.targets[0], (ast.Subscript, ast.Attribute)):
+                return True
+        if isinstance(child, ast.AnnAssign) and isinstance(child.target, (ast.Subscript, ast.Attribute)):
+            return True
+    return False
+
+
+def _validate_sql_load_error_handling_contract(tree: ast.AST) -> RetryResult | None:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        try_body = ast.Module(body=node.body, type_ignores=[])
+        if not _node_calls_function(try_body, 'load_data_with_sql'):
+            continue
+        for handler in node.handlers:
+            if not _handler_is_broad_exception(handler):
+                continue
+            handler_module = ast.Module(body=handler.body, type_ignores=[])
+            if _node_calls_function(handler_module, 'request_retry') or any(isinstance(child, ast.Raise) for child in ast.walk(handler_module)):
+                continue
+            records_query_failure = _handler_records_query_failure(handler)
+            if (
+                _handler_has_pass_only(handler)
+                or _handler_assigns_none(handler)
+                or not _handler_references_exception(handler)
+                or not records_query_failure
+            ):
+                return request_retry(
+                    retry_type="contract_error",
+                    message="SQL 加载异常是阻断性错误。load_data_with_sql(...) 执行失败时必须立即反馈明确的 SQL 错误并停止当前分析流程，要求修正 SQL 后重试。",
+                    diagnostics={
+                        'violated_contract': 'sql_load_error_handling',
+                        'try_line_no': getattr(node, 'lineno', None),
+                        'except_line_no': getattr(handler, 'lineno', None),
+                    },
+                    repair_instructions=[
+                        "不得将 SQL 加载异常降级为无数据、空数据、部分失败、可跳过数据源或普通查询失败。",
+                        "不得通过宽泛 except、仅记录日志、返回默认结果、保存部分成功报告等方式掩盖异常并继续分析。",
+                        "必须直接 raise 原异常，或立即把 request_retry(...) 的返回值赋给 result 并结束当前尝试；只有 load_data_with_sql(...) 成功返回且 DataFrame 为空时，才可以判断为无数据。",
+                    ],
+                )
+            return request_retry(
+                retry_type="contract_error",
+                message="SQL 加载异常是阻断性错误。load_data_with_sql(...) 执行失败时必须立即反馈明确的 SQL 错误并停止当前分析流程，要求修正 SQL 后重试。",
+                diagnostics={
+                    'violated_contract': 'sql_load_exception_must_stop',
+                    'try_line_no': getattr(node, 'lineno', None),
+                    'except_line_no': getattr(handler, 'lineno', None),
+                },
+                repair_instructions=[
+                    "禁止将 SQL 加载异常降级为无数据、空数据、部分失败、可跳过数据源或普通查询失败后继续分析。",
+                    "SQL 语法错误、字段错误、表标识错误、连接错误等执行异常必须直接 raise，或在 except 中立即 result = request_retry(retry_type=\"data_source_unavailable\" 或 \"runtime_error\", ...) 并结束当前尝试。",
+                    "多数据源独立分析中，只有 load_data_with_sql(...) 成功返回空 DataFrame 的数据源，才可以按无数据剔除；SQL 执行失败的数据源必须先修正 SQL，不能出现在部分成功报告里。",
+                ],
+            )
+    return None
+
+
+def _string_constants(tree: ast.AST) -> set[str]:
+    values: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            value = node.value.strip()
+            if value:
+                values.add(value)
+    return values
+
+
+def _joined_string_text(node: ast.JoinedStr) -> str:
+    parts: list[str] = []
+    for value in node.values:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            parts.append(value.value)
+        elif isinstance(value, ast.FormattedValue):
+            parts.append('{}')
+    return ''.join(parts)
+
+
+def _is_quote_identifier_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id == 'quote_identifier'
+    if isinstance(func, ast.Attribute):
+        return func.attr == 'quote_identifier'
+    return False
+
+
+def _quote_identifier_assigned_names(tree: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and _is_quote_identifier_call(node.value):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None and _is_quote_identifier_call(node.value):
+            if isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+    return names
+
+
+def _is_safe_timescale_from_expr(node: ast.AST, quoted_names: set[str]) -> bool:
+    if _is_quote_identifier_call(node):
+        return True
+    if isinstance(node, ast.Name) and node.id in quoted_names:
+        return True
+    return False
+
+
+def _find_unsafe_dynamic_timescale_from(tree: ast.AST) -> dict[str, Any] | None:
+    quoted_names = _quote_identifier_assigned_names(tree)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.JoinedStr):
+            continue
+        prior_text = ''
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                prior_text += value.value
+                continue
+            if not isinstance(value, ast.FormattedValue):
+                continue
+            if re.search(r'\bfrom\s*$', prior_text, re.IGNORECASE) and not _is_safe_timescale_from_expr(value.value, quoted_names):
+                return {
+                    'line_no': getattr(value, 'lineno', getattr(node, 'lineno', None)),
+                    'formatted_expression': ast.unparse(value.value) if hasattr(ast, 'unparse') else '',
+                    'safe_quoted_identifier_names': sorted(quoted_names),
+                }
+            prior_text += '{}'
+    return None
+
+
+def _looks_like_datasource_identifier_constant(value: str) -> bool:
+    text = str(value or '').strip()
+    if len(text) < 3:
+        return False
+    if any(char.isspace() for char in text):
+        return False
+    if any(char in text for char in ('"', "'", '(', ')', '<', '>', '=')):
+        return False
+    if ':' in text:
+        return False
+    return bool(re.search(r'[A-Za-z_$]', text))
+
+
+def _validate_dynamic_timescale_identifier_contract(tree: ast.AST, code: str) -> RetryResult | None:
+    if "ts_query('timescale'" not in code and 'ts_query("timescale"' not in code:
+        return None
+
+    quoted_constants = {
+        value.strip('"')
+        for value in _string_constants(tree)
+        if len(value) >= 2 and value.startswith('"') and value.endswith('"')
+    }
+    unquoted_identifiers = sorted(
+        value
+        for value in _string_constants(tree)
+        if _identifier_requires_quotes(value)
+        and _looks_like_datasource_identifier_constant(value)
+        and value not in quoted_constants
+        and not (value.startswith('"') and value.endswith('"'))
+        and not value.startswith('SELECT ')
+        and not value.startswith('select ')
+    )
+    if not unquoted_identifiers:
+        return None
+
+    unsafe_dynamic_from = _find_unsafe_dynamic_timescale_from(tree)
+    if unsafe_dynamic_from is None:
+        return None
+
+    return request_retry(
+        retry_type="contract_error",
+        message="timescale 内部 SQL 动态拼接 datasource_identifier 时，必须先用双引号引用需要保留大小写或特殊字符的表标识。",
+        diagnostics={
+            'violated_contract': 'timescale_dynamic_identifier_quoting',
+            'identifiers_requiring_quotes': unquoted_identifiers[:20],
+            **unsafe_dynamic_from,
+        },
+        repair_instructions=[
+            '定义 quote_identifier(identifier) 辅助函数：返回 "\"" + identifier.replace("\"", "\"\"") + "\""; 内部 SQL 使用 FROM {quote_identifier(identifier)}。',
+            '不要在 timescale 内部 SQL 中直接写 FROM {identifier}，否则 __Do_xxx、_0_I_xxx、$xxx 等标识会被错误解析。',
+            'validate_query_constraints(...) 的 sql_context.fragments 必须覆盖本轮实际查询的所有时序数据源，不能只校验第一个样例 SQL。',
+        ],
+    )
 
 
 def _extract_static_string_constant(node: ast.AST | None) -> str:
@@ -1675,7 +2111,7 @@ def _validate_explicit_time_range_guard(
     if execution_intent != 'analysis':
         return None
 
-    query_constraints = _extract_static_assignment_literal(tree, 'query_constraints')
+    query_constraints = _extract_query_constraints_literal(tree)
     if not isinstance(query_constraints, dict):
         return None
 
@@ -1702,7 +2138,10 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
         )
 
     execution_intent = _extract_static_string_assignment(tree, 'execution_intent')
-    has_query_constraints = _has_static_assignment(tree, 'query_constraints')
+    has_query_constraints = (
+        _has_static_assignment(tree, 'query_constraints')
+        or _has_validate_query_constraints_argument(tree)
+    )
     calls = _called_function_names(tree)
 
     if execution_intent not in {'analysis', 'probe'}:
@@ -1720,6 +2159,14 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
                 '如果当前代码要正式回答用户问题，应改成完整 analysis：execution_intent、query_constraints、SQL/filter_expressions、validate_query_constraints(...)、数据加载、空数据检查、图表/表格和 result = save_analysis_result(...) 必须一次性齐全。',
             ],
         )
+
+    sql_load_error_retry = _validate_sql_load_error_handling_contract(tree)
+    if sql_load_error_retry is not None:
+        return sql_load_error_retry
+
+    dynamic_timescale_identifier_retry = _validate_dynamic_timescale_identifier_contract(tree, code or '')
+    if dynamic_timescale_identifier_retry is not None:
+        return dynamic_timescale_identifier_retry
 
     if execution_intent == 'analysis':
         missing_items: list[str] = []
@@ -1747,6 +2194,10 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
                     '如果 validate_query_constraints(...) 返回 RetryResult，必须将其赋给 result 并结束当前尝试。',
                 ],
             )
+
+        validation_order_retry = _validate_analysis_sql_validation_order(tree)
+        if validation_order_retry is not None:
+            return validation_order_retry
 
         helper_chart_retry = _validate_helper_chart_usage_contract(tree, calls)
         if helper_chart_retry is not None:
@@ -1811,6 +2262,22 @@ def validate_query_constraints(
         return _build_explicit_time_range_drift_retry(
             expected_time_range=expected_time_range,
             actual_time_range=query_constraints.get('time_range'),
+        )
+
+    malformed_ts_query = _find_malformed_ts_query_literal(sql)
+    if malformed_ts_query:
+        return request_retry(
+            retry_type="query_constraint_violation",
+            message="ts_query(...) 外层 SQL 中的内部 SQL 单引号未正确转义。",
+            diagnostics={
+                'violated_constraint': 'ts_query_inner_sql_escape',
+                **malformed_ts_query,
+            },
+            repair_instructions=[
+                '先构造 inner_sql，再使用 escaped_inner_sql = inner_sql.replace("\'", "\'\'")。',
+                '外层 SQL 写成 SELECT * FROM ts_query(source, escaped_inner_sql)，不要把包含单引号的 inner_sql 原样拼进去。',
+                'SQL 加载异常是阻断性错误；load_data_with_sql(...) 执行失败时必须立即反馈 SQL 错误并停止当前分析流程，不能降级为无数据或可跳过数据源。',
+            ],
         )
 
     fragment_issues, context_filter_code, context_aggregation_code = _validate_sql_context_fragments(
@@ -2203,6 +2670,68 @@ def _result_to_scan_text(exec_result: StructuredResult) -> str:
     return json.dumps(payload, ensure_ascii=False, default=str)
 
 
+def _extract_sql_limit_clauses(code: str) -> list[str]:
+    clauses: list[str] = []
+    for match in re.finditer(
+        r'\blimit\s+\d+(?:\s*,\s*\d+|\s+offset\s+\d+)?',
+        code or '',
+        re.IGNORECASE,
+    ):
+        clause = re.sub(r'\s+', ' ', match.group(0)).strip()
+        if clause and clause.lower() not in {item.lower() for item in clauses}:
+            clauses.append(clause)
+        if len(clauses) >= 10:
+            break
+    return clauses
+
+
+def _extract_dataframe_reduction_clauses(code: str) -> list[str]:
+    clauses: list[str] = []
+    patterns = (
+        r'\.\s*(?:head|tail|sample)\s*\(\s*(?:n\s*=\s*)?\d+',
+        r'\.\s*iloc\s*\[\s*(?::\s*\d+|\-\d+\s*:|\d+\s*:\s*\d+)',
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, code or '', re.IGNORECASE):
+            clause = re.sub(r'\s+', ' ', match.group(0)).strip()
+            if clause and clause.lower() not in {item.lower() for item in clauses}:
+                clauses.append(clause)
+            if len(clauses) >= 10:
+                return clauses
+    return clauses
+
+
+def _text_discloses_limit_usage(text: str) -> bool:
+    scan_text = str(text or '').lower()
+    disclosure_markers = (
+        'limit',
+        '限制',
+        '限量',
+        '截取',
+        '采样',
+        '抽样',
+        '最多',
+        '仅展示',
+        '只展示',
+        '实际展示',
+        '实际覆盖',
+        '实际查询',
+        '返回上限',
+        '条数上限',
+        'topn',
+        'top n',
+    )
+    return any(marker in scan_text for marker in disclosure_markers)
+
+
+def _result_discloses_limit_usage(exec_result: StructuredResult) -> bool:
+    return _text_discloses_limit_usage(_result_to_scan_text(exec_result))
+
+
+def _report_discloses_limit_usage(exec_result: StructuredResult) -> bool:
+    return _text_discloses_limit_usage(exec_result.analysis_report or '')
+
+
 def _is_no_data_like_report(report_text: str) -> bool:
     normalized = str(report_text or '').lower()
     return any(marker.lower() in normalized for marker in NO_DATA_RESULT_MARKERS)
@@ -2354,6 +2883,7 @@ def _find_untracked_datasource_mentions(
 def _validate_structured_result_contract(
     exec_result: StructuredResult,
     *,
+    generated_code: str = '',
     allow_empty_artifact_no_data: bool = False,
     expected_time_range: Optional[dict[str, Any]] = None,
     used_datasource_ids: list[int] | None = None,
@@ -2390,6 +2920,29 @@ def _validate_structured_result_contract(
                 "analysis_report 只能包含 Markdown 自然语言结论、指标说明和表格文本；不要插入 charts[0]、charts[0]['chart_document']、chart_spec、chart_document 或图表 dict。",
                 "如果报告中需要引用图表，只写自然语言，例如：下方图表展示每日产量变化趋势。",
                 "图表对象只能通过 save_analysis_result(..., charts=charts, ...) 的 charts 参数返回。",
+            ],
+            analysis_report=report_text,
+        )
+
+    sql_limit_clauses = _extract_sql_limit_clauses(generated_code)
+    dataframe_reduction_clauses = _extract_dataframe_reduction_clauses(generated_code)
+    reduction_clauses = sql_limit_clauses + dataframe_reduction_clauses
+    if reduction_clauses and not _report_discloses_limit_usage(exec_result):
+        return request_retry(
+            retry_type="result_contract_error",
+            message="当前代码对查询或图表数据做了 LIMIT/head/tail/sample/iloc 等截取或采样，但 analysis_report 正文没有披露该限制，容易让用户误以为图表覆盖了完整时间范围。",
+            diagnostics={
+                "analysis_report_preview": report_text[:800],
+                "chart_count": len(exec_result.charts or []),
+                "table_count": len(exec_result.tables or []),
+                "sql_limit_clauses": sql_limit_clauses,
+                "dataframe_reduction_clauses": dataframe_reduction_clauses,
+            },
+            repair_instructions=[
+                "下一版代码可以继续使用 LIMIT、head/tail/sample/iloc 等策略，但必须在 analysis_report 正文明确写出查询或展示条数限制、截取方向、采样方式和实际覆盖范围。",
+                "如果图表展示范围小于用户要求的时间范围，必须说明目标时间范围、实际展示点数、总命中点数和截取方向；例如每个数据源命中约 1193 点，图表仅展示其中 200 点。",
+                "如果标题或描述写“最近 N 个点”，代码应使用 tail(N) 或按时间倒序取最近数据；不要用 head(N) 后声称展示最近数据。",
+                "如果用户要求完整时间范围趋势，优先改为按时间桶聚合或分批查询完整时间范围，不要悄悄缩短展示范围。",
             ],
             analysis_report=report_text,
         )
@@ -3819,6 +4372,7 @@ def execute_python(
     if isinstance(exec_result, StructuredResult):
         contract_retry = _validate_structured_result_contract(
             exec_result,
+            generated_code=code,
             allow_empty_artifact_no_data=time_range_guard_active,
             expected_time_range=expected_time_range,
             used_datasource_ids=normalized_used_datasource_ids,
