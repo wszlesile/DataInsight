@@ -1,8 +1,11 @@
 import os
+from contextlib import contextmanager
+from typing import Callable, TypeVar
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.engine import URL
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.sql import text
 
@@ -13,6 +16,8 @@ load_dotenv()
 db_type = Config.DB_TYPE.lower()
 if db_type == 'postgres':
     db_type = 'postgresql'
+
+DB_POOL_RECYCLE_SECONDS = int(os.environ.get('SUPOS_DATA_INSIGHT_POOL_RECYCLE_SECONDS', 1800))
 
 if db_type == 'sqlite':
     db_path = os.path.join(
@@ -31,6 +36,7 @@ elif db_type == 'mysql':
             database=Config.DB_NAME,
         ),
         pool_pre_ping=True,
+        pool_recycle=DB_POOL_RECYCLE_SECONDS,
         echo=Config.DEBUG,
     )
 elif db_type == 'postgresql':
@@ -44,6 +50,7 @@ elif db_type == 'postgresql':
             database=Config.DB_NAME,
         ),
         pool_pre_ping=True,
+        pool_recycle=DB_POOL_RECYCLE_SECONDS,
         echo=Config.DEBUG,
     )
 else:
@@ -52,6 +59,13 @@ else:
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 POSTGRES_SCHEMA_LOCK_KEY = 827364219
+T = TypeVar('T')
+
+
+def _is_disconnect_error(exc: Exception) -> bool:
+    if isinstance(exc, DBAPIError) and getattr(exc, 'connection_invalidated', False):
+        return True
+    return False
 
 
 def get_session():
@@ -60,6 +74,48 @@ def get_session():
         yield session
     finally:
         session.close()
+
+
+@contextmanager
+def session_scope(*, expire_on_commit: bool | None = None):
+    """Create a short-lived ORM session for one business operation."""
+    session_kwargs = {}
+    if expire_on_commit is not None:
+        session_kwargs['expire_on_commit'] = expire_on_commit
+    session = SessionLocal(**session_kwargs)
+    try:
+        yield session
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def run_with_session(
+    operation: Callable[[object], T],
+    *,
+    retry_on_disconnect: bool = True,
+    expire_on_commit: bool | None = False,
+) -> T:
+    """
+    Execute a unit of work with a fresh ORM session.
+
+    If the checked-out DB connection was invalidated, retry once with a new
+    session so callers do not need scattered stale-session recovery logic.
+    """
+    attempts = 2 if retry_on_disconnect else 1
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            with session_scope(expire_on_commit=expire_on_commit) as session:
+                return operation(session)
+        except Exception as exc:
+            last_error = exc
+            if attempt >= attempts - 1 or not _is_disconnect_error(exc):
+                raise
+            engine.dispose()
+    raise last_error if last_error is not None else RuntimeError('session operation failed')
 
 
 def init_db():

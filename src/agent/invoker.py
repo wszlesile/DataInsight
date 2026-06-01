@@ -12,7 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from agent import CustomContext, get_data_insight_agent, get_input
 from agent.context_engineering_runtime import is_analysis_like_request
 from config import Config
-from config.database import SessionLocal
+from config.database import SessionLocal, run_with_session
 from service.conversation_context_service import ConversationContextService, ConversationRunContext
 from utils import logger
 from utils.datasource_utils import safe_json_loads
@@ -524,9 +524,11 @@ def _build_regenerate_instruction(
     if not _is_regenerate_request(user_message):
         return ''
 
-    latest_turn = service.get_latest_successful_analysis_turn(
-        runtime.conversation.id,
-        max_turn_no=runtime.history_turn_limit,
+    latest_turn = run_with_session(
+        lambda session: ConversationContextService(session).get_latest_successful_analysis_turn(
+            runtime.conversation.id,
+            max_turn_no=runtime.history_turn_limit,
+        )
     )
     if latest_turn is None:
         return ''
@@ -553,25 +555,28 @@ def _rerun_has_prior_analysis_result(
 
     from model import InsightNsArtifact, InsightNsExecution
 
-    started_at = getattr(runtime.turn, 'started_at', None)
-    execution_query = service.session.query(InsightNsExecution.id).filter(
-        InsightNsExecution.conversation_id == runtime.conversation.id,
-        InsightNsExecution.turn_id == runtime.turn.id,
-        InsightNsExecution.is_deleted == 0,
-    )
-    if started_at is not None:
-        execution_query = execution_query.filter(InsightNsExecution.created_at < started_at)
-    if execution_query.first() is not None:
-        return True
+    def _has_prior(session):
+        started_at = getattr(runtime.turn, 'started_at', None)
+        execution_query = session.query(InsightNsExecution.id).filter(
+            InsightNsExecution.conversation_id == runtime.conversation.id,
+            InsightNsExecution.turn_id == runtime.turn.id,
+            InsightNsExecution.is_deleted == 0,
+        )
+        if started_at is not None:
+            execution_query = execution_query.filter(InsightNsExecution.created_at < started_at)
+        if execution_query.first() is not None:
+            return True
 
-    artifact_query = service.session.query(InsightNsArtifact.id).filter(
-        InsightNsArtifact.conversation_id == runtime.conversation.id,
-        InsightNsArtifact.turn_id == runtime.turn.id,
-        InsightNsArtifact.is_deleted == 0,
-    )
-    if started_at is not None:
-        artifact_query = artifact_query.filter(InsightNsArtifact.created_at < started_at)
-    return artifact_query.first() is not None
+        artifact_query = session.query(InsightNsArtifact.id).filter(
+            InsightNsArtifact.conversation_id == runtime.conversation.id,
+            InsightNsArtifact.turn_id == runtime.turn.id,
+            InsightNsArtifact.is_deleted == 0,
+        )
+        if started_at is not None:
+            artifact_query = artifact_query.filter(InsightNsArtifact.created_at < started_at)
+        return artifact_query.first() is not None
+
+    return run_with_session(_has_prior)
 
 
 def _should_require_rerun_analysis_execution(
@@ -720,23 +725,22 @@ def _finalize_run(
 
 
 def _has_latest_execution(runtime: ConversationRunContext) -> bool:
-    session = SessionLocal()
-    try:
+    def _operation(session):
         return ConversationContextService(session).get_latest_execution(
             runtime.turn.id,
             started_at=runtime.turn.started_at,
         ) is not None
-    finally:
-        session.close()
+
+    return run_with_session(_operation)
 
 
 def _open_fresh_persistence_context(
+    session,
     runtime: ConversationRunContext,
-) -> tuple[Any, ConversationContextService, ConversationRunContext]:
+) -> tuple[ConversationContextService, ConversationRunContext]:
     """Reload the turn with a new DB session before final persistence."""
     from model import InsightNsConversation, InsightNsTurn
 
-    session = SessionLocal()
     conversation = session.query(InsightNsConversation).filter(
         InsightNsConversation.id == runtime.conversation.id,
         InsightNsConversation.is_deleted == 0,
@@ -747,7 +751,6 @@ def _open_fresh_persistence_context(
         InsightNsTurn.is_deleted == 0,
     ).first()
     if conversation is None or turn is None:
-        session.close()
         raise ValueError('分析轮次不存在或已被删除')
 
     active_snapshot = dict(runtime.active_datasource_snapshot or {})
@@ -765,7 +768,7 @@ def _open_fresh_persistence_context(
         is_rerun=runtime.is_rerun,
         history_turn_limit=runtime.history_turn_limit,
     )
-    return session, ConversationContextService(session), fresh_runtime
+    return ConversationContextService(session), fresh_runtime
 
 
 def _finalize_run_with_fresh_session(
@@ -779,8 +782,8 @@ def _finalize_run_with_fresh_session(
     tables: list[dict[str, Any]],
     allow_report_only: bool = False,
 ) -> AgentResponse:
-    session, service, fresh_runtime = _open_fresh_persistence_context(runtime)
-    try:
+    def _operation(session):
+        service, fresh_runtime = _open_fresh_persistence_context(session, runtime)
         return _finalize_run(
             service=service,
             runtime=fresh_runtime,
@@ -793,11 +796,8 @@ def _finalize_run_with_fresh_session(
             tables=tables,
             allow_report_only=allow_report_only,
         )
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+
+    return run_with_session(_operation)
 
 
 def _fail_run_with_fresh_session(
@@ -805,19 +805,16 @@ def _fail_run_with_fresh_session(
     error_message: str,
     preserve_existing_results: bool = False,
 ) -> None:
-    session, service, fresh_runtime = _open_fresh_persistence_context(runtime)
-    try:
+    def _operation(session):
+        service, fresh_runtime = _open_fresh_persistence_context(session, runtime)
         service.fail_run(
             fresh_runtime.conversation.id,
             fresh_runtime.turn.id,
             error_message,
             preserve_existing_results=preserve_existing_results,
         )
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+
+    run_with_session(_operation)
 
 
 def _build_empty_response_error(user_message: str, analysis_flow_started: bool) -> str:
@@ -891,14 +888,15 @@ def _get_selected_datasource_names(runtime: ConversationRunContext) -> list[str]
 
 def _load_turn_executions_fresh(runtime: ConversationRunContext) -> list[Any]:
     """Load execution history with a short-lived session to avoid stale long-running connections."""
-    session = SessionLocal()
-    try:
+    def _operation(session):
         return ConversationContextService(session).get_turn_executions(
             runtime.turn.id,
             started_at=runtime.turn.started_at,
         )
+
+    try:
+        return run_with_session(_operation)
     except SQLAlchemyError:
-        session.rollback()
         logger.warning(
             "读取轮次执行历史失败，跳过本次恢复提示上下文: conversation_id=%s turn_id=%s",
             getattr(runtime.conversation, 'id', ''),
@@ -906,8 +904,6 @@ def _load_turn_executions_fresh(runtime: ConversationRunContext) -> list[Any]:
             exc_info=True,
         )
         return []
-    finally:
-        session.close()
 
 
 def _build_failure_reason_reply(
@@ -1480,14 +1476,15 @@ def _extract_invoke_result(messages: list[Any]) -> tuple[str, str, list[dict[str
 
 def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
     """执行一次非流式分析请求。"""
-    session = SessionLocal()
-    service = ConversationContextService(session)
-    runtime = service.start_run(
-        username=agent_request.username,
-        namespace_id=agent_request.namespace_id,
-        conversation_id=agent_request.conversation_id,
-        user_message=agent_request.user_message,
+    runtime = run_with_session(
+        lambda session: ConversationContextService(session).start_run(
+            username=agent_request.username,
+            namespace_id=agent_request.namespace_id,
+            conversation_id=agent_request.conversation_id,
+            user_message=agent_request.user_message,
+        )
     )
+    service = None
 
     selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)
     try:
@@ -1646,7 +1643,6 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
             allow_report_only=allow_report_only,
         )
     except Exception as exc:
-        session.rollback()
         user_error_message = get_user_facing_agent_error(exc)
         logger.error(
             "Agent 执行失败: conversation_id=%s turn_id=%s error=%s",
@@ -1663,7 +1659,6 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
         raise RuntimeError(user_error_message) from exc
     finally:
         reset_selected_model_id(selected_model_token)
-        session.close()
 
 
 def _stream_with_runtime(
@@ -2022,7 +2017,6 @@ def _stream_with_runtime(
             turn_id=runtime.turn.id,
         )
     except Exception as exc:
-        service.session.rollback()
         user_error_message = get_user_facing_agent_error(exc)
         logger.error(
             "Agent 流式执行失败: conversation_id=%s turn_id=%s error=%s",
@@ -2050,21 +2044,21 @@ def _stream_with_runtime(
 
 def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]:
     """执行一次流式分析请求，并持续产出适合 SSE 的事件。"""
-    session = SessionLocal()
-    service = ConversationContextService(session)
-    runtime = service.start_run(
-        username=agent_request.username,
-        namespace_id=agent_request.namespace_id,
-        conversation_id=agent_request.conversation_id,
-        user_message=agent_request.user_message,
+    runtime = run_with_session(
+        lambda session: ConversationContextService(session).start_run(
+            username=agent_request.username,
+            namespace_id=agent_request.namespace_id,
+            conversation_id=agent_request.conversation_id,
+            user_message=agent_request.user_message,
+        )
     )
+    service = None
 
     selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)
     try:
         yield from _stream_with_runtime(service, runtime, agent_request)
     finally:
         reset_selected_model_id(selected_model_token)
-        session.close()
 
 
 def _build_rerun_agent_request(
@@ -2097,16 +2091,16 @@ def stream_rerun_turn(
     database_conn_info: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """在同一轮次内重新执行一次分析，并把新结果回写到该轮。"""
-    session = SessionLocal()
-    service = ConversationContextService(session)
-    runtime = service.start_rerun(
-        username=username,
-        conversation_id=conversation_id,
-        turn_id=turn_id,
+    runtime = run_with_session(
+        lambda session: ConversationContextService(session).start_rerun(
+            username=username,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+        )
     )
+    service = None
 
     if runtime is None:
-        session.close()
         raise ValueError('轮次详情不存在')
 
     agent_request = _build_rerun_agent_request(
@@ -2122,7 +2116,6 @@ def stream_rerun_turn(
         yield from _stream_with_runtime(service, runtime, agent_request)
     finally:
         reset_selected_model_id(selected_model_token)
-        session.close()
 
 
 def stream_existing_turn_events(
@@ -2131,43 +2124,40 @@ def stream_existing_turn_events(
     turn_id: Any,
     is_rerun: bool = False,
 ) -> Iterator[dict[str, Any]]:
-    """执行已经创建好的轮次，并产出流式事件，供后台任务写入外部队列。"""
-    session = SessionLocal()
-    service = ConversationContextService(session)
-    turn_id_int = int(turn_id or 0)
-    conversation_id_int = int(agent_request.conversation_id or 0)
+    """Execute an existing turn and stream events for the background task queue."""
     from model import InsightNsConversation, InsightNsTurn
 
-    conversation = session.query(InsightNsConversation).filter(
-        InsightNsConversation.id == conversation_id_int,
-        InsightNsConversation.is_deleted == 0,
-    ).first()
-    turn = session.query(InsightNsTurn).filter(
-        InsightNsTurn.id == turn_id_int,
-        InsightNsTurn.conversation_id == conversation_id_int,
-        InsightNsTurn.is_deleted == 0,
-    ).first()
-    if conversation is None or turn is None:
-        session.close()
-        raise ValueError('分析轮次不存在或已被删除')
+    def _load_runtime(session):
+        turn_id_int = int(turn_id or 0)
+        conversation_id_int = int(agent_request.conversation_id or 0)
+        conversation = session.query(InsightNsConversation).filter(
+            InsightNsConversation.id == conversation_id_int,
+            InsightNsConversation.is_deleted == 0,
+        ).first()
+        turn = session.query(InsightNsTurn).filter(
+            InsightNsTurn.id == turn_id_int,
+            InsightNsTurn.conversation_id == conversation_id_int,
+            InsightNsTurn.is_deleted == 0,
+        ).first()
+        if conversation is None or turn is None:
+            raise ValueError('分析轮次不存在或已被删除')
+        active_snapshot = {
+            "namespace_id": conversation.insight_namespace_id,
+            "conversation_id": conversation.id,
+            "selected_datasource_ids": safe_json_loads(turn.selected_datasource_ids_json, []),
+            "selected_datasource_snapshot": safe_json_loads(turn.selected_datasource_snapshot_json, []),
+        }
+        return ConversationRunContext(
+            conversation=conversation,
+            turn=turn,
+            active_datasource_snapshot=active_snapshot,
+            is_rerun=is_rerun,
+            history_turn_limit=max(turn.turn_no - 1, 0) if is_rerun else None,
+        )
 
-    active_snapshot = {
-        "namespace_id": conversation.insight_namespace_id,
-        "conversation_id": conversation.id,
-        "selected_datasource_ids": safe_json_loads(turn.selected_datasource_ids_json, []),
-        "selected_datasource_snapshot": safe_json_loads(turn.selected_datasource_snapshot_json, []),
-    }
-    runtime = ConversationRunContext(
-        conversation=conversation,
-        turn=turn,
-        active_datasource_snapshot=active_snapshot,
-        is_rerun=is_rerun,
-        history_turn_limit=max(turn.turn_no - 1, 0) if is_rerun else None,
-    )
-
+    runtime = run_with_session(_load_runtime)
     selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)
     try:
-        yield from _stream_with_runtime(service, runtime, agent_request)
+        yield from _stream_with_runtime(None, runtime, agent_request)
     finally:
         reset_selected_model_id(selected_model_token)
-        session.close()

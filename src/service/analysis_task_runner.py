@@ -6,7 +6,7 @@ from typing import Any
 
 from agent.invoker import AgentRequest, stream_existing_turn_events
 from config import Config
-from config.database import SessionLocal
+from config.database import run_with_session
 from service.analysis_stream_queue import AnalysisStreamQueue
 from service.analysis_task_service import AnalysisTaskService
 from utils import logger
@@ -43,8 +43,6 @@ class AnalysisTaskRunner:
         turn_id: int,
         is_rerun: bool,
     ) -> None:
-        session = SessionLocal()
-        task_service = AnalysisTaskService(session)
         queue: AnalysisStreamQueue | None = None
         final_status = "success"
         error_message = ""
@@ -56,8 +54,7 @@ class AnalysisTaskRunner:
                 event_max_bytes=Config.STREAM_EVENT_MAX_BYTES,
                 ttl_seconds=Config.STREAM_QUEUE_TTL_SECONDS,
             )
-            task_service.mark_running(task_id, worker_id=self._worker_id)
-            session.commit()
+            self._mark_task_running(task_id)
             for event in stream_existing_turn_events(
                 agent_request,
                 turn_id=turn_id,
@@ -65,17 +62,14 @@ class AnalysisTaskRunner:
             ):
                 event.setdefault("task_id", task_id)
                 queue.push_event(turn_id, event)
-                task_service.heartbeat(task_id)
-                session.commit()
+                self._heartbeat_task(task_id)
                 if event.get("type") == "error":
                     final_status = "failed"
                     error_message = str(event.get("message") or "")
                 elif event.get("type") == "done":
                     final_status = "success"
-            task_service.mark_finished(task_id, status=final_status, error_message=error_message)
-            session.commit()
+            self._mark_task_finished(task_id, status=final_status, error_message=error_message)
         except Exception as exc:
-            session.rollback()
             final_status = "failed"
             error_message = str(exc)
             logger.error("后台分析任务执行失败: task_id=%s error=%s", task_id, exc, exc_info=True)
@@ -94,16 +88,14 @@ class AnalysisTaskRunner:
                 return
             if queue is not None:
                 self._publish_error(queue, turn_id, task_id, error_message)
-            self._fail_turn_if_possible(session, agent_request, turn_id, error_message)
-            task_service.mark_finished(task_id, status="failed", error_message=error_message)
-            session.commit()
+            self._fail_turn_if_possible(agent_request, turn_id, error_message)
+            self._mark_task_finished(task_id, status="failed", error_message=error_message)
         finally:
             if queue is not None:
                 try:
                     queue.expire_turn(turn_id, Config.STREAM_FINISHED_TTL_SECONDS)
                 except Exception:
                     logger.warning("设置流式队列 TTL 失败: turn_id=%s", turn_id, exc_info=True)
-            session.close()
 
     def _publish_error(
         self,
@@ -121,9 +113,29 @@ class AnalysisTaskRunner:
             "message": message,
         })
 
+    def _mark_task_running(self, task_id: str) -> None:
+        def _operation(session):
+            AnalysisTaskService(session).mark_running(task_id, worker_id=self._worker_id)
+            session.commit()
+
+        run_with_session(_operation)
+
+    def _heartbeat_task(self, task_id: str) -> None:
+        def _operation(session):
+            AnalysisTaskService(session).heartbeat(task_id)
+            session.commit()
+
+        run_with_session(_operation)
+
+    def _mark_task_finished(self, task_id: str, *, status: str, error_message: str = "") -> None:
+        def _operation(session):
+            AnalysisTaskService(session).mark_finished(task_id, status=status, error_message=error_message)
+            session.commit()
+
+        run_with_session(_operation)
+
     def _fail_turn_if_possible(
         self,
-        session,
         agent_request: AgentRequest,
         turn_id: int,
         error_message: str,
@@ -131,12 +143,15 @@ class AnalysisTaskRunner:
         try:
             from service.conversation_context_service import ConversationContextService
 
-            ConversationContextService(session).fail_run(
-                int(agent_request.conversation_id or 0),
-                int(turn_id or 0),
-                error_message,
-                preserve_existing_results=False,
-            )
+            def _operation(session):
+                ConversationContextService(session).fail_run(
+                    int(agent_request.conversation_id or 0),
+                    int(turn_id or 0),
+                    error_message,
+                    preserve_existing_results=False,
+                )
+
+            run_with_session(_operation)
         except Exception:
             logger.warning("标记分析轮次失败时出错: turn_id=%s", turn_id, exc_info=True)
 
@@ -148,8 +163,7 @@ class AnalysisTaskRunner:
         turn_id: int,
         is_rerun: bool,
     ) -> bool:
-        recovery_session = SessionLocal()
-        try:
+        def _operation(recovery_session):
             from service.conversation_context_service import ConversationContextService
             from model import InsightNsTurn
 
@@ -198,12 +212,12 @@ class AnalysisTaskRunner:
                 latest_execution.id,
             )
             return True
+
+        try:
+            return run_with_session(_operation)
         except Exception:
-            recovery_session.rollback()
             logger.warning("从最新成功执行记录恢复分析轮次失败: task_id=%s turn_id=%s", task_id, turn_id, exc_info=True)
             return False
-        finally:
-            recovery_session.close()
 
 
 _runner: AnalysisTaskRunner | None = None

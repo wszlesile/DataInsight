@@ -3954,7 +3954,7 @@ def _tool_success_message(
     )
 
 
-@tool(description='执行 Python 代码工具', args_schema=ExePythonCodeInput)
+@tool(description='执行Python代码工具', args_schema=ExePythonCodeInput)
 def execute_python(
     runtime: ToolRuntime[CustomContext],
     code: str,
