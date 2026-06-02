@@ -10,6 +10,7 @@ from werkzeug.datastructures import FileStorage
 
 from api import supos_kernel_api
 from config.config import Config
+from config.database import release_clean_session_connection
 from sqlalchemy.orm import Session
 
 from dto import DataSourceSchema, PropertySchema
@@ -269,6 +270,7 @@ class InsightNsRelDatasourceService:
         conversation = self._get_conversation(insight_conversation_id)
         if conversation is None or conversation.insight_namespace_id != insight_namespace_id:
             return {"success": False, "message": "当前会话不存在或不属于该空间"}
+        release_clean_session_connection(self.session)
 
         normalized_nodes = self._normalize_uns_nodes(nodes)
         normalized_ts_query_source = normalize_ts_query_source(ts_query_source)
@@ -344,6 +346,7 @@ class InsightNsRelDatasourceService:
                             insight_conversation_id=insight_conversation_id,
                             desired_datasource_ids=[],
                         )
+                        selections = self.list_uns_selections(insight_conversation_id)
                         self.session.commit()
                         return {
                             "success": True,
@@ -352,7 +355,7 @@ class InsightNsRelDatasourceService:
                                 "imported": [],
                                 "failed": [],
                                 "removed_datasource_ids": removed_datasource_ids,
-                                "selections": self.list_uns_selections(insight_conversation_id),
+                                "selections": selections,
                             },
                         }
 
@@ -363,6 +366,7 @@ class InsightNsRelDatasourceService:
                         if node_id not in existing_datasources
                     ]
                     if missing_node_ids:
+                        release_clean_session_connection(self.session)
                         detail_results = self._fetch_uns_details_in_parallel(
                             missing_node_ids,
                             authorization,
@@ -420,6 +424,7 @@ class InsightNsRelDatasourceService:
         except RuntimeError as exc:
             return {"success": False, "message": str(exc)}
 
+        selections = self.list_uns_selections(insight_conversation_id)
         self.session.commit()
         message = "UNS 节点选择已同步"
         if imported_rows:
@@ -431,7 +436,7 @@ class InsightNsRelDatasourceService:
                 "imported": imported_rows,
                 "failed": failed_rows,
                 "removed_datasource_ids": removed_datasource_ids,
-                "selections": self.list_uns_selections(insight_conversation_id),
+                "selections": selections,
             },
         }
 

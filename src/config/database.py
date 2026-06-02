@@ -1,11 +1,9 @@
 import os
 from contextlib import contextmanager
-from typing import Callable, TypeVar
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.engine import URL
-from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.sql import text
 
@@ -59,13 +57,6 @@ else:
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 POSTGRES_SCHEMA_LOCK_KEY = 827364219
-T = TypeVar('T')
-
-
-def _is_disconnect_error(exc: Exception) -> bool:
-    if isinstance(exc, DBAPIError) and getattr(exc, 'connection_invalidated', False):
-        return True
-    return False
 
 
 def get_session():
@@ -76,9 +67,20 @@ def get_session():
         session.close()
 
 
+def release_clean_session_connection(session) -> None:
+    """
+    Return an idle read-only transaction's connection to the pool.
+
+    SQLAlchemy starts a transaction on first query. Long external calls should
+    not keep that checked-out connection if there are no pending ORM changes.
+    """
+    if session.in_transaction() and not session.new and not session.dirty and not session.deleted:
+        session.rollback()
+
+
 @contextmanager
 def session_scope(*, expire_on_commit: bool | None = None):
-    """Create a short-lived ORM session for one business operation."""
+    """Create a short-lived ORM session; transaction commit stays with the caller."""
     session_kwargs = {}
     if expire_on_commit is not None:
         session_kwargs['expire_on_commit'] = expire_on_commit
@@ -90,32 +92,6 @@ def session_scope(*, expire_on_commit: bool | None = None):
         raise
     finally:
         session.close()
-
-
-def run_with_session(
-    operation: Callable[[object], T],
-    *,
-    retry_on_disconnect: bool = True,
-    expire_on_commit: bool | None = False,
-) -> T:
-    """
-    Execute a unit of work with a fresh ORM session.
-
-    If the checked-out DB connection was invalidated, retry once with a new
-    session so callers do not need scattered stale-session recovery logic.
-    """
-    attempts = 2 if retry_on_disconnect else 1
-    last_error: Exception | None = None
-    for attempt in range(attempts):
-        try:
-            with session_scope(expire_on_commit=expire_on_commit) as session:
-                return operation(session)
-        except Exception as exc:
-            last_error = exc
-            if attempt >= attempts - 1 or not _is_disconnect_error(exc):
-                raise
-            engine.dispose()
-    raise last_error if last_error is not None else RuntimeError('session operation failed')
 
 
 def init_db():

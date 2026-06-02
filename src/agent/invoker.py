@@ -12,7 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from agent import CustomContext, get_data_insight_agent, get_input
 from agent.context_engineering_runtime import is_analysis_like_request
 from config import Config
-from config.database import SessionLocal, run_with_session
+from config.database import session_scope
 from service.conversation_context_service import ConversationContextService, ConversationRunContext
 from utils import logger
 from utils.datasource_utils import safe_json_loads
@@ -179,8 +179,7 @@ def _load_latest_execution_result(
     execute_python 成功后只向模型返回轻量摘要，
     真正完整的 charts/tables 结果以 execution.result_payload_json 为准。
     """
-    session = SessionLocal()
-    try:
+    with session_scope(expire_on_commit=False) as session:
         latest_execution = ConversationContextService(session).get_latest_execution(
             runtime.turn.id,
             started_at=runtime.turn.started_at,
@@ -192,8 +191,6 @@ def _load_latest_execution_result(
             payload = json.loads(latest_execution.result_payload_json or '{}')
         except Exception:
             return '', [], []
-    finally:
-        session.close()
 
     if not isinstance(payload, dict):
         return '', [], []
@@ -406,8 +403,7 @@ def _is_expected_time_no_data_execution(
     if not expected_time_range:
         return False
 
-    session = SessionLocal()
-    try:
+    with session_scope(expire_on_commit=False) as session:
         executions = ConversationContextService(session).get_turn_executions(
             runtime.turn.id,
             started_at=runtime.turn.started_at,
@@ -415,8 +411,6 @@ def _is_expected_time_no_data_execution(
         if not executions:
             return False
         latest_execution = executions[-1]
-    finally:
-        session.close()
 
     if getattr(latest_execution, 'execution_status', '') == 'success':
         return False
@@ -442,16 +436,13 @@ def _build_expected_time_no_data_report(
         return latest_message.strip()
 
     latest_error = ''
-    session = SessionLocal()
-    try:
+    with session_scope(expire_on_commit=False) as session:
         executions = ConversationContextService(session).get_turn_executions(
             runtime.turn.id,
             started_at=runtime.turn.started_at,
         )
         if executions:
             latest_error = (getattr(executions[-1], 'error_message', '') or '').strip()
-    finally:
-        session.close()
 
     expected_time_range = _build_expected_time_range_from_user_query(user_message or getattr(runtime.turn, 'user_query', ''))
     start = str(expected_time_range.get('start') or '').strip()
@@ -524,12 +515,11 @@ def _build_regenerate_instruction(
     if not _is_regenerate_request(user_message):
         return ''
 
-    latest_turn = run_with_session(
-        lambda session: ConversationContextService(session).get_latest_successful_analysis_turn(
+    with session_scope(expire_on_commit=False) as session:
+        latest_turn = ConversationContextService(session).get_latest_successful_analysis_turn(
             runtime.conversation.id,
             max_turn_no=runtime.history_turn_limit,
         )
-    )
     if latest_turn is None:
         return ''
 
@@ -576,7 +566,8 @@ def _rerun_has_prior_analysis_result(
             artifact_query = artifact_query.filter(InsightNsArtifact.created_at < started_at)
         return artifact_query.first() is not None
 
-    return run_with_session(_has_prior)
+    with session_scope(expire_on_commit=False) as session:
+        return _has_prior(session)
 
 
 def _should_require_rerun_analysis_execution(
@@ -731,7 +722,8 @@ def _has_latest_execution(runtime: ConversationRunContext) -> bool:
             started_at=runtime.turn.started_at,
         ) is not None
 
-    return run_with_session(_operation)
+    with session_scope(expire_on_commit=False) as session:
+        return _operation(session)
 
 
 def _open_fresh_persistence_context(
@@ -797,7 +789,8 @@ def _finalize_run_with_fresh_session(
             allow_report_only=allow_report_only,
         )
 
-    return run_with_session(_operation)
+    with session_scope(expire_on_commit=False) as session:
+        return _operation(session)
 
 
 def _fail_run_with_fresh_session(
@@ -814,7 +807,8 @@ def _fail_run_with_fresh_session(
             preserve_existing_results=preserve_existing_results,
         )
 
-    run_with_session(_operation)
+    with session_scope(expire_on_commit=False) as session:
+        _operation(session)
 
 
 def _build_empty_response_error(user_message: str, analysis_flow_started: bool) -> str:
@@ -895,7 +889,8 @@ def _load_turn_executions_fresh(runtime: ConversationRunContext) -> list[Any]:
         )
 
     try:
-        return run_with_session(_operation)
+        with session_scope(expire_on_commit=False) as session:
+            return _operation(session)
     except SQLAlchemyError:
         logger.warning(
             "读取轮次执行历史失败，跳过本次恢复提示上下文: conversation_id=%s turn_id=%s",
@@ -1476,14 +1471,13 @@ def _extract_invoke_result(messages: list[Any]) -> tuple[str, str, list[dict[str
 
 def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
     """执行一次非流式分析请求。"""
-    runtime = run_with_session(
-        lambda session: ConversationContextService(session).start_run(
+    with session_scope(expire_on_commit=False) as session:
+        runtime = ConversationContextService(session).start_run(
             username=agent_request.username,
             namespace_id=agent_request.namespace_id,
             conversation_id=agent_request.conversation_id,
             user_message=agent_request.user_message,
         )
-    )
     service = None
 
     selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)
@@ -2044,14 +2038,13 @@ def _stream_with_runtime(
 
 def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]:
     """执行一次流式分析请求，并持续产出适合 SSE 的事件。"""
-    runtime = run_with_session(
-        lambda session: ConversationContextService(session).start_run(
+    with session_scope(expire_on_commit=False) as session:
+        runtime = ConversationContextService(session).start_run(
             username=agent_request.username,
             namespace_id=agent_request.namespace_id,
             conversation_id=agent_request.conversation_id,
             user_message=agent_request.user_message,
         )
-    )
     service = None
 
     selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)
@@ -2091,13 +2084,12 @@ def stream_rerun_turn(
     database_conn_info: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """在同一轮次内重新执行一次分析，并把新结果回写到该轮。"""
-    runtime = run_with_session(
-        lambda session: ConversationContextService(session).start_rerun(
+    with session_scope(expire_on_commit=False) as session:
+        runtime = ConversationContextService(session).start_rerun(
             username=username,
             conversation_id=conversation_id,
             turn_id=turn_id,
         )
-    )
     service = None
 
     if runtime is None:
@@ -2155,7 +2147,8 @@ def stream_existing_turn_events(
             history_turn_limit=max(turn.turn_no - 1, 0) if is_rerun else None,
         )
 
-    runtime = run_with_session(_load_runtime)
+    with session_scope(expire_on_commit=False) as session:
+        runtime = _load_runtime(session)
     selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)
     try:
         yield from _stream_with_runtime(None, runtime, agent_request)

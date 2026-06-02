@@ -6,7 +6,7 @@ from typing import Any
 
 from agent.invoker import AgentRequest, stream_existing_turn_events
 from config import Config
-from config.database import run_with_session
+from config.database import session_scope
 from service.analysis_stream_queue import AnalysisStreamQueue
 from service.analysis_task_service import AnalysisTaskService
 from utils import logger
@@ -114,25 +114,19 @@ class AnalysisTaskRunner:
         })
 
     def _mark_task_running(self, task_id: str) -> None:
-        def _operation(session):
+        with session_scope(expire_on_commit=False) as session:
             AnalysisTaskService(session).mark_running(task_id, worker_id=self._worker_id)
             session.commit()
 
-        run_with_session(_operation)
-
     def _heartbeat_task(self, task_id: str) -> None:
-        def _operation(session):
+        with session_scope(expire_on_commit=False) as session:
             AnalysisTaskService(session).heartbeat(task_id)
             session.commit()
 
-        run_with_session(_operation)
-
     def _mark_task_finished(self, task_id: str, *, status: str, error_message: str = "") -> None:
-        def _operation(session):
+        with session_scope(expire_on_commit=False) as session:
             AnalysisTaskService(session).mark_finished(task_id, status=status, error_message=error_message)
             session.commit()
-
-        run_with_session(_operation)
 
     def _fail_turn_if_possible(
         self,
@@ -143,7 +137,7 @@ class AnalysisTaskRunner:
         try:
             from service.conversation_context_service import ConversationContextService
 
-            def _operation(session):
+            with session_scope(expire_on_commit=False) as session:
                 ConversationContextService(session).fail_run(
                     int(agent_request.conversation_id or 0),
                     int(turn_id or 0),
@@ -151,7 +145,6 @@ class AnalysisTaskRunner:
                     preserve_existing_results=False,
                 )
 
-            run_with_session(_operation)
         except Exception:
             logger.warning("标记分析轮次失败时出错: turn_id=%s", turn_id, exc_info=True)
 
@@ -214,7 +207,8 @@ class AnalysisTaskRunner:
             return True
 
         try:
-            return run_with_session(_operation)
+            with session_scope(expire_on_commit=False) as session:
+                return _operation(session)
         except Exception:
             logger.warning("从最新成功执行记录恢复分析轮次失败: task_id=%s turn_id=%s", task_id, turn_id, exc_info=True)
             return False
