@@ -21,6 +21,7 @@ def create_insight_namespace_controller() -> Blueprint:
     blueprint.route('/<int:namespace_id>/datasources', methods=['GET'])(controller.list_datasources)
     blueprint.route('/<int:namespace_id>/datasources/upload', methods=['POST'])(controller.upload_datasource_file)
     blueprint.route('/<int:namespace_id>/datasources/import-uns', methods=['POST'])(controller.import_uns_datasources)
+    blueprint.route('/<int:namespace_id>/datasources/<int:datasource_id>/content', methods=['GET'])(controller.get_datasource_file_content)
     blueprint.route('/<int:namespace_id>/datasources/<int:datasource_id>/description', methods=['PUT'])(controller.update_datasource_description)
     blueprint.route('/<int:namespace_id>/datasources/<int:datasource_id>', methods=['DELETE'])(controller.delete_datasource)
     blueprint.route('/<int:namespace_id>', methods=['PUT'])(controller.rename_namespace)
@@ -192,6 +193,24 @@ class InsightNamespaceController(BaseController):
                 insight_namespace_id=namespace_id,
                 datasource_id=datasource_id,
                 description=data.get('description', ''),
+            )
+            if result['success']:
+                return jsonify(Result.success(data=result['data'], message=result['message']).to_dict())
+            return self.error_response(result['message'], 400)
+        finally:
+            session.close()
+
+    def get_datasource_file_content(self, namespace_id: int, datasource_id: int):
+        page_no = request.args.get('page_no', request.args.get('pageNo', 1), type=int)
+        page_size = request.args.get('page_size', request.args.get('pageSize', 50), type=int)
+        session = SessionLocal()
+        try:
+            service = InsightNsRelDatasourceService(session)
+            result = service.get_uploaded_file_datasource_content(
+                insight_namespace_id=namespace_id,
+                datasource_id=datasource_id,
+                page_no=page_no or 1,
+                page_size=page_size or 50,
             )
             if result['success']:
                 return jsonify(Result.success(data=result['data'], message=result['message']).to_dict())

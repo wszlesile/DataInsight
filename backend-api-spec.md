@@ -1065,7 +1065,86 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 
 - 空间数据源列表中，点击“编辑描述”后保存
 
-### 4.5 删除空间数据源
+### 4.5 分页读取外部上传数据源文件内容
+
+`GET /api/insight/namespaces/{namespace_id}/datasources/{datasource_id}/content`
+
+用途：
+
+- 读取外部上传文件数据源的原始文件内容
+- 支持分页展示，供前端“查看数据”弹窗使用
+- 仅支持 `local_file` 类型的数据源，即通过上传 Excel / CSV 文件创建的数据源
+
+查询参数：
+
+- `page_no`
+  - 页码，从 `1` 开始
+  - 可选，默认 `1`
+  - 兼容驼峰参数 `pageNo`
+- `page_size`
+  - 每页行数
+  - 可选，默认 `50`
+  - 后端会按 `DATASOURCE_FILE_CONTENT_MAX_PAGE_SIZE` 限制最大值，默认最大 `200`
+  - 兼容驼峰参数 `pageSize`
+
+请求示例：
+
+```http
+GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
+```
+
+响应 `data` 示例：
+
+```json
+{
+  "datasource_id": 82,
+  "datasource_name": "设备信息表 / Sheet",
+  "file_name": "设备信息表.xlsx",
+  "sheet_name": "Sheet",
+  "columns": ["设备ID", "设备名称", "设备类型", "制造商", "安装日期", "位置", "额定功率(kW)", "状态"],
+  "rows": [
+    {
+      "设备ID": "EQ001",
+      "设备名称": "数控机床-A1",
+      "设备类型": "加工设备",
+      "制造商": "沈阳机床",
+      "安装日期": "2022-03-15",
+      "位置": "车间A-01",
+      "额定功率(kW)": 45,
+      "状态": "运行中"
+    }
+  ],
+  "page_no": 1,
+  "page_size": 50,
+  "max_page_size": 200,
+  "total_rows": 10,
+  "total_pages": 1,
+  "has_next": false,
+  "has_prev": false
+}
+```
+
+响应字段说明：
+
+- `columns`
+  - 原始文件列名列表
+- `rows`
+  - 当前页数据行，字段名与 `columns` 对应
+- `total_rows`
+  - 原始文件数据行总数，不包含表头
+- `total_pages`
+  - 总页数
+- `has_next` / `has_prev`
+  - 是否存在下一页 / 上一页
+
+失败场景：
+
+- 数据源不存在
+- 数据源不是 `local_file`
+- 原始上传文件不存在或已被移动
+- 文件格式不支持或解析失败
+
+### 4.6 删除空间数据源
 
 `DELETE /api/insight/namespaces/{namespace_id}/datasources/{datasource_id}`
 
@@ -1089,7 +1168,7 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 }
 ```
 
-### 4.6 绑定数据源到会话
+### 4.7 绑定数据源到会话
 
 `POST /api/insight/conversation/datasource/`
 
@@ -1118,7 +1197,7 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 
 - 空间数据源列表勾选时调用
 
-### 4.7 从会话解绑数据源
+### 4.8 从会话解绑数据源
 
 `DELETE /api/insight/conversation/datasource/`
 
@@ -1832,6 +1911,7 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 - `unbindConversationDatasource`
 - `listNamespaceDatasources`
 - `uploadNamespaceDatasource`
+- `getNamespaceDatasourceContent`
 - `fetchUnsTreeNodes`
 - `importNamespaceUnsDatasources`
 - `deleteNamespaceDatasource`
@@ -1865,13 +1945,15 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
    - `DELETE /api/insight/conversation/datasource/`
 5. 编辑数据源描述时：
    - `PUT /api/insight/namespaces/{namespace_id}/datasources/{datasource_id}/description`
-6. 上传文件时：
+6. 查看外部上传文件原始数据时：
+   - `GET /api/insight/namespaces/{namespace_id}/datasources/{datasource_id}/content?page_no=1&page_size=50`
+7. 上传文件时：
    - `POST /api/insight/namespaces/{namespace_id}/datasources/upload`
-7. 加载 UNS 树时：
+8. 加载 UNS 树时：
    - `POST /api/insight/namespaces/{namespace_id}/uns/tree`
-8. 加载当前会话 UNS 已选节点回显时：
+9. 加载当前会话 UNS 已选节点回显时：
    - `GET /api/insight/namespaces/{namespace_id}/uns/selections?insight_conversation_id=...`
-9. 勾选或取消勾选 UNS 节点时：
+10. 勾选或取消勾选 UNS 节点时：
    - `POST /api/insight/namespaces/{namespace_id}/datasources/import-uns`
    - 请求体传 `insight_conversation_id + 当前全量已选 nodes`
 11. 删除数据源时：

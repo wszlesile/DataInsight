@@ -170,6 +170,15 @@ export function updateNamespaceDatasourceDescription(namespaceId, datasourceId, 
   })
 }
 
+export function getNamespaceDatasourceContent(namespaceId, datasourceId, params = {}) {
+  return api.get(`/insight/namespaces/${namespaceId}/datasources/${datasourceId}/content`, {
+    params: {
+      page_no: params.pageNo || params.page_no || 1,
+      page_size: params.pageSize || params.page_size || 50
+    }
+  })
+}
+
 export const UNS_TREE_DATA_TYPE_FILTER = [1, 2]
 
 export function fetchUnsTreeNodes(namespaceId, parentId = '0', options = {}) {

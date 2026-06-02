@@ -1,4 +1,4 @@
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 from threading import BoundedSemaphore
@@ -14,6 +14,13 @@ from sqlalchemy.orm import Session
 
 from dto import DataSourceSchema, PropertySchema
 from model import InsightDatasource, InsightNsConversation, InsightNsRelDatasource, InsightNsUnsSelection
+from service.datasource_description_runner import (
+    DESCRIPTION_SOURCE_DEFAULT,
+    DESCRIPTION_SOURCE_USER,
+    build_description_meta,
+    get_datasource_description_runner,
+    schema_guard_hash,
+)
 from utils import (
     TABLE_ENGINE_RELATIONAL,
     TABLE_ENGINE_TIME_SERIES,
@@ -21,6 +28,7 @@ from utils import (
     normalize_datasource_type,
     normalize_ts_query_source,
     safe_json_loads,
+    logger,
 )
 
 SHARED_UNS_NAMESPACE_ID = 0
@@ -169,8 +177,17 @@ class InsightNsRelDatasourceService:
         if not isinstance(schema_payload, dict):
             schema_payload = {}
         schema_payload['description'] = str(description or '').strip()
+        config_payload = safe_json_loads(datasource.datasource_config_json, {})
+        if not isinstance(config_payload, dict):
+            config_payload = {}
+        current_meta = config_payload.get('description_meta') if isinstance(config_payload.get('description_meta'), dict) else {}
+        config_payload['description_meta'] = build_description_meta(
+            DESCRIPTION_SOURCE_USER,
+            int(current_meta.get('version') or 0) + 1,
+        )
 
         datasource.datasource_schema = dump_json(schema_payload)
+        datasource.datasource_config_json = dump_json(config_payload)
         self.session.commit()
         self.session.refresh(datasource)
         return {
@@ -178,6 +195,59 @@ class InsightNsRelDatasourceService:
             "message": "数据源描述已更新",
             "data": self._datasource_to_dict(datasource),
         }
+
+    def get_uploaded_file_datasource_content(
+        self,
+        insight_namespace_id: int,
+        datasource_id: int,
+        page_no: int = 1,
+        page_size: int = 50,
+    ) -> dict[str, Any]:
+        datasource = self.session.query(InsightDatasource).filter(
+            InsightDatasource.id == datasource_id,
+            InsightDatasource.insight_namespace_id == insight_namespace_id,
+            InsightDatasource.datasource_type == 'local_file',
+            InsightDatasource.is_deleted == 0,
+        ).first()
+        if datasource is None:
+            return {"success": False, "message": "数据源不存在或不是外部上传文件"}
+
+        config_payload = safe_json_loads(datasource.datasource_config_json, {})
+        if not isinstance(config_payload, dict):
+            config_payload = {}
+        file_path_text = str(config_payload.get('file_path') or '').strip()
+        if not file_path_text:
+            return {"success": False, "message": "数据源文件路径不存在"}
+
+        file_path = Path(file_path_text)
+        if not file_path.exists() or not file_path.is_file():
+            return {"success": False, "message": "数据源文件不存在或已被移动"}
+
+        normalized_page_no = max(int(page_no or 1), 1)
+        max_page_size = max(int(getattr(Config, 'DATASOURCE_FILE_CONTENT_MAX_PAGE_SIZE', 200) or 200), 1)
+        normalized_page_size = min(max(int(page_size or 50), 1), max_page_size)
+        sheet_name = str(config_payload.get('sheet_name') or '').strip() or None
+
+        try:
+            page_data = self._read_file_content_page(
+                file_path=file_path,
+                sheet_name=sheet_name,
+                page_no=normalized_page_no,
+                page_size=normalized_page_size,
+            )
+        except ValueError as exc:
+            return {"success": False, "message": str(exc)}
+
+        page_data.update({
+            "datasource_id": datasource.id,
+            "datasource_name": datasource.datasource_name,
+            "file_name": str(config_payload.get('original_filename') or file_path.name),
+            "sheet_name": sheet_name or '',
+            "page_no": normalized_page_no,
+            "page_size": normalized_page_size,
+            "max_page_size": max_page_size,
+        })
+        return {"success": True, "message": "数据源文件内容读取成功", "data": page_data}
 
     def import_uns_nodes_to_namespace(
         self,
@@ -1107,6 +1177,69 @@ class InsightNsRelDatasourceService:
         )
         return dump_json(schema.model_dump())
 
+    def _build_file_preview_summary(self, dataframe: pd.DataFrame, sheet_name: str | None = None) -> dict[str, Any]:
+        sample_frame = dataframe.head(20)
+        columns = [str(column) for column in dataframe.columns]
+        sample_rows = [
+            {
+                str(column): self._preview_value(row.get(column))
+                for column in dataframe.columns
+            }
+            for row in sample_frame.to_dict(orient='records')
+        ]
+
+        column_stats: dict[str, Any] = {}
+        for column in dataframe.columns:
+            series = dataframe[column]
+            stats: dict[str, Any] = {
+                "non_null_count": int(series.notna().sum()),
+                "null_count": int(series.isna().sum()),
+                "example": self._preview_value(self._extract_example_value(series)),
+            }
+            if pd.api.types.is_numeric_dtype(series):
+                numeric = pd.to_numeric(series, errors='coerce').dropna()
+                if not numeric.empty:
+                    stats.update({
+                        "min": self._preview_value(numeric.min()),
+                        "max": self._preview_value(numeric.max()),
+                        "mean": self._preview_value(numeric.mean()),
+                    })
+            else:
+                values = series.dropna().astype(str)
+                if not values.empty:
+                    stats["unique_preview_count"] = int(values.nunique(dropna=True))
+                    stats["top_values"] = [
+                        self._preview_value(value)
+                        for value in values.value_counts().head(5).index.tolist()
+                    ]
+            column_stats[str(column)] = stats
+
+        return {
+            "sheet_name": sheet_name or "",
+            "columns": columns,
+            "row_count_preview": int(len(dataframe)),
+            "sample_rows": sample_rows,
+            "column_stats": column_stats,
+        }
+
+    def _preview_value(self, value: Any) -> Any:
+        if value is None:
+            return None
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+        if hasattr(value, 'isoformat'):
+            try:
+                return value.isoformat()
+            except Exception:
+                return str(value)
+        if isinstance(value, (int, float, bool)):
+            return value
+        text = str(value)
+        return text if len(text) <= 120 else f"{text[:117]}..."
+
     def _build_uns_time_series_datasource_schema(
         self,
         detail: dict[str, Any],
@@ -1293,7 +1426,8 @@ class InsightNsRelDatasourceService:
                 stored_path.unlink(missing_ok=True)
             return {"success": False, "message": str(exc)}
 
-        created_datasources: list[dict[str, Any]] = []
+        created_datasource_ids: list[int] = []
+        description_items: list[dict[str, Any]] = []
         for payload in datasource_payloads:
             datasource = self._get_or_create_datasource(
                 insight_namespace_id=insight_namespace_id,
@@ -1303,9 +1437,20 @@ class InsightNsRelDatasourceService:
                 datasource_schema=payload["datasource_schema"],
                 datasource_config_json=payload["datasource_config_json"],
             )
-            created_datasources.append(self._datasource_to_dict(datasource))
+            created_datasource_ids.append(int(datasource.id or 0))
+            description_items.append({
+                "datasource_id": int(datasource.id or 0),
+                "datasource_name": datasource.datasource_name,
+                "original_filename": original_filename,
+                "sheet_name": payload.get("sheet_name", ""),
+                "preview_summary": payload.get("preview_summary") or {},
+                "base_description": payload.get("base_description", ""),
+                "schema_hash": payload.get("schema_hash", ""),
+            })
 
         self.session.commit()
+        self._submit_uploaded_datasource_description_job(description_items)
+        created_datasources = self._load_datasource_dicts(created_datasource_ids)
         message = "文件上传成功"
         if len(created_datasources) > 1:
             message = f"Excel 文件上传成功，已创建 {len(created_datasources)} 个工作表数据源"
@@ -1315,6 +1460,38 @@ class InsightNsRelDatasourceService:
             "data": self._build_upload_response_data(created_datasources),
         }
 
+    def _submit_uploaded_datasource_description_job(self, description_items: list[dict[str, Any]]) -> None:
+        valid_items = [item for item in description_items if int(item.get("datasource_id") or 0) > 0]
+        if not valid_items:
+            return
+        try:
+            future = get_datasource_description_runner().submit(valid_items)
+            wait_seconds = max(float(getattr(Config, 'DATASOURCE_DESCRIPTION_SYNC_WAIT_SECONDS', 2) or 0), 0)
+            if wait_seconds > 0:
+                future.result(timeout=wait_seconds)
+                self.session.expire_all()
+        except TimeoutError:
+            logger.info("上传数据源描述仍在后台生成: datasource_ids=%s", [
+                item.get("datasource_id") for item in valid_items
+            ])
+        except Exception:
+            logger.warning("提交或等待上传数据源描述生成任务失败，保留默认描述", exc_info=True)
+
+    def _load_datasource_dicts(self, datasource_ids: list[int]) -> list[dict[str, Any]]:
+        normalized_ids = [int(item or 0) for item in datasource_ids if int(item or 0) > 0]
+        if not normalized_ids:
+            return []
+        rows = self.session.query(InsightDatasource).filter(
+            InsightDatasource.id.in_(normalized_ids),
+            InsightDatasource.is_deleted == 0,
+        ).all()
+        row_map = {int(row.id): row for row in rows}
+        return [
+            self._datasource_to_dict(row_map[datasource_id])
+            for datasource_id in normalized_ids
+            if datasource_id in row_map
+        ]
+
     def _build_file_datasource_schema(
         self,
         file_path: Path,
@@ -1322,6 +1499,19 @@ class InsightNsRelDatasourceService:
         sheet_name: str | None = None,
     ) -> str:
         """读取上传文件前几行数据，并推断元数据 Schema。"""
+        datasource_schema, _preview_summary, _description = self._build_file_datasource_schema_with_preview(
+            file_path,
+            datasource_name,
+            sheet_name=sheet_name,
+        )
+        return datasource_schema
+
+    def _build_file_datasource_schema_with_preview(
+        self,
+        file_path: Path,
+        datasource_name: str,
+        sheet_name: str | None = None,
+    ) -> tuple[str, dict[str, Any], str]:
         dataframe = self._read_file_preview(file_path, sheet_name=sheet_name)
 
         properties: dict[str, PropertySchema] = {}
@@ -1343,7 +1533,7 @@ class InsightNsRelDatasourceService:
             properties=properties,
             required=[str(column) for column in dataframe.columns],
         )
-        return dump_json(schema.model_dump())
+        return dump_json(schema.model_dump()), self._build_file_preview_summary(dataframe, sheet_name), description
 
     def _build_uploaded_file_datasource_payloads(
         self,
@@ -1352,7 +1542,7 @@ class InsightNsRelDatasourceService:
         original_filename: str,
         stored_filename: str,
         base_name: str,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         suffix = stored_path.suffix.lower()
         file_path = str(stored_path).replace('\\', '/')
         file_size_bytes = stored_path.stat().st_size
@@ -1362,7 +1552,7 @@ class InsightNsRelDatasourceService:
             if not sheet_names:
                 raise ValueError('Excel 文件未发现可用的工作表')
 
-            payloads: list[dict[str, str]] = []
+            payloads: list[dict[str, Any]] = []
             sheet_count = len(sheet_names)
             for index, raw_sheet_name in enumerate(sheet_names, start=1):
                 sheet_name = str(raw_sheet_name or '').strip() or f"Sheet{index}"
@@ -1370,7 +1560,7 @@ class InsightNsRelDatasourceService:
                     insight_namespace_id=insight_namespace_id,
                     base_name=f"{base_name} / {sheet_name}",
                 )
-                datasource_schema = self._build_file_datasource_schema(
+                datasource_schema, preview_summary, base_description = self._build_file_datasource_schema_with_preview(
                     stored_path,
                     datasource_name,
                     sheet_name=sheet_name,
@@ -1385,12 +1575,17 @@ class InsightNsRelDatasourceService:
                     "worksheet_index": index,
                     "worksheet_count": sheet_count,
                     "workbook_group_id": workbook_group_id,
+                    "description_meta": build_description_meta(DESCRIPTION_SOURCE_DEFAULT),
                 })
                 payloads.append({
                     "datasource_name": datasource_name,
                     "datasource_schema": datasource_schema,
                     "datasource_config_json": datasource_config_json,
                     "knowledge_tag": f"upload_{workbook_group_id}_{index}",
+                    "sheet_name": sheet_name,
+                    "preview_summary": preview_summary,
+                    "base_description": base_description,
+                    "schema_hash": schema_guard_hash(safe_json_loads(datasource_schema, {})),
                 })
             return payloads
 
@@ -1398,19 +1593,27 @@ class InsightNsRelDatasourceService:
             insight_namespace_id=insight_namespace_id,
             base_name=base_name,
         )
-        datasource_schema = self._build_file_datasource_schema(stored_path, datasource_name)
+        datasource_schema, preview_summary, base_description = self._build_file_datasource_schema_with_preview(
+            stored_path,
+            datasource_name,
+        )
         datasource_config_json = dump_json({
             "file_path": file_path,
             "original_filename": original_filename,
             "stored_filename": stored_filename,
             "file_extension": suffix.lstrip('.'),
             "file_size_bytes": file_size_bytes,
+            "description_meta": build_description_meta(DESCRIPTION_SOURCE_DEFAULT),
         })
         return [{
             "datasource_name": datasource_name,
             "datasource_schema": datasource_schema,
             "datasource_config_json": datasource_config_json,
             "knowledge_tag": f"upload_{uuid4().hex[:16]}",
+            "sheet_name": "",
+            "preview_summary": preview_summary,
+            "base_description": base_description,
+            "schema_hash": schema_guard_hash(safe_json_loads(datasource_schema, {})),
         }]
 
     def _list_excel_sheet_names(self, file_path: Path) -> list[str]:
@@ -1463,6 +1666,132 @@ class InsightNsRelDatasourceService:
             raise
         except Exception as exc:
             raise ValueError(f'文件解析失败：{exc}') from exc
+
+    def _read_file_content_page(
+        self,
+        file_path: Path,
+        sheet_name: str | None,
+        page_no: int,
+        page_size: int,
+    ) -> dict[str, Any]:
+        suffix = file_path.suffix.lower()
+        offset = (page_no - 1) * page_size
+        if suffix == '.csv':
+            dataframe = self._read_csv_page(file_path, offset=offset, limit=page_size)
+            total_rows = self._count_csv_data_rows(file_path)
+        elif suffix in {'.xlsx', '.xls'}:
+            dataframe = self._read_excel_page(file_path, sheet_name=sheet_name, offset=offset, limit=page_size)
+            total_rows = self._count_excel_data_rows(file_path, sheet_name=sheet_name)
+        else:
+            raise ValueError(f'暂不支持读取 {suffix} 文件内容')
+
+        total_pages = (total_rows + page_size - 1) // page_size if total_rows >= 0 else 0
+        return {
+            "columns": [str(column) for column in dataframe.columns],
+            "rows": self._dataframe_to_content_rows(dataframe),
+            "total_rows": total_rows,
+            "total_pages": total_pages,
+            "has_next": page_no < total_pages if total_pages > 0 else False,
+            "has_prev": page_no > 1,
+        }
+
+    def _read_csv_page(self, file_path: Path, offset: int, limit: int) -> pd.DataFrame:
+        last_error: Exception | None = None
+        for encoding in ('utf-8', 'utf-8-sig', 'gb18030', 'gbk'):
+            try:
+                return pd.read_csv(
+                    file_path,
+                    nrows=limit,
+                    skiprows=range(1, offset + 1) if offset > 0 else None,
+                    encoding=encoding,
+                )
+            except UnicodeDecodeError as exc:
+                last_error = exc
+                continue
+            except Exception as exc:
+                raise ValueError(f'CSV 文件读取失败：{exc}') from exc
+        raise ValueError(f'CSV 文件编码识别失败：{last_error}')
+
+    def _read_excel_page(
+        self,
+        file_path: Path,
+        sheet_name: str | None,
+        offset: int,
+        limit: int,
+    ) -> pd.DataFrame:
+        try:
+            if file_path.suffix.lower() == '.xlsx':
+                return pd.read_excel(
+                    file_path,
+                    nrows=limit,
+                    skiprows=range(1, offset + 1) if offset > 0 else None,
+                    engine='openpyxl',
+                    sheet_name=sheet_name if sheet_name else 0,
+                )
+            if file_path.suffix.lower() == '.xls':
+                return pd.read_excel(
+                    file_path,
+                    nrows=limit,
+                    skiprows=range(1, offset + 1) if offset > 0 else None,
+                    engine='xlrd',
+                    sheet_name=sheet_name if sheet_name else 0,
+                )
+            raise ValueError(f'暂不支持读取 {file_path.suffix} 文件内容')
+        except ImportError as exc:
+            raise ValueError(f'文件解析依赖缺失：{exc}') from exc
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f'Excel 文件读取失败：{exc}') from exc
+
+    def _count_csv_data_rows(self, file_path: Path) -> int:
+        last_error: Exception | None = None
+        for encoding in ('utf-8', 'utf-8-sig', 'gb18030', 'gbk'):
+            try:
+                with file_path.open('r', encoding=encoding, newline='') as file:
+                    line_count = sum(1 for _ in file)
+                return max(line_count - 1, 0)
+            except UnicodeDecodeError as exc:
+                last_error = exc
+                continue
+            except Exception as exc:
+                raise ValueError(f'CSV 文件行数统计失败：{exc}') from exc
+        raise ValueError(f'CSV 文件编码识别失败：{last_error}')
+
+    def _count_excel_data_rows(self, file_path: Path, sheet_name: str | None = None) -> int:
+        try:
+            if file_path.suffix.lower() == '.xlsx':
+                from openpyxl import load_workbook
+
+                workbook = load_workbook(file_path, read_only=True, data_only=True)
+                try:
+                    worksheet = workbook[sheet_name] if sheet_name else workbook.worksheets[0]
+                    return max(int(worksheet.max_row or 0) - 1, 0)
+                finally:
+                    workbook.close()
+            if file_path.suffix.lower() == '.xls':
+                import xlrd
+
+                workbook = xlrd.open_workbook(str(file_path), on_demand=True)
+                try:
+                    worksheet = workbook.sheet_by_name(sheet_name) if sheet_name else workbook.sheet_by_index(0)
+                    return max(int(worksheet.nrows or 0) - 1, 0)
+                finally:
+                    workbook.release_resources()
+            raise ValueError(f'暂不支持读取 {file_path.suffix} 文件内容')
+        except ImportError as exc:
+            raise ValueError(f'文件解析依赖缺失：{exc}') from exc
+        except Exception as exc:
+            raise ValueError(f'Excel 文件行数统计失败：{exc}') from exc
+
+    def _dataframe_to_content_rows(self, dataframe: pd.DataFrame) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for row in dataframe.to_dict(orient='records'):
+            rows.append({
+                str(column): self._preview_value(value)
+                for column, value in row.items()
+            })
+        return rows
 
     def _to_dict(self, rel: InsightNsRelDatasource, datasource: InsightDatasource) -> dict[str, Any]:
         datasource_config = safe_json_loads(datasource.datasource_config_json, {})

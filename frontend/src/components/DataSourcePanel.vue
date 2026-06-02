@@ -154,6 +154,15 @@
                       <span>{{ resource.checked ? '已绑定' : '绑定到当前会话' }}</span>
                     </label>
                     <button
+                      v-if="resource.canPreviewContent"
+                      class="edit-btn"
+                      type="button"
+                      :disabled="contentPreview.loading && contentPreview.datasourceId === resource.datasource_id"
+                      @click.stop="openDatasourceContentPreview(resource)"
+                    >
+                      查看数据
+                    </button>
+                    <button
                       class="edit-btn"
                       type="button"
                       :disabled="editingDatasourceIds.includes(resource.datasource_id)"
@@ -191,6 +200,54 @@
         </div>
       </div>
     </div>
+
+    <el-dialog
+      v-model="contentPreview.visible"
+      class="datasource-content-dialog"
+      width="920px"
+      :title="contentPreview.title || '数据预览'"
+      destroy-on-close
+    >
+      <div class="content-preview-meta">
+        <span>{{ contentPreview.fileName || '-' }}</span>
+        <span v-if="contentPreview.sheetName">工作表：{{ contentPreview.sheetName }}</span>
+        <span>共 {{ contentPreview.totalRows }} 行</span>
+      </div>
+
+      <div v-loading="contentPreview.loading" class="content-preview-table-wrap">
+        <table v-if="contentPreview.columns.length" class="content-preview-table">
+          <thead>
+            <tr>
+              <th v-for="column in contentPreview.columns" :key="column">{{ column }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(row, rowIndex) in contentPreview.rows" :key="rowIndex">
+              <td v-for="column in contentPreview.columns" :key="`${rowIndex}-${column}`">
+                {{ formatPreviewCell(row[column]) }}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else-if="!contentPreview.loading" class="content-preview-empty">暂无可展示数据</div>
+      </div>
+
+      <div class="content-preview-footer">
+        <span class="content-preview-page-text">
+          第 {{ contentPreview.pageNo }} / {{ contentPreview.totalPages || 1 }} 页
+        </span>
+        <el-pagination
+          background
+          layout="prev, pager, next, sizes"
+          :current-page="contentPreview.pageNo"
+          :page-size="contentPreview.pageSize"
+          :page-sizes="contentPreview.pageSizes"
+          :total="contentPreview.totalRows"
+          @current-change="handleContentPreviewPageChange"
+          @size-change="handleContentPreviewSizeChange"
+        />
+      </div>
+    </el-dialog>
   </section>
 </template>
 
@@ -201,6 +258,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   bindConversationDatasource,
   fetchUnsTreeNodes,
+  getNamespaceDatasourceContent,
   deleteNamespaceDatasource,
   importNamespaceUnsDatasources,
   listNamespaceUnsSelections,
@@ -233,6 +291,21 @@ const partialUnsFolderIds = ref([])
 const namespaceDatasources = ref([])
 const bindingDatasourceIds = ref([])
 const editingDatasourceIds = ref([])
+const contentPreview = ref({
+  visible: false,
+  loading: false,
+  datasourceId: 0,
+  title: '',
+  fileName: '',
+  sheetName: '',
+  columns: [],
+  rows: [],
+  pageNo: 1,
+  pageSize: 50,
+  pageSizes: [20, 50, 100, 200],
+  totalRows: 0,
+  totalPages: 0,
+})
 
 let latestDatasourceFetchToken = 0
 let latestUnsTreeToken = 0
@@ -345,6 +418,7 @@ const mapDatasourceCard = (item) => {
     icon,
     typeLabel: getDatasourceTypeLabel(item.datasource_type),
     knowledgeTag: item.knowledge_tag || '',
+    canPreviewContent: item.datasource_type === 'local_file',
     raw: item,
     payload: {
       datasourceId: Number(item.datasource_id),
@@ -803,6 +877,80 @@ const handleEditDatasourceDescription = async (resource) => {
   } finally {
     editingDatasourceIds.value = editingDatasourceIds.value.filter((item) => item !== datasourceId)
   }
+}
+
+const resetContentPreviewRows = () => {
+  contentPreview.value.columns = []
+  contentPreview.value.rows = []
+  contentPreview.value.totalRows = 0
+  contentPreview.value.totalPages = 0
+}
+
+const loadDatasourceContentPreview = async () => {
+  const datasourceId = Number(contentPreview.value.datasourceId || 0)
+  if (!props.activeNamespaceId || !datasourceId) return
+
+  contentPreview.value.loading = true
+  try {
+    const response = await getNamespaceDatasourceContent(
+      props.activeNamespaceId,
+      datasourceId,
+      {
+        pageNo: contentPreview.value.pageNo,
+        pageSize: contentPreview.value.pageSize,
+      }
+    )
+    if (!response.data?.success) {
+      throw new Error(response.data?.message || '读取数据源内容失败')
+    }
+
+    const data = response.data.data || {}
+    contentPreview.value.columns = Array.isArray(data.columns) ? data.columns : []
+    contentPreview.value.rows = Array.isArray(data.rows) ? data.rows : []
+    contentPreview.value.fileName = data.file_name || ''
+    contentPreview.value.sheetName = data.sheet_name || ''
+    contentPreview.value.pageNo = Number(data.page_no || contentPreview.value.pageNo || 1)
+    contentPreview.value.pageSize = Number(data.page_size || contentPreview.value.pageSize || 50)
+    contentPreview.value.totalRows = Number(data.total_rows || 0)
+    contentPreview.value.totalPages = Number(data.total_pages || 0)
+  } catch (error) {
+    console.error('Load datasource content preview error:', error)
+    resetContentPreviewRows()
+    ElMessage.error(error?.response?.data?.message || error.message || '读取数据源内容失败')
+  } finally {
+    contentPreview.value.loading = false
+  }
+}
+
+const openDatasourceContentPreview = async (resource) => {
+  if (!props.activeNamespaceId || !resource?.datasource_id) return
+
+  contentPreview.value.visible = true
+  contentPreview.value.datasourceId = Number(resource.datasource_id)
+  contentPreview.value.title = resource.title || '数据预览'
+  contentPreview.value.fileName = ''
+  contentPreview.value.sheetName = ''
+  contentPreview.value.pageNo = 1
+  contentPreview.value.pageSize = 50
+  resetContentPreviewRows()
+  await loadDatasourceContentPreview()
+}
+
+const handleContentPreviewPageChange = async (pageNo) => {
+  contentPreview.value.pageNo = Number(pageNo || 1)
+  await loadDatasourceContentPreview()
+}
+
+const handleContentPreviewSizeChange = async (pageSize) => {
+  contentPreview.value.pageSize = Number(pageSize || 50)
+  contentPreview.value.pageNo = 1
+  await loadDatasourceContentPreview()
+}
+
+const formatPreviewCell = (value) => {
+  if (value === null || value === undefined || value === '') return '-'
+  if (typeof value === 'object') return JSON.stringify(value)
+  return String(value)
 }
 
 const toggleDatasourceBinding = async (resource, event) => {
@@ -1338,6 +1486,73 @@ watch(
 .delete-btn:disabled {
   cursor: not-allowed;
   opacity: 0.6;
+}
+
+.content-preview-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.content-preview-table-wrap {
+  min-height: 260px;
+  max-height: 520px;
+  overflow: auto;
+  border: 1px solid #e5edf7;
+  border-radius: 10px;
+}
+
+.content-preview-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: auto;
+  font-size: 12px;
+  color: #0f172a;
+}
+
+.content-preview-table th,
+.content-preview-table td {
+  border-bottom: 1px solid #e5edf7;
+  border-right: 1px solid #e5edf7;
+  padding: 8px 10px;
+  max-width: 220px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.content-preview-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #f8fbff;
+  color: #334155;
+  font-weight: 700;
+}
+
+.content-preview-empty {
+  height: 260px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.content-preview-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.content-preview-page-text {
+  color: #64748b;
+  font-size: 12px;
 }
 
 .source-pill {
