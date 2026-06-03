@@ -97,6 +97,29 @@ export function deleteConversation(conversationId) {
   return api.delete(`/insight/conversations/${conversationId}`)
 }
 
+export function getConversationPrompt(conversationId, namespaceId) {
+  return api.get(`/insight/conversations/${conversationId}/prompt`, {
+    params: {
+      namespace_id: namespaceId
+    }
+  })
+}
+
+export function updateConversationPrompt(conversationId, namespaceId, promptContent) {
+  return api.put(`/insight/conversations/${conversationId}/prompt`, {
+    namespace_id: namespaceId,
+    prompt_content: promptContent || ''
+  })
+}
+
+export function deleteConversationPrompt(conversationId, namespaceId) {
+  return api.delete(`/insight/conversations/${conversationId}/prompt`, {
+    data: {
+      namespace_id: namespaceId
+    }
+  })
+}
+
 export function getConversationHistory(conversationId) {
   return api.get(`/insight/conversations/${conversationId}/history`)
 }

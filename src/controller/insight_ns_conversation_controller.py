@@ -10,6 +10,7 @@ from dto import get_current_user_context
 from service.analysis_stream_queue import AnalysisStreamQueue
 from service.analysis_task_runner import encode_sse, get_analysis_task_runner
 from service.analysis_task_service import ACTIVE_TASK_STATUSES, AnalysisTaskService
+from service.insight_ns_conversation_prompt_service import InsightNsConversationPromptService
 from service.insight_ns_conversation_service import InsightNsConversationService
 from service.conversation_context_service import ConversationContextService
 from utils.llm_error_utils import get_user_facing_agent_error
@@ -26,6 +27,9 @@ def create_insight_ns_conversation_controller() -> Blueprint:
     blueprint.route('', methods=['GET'])(controller.list_conversations)
     blueprint.route('/<int:conversation_id>', methods=['PUT'])(controller.rename_conversation)
     blueprint.route('/<int:conversation_id>', methods=['DELETE'])(controller.delete_conversation)
+    blueprint.route('/<int:conversation_id>/prompt', methods=['GET'])(controller.get_conversation_prompt)
+    blueprint.route('/<int:conversation_id>/prompt', methods=['PUT'])(controller.update_conversation_prompt)
+    blueprint.route('/<int:conversation_id>/prompt', methods=['DELETE'])(controller.delete_conversation_prompt)
     blueprint.route('/<int:conversation_id>/history', methods=['GET'])(controller.get_history)
     blueprint.route('/<int:conversation_id>/running-turn', methods=['GET'])(controller.get_running_turn)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>', methods=['GET'])(controller.get_turn_detail)
@@ -122,6 +126,58 @@ class InsightNsConversationController(BaseController):
             if not deleted:
                 return self.error_response('会话不存在', 404)
             return jsonify(Result.success(message='会话已删除').to_dict())
+        finally:
+            session.close()
+
+    def get_conversation_prompt(self, conversation_id: int):
+        namespace_id = request.args.get('namespace_id', '0')
+        session = SessionLocal()
+        try:
+            prompt = InsightNsConversationPromptService(session).get_prompt(
+                username=self._get_username(),
+                namespace_id=namespace_id,
+                conversation_id=conversation_id,
+            )
+            if prompt is None:
+                return self.error_response('会话不存在', 404)
+            return jsonify(Result.success(data=prompt).to_dict())
+        finally:
+            session.close()
+
+    def update_conversation_prompt(self, conversation_id: int):
+        data = self.get_json_data()
+        namespace_id = data.get('namespace_id', 0)
+        prompt_content = data.get('prompt_content', '')
+        session = SessionLocal()
+        try:
+            try:
+                prompt = InsightNsConversationPromptService(session).upsert_prompt(
+                    username=self._get_username(),
+                    namespace_id=namespace_id,
+                    conversation_id=conversation_id,
+                    prompt_content=prompt_content,
+                )
+            except ValueError as exc:
+                return self.error_response(str(exc), 400)
+            if prompt is None:
+                return self.error_response('会话不存在', 404)
+            return jsonify(Result.success(data=prompt, message='会话提示词已保存').to_dict())
+        finally:
+            session.close()
+
+    def delete_conversation_prompt(self, conversation_id: int):
+        data = self.get_json_data()
+        namespace_id = data.get('namespace_id') or request.args.get('namespace_id', '0')
+        session = SessionLocal()
+        try:
+            deleted = InsightNsConversationPromptService(session).delete_prompt(
+                username=self._get_username(),
+                namespace_id=namespace_id,
+                conversation_id=conversation_id,
+            )
+            if deleted is None:
+                return self.error_response('会话不存在', 404)
+            return jsonify(Result.success(message='会话提示词已清空').to_dict())
         finally:
             session.close()
 

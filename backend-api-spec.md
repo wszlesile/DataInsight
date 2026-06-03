@@ -336,7 +336,76 @@ data: {"type":"status","message":"已收到请求，正在理解分析需求。"
 }
 ```
 
-### 3.5 获取会话历史
+### 3.5 获取会话提示词
+
+`GET /api/insight/conversations/{conversation_id}/prompt?namespace_id={namespace_id}`
+
+用途：
+
+- 获取当前会话绑定的补充系统提示词
+- 该提示词会在分析时追加到基础系统提示词后，不参与历史上下文压缩
+
+查询参数说明：
+
+- `namespace_id`
+  - 空间 ID
+  - 必填
+
+响应 `data` 示例：
+
+```json
+{
+  "id": 12,
+  "insight_namespace_id": 7,
+  "insight_conversation_id": 19,
+  "prompt_content": "净效率 = 有效产出 / 实际运行时长。",
+  "is_enabled": 1,
+  "is_deleted": 0,
+  "created_at": "2026-06-03T10:20:00",
+  "updated_at": "2026-06-03T10:20:00"
+}
+```
+
+### 3.6 保存会话提示词
+
+`PUT /api/insight/conversations/{conversation_id}/prompt`
+
+请求体：
+
+```json
+{
+  "namespace_id": 7,
+  "prompt_content": "净效率 = 有效产出 / 实际运行时长。"
+}
+```
+
+请求字段说明：
+
+- `namespace_id`
+  - 空间 ID
+  - 必填
+- `prompt_content`
+  - 当前会话的补充系统提示词，纯文本
+  - 最大长度 20000 字
+
+### 3.7 清空会话提示词
+
+`DELETE /api/insight/conversations/{conversation_id}/prompt`
+
+请求体：
+
+```json
+{
+  "namespace_id": 7
+}
+```
+
+用途：
+
+- 清空当前会话绑定的补充系统提示词
+- 清空后新一轮分析不再注入该补充提示词
+
+### 3.8 获取会话历史
 
 `GET /api/insight/conversations/{conversation_id}/history`
 
@@ -453,7 +522,7 @@ data: {"type":"status","message":"已收到请求，正在理解分析需求。"
 - `sort_no`
   - 图表展示顺序
 
-### 3.5 获取单轮详情
+### 3.9 获取单轮详情
 
 `GET /api/insight/conversations/{conversation_id}/turns/{turn_id}`
 
@@ -1905,6 +1974,9 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 - `createConversation`
 - `renameConversation`
 - `deleteConversation`
+- `getConversationPrompt`
+- `updateConversationPrompt`
+- `deleteConversationPrompt`
 - `getConversationHistory`
 - `getTurnDetail`
 - `bindConversationDatasource`
@@ -1932,6 +2004,7 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 4. 调 `GET /api/insight/conversations/{conversation_id}/running-turn` 判断是否有未完成轮次
 5. 如果存在未完成轮次，前端暂停输入框并订阅 `GET /api/insight/conversations/{conversation_id}/turns/{turn_id}/stream`
 6. 同时调 `GET /api/insight/namespaces/{namespace_id}/datasources?insight_conversation_id=...`
+7. 数据源面板展示会话提示词入口时，调 `GET /api/insight/conversations/{conversation_id}/prompt?namespace_id=...`
 
 ### 10.2 空间数据源面板
 
@@ -1958,6 +2031,10 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
    - 请求体传 `insight_conversation_id + 当前全量已选 nodes`
 11. 删除数据源时：
    - `DELETE /api/insight/namespaces/{namespace_id}/datasources/{datasource_id}`
+12. 配置会话提示词时：
+   - 查询：`GET /api/insight/conversations/{conversation_id}/prompt?namespace_id=...`
+   - 保存：`PUT /api/insight/conversations/{conversation_id}/prompt`
+   - 清空：`DELETE /api/insight/conversations/{conversation_id}/prompt`
 
 ### 10.3 聊天分析
 

@@ -96,14 +96,25 @@
       <div v-else class="external-section">
         <div class="section-header">
           <span class="section-title">上传外部数据</span>
-          <button
-            class="plain-action"
-            type="button"
-            :disabled="!activeNamespaceId || uploading"
-            @click="triggerFileUpload"
-          >
-            {{ uploading ? '上传中...' : '上传文件' }}
-          </button>
+          <div class="section-actions">
+            <button
+              class="plain-action prompt-action"
+              :class="{ active: hasConversationPrompt }"
+              type="button"
+              :disabled="!activeNamespaceId || !activeConversation?.id"
+              @click="openConversationPromptDialog"
+            >
+              {{ hasConversationPrompt ? '提示词已配置' : '会话提示词' }}
+            </button>
+            <button
+              class="plain-action"
+              type="button"
+              :disabled="!activeNamespaceId || uploading"
+              @click="triggerFileUpload"
+            >
+              {{ uploading ? '上传中...' : '上传文件' }}
+            </button>
+          </div>
         </div>
 
         <div class="upload-file-card">
@@ -202,6 +213,50 @@
     </div>
 
     <el-dialog
+      v-model="conversationPromptDialogVisible"
+      title="会话提示词"
+      width="560px"
+      destroy-on-close
+    >
+      <div class="conversation-prompt-editor">
+        <textarea
+          v-model="conversationPromptDraft"
+          class="conversation-prompt-textarea"
+          :maxlength="conversationPromptMaxLength"
+          placeholder="输入当前会话的业务规则、公式口径、指标说明等补充背景"
+        ></textarea>
+        <div class="conversation-prompt-meta">
+          {{ conversationPromptDraft.length }} / {{ conversationPromptMaxLength }}
+        </div>
+      </div>
+      <template #footer>
+        <div class="conversation-prompt-footer">
+          <button
+            class="plain-action muted-action"
+            type="button"
+            :disabled="conversationPromptSaving || conversationPromptLoading || !hasConversationPrompt"
+            @click="clearConversationPrompt"
+          >
+            清空
+          </button>
+          <div class="conversation-prompt-footer-actions">
+            <button class="plain-action muted-action" type="button" @click="conversationPromptDialogVisible = false">
+              取消
+            </button>
+            <button
+              class="plain-action"
+              type="button"
+              :disabled="conversationPromptSaving || conversationPromptLoading"
+              @click="saveConversationPrompt"
+            >
+              {{ conversationPromptSaving ? '保存中...' : '保存' }}
+            </button>
+          </div>
+        </div>
+      </template>
+    </el-dialog>
+
+    <el-dialog
       v-model="contentPreview.visible"
       class="datasource-content-dialog"
       width="920px"
@@ -257,13 +312,16 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 
 import {
   bindConversationDatasource,
+  deleteConversationPrompt,
   fetchUnsTreeNodes,
+  getConversationPrompt,
   getNamespaceDatasourceContent,
   deleteNamespaceDatasource,
   importNamespaceUnsDatasources,
   listNamespaceUnsSelections,
   listNamespaceDatasources,
   unbindConversationDatasource,
+  updateConversationPrompt,
   updateNamespaceDatasourceDescription,
   uploadNamespaceDatasource,
 } from '../api/agent.js'
@@ -291,6 +349,12 @@ const partialUnsFolderIds = ref([])
 const namespaceDatasources = ref([])
 const bindingDatasourceIds = ref([])
 const editingDatasourceIds = ref([])
+const conversationPromptDialogVisible = ref(false)
+const conversationPromptLoading = ref(false)
+const conversationPromptSaving = ref(false)
+const conversationPromptContent = ref('')
+const conversationPromptDraft = ref('')
+const conversationPromptMaxLength = 20000
 const contentPreview = ref({
   visible: false,
   loading: false,
@@ -325,6 +389,7 @@ const unsTreeProps = {
 }
 
 const selectedUnsNodeIds = computed(() => selectedUnsNodes.value.map((item) => item.id))
+const hasConversationPrompt = computed(() => Boolean(conversationPromptContent.value.trim()))
 
 const isUnsFolderNode = (node) => {
   return Boolean(node?.hasChildren) || Number(node?.countChildren || 0) > 0 || Number(node?.type) === 0
@@ -769,6 +834,85 @@ const fetchUnsSelections = async () => {
   }
 }
 
+const fetchConversationPrompt = async () => {
+  if (!props.activeNamespaceId || !props.activeConversation?.id) {
+    conversationPromptContent.value = ''
+    conversationPromptDraft.value = ''
+    return
+  }
+
+  conversationPromptLoading.value = true
+  try {
+    const response = await getConversationPrompt(props.activeConversation.id, props.activeNamespaceId)
+    if (response.data?.success) {
+      const promptContent = response.data.data?.prompt_content || ''
+      conversationPromptContent.value = promptContent
+      if (!conversationPromptDialogVisible.value) {
+        conversationPromptDraft.value = promptContent
+      }
+    }
+  } catch (error) {
+    console.error('Fetch conversation prompt error:', error)
+  } finally {
+    conversationPromptLoading.value = false
+  }
+}
+
+const openConversationPromptDialog = async () => {
+  if (!props.activeNamespaceId || !props.activeConversation?.id) {
+    ElMessage.warning('请先创建或选择会话，再配置会话提示词')
+    return
+  }
+  conversationPromptDialogVisible.value = true
+  conversationPromptDraft.value = conversationPromptContent.value
+  await fetchConversationPrompt()
+  conversationPromptDraft.value = conversationPromptContent.value
+}
+
+const saveConversationPrompt = async () => {
+  if (!props.activeNamespaceId || !props.activeConversation?.id) return
+
+  conversationPromptSaving.value = true
+  try {
+    const response = await updateConversationPrompt(
+      props.activeConversation.id,
+      props.activeNamespaceId,
+      conversationPromptDraft.value
+    )
+    if (!response.data?.success) {
+      throw new Error(response.data?.message || '保存会话提示词失败')
+    }
+    conversationPromptContent.value = response.data.data?.prompt_content || ''
+    conversationPromptDialogVisible.value = false
+    ElMessage.success(response.data.message || '会话提示词已保存')
+  } catch (error) {
+    console.error('Save conversation prompt error:', error)
+    ElMessage.error(error?.response?.data?.message || error.message || '保存会话提示词失败')
+  } finally {
+    conversationPromptSaving.value = false
+  }
+}
+
+const clearConversationPrompt = async () => {
+  if (!props.activeNamespaceId || !props.activeConversation?.id) return
+
+  conversationPromptSaving.value = true
+  try {
+    const response = await deleteConversationPrompt(props.activeConversation.id, props.activeNamespaceId)
+    if (!response.data?.success) {
+      throw new Error(response.data?.message || '清空会话提示词失败')
+    }
+    conversationPromptContent.value = ''
+    conversationPromptDraft.value = ''
+    ElMessage.success(response.data.message || '会话提示词已清空')
+  } catch (error) {
+    console.error('Clear conversation prompt error:', error)
+    ElMessage.error(error?.response?.data?.message || error.message || '清空会话提示词失败')
+  } finally {
+    conversationPromptSaving.value = false
+  }
+}
+
 const triggerFileUpload = () => {
   if (!props.activeNamespaceId) {
     ElMessage.warning('请先创建或选择洞察空间，再上传外部数据')
@@ -1007,6 +1151,7 @@ watch(
     backendPartialUnsNodeIds.value = []
     partialUnsFolderIds.value = []
     unsRootNodes.value = []
+    await fetchConversationPrompt()
     await fetchNamespaceDatasources()
     if (activeUploadMode.value === 'uns') {
       await fetchUnsSelections()
@@ -1019,6 +1164,7 @@ watch(
 watch(
   () => props.activeConversation?.id,
   async () => {
+    await fetchConversationPrompt()
     await fetchNamespaceDatasources()
     if (activeUploadMode.value === 'uns') {
       await fetchUnsSelections()
@@ -1152,6 +1298,14 @@ watch(
   text-align: right;
 }
 
+.section-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .plain-action {
   border: none;
   background: #e0edff;
@@ -1166,6 +1320,60 @@ watch(
 .plain-action:disabled {
   cursor: not-allowed;
   opacity: 0.6;
+}
+
+.prompt-action.active {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.muted-action {
+  background: #f1f5f9;
+  color: #475569;
+}
+
+.conversation-prompt-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.conversation-prompt-textarea {
+  min-height: 220px;
+  width: 100%;
+  resize: vertical;
+  border: 1px solid #dbe3ef;
+  border-radius: 10px;
+  padding: 12px;
+  color: #0f172a;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  outline: none;
+}
+
+.conversation-prompt-textarea:focus {
+  border-color: #60a5fa;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.08);
+}
+
+.conversation-prompt-meta {
+  color: #64748b;
+  font-size: 12px;
+  text-align: right;
+}
+
+.conversation-prompt-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.conversation-prompt-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .placeholder-card {

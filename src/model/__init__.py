@@ -284,6 +284,39 @@ class InsightNsConversation(Base):
         }
 
 
+class InsightNsConversationPrompt(Base):
+    """Conversation-scoped supplemental system prompt."""
+
+    __tablename__ = 'insight_ns_conversation_prompt'
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment='会话提示词主键')
+    insight_namespace_id = Column(Integer, nullable=False, comment='所属洞察空间 ID')
+    insight_conversation_id = Column(Integer, nullable=False, comment='所属会话 ID')
+    prompt_content = Column(Text, nullable=False, default='', comment='补充系统提示词内容')
+    is_enabled = Column(Integer, nullable=False, default=1, comment='是否启用')
+    is_deleted = Column(Integer, nullable=False, default=0, comment='软删除标记')
+    created_at = Column(DateTime, default=_now, comment='创建时间')
+    updated_at = Column(DateTime, default=_now, onupdate=_now, comment='更新时间')
+
+    __table_args__ = (
+        Index('idx_conversation_prompt_conversation', 'insight_conversation_id'),
+        Index('idx_conversation_prompt_namespace_conversation', 'insight_namespace_id', 'insight_conversation_id'),
+        {'comment': '会话补充系统提示词表'},
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "insight_namespace_id": self.insight_namespace_id,
+            "insight_conversation_id": self.insight_conversation_id,
+            "prompt_content": self.prompt_content,
+            "is_enabled": self.is_enabled,
+            "is_deleted": self.is_deleted,
+            "created_at": _format(self.created_at),
+            "updated_at": _format(self.updated_at),
+        }
+
+
 class InsightNsTurn(Base):
     """会话中的单轮分析事实。"""
 

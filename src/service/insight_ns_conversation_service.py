@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from model import (
     InsightNsArtifact,
     InsightNsConversation,
+    InsightNsConversationPrompt,
     InsightNsExecution,
     InsightNsMemory,
     InsightNsMessage,
@@ -196,6 +197,17 @@ class InsightNsConversationService:
             InsightNsRelKnowledge.is_deleted == 0,
         ).update(
             {InsightNsRelKnowledge.is_deleted: 1},
+            synchronize_session=False,
+        )
+        self.session.query(InsightNsConversationPrompt).filter(
+            InsightNsConversationPrompt.insight_conversation_id == conversation.id,
+            InsightNsConversationPrompt.is_deleted == 0,
+        ).update(
+            {
+                InsightNsConversationPrompt.is_deleted: 1,
+                InsightNsConversationPrompt.is_enabled: 0,
+                InsightNsConversationPrompt.updated_at: now,
+            },
             synchronize_session=False,
         )
 

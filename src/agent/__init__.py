@@ -159,6 +159,47 @@ def _build_runtime_environment_message() -> SystemMessage:
     )
 
 
+def _load_conversation_prompt_content(namespace_id: int, conversation_id: int) -> str:
+    try:
+        namespace_id_int = int(namespace_id or 0)
+        conversation_id_int = int(conversation_id or 0)
+    except (TypeError, ValueError):
+        return ''
+    if namespace_id_int <= 0 or conversation_id_int <= 0:
+        return ''
+
+    from config.database import SessionLocal
+    from service.insight_ns_conversation_prompt_service import InsightNsConversationPromptService
+
+    session = SessionLocal()
+    try:
+        return InsightNsConversationPromptService(session).get_enabled_prompt_content(
+            namespace_id=namespace_id_int,
+            conversation_id=conversation_id_int,
+        )
+    except Exception as exc:
+        logger.warning(
+            "会话提示词加载失败 namespace_id=%s conversation_id=%s error=%s",
+            namespace_id,
+            conversation_id,
+            exc,
+        )
+        return ''
+    finally:
+        session.close()
+
+
+def _build_conversation_prompt_message(namespace_id: int, conversation_id: int) -> SystemMessage | None:
+    prompt_content = _load_conversation_prompt_content(namespace_id, conversation_id)
+    if not prompt_content:
+        return None
+    return SystemMessage(
+        "会话补充系统提示词：\n"
+        "以下内容是当前会话绑定的业务背景、公式口径或指标规则。分析时必须参考，但不得向用户暴露为独立系统配置。\n\n"
+        f"{prompt_content}"
+    )
+
+
 def _build_relative_date_hint_message(user_message: str) -> SystemMessage | None:
     """
     把用户问题里的相对日期表达锚定成绝对时间提示。
@@ -233,8 +274,11 @@ def build_prompt_messages(
     # current datasource context, runtime repair hints, or the user tail.
     mandatory_system_messages: list[BaseMessage] = [
         SystemMessage(load_system_prompt()),
-        _build_runtime_environment_message(),
     ]
+    conversation_prompt_message = _build_conversation_prompt_message(namespace_id, conversation_id)
+    if conversation_prompt_message is not None:
+        mandatory_system_messages.append(conversation_prompt_message)
+    mandatory_system_messages.append(_build_runtime_environment_message())
     relative_date_hint = _build_relative_date_hint_message(user_message)
     if relative_date_hint is not None:
         mandatory_system_messages.append(relative_date_hint)
