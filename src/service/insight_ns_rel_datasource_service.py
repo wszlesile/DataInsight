@@ -39,7 +39,12 @@ BIND_SOURCE_IMPORT_SELECTED = 'import_selected'
 BIND_SOURCE_SYSTEM_DEFAULT = 'system_default'
 UNS_TIME_SERIES_DATA_TYPE = 1
 UNS_RELATIONAL_TABLE_DATA_TYPE = 2
-UNS_TABLE_DATA_TYPES = {UNS_TIME_SERIES_DATA_TYPE, UNS_RELATIONAL_TABLE_DATA_TYPE}
+UNS_PROTOCOL_TABLE_DATA_TYPE = 9
+UNS_TABLE_DATA_TYPES = {
+    UNS_TIME_SERIES_DATA_TYPE,
+    UNS_RELATIONAL_TABLE_DATA_TYPE,
+    UNS_PROTOCOL_TABLE_DATA_TYPE,
+}
 UNS_MAX_EXPANDED_FILES = Config.UNS_MAX_EXPANDED_FILES
 UNS_MAX_EXPAND_DEPTH = Config.UNS_MAX_EXPAND_DEPTH
 UNS_TREE_PAGE_SIZE = Config.UNS_TREE_PAGE_SIZE
@@ -286,8 +291,6 @@ class InsightNsRelDatasourceService:
                 if normalized_nodes:
                     if not authorization:
                         return {"success": False, "message": "缺少 SUPOS 认证信息，无法导入 UNS 节点"}
-                    if not lake_rds_database_name:
-                        return {"success": False, "message": "当前用户上下文未初始化 LakeRDS 数据库名"}
 
                     expand_result = self._expand_uns_file_nodes(normalized_nodes, authorization)
                     if expand_result["failed"]:
@@ -310,6 +313,14 @@ class InsightNsRelDatasourceService:
                         for node in expanded_file_nodes
                         if str(node.get("id") or "").strip()
                     }
+                    if any(
+                        data_type in {UNS_TIME_SERIES_DATA_TYPE, UNS_RELATIONAL_TABLE_DATA_TYPE}
+                        for data_type in node_type_by_id.values()
+                    ) and not lake_rds_database_name:
+                        return {
+                            "success": False,
+                            "message": "当前用户上下文未初始化 LakeRDS 数据库名",
+                        }
                     if any(data_type == UNS_TIME_SERIES_DATA_TYPE for data_type in node_type_by_id.values()) \
                             and not normalized_ts_query_source:
                         return {
@@ -814,6 +825,11 @@ class InsightNsRelDatasourceService:
                     ts_query_source=ts_query_source,
                 )
             )
+        elif data_type == UNS_PROTOCOL_TABLE_DATA_TYPE:
+            datasource.datasource_schema = self._build_uns_datasource_schema(detail, datasource.datasource_name)
+            datasource.datasource_config_json = dump_json(
+                self._build_protocol_table_config(detail=detail, alias=alias)
+            )
         else:
             datasource.datasource_schema = self._build_uns_datasource_schema(detail, datasource.datasource_name)
             datasource.datasource_config_json = dump_json({
@@ -826,6 +842,31 @@ class InsightNsRelDatasourceService:
                 "uns_path_name": detail.get('pathName') or detail.get('name') or '',
             })
         return datasource
+
+    def _build_protocol_table_config(self, *, detail: dict[str, Any], alias: str) -> dict[str, Any]:
+        protocol = safe_json_loads(detail.get('protocol'), {})
+        db_protocol = protocol.get('db') if isinstance(protocol, dict) else {}
+        if not isinstance(db_protocol, dict):
+            db_protocol = {}
+
+        data_path = str(db_protocol.get('dataPath') or '').strip().rstrip('/')
+        database_suffix = data_path.rsplit('/', 1)[-1].strip() if data_path else ''
+        schema_name = str(db_protocol.get('schemaName') or '').strip()
+        table_name = str(db_protocol.get('tableName') or '').strip()
+        if not database_suffix:
+            raise ValueError('dataType=9 的 UNS 节点 protocol.db.dataPath 缺失或无效')
+        if not schema_name or not table_name:
+            raise ValueError('dataType=9 的 UNS 节点 protocol.db.schemaName/tableName 缺失')
+
+        return {
+            "database_name": f"feq_{database_suffix}",
+            "table_name": f"{schema_name}.{table_name}",
+            "uns_alias": alias,
+            "uns_data_type": UNS_PROTOCOL_TABLE_DATA_TYPE,
+            "table_engine": TABLE_ENGINE_RELATIONAL,
+            "uns_path": detail.get('path') or '',
+            "uns_path_name": detail.get('pathName') or detail.get('name') or '',
+        }
 
     def _build_time_series_table_config(
         self,
