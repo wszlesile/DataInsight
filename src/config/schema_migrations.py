@@ -92,19 +92,19 @@ def _statements_from_lines(lines: list[str]) -> list[str]:
     return statements
 
 
-def _has_column(table_name: str, column_name: str) -> bool:
-    inspector = inspect(engine)
+def _has_column(connection, table_name: str, column_name: str) -> bool:
+    inspector = inspect(connection)
     try:
         return any(column.get("name") == column_name for column in inspector.get_columns(table_name))
     except SQLAlchemyError:
         return False
 
 
-def _should_skip_statement(directive: str | None) -> bool:
+def _should_skip_statement(connection, directive: str | None) -> bool:
     if not directive or "." not in directive:
         return False
     table_name, column_name = [part.strip() for part in directive.split(".", 1)]
-    return bool(table_name and column_name and _has_column(table_name, column_name))
+    return bool(table_name and column_name and _has_column(connection, table_name, column_name))
 
 
 def _is_duplicate_column_error(exc: Exception) -> bool:
@@ -115,7 +115,7 @@ def _is_duplicate_column_error(exc: Exception) -> bool:
 def _apply_migration_file(connection, path: Path) -> None:
     sql = path.read_text(encoding="utf-8")
     for directive, statement in _split_sql_statements(sql):
-        if _should_skip_statement(directive):
+        if _should_skip_statement(connection, directive):
             continue
         try:
             connection.execute(text(statement))

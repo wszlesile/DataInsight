@@ -13,6 +13,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from model import (
+    InsightAnalysisTask,
     InsightNsArtifact,
     InsightNsConversation,
     InsightNsConversationPrompt,
@@ -254,6 +255,7 @@ class InsightNsConversationService:
         executions = self.session.query(InsightNsExecution).filter(
             InsightNsExecution.conversation_id == conversation.id,
             InsightNsExecution.is_deleted == 0,
+            InsightNsExecution.content_enabled == 1,
         ).order_by(
             InsightNsExecution.created_at.asc(),
             InsightNsExecution.id.asc(),
@@ -261,6 +263,7 @@ class InsightNsConversationService:
         artifacts = self.session.query(InsightNsArtifact).filter(
             InsightNsArtifact.conversation_id == conversation.id,
             InsightNsArtifact.is_deleted == 0,
+            InsightNsArtifact.content_enabled == 1,
         ).order_by(
             InsightNsArtifact.sort_no.asc(),
             InsightNsArtifact.created_at.asc(),
@@ -319,6 +322,7 @@ class InsightNsConversationService:
             InsightNsMessage.insight_conversation_id == conversation.id,
             InsightNsMessage.turn_id == turn.id,
             InsightNsMessage.is_deleted == 0,
+            InsightNsMessage.content_enabled == 1,
         ).order_by(
             InsightNsMessage.seq_no.asc(),
             InsightNsMessage.id.asc(),
@@ -327,6 +331,7 @@ class InsightNsConversationService:
             InsightNsExecution.conversation_id == conversation.id,
             InsightNsExecution.turn_id == turn.id,
             InsightNsExecution.is_deleted == 0,
+            InsightNsExecution.content_enabled == 1,
         ).order_by(
             InsightNsExecution.created_at.asc(),
             InsightNsExecution.id.asc(),
@@ -335,6 +340,7 @@ class InsightNsConversationService:
             InsightNsArtifact.conversation_id == conversation.id,
             InsightNsArtifact.turn_id == turn.id,
             InsightNsArtifact.is_deleted == 0,
+            InsightNsArtifact.content_enabled == 1,
         ).order_by(
             InsightNsArtifact.sort_no.asc(),
             InsightNsArtifact.created_at.asc(),
@@ -344,6 +350,105 @@ class InsightNsConversationService:
         return {
             "conversation": conversation.to_dict(),
             "turn": turn.to_dict(),
+            "messages": [message.to_dict() for message in messages],
+            "executions": [execution.to_dict() for execution in executions],
+            "latest_execution": executions[-1].to_dict() if executions else None,
+            "artifacts": [self._artifact_to_view(artifact) for artifact in artifacts],
+        }
+
+    def list_turn_versions(self, username: str, conversation_id: Any, turn_id: Any) -> dict[str, Any] | None:
+        """返回某个轮次可回溯的分析任务版本列表。"""
+        conversation = self._get_accessible_conversation(username, conversation_id)
+        if conversation is None:
+            return None
+        turn = self._get_turn(conversation, turn_id)
+        if turn is None:
+            return None
+
+        tasks = self.session.query(InsightAnalysisTask).filter(
+            InsightAnalysisTask.conversation_id == conversation.id,
+            InsightAnalysisTask.turn_id == turn.id,
+        ).order_by(
+            InsightAnalysisTask.created_at.desc(),
+            InsightAnalysisTask.id.desc(),
+        ).all()
+
+        versions = [self._build_task_version_item(task, turn) for task in tasks]
+        initial_version = self._build_initial_version_item(turn)
+        if initial_version is not None:
+            versions.append(initial_version)
+
+        return {
+            "conversation": conversation.to_dict(),
+            "turn": turn.to_dict(),
+            "versions": versions,
+        }
+
+    def get_turn_version_detail(
+        self,
+        username: str,
+        conversation_id: Any,
+        turn_id: Any,
+        analysis_task_id: Any = None,
+    ) -> dict[str, Any] | None:
+        """按分析任务查看某个轮次版本的完整执行产物。"""
+        conversation = self._get_accessible_conversation(username, conversation_id)
+        if conversation is None:
+            return None
+        turn = self._get_turn(conversation, turn_id)
+        if turn is None:
+            return None
+
+        task_id_int = to_int(analysis_task_id, 0)
+        if task_id_int > 0:
+            task = self.session.query(InsightAnalysisTask).filter(
+                InsightAnalysisTask.id == task_id_int,
+                InsightAnalysisTask.conversation_id == conversation.id,
+                InsightAnalysisTask.turn_id == turn.id,
+            ).first()
+            if task is None:
+                return None
+            task_filter = lambda model: model.analysis_task_id == task_id_int
+            version = self._build_task_version_item(task, turn)
+        else:
+            task_filter = lambda model: model.analysis_task_id.is_(None)
+            version = self._build_initial_version_item(turn)
+            if version is None:
+                return None
+
+        messages = self.session.query(InsightNsMessage).filter(
+            InsightNsMessage.insight_conversation_id == conversation.id,
+            InsightNsMessage.turn_id == turn.id,
+            InsightNsMessage.is_deleted == 0,
+            task_filter(InsightNsMessage),
+        ).order_by(
+            InsightNsMessage.seq_no.asc(),
+            InsightNsMessage.id.asc(),
+        ).all()
+        executions = self.session.query(InsightNsExecution).filter(
+            InsightNsExecution.conversation_id == conversation.id,
+            InsightNsExecution.turn_id == turn.id,
+            InsightNsExecution.is_deleted == 0,
+            task_filter(InsightNsExecution),
+        ).order_by(
+            InsightNsExecution.created_at.asc(),
+            InsightNsExecution.id.asc(),
+        ).all()
+        artifacts = self.session.query(InsightNsArtifact).filter(
+            InsightNsArtifact.conversation_id == conversation.id,
+            InsightNsArtifact.turn_id == turn.id,
+            InsightNsArtifact.is_deleted == 0,
+            task_filter(InsightNsArtifact),
+        ).order_by(
+            InsightNsArtifact.sort_no.asc(),
+            InsightNsArtifact.created_at.asc(),
+            InsightNsArtifact.id.asc(),
+        ).all()
+
+        return {
+            "conversation": conversation.to_dict(),
+            "turn": turn.to_dict(),
+            "version": version,
             "messages": [message.to_dict() for message in messages],
             "executions": [execution.to_dict() for execution in executions],
             "latest_execution": executions[-1].to_dict() if executions else None,
@@ -395,6 +500,92 @@ class InsightNsConversationService:
             InsightNsConversation.id == conversation_id_int,
             InsightNsConversation.is_deleted == 0,
         ).first()
+
+    def _get_turn(self, conversation: InsightNsConversation, turn_id: Any) -> InsightNsTurn | None:
+        turn_id_int = to_int(turn_id, 0)
+        if turn_id_int <= 0:
+            return None
+        return self.session.query(InsightNsTurn).filter(
+            InsightNsTurn.id == turn_id_int,
+            InsightNsTurn.conversation_id == conversation.id,
+            InsightNsTurn.is_deleted == 0,
+        ).first()
+
+    def _count_version_rows(self, model, turn_id: int, analysis_task_id: int | None, enabled_only: bool = False) -> int:
+        query = self.session.query(model.id).filter(
+            model.turn_id == turn_id,
+            model.is_deleted == 0,
+        )
+        if analysis_task_id is None:
+            query = query.filter(model.analysis_task_id.is_(None))
+        else:
+            query = query.filter(model.analysis_task_id == analysis_task_id)
+        if enabled_only:
+            query = query.filter(model.content_enabled == 1)
+        return query.count()
+
+    def _build_task_version_item(self, task: InsightAnalysisTask, turn: InsightNsTurn) -> dict[str, Any]:
+        task_id = int(task.id or 0)
+        message_count = self._count_version_rows(InsightNsMessage, turn.id, task_id)
+        execution_count = self._count_version_rows(InsightNsExecution, turn.id, task_id)
+        artifact_count = self._count_version_rows(InsightNsArtifact, turn.id, task_id)
+        current_count = (
+            self._count_version_rows(InsightNsMessage, turn.id, task_id, enabled_only=True)
+            + self._count_version_rows(InsightNsExecution, turn.id, task_id, enabled_only=True)
+            + self._count_version_rows(InsightNsArtifact, turn.id, task_id, enabled_only=True)
+        )
+        return {
+            "analysis_task_id": task_id,
+            "task_id": task.task_id,
+            "task_type": task.task_type,
+            "status": task.status,
+            "is_current": current_count > 0,
+            "message_count": message_count,
+            "execution_count": execution_count,
+            "artifact_count": artifact_count,
+            "created_at": task.created_at.isoformat() if task.created_at else None,
+            "started_at": task.started_at.isoformat() if task.started_at else None,
+            "finished_at": task.finished_at.isoformat() if task.finished_at else None,
+            "label": "刷新分析" if task.task_type == "rerun" else "分析",
+        }
+
+    def _build_initial_version_item(self, turn: InsightNsTurn) -> dict[str, Any] | None:
+        message_count = self._count_version_rows(InsightNsMessage, turn.id, None)
+        execution_count = self._count_version_rows(InsightNsExecution, turn.id, None)
+        artifact_count = self._count_version_rows(InsightNsArtifact, turn.id, None)
+        assistant_message_count = self.session.query(InsightNsMessage.id).filter(
+            InsightNsMessage.turn_id == turn.id,
+            InsightNsMessage.analysis_task_id.is_(None),
+            InsightNsMessage.role == 'assistant',
+            InsightNsMessage.is_deleted == 0,
+        ).count()
+        if assistant_message_count + execution_count + artifact_count <= 0:
+            return None
+        current_count = (
+            self.session.query(InsightNsMessage.id).filter(
+                InsightNsMessage.turn_id == turn.id,
+                InsightNsMessage.analysis_task_id.is_(None),
+                InsightNsMessage.role == 'assistant',
+                InsightNsMessage.is_deleted == 0,
+                InsightNsMessage.content_enabled == 1,
+            ).count()
+            + self._count_version_rows(InsightNsExecution, turn.id, None, enabled_only=True)
+            + self._count_version_rows(InsightNsArtifact, turn.id, None, enabled_only=True)
+        )
+        return {
+            "analysis_task_id": None,
+            "task_id": None,
+            "task_type": "initial",
+            "status": turn.status,
+            "is_current": current_count > 0,
+            "message_count": message_count,
+            "execution_count": execution_count,
+            "artifact_count": artifact_count,
+            "created_at": turn.created_at.isoformat() if turn.created_at else None,
+            "started_at": turn.started_at.isoformat() if turn.started_at else None,
+            "finished_at": turn.finished_at.isoformat() if turn.finished_at else None,
+            "label": "初始分析",
+        }
 
     def _group_executions_by_turn(self, executions: list[InsightNsExecution]) -> dict[int, list[dict[str, Any]]]:
         execution_map: dict[int, list[dict[str, Any]]] = {}

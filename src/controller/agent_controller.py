@@ -154,6 +154,7 @@ class AgentController(BaseController):
             session.commit()
             get_analysis_task_runner().submit(
                 task_id=task.task_id,
+                analysis_task_id=task.id,
                 agent_request=agent_request,
                 turn_id=runtime.turn.id,
                 is_rerun=False,

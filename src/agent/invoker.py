@@ -472,6 +472,7 @@ def _build_agent_context(agent_request: AgentRequest, runtime: ConversationRunCo
         auth_token=agent_request.auth_token or '',
         database_conn_info=dict(agent_request.database_conn_info or {}),
         active_datasource_snapshot=dict(runtime.active_datasource_snapshot or {}),
+        analysis_task_id=runtime.analysis_task_id,
     )
 
 
@@ -551,6 +552,7 @@ def _rerun_has_prior_analysis_result(
             InsightNsExecution.conversation_id == runtime.conversation.id,
             InsightNsExecution.turn_id == runtime.turn.id,
             InsightNsExecution.is_deleted == 0,
+            InsightNsExecution.content_enabled == 1,
         )
         if started_at is not None:
             execution_query = execution_query.filter(InsightNsExecution.created_at < started_at)
@@ -561,6 +563,7 @@ def _rerun_has_prior_analysis_result(
             InsightNsArtifact.conversation_id == runtime.conversation.id,
             InsightNsArtifact.turn_id == runtime.turn.id,
             InsightNsArtifact.is_deleted == 0,
+            InsightNsArtifact.content_enabled == 1,
         )
         if started_at is not None:
             artifact_query = artifact_query.filter(InsightNsArtifact.created_at < started_at)
@@ -696,6 +699,7 @@ def _finalize_run(
         charts=charts,
         tables=tables,
         replace_existing_results=runtime.is_rerun,
+        analysis_task_id=runtime.analysis_task_id,
     )
     chart_artifact_ids: list[int] = []
     for artifact in run_result.get('artifacts', []):
@@ -759,6 +763,7 @@ def _open_fresh_persistence_context(
         active_datasource_snapshot=active_snapshot,
         is_rerun=runtime.is_rerun,
         history_turn_limit=runtime.history_turn_limit,
+        analysis_task_id=runtime.analysis_task_id,
     )
     return ConversationContextService(session), fresh_runtime
 
@@ -2115,6 +2120,7 @@ def stream_existing_turn_events(
     *,
     turn_id: Any,
     is_rerun: bool = False,
+    analysis_task_id: int | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Execute an existing turn and stream events for the background task queue."""
     from model import InsightNsConversation, InsightNsTurn
@@ -2145,6 +2151,7 @@ def stream_existing_turn_events(
             active_datasource_snapshot=active_snapshot,
             is_rerun=is_rerun,
             history_turn_limit=max(turn.turn_no - 1, 0) if is_rerun else None,
+            analysis_task_id=analysis_task_id,
         )
 
     with session_scope(expire_on_commit=False) as session:

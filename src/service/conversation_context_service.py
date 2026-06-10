@@ -84,6 +84,7 @@ class ConversationRunContext:
     active_datasource_snapshot: dict[str, Any]
     is_rerun: bool = False
     history_turn_limit: int | None = None
+    analysis_task_id: int | None = None
     short_term_memory: dict[str, Any] = field(default_factory=dict)
 
 
@@ -229,6 +230,7 @@ class ConversationContextService:
         content_json: dict[str, Any] | None = None,
         tool_name: str = '',
         tool_call_id: str = '',
+        analysis_task_id: int | None = None,
     ) -> InsightNsMessage:
         """持久化一条用于多轮上下文重放的消息记录。"""
         message = InsightNsMessage(
@@ -245,6 +247,8 @@ class ConversationContextService:
             tool_name=tool_name or '',
             tool_call_id=tool_call_id or '',
             insight_result='',
+            content_enabled=1,
+            analysis_task_id=analysis_task_id,
         )
         self.session.add(message)
         self.session.flush()
@@ -259,6 +263,7 @@ class ConversationContextService:
         charts: list[dict[str, Any]] | None = None,
         tables: list[dict[str, Any]] | None = None,
         replace_existing_results: bool = False,
+        analysis_task_id: int | None = None,
     ) -> dict[str, Any]:
         """结束一次成功轮次，并刷新会话记忆。"""
         conversation = self._get_conversation_by_id(conversation_id)
@@ -311,6 +316,7 @@ class ConversationContextService:
                 "tables": tables or [],
                 "used_datasource_ids": safe_json_loads(turn.used_datasource_ids_json, []),
             },
+            analysis_task_id=analysis_task_id,
         )
 
         artifacts: list[dict[str, Any]] = []
@@ -327,6 +333,7 @@ class ConversationContextService:
                     "turn_no": turn.turn_no,
                     "chart_type": chart.get('chart_type') or '',
                 },
+                analysis_task_id=analysis_task_id,
                 sort_no=index,
             ))
         if analysis_report:
@@ -339,6 +346,7 @@ class ConversationContextService:
                 summary_text=analysis_report,
                 content={"report_markdown": analysis_report},
                 metadata={"turn_no": turn.turn_no},
+                analysis_task_id=analysis_task_id,
                 sort_no=0,
             ))
         for index, table in enumerate(tables or [], start=1):
@@ -351,6 +359,7 @@ class ConversationContextService:
                 summary_text=str(table.get('description') or '').strip(),
                 content=table,
                 metadata={"turn_no": turn.turn_no},
+                analysis_task_id=analysis_task_id,
                 sort_no=100 + index,
             ))
 
@@ -445,6 +454,7 @@ class ConversationContextService:
             InsightNsArtifact.conversation_id == conversation.id,
             InsightNsArtifact.turn_id == turn.id,
             InsightNsArtifact.is_deleted == 0,
+            InsightNsArtifact.content_enabled == 1,
         ).first() is not None
 
     def _archive_current_rerun_executions(
@@ -462,7 +472,7 @@ class ConversationContextService:
             InsightNsExecution.is_deleted == 0,
         ).update(
             {
-                InsightNsExecution.is_deleted: 1,
+                InsightNsExecution.content_enabled: 0,
                 InsightNsExecution.updated_at: _now(),
             },
             synchronize_session=False,
@@ -486,6 +496,7 @@ class ConversationContextService:
             InsightNsMessage.role.in_(['user', 'assistant']),
             InsightNsMessage.message_kind.in_(['prompt', 'final_answer']),
             InsightNsMessage.is_deleted == 0,
+            InsightNsMessage.content_enabled == 1,
             InsightNsTurn.is_deleted == 0,
         )
         if max_turn_no is not None and max_turn_no >= 0:
@@ -532,6 +543,7 @@ class ConversationContextService:
         ).filter(
             InsightNsArtifact.conversation_id == conversation_id_int,
             InsightNsArtifact.is_deleted == 0,
+            InsightNsArtifact.content_enabled == 1,
             InsightNsTurn.is_deleted == 0,
         )
         if max_turn_no is not None and max_turn_no >= 0:
@@ -560,6 +572,7 @@ class ConversationContextService:
         ).filter(
             InsightNsExecution.conversation_id == conversation_id_int,
             InsightNsExecution.is_deleted == 0,
+            InsightNsExecution.content_enabled == 1,
             InsightNsTurn.is_deleted == 0,
         )
         if terminal_only:
@@ -585,6 +598,7 @@ class ConversationContextService:
         query = self.session.query(InsightNsExecution).filter(
             InsightNsExecution.turn_id == turn_id_int,
             InsightNsExecution.is_deleted == 0,
+            InsightNsExecution.content_enabled == 1,
         )
         if started_at is not None:
             query = query.filter(InsightNsExecution.created_at >= started_at)
@@ -634,6 +648,7 @@ class ConversationContextService:
         query = self.session.query(InsightNsExecution).filter(
             InsightNsExecution.turn_id == turn_id_int,
             InsightNsExecution.is_deleted == 0,
+            InsightNsExecution.content_enabled == 1,
         )
         if started_at is not None:
             query = query.filter(InsightNsExecution.created_at >= started_at)
@@ -790,28 +805,31 @@ class ConversationContextService:
             InsightNsMessage.turn_id == turn.id,
             InsightNsMessage.role == 'assistant',
             InsightNsMessage.is_deleted == 0,
+            InsightNsMessage.content_enabled == 1,
         ).update(
-            {InsightNsMessage.is_deleted: 1},
+            {InsightNsMessage.content_enabled: 0},
             synchronize_session=False,
         )
         self.session.query(InsightNsArtifact).filter(
             InsightNsArtifact.conversation_id == conversation.id,
             InsightNsArtifact.turn_id == turn.id,
             InsightNsArtifact.is_deleted == 0,
+            InsightNsArtifact.content_enabled == 1,
         ).update(
-            {InsightNsArtifact.is_deleted: 1},
+            {InsightNsArtifact.content_enabled: 0},
             synchronize_session=False,
         )
         execution_query = self.session.query(InsightNsExecution).filter(
             InsightNsExecution.conversation_id == conversation.id,
             InsightNsExecution.turn_id == turn.id,
             InsightNsExecution.is_deleted == 0,
+            InsightNsExecution.content_enabled == 1,
         )
         if started_at is not None:
             execution_query = execution_query.filter(InsightNsExecution.created_at < started_at)
         execution_query.update(
             {
-                InsightNsExecution.is_deleted: 1,
+                InsightNsExecution.content_enabled: 0,
                 InsightNsExecution.updated_at: now,
             },
             synchronize_session=False,
@@ -1045,6 +1063,7 @@ class ConversationContextService:
         summary_text: str,
         content: dict[str, Any],
         metadata: dict[str, Any],
+        analysis_task_id: int | None = None,
         sort_no: int = 0,
     ) -> dict[str, Any]:
         artifact = InsightNsArtifact(
@@ -1057,6 +1076,8 @@ class ConversationContextService:
             content_json=dump_json(content or {}),
             metadata_json=dump_json(metadata),
             sort_no=sort_no,
+            content_enabled=1,
+            analysis_task_id=analysis_task_id,
         )
         self.session.add(artifact)
         self.session.flush()
@@ -1352,6 +1373,7 @@ class ConversationContextService:
             InsightNsExecution.conversation_id == conversation_id,
             InsightNsExecution.execution_status == 'success',
             InsightNsExecution.is_deleted == 0,
+            InsightNsExecution.content_enabled == 1,
         ).all()
         return {to_int(row[0], 0) for row in rows if to_int(row[0], 0) > 0}
 
@@ -1360,5 +1382,6 @@ class ConversationContextService:
         rows = self.session.query(InsightNsExecution.turn_id).filter(
             InsightNsExecution.conversation_id == conversation_id,
             InsightNsExecution.is_deleted == 0,
+            InsightNsExecution.content_enabled == 1,
         ).all()
         return {to_int(row[0], 0) for row in rows if to_int(row[0], 0) > 0}

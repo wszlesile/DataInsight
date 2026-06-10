@@ -3109,6 +3109,7 @@ def _create_execution_record(
     title: str,
     description: str,
     used_datasource_ids: list[int] | None = None,
+    analysis_task_id: int | None = None,
 ) -> int:
     """在生成代码真正执行前，先创建一条执行记录。"""
     from config.database import SessionLocal
@@ -3125,6 +3126,8 @@ def _create_execution_record(
             generated_code=code or '',
             used_datasource_ids_json=json.dumps(used_datasource_ids or [], ensure_ascii=False),
             execution_status='running',
+            content_enabled=1,
+            analysis_task_id=analysis_task_id,
         )
         session.add(execution)
         session.commit()
@@ -3980,6 +3983,7 @@ def execute_python(
         title=title,
         description=description,
         used_datasource_ids=normalized_used_datasource_ids,
+        analysis_task_id=getattr(runtime.context, 'analysis_task_id', None),
     )
     execution_log_context = {
         'username': getattr(runtime.context, 'username', 'anonymous'),

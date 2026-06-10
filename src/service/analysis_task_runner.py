@@ -24,6 +24,7 @@ class AnalysisTaskRunner:
         self,
         *,
         task_id: str,
+        analysis_task_id: int | None = None,
         agent_request: AgentRequest,
         turn_id: int,
         is_rerun: bool = False,
@@ -31,6 +32,7 @@ class AnalysisTaskRunner:
         self._executor.submit(
             self._run_task,
             task_id,
+            analysis_task_id,
             agent_request,
             int(turn_id),
             bool(is_rerun),
@@ -39,6 +41,7 @@ class AnalysisTaskRunner:
     def _run_task(
         self,
         task_id: str,
+        analysis_task_id: int | None,
         agent_request: AgentRequest,
         turn_id: int,
         is_rerun: bool,
@@ -59,6 +62,7 @@ class AnalysisTaskRunner:
                 agent_request,
                 turn_id=turn_id,
                 is_rerun=is_rerun,
+                analysis_task_id=analysis_task_id,
             ):
                 event.setdefault("task_id", task_id)
                 queue.push_event(turn_id, event)
@@ -75,6 +79,7 @@ class AnalysisTaskRunner:
             logger.error("后台分析任务执行失败: task_id=%s error=%s", task_id, exc, exc_info=True)
             if self._recover_successful_turn_if_possible(
                 task_id=task_id,
+                analysis_task_id=analysis_task_id,
                 agent_request=agent_request,
                 turn_id=turn_id,
                 is_rerun=is_rerun,
@@ -152,6 +157,7 @@ class AnalysisTaskRunner:
         self,
         *,
         task_id: str,
+        analysis_task_id: int | None,
         agent_request: AgentRequest,
         turn_id: int,
         is_rerun: bool,
@@ -195,6 +201,7 @@ class AnalysisTaskRunner:
                 charts=charts,
                 tables=tables,
                 replace_existing_results=bool(is_rerun),
+                analysis_task_id=analysis_task_id,
             )
             AnalysisTaskService(recovery_session).mark_finished(task_id, status="success", error_message="")
             recovery_session.commit()

@@ -438,6 +438,8 @@ class InsightNsExecution(Base):
     created_at = Column(DateTime, default=_now, comment='创建时间')
     updated_at = Column(DateTime, default=_now, onupdate=_now, comment='更新时间')
     finished_at = Column(DateTime, nullable=True, comment='执行结束时间')
+    content_enabled = Column(Integer, nullable=False, default=1, comment='轮次内容是否为当前展示版本')
+    analysis_task_id = Column(Integer, nullable=True, comment='所属分析任务自增 ID')
 
     __table_args__ = (
         Index('idx_execution_conversation_turn', 'conversation_id', 'turn_id'),
@@ -467,6 +469,8 @@ class InsightNsExecution(Base):
             "created_at": _format(self.created_at),
             "updated_at": _format(self.updated_at),
             "finished_at": _format(self.finished_at),
+            "content_enabled": self.content_enabled,
+            "analysis_task_id": self.analysis_task_id,
         }
 
 
@@ -491,6 +495,8 @@ class InsightNsMessage(Base):
     insight_result = Column(Text, nullable=False, default='', comment='兼容旧逻辑的结果字段')
     is_deleted = Column(Integer, nullable=False, default=0, comment='软删除标记')
     created_at = Column(DateTime, default=_now, comment='创建时间')
+    content_enabled = Column(Integer, nullable=False, default=1, comment='轮次内容是否为当前展示版本')
+    analysis_task_id = Column(Integer, nullable=True, comment='所属分析任务自增 ID')
 
     __table_args__ = (
         Index('idx_message_conversation_turn_seq', 'insight_conversation_id', 'turn_no', 'seq_no', unique=True),
@@ -516,6 +522,8 @@ class InsightNsMessage(Base):
             "insight_result": self.insight_result,
             "is_deleted": self.is_deleted,
             "created_at": _format(self.created_at),
+            "content_enabled": self.content_enabled,
+            "analysis_task_id": self.analysis_task_id,
         }
 
 
@@ -568,6 +576,8 @@ class InsightNsArtifact(Base):
     sort_no = Column(Integer, nullable=False, default=0, comment='产物展示顺序')
     is_deleted = Column(Integer, nullable=False, default=0, comment='软删除标记')
     created_at = Column(DateTime, default=_now, comment='创建时间')
+    content_enabled = Column(Integer, nullable=False, default=1, comment='轮次内容是否为当前展示版本')
+    analysis_task_id = Column(Integer, nullable=True, comment='所属分析任务自增 ID')
 
     __table_args__ = (
         Index('idx_artifact_conversation_turn', 'conversation_id', 'turn_id'),
@@ -588,6 +598,8 @@ class InsightNsArtifact(Base):
             "sort_no": self.sort_no,
             "is_deleted": self.is_deleted,
             "created_at": _format(self.created_at),
+            "content_enabled": self.content_enabled,
+            "analysis_task_id": self.analysis_task_id,
         }
 
 

@@ -194,6 +194,8 @@ class AnalysisTaskService:
 
     def _serialize_task(self, task: InsightAnalysisTask) -> dict[str, Any]:
         return {
+            "id": task.id,
+            "analysis_task_id": task.id,
             "task_id": task.task_id,
             "username": task.username,
             "namespace_id": task.namespace_id,

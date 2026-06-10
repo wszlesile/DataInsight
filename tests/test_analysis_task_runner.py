@@ -78,7 +78,7 @@ class AnalysisTaskRunnerTestCase(unittest.TestCase):
             patch("service.analysis_task_runner.get_redis_client", side_effect=RuntimeError("redis down")),
             patch("service.analysis_task_runner.SessionLocal", self.session_factory),
         ):
-            runner._run_task(task.task_id, request, 39, False)
+            runner._run_task(task.task_id, task.id, request, 39, False)
 
         self.session.expire_all()
         saved_task = self.session.query(InsightAnalysisTask).filter_by(task_id=task.task_id).first()

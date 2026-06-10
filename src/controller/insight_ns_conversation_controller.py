@@ -33,6 +33,9 @@ def create_insight_ns_conversation_controller() -> Blueprint:
     blueprint.route('/<int:conversation_id>/history', methods=['GET'])(controller.get_history)
     blueprint.route('/<int:conversation_id>/running-turn', methods=['GET'])(controller.get_running_turn)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>', methods=['GET'])(controller.get_turn_detail)
+    blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/versions', methods=['GET'])(controller.list_turn_versions)
+    blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/versions/initial', methods=['GET'])(controller.get_initial_turn_version)
+    blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/versions/<int:analysis_task_id>', methods=['GET'])(controller.get_turn_version_detail)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/stream', methods=['GET'])(controller.stream_turn_events)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/export/pdf', methods=['POST'])(controller.export_turn_pdf)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/rerun/stream', methods=['POST'])(controller.rerun_turn_stream)
@@ -212,6 +215,56 @@ class InsightNsConversationController(BaseController):
         finally:
             session.close()
 
+    def list_turn_versions(self, conversation_id: int, turn_id: int):
+        """返回某个轮次的分析历史版本列表。"""
+        session = SessionLocal()
+        try:
+            service = InsightNsConversationService(session)
+            versions = service.list_turn_versions(
+                username=self._get_username(),
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+            )
+            if versions is None:
+                return self.error_response('轮次详情不存在', 404)
+            return jsonify(Result.success(data=versions).to_dict())
+        finally:
+            session.close()
+
+    def get_initial_turn_version(self, conversation_id: int, turn_id: int):
+        """返回升级前或同步链路产生的初始版本。"""
+        session = SessionLocal()
+        try:
+            service = InsightNsConversationService(session)
+            detail = service.get_turn_version_detail(
+                username=self._get_username(),
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                analysis_task_id=None,
+            )
+            if detail is None:
+                return self.error_response('轮次版本不存在', 404)
+            return jsonify(Result.success(data=detail).to_dict())
+        finally:
+            session.close()
+
+    def get_turn_version_detail(self, conversation_id: int, turn_id: int, analysis_task_id: int):
+        """按分析任务 ID 返回某个轮次版本的执行与产物。"""
+        session = SessionLocal()
+        try:
+            service = InsightNsConversationService(session)
+            detail = service.get_turn_version_detail(
+                username=self._get_username(),
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                analysis_task_id=analysis_task_id,
+            )
+            if detail is None:
+                return self.error_response('轮次版本不存在', 404)
+            return jsonify(Result.success(data=detail).to_dict())
+        finally:
+            session.close()
+
     def get_running_turn(self, conversation_id: int):
         """返回当前用户在指定会话下仍在排队或运行中的轮次。"""
         session = SessionLocal()
@@ -370,6 +423,7 @@ class InsightNsConversationController(BaseController):
             session.commit()
             get_analysis_task_runner().submit(
                 task_id=task.task_id,
+                analysis_task_id=task.id,
                 agent_request=agent_request,
                 turn_id=runtime.turn.id,
                 is_rerun=True,
