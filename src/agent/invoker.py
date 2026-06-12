@@ -1152,6 +1152,18 @@ def _extract_execution_error_type(execution: Any) -> str:
     return ''
 
 
+def _latest_failed_execution_error_type(runtime: ConversationRunContext) -> str:
+    """读取本轮最后一次失败执行的结构化错误类型。"""
+    executions = _load_turn_executions_fresh(runtime)
+    for execution in reversed(executions):
+        if getattr(execution, 'execution_status', '') == 'success':
+            continue
+        error_type = _extract_execution_error_type(execution)
+        if error_type:
+            return error_type
+    return ''
+
+
 def _user_query_has_explicit_time_range(user_query: str) -> bool:
     text = str(user_query or '')
     return bool(
@@ -1353,6 +1365,15 @@ def _build_analysis_recovery_instruction(
     if latest_error_types:
         lines.append(f'最近的结构化错误类型：{", ".join(latest_error_types)}。')
 
+    latest_error_type = latest_error_types[-1] if latest_error_types else ''
+    if latest_error_type in {'contract_error', 'missing_query_constraints', 'invalid_query_constraints'}:
+        lines.extend([
+            '最近失败发生在 execute_python 的静态契约检查阶段，上一版代码没有真正进入数据执行。',
+            '下一步必须重新调用 execute_python，并提交一份完整的新代码；不能只用自然语言说明，也不能直接结束本轮。',
+            '如果继续按分析执行：代码顶部必须声明 execution_intent = "analysis"，并一次性包含 query_constraints、validate_query_constraints(...)、数据加载、空数据检查、图表/表格构造和 result = save_analysis_result(...)。',
+            '如果只是探测字段、样例、候选值或数据覆盖：代码顶部必须声明 execution_intent = "probe"，并以 result = request_retry(...) 返回结构化探测反馈。',
+        ])
+
     if failure_summary:
         lines.append('本轮重复失败摘要如下，优先修复出现次数最多的问题，不要沿着同一错误反复试错：')
         lines.extend(f'- {_clip_retry_text(item, RETRY_ERROR_MAX_CHARS)}' for item in failure_summary)
@@ -1388,7 +1409,6 @@ def _build_analysis_recovery_instruction(
             lines.append(
                 '如果 diagnostics 中候选值已经足够明确，应从中选择单个真实值收敛成精确筛选条件；不要把 probe 中的 LIKE/contains 直接延续到正式分析。'
             )
-    latest_error_type = latest_error_types[-1] if latest_error_types else ''
     if latest_error_type == 'chart_contract_error' or any(_is_chart_contract_error_text(item) for item in failed_errors):
         lines.extend([
             '本轮已出现图表产物契约错误。下一版必须把修复重点放在 charts 构造，不要重新发散数据查询逻辑。',
@@ -1615,6 +1635,9 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                     break
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
+                latest_failed_error_type = _latest_failed_execution_error_type(runtime)
+                if latest_failed_error_type in {'contract_error', 'missing_query_constraints', 'invalid_query_constraints'}:
+                    raise ValueError('生成的分析代码未通过静态契约检查，且模型未按反馈重新生成可执行代码，请重试。')
                 _ensure_analysis_result_ready(analysis_report=analysis_report, charts=charts, tables=tables)
                 break
 
@@ -1972,6 +1995,9 @@ def _stream_with_runtime(
                     break
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
+                latest_failed_error_type = _latest_failed_execution_error_type(runtime)
+                if latest_failed_error_type in {'contract_error', 'missing_query_constraints', 'invalid_query_constraints'}:
+                    raise ValueError('生成的分析代码未通过静态契约检查，且模型未按反馈重新生成可执行代码，请重试。')
                 _ensure_analysis_result_ready(analysis_report=analysis_report, charts=charts, tables=tables)
                 break
 

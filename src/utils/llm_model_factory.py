@@ -108,6 +108,10 @@ def _resolve_supos_gateway_model(base_url: str, api_key: str) -> str:
     if not model_id:
         raise LLMProviderUnavailableError('Supos LLM gateway first model entry must contain id')
     return model_id
+def _resolve_provider_base_url(provider: ModelProvider) -> str:
+    if provider.name == 'supos_llm_gateway':
+        return f"{Config.SUPOS_WEB.rstrip('/')}/os/llm-gateway/v1"
+    return Config.BASE_URL
 
 def _resolve_model_name(provider: ModelProvider, api_key: str, base_url: str) -> str:
     if provider.name == 'supos_llm_gateway':
@@ -127,7 +131,7 @@ def create_runtime_config(selected_model_id: str = '') -> LlmRuntimeConfig:
     """Resolve the chat model runtime config for the current request."""
     provider = resolve_model_provider(Config.LLM_PROVIDER)
     api_key = getattr(Config, provider.api_key_attr)
-    base_url = Config.BASE_URL
+    base_url = _resolve_provider_base_url(provider)
     model_id = (
         (selected_model_id or '').strip()
         or _CURRENT_SELECTED_MODEL_ID.get()
