@@ -28,8 +28,12 @@ MISSING_DEP_PATTERN = re.compile(r"No module named '(?P<module>[^']+)'")
 RELATIVE_SHORT_TIME_PATTERN = re.compile(
     r"(近|最近|过去)\s*(?P<amount>\d+)\s*(?P<unit>分钟|分|小时|时|h|H|min|mins|minute|minutes)"
 )
+RELATIVE_DATE_TIME_PATTERN = re.compile(
+    r"(近|最近|过去)\s*(?P<amount>\d+|[一二两三四五六七八九十]{1,3})\s*"
+    r"(?P<unit>天|日|周|星期|月|个月|年)"
+)
 ANALYSIS_EXPLICIT_TIME_PATTERN = re.compile(
-    r"(今天|昨天|前天|本周|上周|本月|上月|今年|去年|近\s*\d+\s*[天日周月年]|"
+    r"(今天|昨天|前天|本周|上周|本月|上月|今年|去年|(?:近|最近|过去)\s*(?:\d+|[一二两三四五六七八九十]{1,3})\s*(?:天|日|周|星期|月|个月|年)|"
     r"\d{4}[-/年]\d{1,2}([-/月]\d{1,2})?|\d{1,2}月\d{1,2}日)"
 )
 MAX_ANALYSIS_AGENT_ROUNDS = 3
@@ -259,6 +263,68 @@ def _month_window(year: int, month: int) -> tuple[Any, Any]:
     return start, end
 
 
+def _parse_simple_chinese_number(text: Any) -> int:
+    raw_text = str(text or '').strip()
+    if not raw_text:
+        return 0
+    if raw_text.isdigit():
+        return int(raw_text)
+    digit_map = {
+        '一': 1,
+        '二': 2,
+        '两': 2,
+        '三': 3,
+        '四': 4,
+        '五': 5,
+        '六': 6,
+        '七': 7,
+        '八': 8,
+        '九': 9,
+    }
+    if raw_text == '十':
+        return 10
+    if '十' in raw_text:
+        left, _, right = raw_text.partition('十')
+        tens = digit_map.get(left, 1 if left == '' else 0)
+        ones = digit_map.get(right, 0) if right else 0
+        return tens * 10 + ones
+    return digit_map.get(raw_text, 0)
+
+
+def _shift_month(date_value: Any, months: int) -> Any:
+    month_index = date_value.year * 12 + date_value.month - 1 + months
+    year = month_index // 12
+    month = month_index % 12 + 1
+    day = min(date_value.day, monthrange(year, month)[1])
+    return date_value.replace(year=year, month=month, day=day)
+
+
+def _format_relative_date_time_range(amount: int, unit: str, label: str) -> dict[str, Any]:
+    today = datetime.now(ZoneInfo('Asia/Shanghai')).date()
+    normalized_unit = str(unit or '').strip()
+    if normalized_unit in {'天', '日'}:
+        start = today - timedelta(days=amount)
+    elif normalized_unit in {'周', '星期'}:
+        start = today - timedelta(days=amount * 7)
+    elif normalized_unit in {'月', '个月'}:
+        start = _shift_month(today, -amount)
+    elif normalized_unit == '年':
+        try:
+            start = today.replace(year=today.year - amount)
+        except ValueError:
+            start = today.replace(year=today.year - amount, day=28)
+    else:
+        return {}
+    end = today + timedelta(days=1)
+    payload = _format_expected_time_range(start, end, label)
+    payload.update({
+        'relative_window': True,
+        'amount': amount,
+        'unit': normalized_unit,
+    })
+    return payload
+
+
 def _format_expected_time_range(start: Any, end: Any, label: str) -> dict[str, Any]:
     display_end = end - timedelta(days=1)
     return {
@@ -301,6 +367,16 @@ def _build_expected_time_range_from_user_query(user_query: str) -> dict[str, Any
                 amount=amount,
                 unit=relative_match.group('unit'),
                 label=relative_match.group(0),
+            )
+
+    relative_date_match = RELATIVE_DATE_TIME_PATTERN.search(text)
+    if relative_date_match:
+        amount = _parse_simple_chinese_number(relative_date_match.group('amount'))
+        if amount > 0:
+            return _format_relative_date_time_range(
+                amount=amount,
+                unit=relative_date_match.group('unit'),
+                label=relative_date_match.group(0),
             )
 
     today = datetime.now(ZoneInfo('Asia/Shanghai')).date()
@@ -1897,7 +1973,7 @@ def _stream_with_runtime(
                                 service=service,
                                 runtime=runtime,
                             )
-                            if execution_report and (execution_charts or execution_tables):
+                            if execution_report:
                                 analysis_report = execution_report
                                 charts = execution_charts
                                 tables = execution_tables

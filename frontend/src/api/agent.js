@@ -132,6 +132,18 @@ export function getTurnDetail(conversationId, turnId) {
   return api.get(`/insight/conversations/${conversationId}/turns/${turnId}`)
 }
 
+export function listTurnVersions(conversationId, turnId) {
+  return api.get(`/insight/conversations/${conversationId}/turns/${turnId}/versions`)
+}
+
+export function getInitialTurnVersion(conversationId, turnId) {
+  return api.get(`/insight/conversations/${conversationId}/turns/${turnId}/versions/initial`)
+}
+
+export function getTurnVersionDetail(conversationId, turnId, analysisTaskId) {
+  return api.get(`/insight/conversations/${conversationId}/turns/${turnId}/versions/${analysisTaskId}`)
+}
+
 export function bindConversationDatasource(conversationId, datasourceId) {
   return api.post('/insight/conversation/datasource/', {
     insight_conversation_id: conversationId,
@@ -254,6 +266,12 @@ export function streamTurnEvents(conversationId, turnId, onMessage, onError, onD
 
 export function submitRerunTurnTask(conversationId, turnId) {
   return api.post(`/insight/conversations/${conversationId}/turns/${turnId}/rerun/task`, {})
+}
+
+export function rerunExecutionLocally(conversationId, turnId, executionId, analysisParameters = {}) {
+  return api.post(`/insight/conversations/${conversationId}/turns/${turnId}/executions/${executionId}/rerun`, {
+    analysis_parameters: analysisParameters || {}
+  })
 }
 
 export function streamRerunTurn(conversationId, turnId, onMessage, onError, onDone) {

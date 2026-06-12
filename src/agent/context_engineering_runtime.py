@@ -55,6 +55,7 @@ class CustomContext(BaseModel):
     database_conn_info: dict[str, Any] = Field(default_factory=dict)
     active_datasource_snapshot: dict[str, Any] = Field(default_factory=dict)
     analysis_task_id: int | None = None
+    analysis_parameters_override: dict[str, Any] = Field(default_factory=dict)
 
 
 def classify_analysis_context_mode(user_message: str) -> str:

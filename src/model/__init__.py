@@ -430,6 +430,11 @@ class InsightNsExecution(Base):
     execution_status = Column(String(32), nullable=False, default='running', comment='执行状态')
     analysis_report = Column(Text, nullable=False, default='', comment='分析报告内容')
     result_payload_json = Column(Text, nullable=False, default='{}', comment='结构化执行结果 JSON')
+    analysis_parameters_schema_json = Column(Text, nullable=False, default='{}', comment='Reusable analysis parameter schema JSON')
+    analysis_parameters_json = Column(Text, nullable=False, default='{}', comment='Analysis parameter values JSON')
+    analysis_logic_signature = Column(String(128), nullable=False, default='', comment='Analysis logic signature')
+    parent_execution_id = Column(Integer, nullable=True, comment='Parent execution id for local rerun')
+    execution_source = Column(String(32), nullable=False, default='llm_generated', comment='Execution source')
     stdout_text = Column(Text, nullable=False, default='', comment='标准输出文本')
     stderr_text = Column(Text, nullable=False, default='', comment='标准错误文本')
     execution_seconds = Column(Integer, nullable=False, default=0, comment='执行耗时毫秒数')
@@ -461,6 +466,13 @@ class InsightNsExecution(Base):
             "execution_status": self.execution_status,
             "analysis_report": self.analysis_report,
             "result_payload_json": self.result_payload_json,
+            "analysis_parameters_schema_json": self.analysis_parameters_schema_json,
+            "analysis_parameters_schema": _safe_json_loads(self.analysis_parameters_schema_json, {}),
+            "analysis_parameters_json": self.analysis_parameters_json,
+            "analysis_parameters": _safe_json_loads(self.analysis_parameters_json, {}),
+            "analysis_logic_signature": self.analysis_logic_signature,
+            "parent_execution_id": self.parent_execution_id,
+            "execution_source": self.execution_source,
             "stdout_text": self.stdout_text,
             "stderr_text": self.stderr_text,
             "execution_seconds": self.execution_seconds,

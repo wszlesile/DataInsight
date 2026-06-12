@@ -47,6 +47,9 @@ function parseTemporalValue(value) {
   }
   const text = String(value).trim()
   if (!text) return null
+  if (!/^\d{4}[-/]\d{1,2}(?:[-/]\d{1,2})?(?:[ T]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$/.test(text)) {
+    return null
+  }
   const date = new Date(text)
   return Number.isNaN(date.getTime()) ? null : date
 }
@@ -109,12 +112,14 @@ function sanitizeChartSpec(chartSpec) {
 
   if (backendManaged) {
     applyAxisDisplayRules(normalized)
+    applyGridContainLabelSafety(normalized)
     applyTooltipDisplayRules(normalized)
     return normalized
   }
 
   applyTitleLegendGridRules(normalized)
   applyAxisDisplayRules(normalized)
+  applyGridContainLabelSafety(normalized)
   applySeriesDisplayRules(normalized)
   applyTooltipDisplayRules(normalized)
   return normalized
@@ -222,6 +227,94 @@ function applyAxisDisplayRules(normalized) {
       }
     })
   })
+}
+
+function coerceAxisList(value) {
+  if (Array.isArray(value)) return value.filter((item) => item && typeof item === 'object')
+  return value && typeof value === 'object' ? [value] : []
+}
+
+function getSeriesNumericValue(rawValue) {
+  const value = rawValue && typeof rawValue === 'object' && !Array.isArray(rawValue) && 'value' in rawValue
+    ? rawValue.value
+    : rawValue
+  const numericValue = Array.isArray(value) ? value[value.length - 1] : value
+  const parsed = typeof numericValue === 'number' ? numericValue : Number(numericValue)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function estimateAxisLabelWidth(label) {
+  const text = String(label ?? '')
+  if (!text) return 0
+  let width = 0
+  for (const char of text) {
+    width += /[\u4e00-\u9fff]/.test(char) ? 12 : 7
+  }
+  return width
+}
+
+function ensureGridOffset(value, minValue) {
+  if (typeof value === 'number') return Math.max(value, minValue)
+  if (typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value.trim())) {
+    return Math.max(Number(value), minValue)
+  }
+  return value ?? minValue
+}
+
+function applyGridContainLabelSafety(normalized) {
+  const currentGrid = Array.isArray(normalized.grid) ? normalized.grid[0] : normalized.grid
+  const gridItem = currentGrid && typeof currentGrid === 'object' ? currentGrid : {}
+  const yAxes = coerceAxisList(normalized.yAxis)
+  const seriesList = Array.isArray(normalized.series) ? normalized.series : []
+
+  let minLeft = 56
+  let minRight = 24
+
+  yAxes.forEach((axis, axisIndex) => {
+    const position = axis.position === 'right' ? 'right' : 'left'
+    let labelWidth = 0
+
+    if (axis.type === 'category') {
+      const labels = Array.isArray(axis.data) ? axis.data : []
+      labelWidth = labels.reduce((max, item) => Math.max(max, estimateAxisLabelWidth(item)), 0)
+    } else if (axis.type === 'value' || axis.type === 'log' || !axis.type) {
+      const values = []
+      seriesList.forEach((series) => {
+        if (!series || typeof series !== 'object') return
+        if ((series.yAxisIndex ?? 0) !== axisIndex) return
+        const data = Array.isArray(series.data) ? series.data : []
+        data.forEach((item) => {
+          const numericValue = getSeriesNumericValue(item)
+          if (numericValue !== null) values.push(numericValue)
+        })
+      })
+      if (values.length) {
+        const minValue = Math.min(0, ...values)
+        const maxValue = Math.max(...values)
+        labelWidth = [minValue, maxValue]
+          .map((value) => estimateAxisLabelWidth(formatChartNumber(value)))
+          .reduce((max, width) => Math.max(max, width), 0)
+      }
+    }
+
+    if (labelWidth <= 0) return
+    const safeOffset = Math.min(132, Math.max(56, Math.ceil(labelWidth + 24)))
+    if (position === 'right') {
+      minRight = Math.max(minRight, safeOffset)
+    } else {
+      minLeft = Math.max(minLeft, safeOffset)
+    }
+  })
+
+  gridItem.left = ensureGridOffset(gridItem.left, minLeft)
+  gridItem.right = ensureGridOffset(gridItem.right, minRight)
+  gridItem.containLabel = gridItem.containLabel ?? true
+
+  if (Array.isArray(normalized.grid)) {
+    normalized.grid[0] = gridItem
+  } else {
+    normalized.grid = gridItem
+  }
 }
 
 function applySeriesDisplayRules(normalized) {

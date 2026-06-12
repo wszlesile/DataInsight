@@ -152,6 +152,8 @@ def create_data_insight_model(runtime_config: LlmRuntimeConfig | None = None):
             api_key=runtime_config.api_key,
             base_url=runtime_config.base_url,
             temperature=runtime_config.temperature,
+            timeout=max(float(Config.LLM_REQUEST_TIMEOUT_SECONDS or 60), 1.0),
+            max_retries=max(int(Config.LLM_MAX_RETRIES or 0), 0),
         )
     if runtime_config.adapter == 'qwen':
         return ChatQwen(

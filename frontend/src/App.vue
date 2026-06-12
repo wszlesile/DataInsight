@@ -168,6 +168,15 @@
                         <button
                           class="action-btn"
                           type="button"
+                          :disabled="!canLocalRunTurn(item) || localRerunLoading"
+                          :title="getLocalRunDisabledReason(item)"
+                          @click="onLocalRerunTurn(item)"
+                        >
+                          {{ localRerunLoading && localRerunTurnId === item.turnId ? '本地执行中...' : '本地执行' }}
+                        </button>
+                        <button
+                          class="action-btn"
+                          type="button"
                           @click="toggleCollect({
                             collectType: 'turn',
                             targetId: item.turnId,
@@ -491,88 +500,211 @@
             <div class="detail-title">第 {{ turnDetail.turn.turn_no }} 轮分析</div>
             <div class="detail-meta">状态：{{ turnDetail.turn.status }} | 开始时间：{{ formatDateTime(turnDetail.turn.started_at) }}</div>
           </div>
-          <button
-            class="action-btn"
-            type="button"
-            @click="toggleCollect({
-              collectType: 'turn',
-              targetId: turnDetail.turn.id,
-              title: turnDetail.turn.user_query,
-              summaryText: turnDetail.turn.final_answer,
-              conversationId: turnDetail.conversation.id
-            })"
-          >
-            {{ isCollected('turn', turnDetail.turn.id) ? '取消收藏' : '收藏本轮' }}
-          </button>
-        </div>
-
-        <div class="detail-section">
-          <div class="section-title">问题</div>
-          <div class="detail-card">{{ turnDetail.turn.user_query }}</div>
-        </div>
-
-        <div v-if="turnDetail.turn.final_answer" class="detail-section">
-          <div class="section-title">最终结论</div>
-          <div class="detail-card" v-html="renderMarkdown(turnDetail.turn.final_answer)" />
-        </div>
-
-        <div class="detail-section">
-          <div class="section-title">消息明细</div>
-          <div class="detail-list">
-            <div v-for="message in turnDetail.messages" :key="message.id" class="detail-list-item">
-              <div class="detail-list-actions">
-                <span class="detail-pill">{{ message.role }}</span>
-                <span class="detail-pill muted">{{ message.message_kind }}</span>
-              </div>
-              <div class="detail-card">{{ message.content || '空内容' }}</div>
-            </div>
+          <div class="detail-list-actions">
+            <button
+              class="action-btn"
+              type="button"
+              :disabled="!canLocalRunTurn(getTurnDetailLocalRunItem()) || localRerunLoading"
+              :title="getLocalRunDisabledReason(getTurnDetailLocalRunItem())"
+              @click="onLocalRerunTurn(getTurnDetailLocalRunItem())"
+            >
+              {{ localRerunLoading && localRerunTurnId === turnDetail.turn.id ? '本地执行中...' : '本地执行' }}
+            </button>
+            <button
+              class="action-btn"
+              type="button"
+              @click="toggleCollect({
+                collectType: 'turn',
+                targetId: turnDetail.turn.id,
+                title: turnDetail.turn.user_query,
+                summaryText: turnDetail.turn.final_answer,
+                conversationId: turnDetail.conversation.id
+              })"
+            >
+              {{ isCollected('turn', turnDetail.turn.id) ? '取消收藏' : '收藏本轮' }}
+            </button>
           </div>
         </div>
 
-        <div v-if="turnDetail.artifacts.length" class="detail-section">
-          <div class="section-title">分析产物</div>
-          <div class="detail-list">
-            <div v-for="artifact in turnDetail.artifacts" :key="artifact.id" class="detail-list-item">
-              <div class="detail-list-actions">
-                <span class="detail-pill">{{ artifact.artifact_type }}</span>
-                <button
-                  v-if="artifact.artifact_type === 'chart' && artifactChartSpec(artifact)"
-                  class="action-btn"
-                  type="button"
-                  @click="previewChartArtifact(artifact)"
-                >
-                  预览
-                </button>
-                <button
-                  class="action-btn"
-                  type="button"
-                  @click="toggleCollect({
-                    collectType: 'artifact',
-                    targetId: artifact.id,
-                    title: artifact.title,
-                    summaryText: artifact.summary_text,
-                    conversationId: turnDetail.conversation.id,
-                    artifactId: artifact.id
-                  })"
-                >
-                  {{ isCollected('artifact', artifact.id) ? '取消收藏' : '收藏产物' }}
-                </button>
+        <el-tabs v-model="turnDetailActiveTab" class="detail-tabs" @tab-change="onTurnDetailTabChange">
+          <el-tab-pane label="当前结果" name="current">
+            <div class="detail-section">
+              <div class="section-title">问题</div>
+              <div class="detail-card">{{ turnDetail.turn.user_query }}</div>
+            </div>
+
+            <div v-if="turnDetail.turn.final_answer" class="detail-section">
+              <div class="section-title">最终结论</div>
+              <div class="detail-card" v-html="renderMarkdown(turnDetail.turn.final_answer)" />
+            </div>
+
+            <div class="detail-section">
+              <div class="section-title">消息明细</div>
+              <div class="detail-list">
+                <div v-for="message in turnDetail.messages" :key="message.id" class="detail-list-item">
+                  <div class="detail-list-actions">
+                    <span class="detail-pill">{{ message.role }}</span>
+                    <span class="detail-pill muted">{{ message.message_kind }}</span>
+                  </div>
+                  <div class="detail-card">{{ message.content || '空内容' }}</div>
+                </div>
               </div>
+            </div>
+
+            <div v-if="turnDetail.artifacts.length" class="detail-section">
+              <div class="section-title">分析产物</div>
+              <div class="detail-list">
+                <div v-for="artifact in turnDetail.artifacts" :key="artifact.id" class="detail-list-item">
+                  <div class="detail-list-actions">
+                    <span class="detail-pill">{{ artifact.artifact_type }}</span>
+                    <button
+                      v-if="artifact.artifact_type === 'chart' && artifactChartSpec(artifact)"
+                      class="action-btn"
+                      type="button"
+                      @click="previewChartArtifact(artifact)"
+                    >
+                      预览
+                    </button>
+                    <button
+                      class="action-btn"
+                      type="button"
+                      @click="toggleCollect({
+                        collectType: 'artifact',
+                        targetId: artifact.id,
+                        title: artifact.title,
+                        summaryText: artifact.summary_text,
+                        conversationId: turnDetail.conversation.id,
+                        artifactId: artifact.id
+                      })"
+                    >
+                      {{ isCollected('artifact', artifact.id) ? '取消收藏' : '收藏产物' }}
+                    </button>
+                  </div>
+                  <div class="detail-card">
+                    <div class="artifact-title">{{ artifact.title || '未命名产物' }}</div>
+                    <div v-if="artifact.summary_text" class="artifact-summary">{{ artifact.summary_text }}</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div v-if="previewArtifact && artifactChartSpec(previewArtifact)" class="detail-section">
+              <div class="section-title">产物预览</div>
               <div class="detail-card">
-                <div class="artifact-title">{{ artifact.title || '未命名产物' }}</div>
-                <div v-if="artifact.summary_text" class="artifact-summary">{{ artifact.summary_text }}</div>
+                <div class="artifact-title">{{ previewArtifact.title || '图表预览' }}</div>
+                <ChartDisplay :chart-spec="artifactChartSpec(previewArtifact)" />
               </div>
             </div>
-          </div>
-        </div>
+          </el-tab-pane>
 
-        <div v-if="previewArtifact && artifactChartSpec(previewArtifact)" class="detail-section">
-          <div class="section-title">产物预览</div>
-          <div class="detail-card">
-            <div class="artifact-title">{{ previewArtifact.title || '图表预览' }}</div>
-            <ChartDisplay :chart-spec="artifactChartSpec(previewArtifact)" />
-          </div>
-        </div>
+          <el-tab-pane label="分析历史" name="versions">
+            <div v-if="turnVersionsLoading" class="detail-empty version-empty">正在加载分析历史...</div>
+            <div v-else-if="!turnVersions.length" class="detail-empty version-empty">当前轮次还没有分析历史。</div>
+            <div v-else class="version-layout">
+              <div class="version-list">
+                <button
+                  v-for="version in turnVersions"
+                  :key="getTurnVersionKey(version)"
+                  class="version-item"
+                  :class="{ active: selectedVersionKey === getTurnVersionKey(version), current: version.is_current }"
+                  type="button"
+                  @click="selectTurnVersion(version)"
+                >
+                  <div class="version-item-main">
+                    <span>{{ getVersionLabel(version) }}</span>
+                    <span v-if="version.is_current" class="detail-pill">当前</span>
+                  </div>
+                  <div class="version-item-meta">
+                    <span>{{ version.status || 'unknown' }}</span>
+                    <span>{{ formatDateTime(version.finished_at || version.started_at || version.created_at) }}</span>
+                  </div>
+                  <div class="version-item-meta">
+                    <span>执行 {{ version.execution_count || 0 }}</span>
+                    <span>产物 {{ version.artifact_count || 0 }}</span>
+                  </div>
+                </button>
+              </div>
+
+              <div class="version-preview">
+                <div v-if="turnVersionDetailLoading" class="detail-empty version-empty">正在加载版本产物...</div>
+                <div v-else-if="selectedVersionDetail" class="version-content">
+                  <div class="detail-list-actions version-summary">
+                    <span class="detail-pill">{{ selectedVersionDetail.version?.status || 'unknown' }}</span>
+                    <span class="detail-pill muted">{{ getVersionLabel(selectedVersionDetail.version || {}) }}</span>
+                    <span class="detail-meta">{{ formatDateTime(selectedVersionDetail.version?.finished_at || selectedVersionDetail.version?.started_at || selectedVersionDetail.version?.created_at) }}</span>
+                  </div>
+
+                  <div v-if="hasObjectEntries(getVersionParameters(selectedVersionDetail))" class="detail-section">
+                    <div class="section-title">执行参数</div>
+                    <pre class="detail-card version-json">{{ formatJson(getVersionParameters(selectedVersionDetail)) }}</pre>
+                  </div>
+
+                  <div v-if="getVersionCharts(selectedVersionDetail).length" class="detail-section">
+                    <div class="section-title">图表</div>
+                    <div class="answer-chart-grid">
+                      <div
+                        v-for="(chart, chartIndex) in getVersionCharts(selectedVersionDetail)"
+                        :key="`version-chart-${chart.id || chartIndex}`"
+                        class="answer-chart-card"
+                      >
+                        <div class="answer-chart-title">{{ chart.title || `图表 ${chartIndex + 1}` }}</div>
+                        <div v-if="chart.summaryText" class="answer-chart-desc">{{ chart.summaryText }}</div>
+                        <ChartDisplay :chart-spec="chart.chartSpec" />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div v-if="getVersionTables(selectedVersionDetail).length" class="detail-section">
+                    <div class="section-title">表格</div>
+                    <div class="answer-table-list">
+                      <div
+                        v-for="(table, tableIndex) in getVersionTables(selectedVersionDetail)"
+                        :key="`version-table-${table.id || tableIndex}`"
+                        class="answer-table-card"
+                      >
+                        <div class="answer-table-title">{{ table.title || `表格 ${tableIndex + 1}` }}</div>
+                        <div v-if="table.description || table.summary_text" class="answer-table-desc">
+                          {{ table.description || table.summary_text }}
+                        </div>
+                        <div class="answer-table-scroll">
+                          <table class="answer-table">
+                            <thead>
+                              <tr>
+                                <th v-for="column in getTableColumns(table)" :key="column.field">
+                                  {{ column.title || column.field }}
+                                </th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              <tr v-for="(row, rowIndex) in getTableRows(table)" :key="rowIndex">
+                                <td v-for="column in getTableColumns(table)" :key="`${rowIndex}-${column.field}`">
+                                  {{ formatTableCell(row[column.field]) }}
+                                </td>
+                              </tr>
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div v-if="getVersionReport(selectedVersionDetail)" class="detail-section">
+                    <div class="section-title">报告</div>
+                    <div class="detail-card answer-report" v-html="renderMarkdown(getVersionReport(selectedVersionDetail))" />
+                  </div>
+
+                  <div
+                    v-if="!getVersionReport(selectedVersionDetail) && !getVersionCharts(selectedVersionDetail).length && !getVersionTables(selectedVersionDetail).length"
+                    class="detail-empty version-empty"
+                  >
+                    当前版本没有可展示产物。
+                  </div>
+                </div>
+                <div v-else class="detail-empty version-empty">请选择一个分析版本。</div>
+              </div>
+            </div>
+          </el-tab-pane>
+        </el-tabs>
       </div>
       <div v-else class="detail-empty">没有可展示的轮次详情。</div>
     </el-drawer>
@@ -596,15 +728,19 @@ import {
   deleteConversation,
   deleteNamespace,
   exportTurnPdf,
+  getInitialTurnVersion,
   getConversationHistory,
   getTurnDetail,
+  getTurnVersionDetail,
   listLlmModels,
   listCollects,
   listConversations,
   listNamespaces,
+  listTurnVersions,
   removeCollect,
   renameConversation,
   renameNamespace,
+  rerunExecutionLocally,
   selectLlmModel,
   submitAgentTask,
   submitRerunTurnTask,
@@ -635,10 +771,18 @@ const currentTaskId = ref('')
 const currentTurnId = ref(0)
 const currentRunMode = ref('new')
 const rerunSourceTurnId = ref(0)
+const localRerunLoading = ref(false)
+const localRerunTurnId = ref(0)
 const messagesContainer = ref(null)
 const turnDetailVisible = ref(false)
 const turnDetailLoading = ref(false)
 const turnDetail = ref(null)
+const turnDetailActiveTab = ref('current')
+const turnVersionsLoading = ref(false)
+const turnVersions = ref([])
+const selectedVersionKey = ref('')
+const selectedVersionDetail = ref(null)
+const turnVersionDetailLoading = ref(false)
 const previewArtifact = ref(null)
 const favoritesPanelVisible = ref(false)
 const llmModels = ref([])
@@ -1209,6 +1353,7 @@ const resumeRunningTurnIfAny = async (conversationId) => {
 const mapHistoryItem = (item) => ({
   turnId: item.turn_id,
   question: item.question,
+  latestExecution: item.latest_execution || null,
   chartArtifactId: item.chart_artifact_id || 0,
   charts: normalizeCharts(item.charts || []),
   tables: item.tables || [],
@@ -1330,14 +1475,28 @@ const loadConversationHistory = async (conversationId) => {
   }
 }
 
-const openTurnDetail = async (turnId) => {
+const resetTurnVersionState = () => {
+  turnVersionsLoading.value = false
+  turnVersions.value = []
+  selectedVersionKey.value = ''
+  selectedVersionDetail.value = null
+  turnVersionDetailLoading.value = false
+}
+
+const openTurnDetail = async (turnId, options = {}) => {
   if (!activeConversationId.value || !turnId) return
+  const resetTab = options.resetTab !== false
   turnDetailVisible.value = true
   turnDetailLoading.value = true
   previewArtifact.value = null
+  resetTurnVersionState()
+  if (resetTab) turnDetailActiveTab.value = 'current'
   try {
     const response = await getTurnDetail(activeConversationId.value, turnId)
     turnDetail.value = response.data.success ? response.data.data : null
+    if (!resetTab && turnDetailActiveTab.value === 'versions') {
+      await loadTurnVersions(turnId)
+    }
   } catch (error) {
     console.error('Load turn detail error:', error)
     turnDetail.value = null
@@ -1551,6 +1710,260 @@ const onRerunTurn = async (item) => {
     console.error('Submit rerun task error:', error)
     ElMessage.error(error?.message || '提交刷新分析任务失败')
     loading.value = false
+  }
+}
+
+const getTurnVersionKey = (version) => (
+  version?.analysis_task_id ? String(version.analysis_task_id) : 'initial'
+)
+
+const getVersionLabel = (version) => {
+  if (!version) return '分析版本'
+  if (version.task_type === 'initial') return '初始分析'
+  if (version.task_type === 'rerun') return `刷新分析 #${version.analysis_task_id || ''}`.trim()
+  if (version.task_type === 'local_rerun') return `本地执行 #${version.analysis_task_id || ''}`.trim()
+  return `${version.label || '分析'}${version.analysis_task_id ? ` #${version.analysis_task_id}` : ''}`
+}
+
+const loadTurnVersionDetail = async (version) => {
+  if (!activeConversationId.value || !turnDetail.value?.turn?.id || !version) return
+  selectedVersionKey.value = getTurnVersionKey(version)
+  selectedVersionDetail.value = null
+  turnVersionDetailLoading.value = true
+  try {
+    const response = version.analysis_task_id
+      ? await getTurnVersionDetail(activeConversationId.value, turnDetail.value.turn.id, version.analysis_task_id)
+      : await getInitialTurnVersion(activeConversationId.value, turnDetail.value.turn.id)
+    selectedVersionDetail.value = response.data?.success ? response.data.data : null
+  } catch (error) {
+    console.error('Load turn version detail error:', error)
+    selectedVersionDetail.value = null
+    ElMessage.error(error?.response?.data?.message || '加载分析版本失败')
+  } finally {
+    turnVersionDetailLoading.value = false
+  }
+}
+
+const loadTurnVersions = async (turnId = turnDetail.value?.turn?.id) => {
+  if (!activeConversationId.value || !turnId) return
+  turnVersionsLoading.value = true
+  selectedVersionDetail.value = null
+  try {
+    const response = await listTurnVersions(activeConversationId.value, turnId)
+    const versions = response.data?.success ? response.data.data?.versions || [] : []
+    turnVersions.value = versions
+    if (versions.length) {
+      await loadTurnVersionDetail(versions[0])
+    }
+  } catch (error) {
+    console.error('Load turn versions error:', error)
+    turnVersions.value = []
+    ElMessage.error(error?.response?.data?.message || '加载分析历史失败')
+  } finally {
+    turnVersionsLoading.value = false
+  }
+}
+
+const onTurnDetailTabChange = async (tabName) => {
+  if (tabName === 'versions' && turnDetail.value?.turn?.id && !turnVersions.value.length) {
+    await loadTurnVersions(turnDetail.value.turn.id)
+  }
+}
+
+const selectTurnVersion = async (version) => {
+  if (selectedVersionKey.value === getTurnVersionKey(version) && selectedVersionDetail.value) return
+  await loadTurnVersionDetail(version)
+}
+
+const parseJsonObject = (value) => {
+  if (!value) return {}
+  if (typeof value === 'object' && !Array.isArray(value)) return value
+  if (typeof value !== 'string') return {}
+  try {
+    const parsed = JSON.parse(value)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch (error) {
+    return {}
+  }
+}
+
+const formatJson = (value) => JSON.stringify(value || {}, null, 2)
+
+const hasObjectEntries = (value) => (
+  value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0
+)
+
+const getArtifactContent = (artifact) => parseJsonObject(artifact?.content_json)
+
+const getVersionArtifactsByType = (detail, artifactType) => (
+  Array.isArray(detail?.artifacts)
+    ? detail.artifacts.filter((artifact) => artifact?.artifact_type === artifactType)
+    : []
+)
+
+const getVersionParameters = (detail) => (
+  parseJsonObject(detail?.latest_execution?.analysis_parameters || detail?.latest_execution?.analysis_parameters_json)
+)
+
+const getVersionReport = (detail) => {
+  const reportArtifact = getVersionArtifactsByType(detail, 'report')[0]
+  if (reportArtifact) {
+    const content = getArtifactContent(reportArtifact)
+    return content.report_markdown || reportArtifact.summary_text || ''
+  }
+  return detail?.latest_execution?.analysis_report || ''
+}
+
+const getVersionCharts = (detail) => normalizeCharts(
+  getVersionArtifactsByType(detail, 'chart').map((artifact) => {
+    const content = getArtifactContent(artifact)
+    return {
+      id: artifact.id,
+      title: artifact.title,
+      summary_text: artifact.summary_text,
+      chart_type: content.chart_type || '',
+      chart_spec: content.chart_spec || {},
+      sort_no: artifact.sort_no || 0
+    }
+  })
+)
+
+const getVersionTables = (detail) => (
+  getVersionArtifactsByType(detail, 'table')
+    .map((artifact) => {
+      const content = getArtifactContent(artifact)
+      return {
+        id: artifact.id,
+        title: artifact.title,
+        summary_text: artifact.summary_text,
+        description: artifact.summary_text,
+        columns: Array.isArray(content.columns) ? content.columns : [],
+        rows: Array.isArray(content.rows) ? content.rows : [],
+        sort_no: artifact.sort_no || 0
+      }
+    })
+    .sort((left, right) => (left.sort_no || 0) - (right.sort_no || 0))
+)
+
+const getExecutionParameterSchema = (execution) => (
+  parseJsonObject(execution?.analysis_parameters_schema || execution?.analysis_parameters_schema_json)
+)
+
+const getExecutionParameters = (execution) => (
+  parseJsonObject(execution?.analysis_parameters || execution?.analysis_parameters_json)
+)
+
+const getSchemaParameters = (schema) => (
+  Array.isArray(schema?.parameters) ? schema.parameters.filter((param) => param?.name) : []
+)
+
+const hasReusableParameterSchema = (schema) => (
+  schema
+  && typeof schema === 'object'
+  && !Array.isArray(schema)
+  && Array.isArray(schema.parameters)
+  && schema.defaults
+  && typeof schema.defaults === 'object'
+  && !Array.isArray(schema.defaults)
+)
+
+const hasLocalRunnableExecution = (execution) => {
+  if (!execution?.id) return false
+  if (execution.execution_status && execution.execution_status !== 'success') return false
+  return hasReusableParameterSchema(getExecutionParameterSchema(execution))
+}
+
+const canLocalRunTurn = (item) => Boolean(item?.turnId && hasLocalRunnableExecution(item.latestExecution))
+
+const getLocalRunDisabledReason = (item) => {
+  const execution = item?.latestExecution
+  if (!execution?.id) return '当前轮次没有可复用的执行记录'
+  if (execution.execution_status && execution.execution_status !== 'success') return '只有成功的执行记录可以本地执行'
+  const schema = getExecutionParameterSchema(execution)
+  if (!hasReusableParameterSchema(schema)) return '当前执行记录没有参数契约，请先刷新生成可本地执行版本'
+  if (!getSchemaParameters(schema).length) return '当前分析没有可调整参数，将按固定口径本地执行'
+  return '使用当前参数在本地重新执行'
+}
+
+const buildDefaultLocalParameters = (execution) => {
+  const schema = getExecutionParameterSchema(execution)
+  return {
+    ...parseJsonObject(schema.defaults),
+    ...getExecutionParameters(execution)
+  }
+}
+
+const promptLocalExecutionParameters = async (execution) => {
+  const defaultParams = buildDefaultLocalParameters(execution)
+  const { value } = await ElMessageBox.prompt(
+    '可调整本次本地执行参数，保持 JSON 对象格式。',
+    '本地执行参数',
+    {
+      inputType: 'textarea',
+      inputValue: JSON.stringify(defaultParams, null, 2),
+      inputValidator: (rawValue) => {
+        try {
+          const parsed = JSON.parse(rawValue || '{}')
+          return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        } catch (error) {
+          return false
+        }
+      },
+      inputErrorMessage: '请输入合法的 JSON 对象',
+      confirmButtonText: '开始执行',
+      cancelButtonText: '取消'
+    }
+  )
+  return JSON.parse(value || '{}')
+}
+
+const getTurnDetailLocalRunItem = () => ({
+  turnId: turnDetail.value?.turn?.id || 0,
+  question: turnDetail.value?.turn?.user_query || '',
+  report: turnDetail.value?.turn?.final_answer || '',
+  latestExecution: turnDetail.value?.latest_execution || null
+})
+
+const refreshAfterLocalRerun = async (turnId) => {
+  const shouldReloadVersions = turnDetailVisible.value && turnDetail.value?.turn?.id === turnId && turnDetailActiveTab.value === 'versions'
+  await Promise.all([fetchConversations(), fetchCollects()])
+  if (activeConversationId.value) await loadConversationHistory(activeConversationId.value)
+  if (turnDetailVisible.value && turnDetail.value?.turn?.id === turnId) {
+    await openTurnDetail(turnId, { resetTab: !shouldReloadVersions })
+  }
+}
+
+const onLocalRerunTurn = async (item) => {
+  if (!activeConversationId.value || !item?.turnId || localRerunLoading.value) return
+  const execution = item.latestExecution
+  if (!hasLocalRunnableExecution(execution)) {
+    ElMessage.warning(getLocalRunDisabledReason(item))
+    return
+  }
+
+  try {
+    const analysisParameters = await promptLocalExecutionParameters(execution)
+    localRerunLoading.value = true
+    localRerunTurnId.value = item.turnId
+    const response = await rerunExecutionLocally(
+      activeConversationId.value,
+      item.turnId,
+      execution.id,
+      analysisParameters
+    )
+    const data = response.data?.data || {}
+    if (!response.data?.success || (data.status && data.status !== 'success')) {
+      throw new Error(response.data?.message || data.error_message || '本地执行失败')
+    }
+    ElMessage.success('本地执行完成')
+    await refreshAfterLocalRerun(item.turnId)
+  } catch (error) {
+    if (error === 'cancel' || error === 'close') return
+    console.error('Local rerun error:', error)
+    ElMessage.error(error?.response?.data?.message || error?.message || '本地执行失败')
+  } finally {
+    localRerunLoading.value = false
+    localRerunTurnId.value = 0
   }
 }
 
@@ -1990,6 +2403,7 @@ onMounted(async () => {
 .chat-subtitle { margin-top: 4px; font-size: 12px; color: #64748b; font-weight: 500; }
 .chat-header-actions, .result-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .action-btn { border: 1px solid #dbe3ef; background: #fff; border-radius: 10px; padding: 8px 12px; font-size: 12px; color: #475569; cursor: pointer; }
+.action-btn:disabled { cursor: not-allowed; opacity: 0.52; background: #f8fafc; }
 .chat-messages { flex: 1; overflow-y: auto; padding: 20px; background: radial-gradient(circle at top center, rgba(37, 99, 235, 0.08), transparent 24%), linear-gradient(180deg, #f7fbff 0%, #eef5fb 100%); }
 .welcome-card { text-align: center; padding: 48px 24px; color: #1e293b; }
 .welcome-icon { width: 84px; height: 84px; margin: 0 auto 20px; border-radius: 24px; background: linear-gradient(135deg, #2563eb, #0ea5e9); display: inline-flex; align-items: center; justify-content: center; font-size: 36px; }
@@ -2087,5 +2501,18 @@ onMounted(async () => {
 .detail-list-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .detail-pill { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #e2e8f0; color: #334155; }
 .detail-pill.muted { background: #f1f5f9; color: #64748b; }
+.detail-tabs :deep(.el-tabs__content) { overflow: visible; }
+.version-layout { display: grid; grid-template-columns: minmax(180px, 220px) minmax(0, 1fr); gap: 14px; align-items: start; }
+.version-list { display: flex; flex-direction: column; gap: 8px; }
+.version-item { width: 100%; border: 1px solid #e5edf7; background: #fff; border-radius: 10px; padding: 10px; text-align: left; cursor: pointer; color: #334155; }
+.version-item:hover, .version-item.active { border-color: #60a5fa; background: #f8fbff; }
+.version-item.current { box-shadow: inset 3px 0 0 #2563eb; }
+.version-item-main { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; font-weight: 700; color: #0f172a; }
+.version-item-meta { display: flex; justify-content: space-between; gap: 8px; margin-top: 6px; font-size: 11px; color: #64748b; }
+.version-preview, .version-content { min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+.version-summary { margin-bottom: 2px; }
+.version-json { margin: 0; overflow-x: auto; font-size: 12px; white-space: pre; }
+.version-empty { min-height: 120px; border: 1px dashed #dbe3ef; border-radius: 12px; display: flex; align-items: center; justify-content: center; background: #f8fbff; }
+@media (max-width: 1180px) { .version-layout { grid-template-columns: 1fr; } }
 @media (max-width: 1440px) { .result-card { margin-left: 0; } }
 </style>

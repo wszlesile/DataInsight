@@ -48,6 +48,7 @@ class CustomContext(BaseModel):
     auth_token: str = ''
     database_conn_info: dict[str, Any] = Field(default_factory=dict)
     active_datasource_snapshot: dict[str, Any] = Field(default_factory=dict)
+    analysis_parameters_override: dict[str, Any] = Field(default_factory=dict)
 
 
 def _build_datasource_payload_item(datasource: InsightDatasource) -> dict[str, Any]:

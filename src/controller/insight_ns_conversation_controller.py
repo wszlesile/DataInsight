@@ -7,6 +7,7 @@ from flask import Blueprint, Response, jsonify, request, send_file
 from config.database import SessionLocal
 from controller.base_controller import BaseController
 from dto import get_current_user_context
+from model import InsightNsTurn
 from service.analysis_stream_queue import AnalysisStreamQueue
 from service.analysis_task_runner import encode_sse, get_analysis_task_runner
 from service.analysis_task_service import ACTIVE_TASK_STATUSES, AnalysisTaskService
@@ -36,6 +37,7 @@ def create_insight_ns_conversation_controller() -> Blueprint:
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/versions', methods=['GET'])(controller.list_turn_versions)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/versions/initial', methods=['GET'])(controller.get_initial_turn_version)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/versions/<int:analysis_task_id>', methods=['GET'])(controller.get_turn_version_detail)
+    blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/executions/<int:execution_id>/rerun', methods=['POST'])(controller.rerun_execution)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/stream', methods=['GET'])(controller.stream_turn_events)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/export/pdf', methods=['POST'])(controller.export_turn_pdf)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/rerun/stream', methods=['POST'])(controller.rerun_turn_stream)
@@ -265,6 +267,42 @@ class InsightNsConversationController(BaseController):
         finally:
             session.close()
 
+    def rerun_execution(self, conversation_id: int, turn_id: int, execution_id: int):
+        """按参数本地复跑某条成功的执行记录，不调用 LLM。"""
+        from service.analysis_execution_rerun_service import AnalysisExecutionRerunService
+
+        data = self.get_json_data()
+        analysis_parameters = data.get('analysis_parameters') or {}
+        if not isinstance(analysis_parameters, dict):
+            return self.error_response('analysis_parameters 必须是 JSON 对象', 400)
+        username = self._get_username()
+        auth_token, _, database_conn_info = self._build_request_runtime_context()
+        session = SessionLocal()
+        try:
+            try:
+                result = AnalysisExecutionRerunService(session).rerun_execution(
+                    username=username,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    execution_id=execution_id,
+                    analysis_parameters=analysis_parameters,
+                    runtime_user_context={
+                        'token': auth_token,
+                        'database_conn_info': database_conn_info,
+                    },
+                )
+            except ValueError as exc:
+                session.rollback()
+                return self.error_response(str(exc), 400)
+            except Exception as exc:
+                session.rollback()
+                return self.error_response(get_user_facing_agent_error(exc), 500)
+            if result is None:
+                return self.error_response('执行记录不存在', 404)
+            return jsonify(Result.success(data=result, message='本地复跑已完成').to_dict())
+        finally:
+            session.close()
+
     def get_running_turn(self, conversation_id: int):
         """返回当前用户在指定会话下仍在排队或运行中的轮次。"""
         session = SessionLocal()
@@ -317,6 +355,9 @@ class InsightNsConversationController(BaseController):
                 event = queue.pop_event(turn_id, timeout_seconds=Config.STREAM_BLPOP_TIMEOUT_SECONDS)
                 if event is None:
                     if self._is_turn_task_finished(username, conversation_id, turn_id):
+                        terminal_event = self._build_finished_turn_event(username, conversation_id, turn_id)
+                        if terminal_event is not None:
+                            yield encode_sse(terminal_event)
                         return
                     yield ': heartbeat\n\n'
                     continue
@@ -444,6 +485,58 @@ class InsightNsConversationController(BaseController):
                 turn_id=turn_id,
             )
             return task is None or task.status not in ACTIVE_TASK_STATUSES
+        finally:
+            session.close()
+
+    def _build_finished_turn_event(self, username: str, conversation_id: int, turn_id: int) -> dict[str, Any] | None:
+        session = SessionLocal()
+        try:
+            task = AnalysisTaskService(session).get_latest_task_for_turn(
+                username=username,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+            )
+            turn = session.query(InsightNsTurn).filter(
+                InsightNsTurn.id == int(turn_id or 0),
+                InsightNsTurn.conversation_id == int(conversation_id or 0),
+                InsightNsTurn.is_deleted == 0,
+            ).first()
+            task_status = str(getattr(task, 'status', '') or '')
+            turn_status = str(getattr(turn, 'status', '') or '')
+            base_event = {
+                'conversation_id': conversation_id,
+                'turn_id': turn_id,
+            }
+            if task is not None:
+                base_event['task_id'] = task.task_id
+            if task_status == 'failed' or turn_status == 'failed':
+                message = (
+                    str(getattr(task, 'error_message', '') or '').strip()
+                    or str(getattr(turn, 'error_message', '') or '').strip()
+                    or '分析任务执行失败'
+                )
+                return {
+                    **base_event,
+                    'type': 'error',
+                    'stage': 'error',
+                    'level': 'error',
+                    'message': message,
+                }
+            if task_status == 'cancelled':
+                return {
+                    **base_event,
+                    'type': 'error',
+                    'stage': 'error',
+                    'level': 'warning',
+                    'message': '分析任务已取消',
+                }
+            if task_status == 'success' or turn_status == 'success':
+                return {
+                    **base_event,
+                    'type': 'done',
+                    'stage': 'done',
+                }
+            return None
         finally:
             session.close()
 

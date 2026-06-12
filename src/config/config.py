@@ -55,7 +55,7 @@ class Config:
     # 应用配置
     APP_NAME = "DataInsight App"
     VERSION = "1.0.0"
-    SCHEMA_VERSION = os.environ.get('DATA_INSIGHT_SCHEMA_VERSION', '1.2.0')
+    SCHEMA_VERSION = os.environ.get('DATA_INSIGHT_SCHEMA_VERSION', '1.3.0')
 
     # 用户系统配置
     USER_AUTH_ENDPOINT = '/os/inter-api/auth/v1/current-user/sessionInfo'
@@ -117,6 +117,8 @@ class Config:
     SUPOS_LLM_GATEWAY_API_KEY = os.environ.get('SUPOS_DATAINSIGHT-SERVER_APPKEY', '')
     BASE_URL = os.environ.get('BASE_URL', 'https://api.minimax.chat/v1')
     TEMPERATURE = float(os.environ.get('TEMPERATURE', 0.7))
+    LLM_REQUEST_TIMEOUT_SECONDS = float(os.environ.get('LLM_REQUEST_TIMEOUT_SECONDS', 60))
+    LLM_MAX_RETRIES = int(os.environ.get('LLM_MAX_RETRIES', 1))
 
     CONTEXT_COMPRESSION_ENABLED = os.environ.get('CONTEXT_COMPRESSION_ENABLED', 'true').lower() == 'true'
     CONTEXT_COMPRESSION_USE_LLM = os.environ.get('CONTEXT_COMPRESSION_USE_LLM', 'true').lower() == 'true'

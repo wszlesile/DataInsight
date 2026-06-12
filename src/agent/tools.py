@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import json
 import math
 import multiprocessing as mp
@@ -38,6 +39,7 @@ from utils import (
 CURRENT_USERNAME = ContextVar('current_username', default='anonymous')
 CURRENT_EXPECTED_TIME_RANGE = ContextVar('current_expected_time_range', default={})
 CURRENT_TIME_RANGE_GUARD_ACTIVE = ContextVar('current_time_range_guard_active', default=False)
+CURRENT_ANALYSIS_PARAMETERS_OVERRIDE = ContextVar('current_analysis_parameters_override', default={})
 
 TOOL_ERROR_CURRENT_CODE_MAX_CHARS = int(os.environ.get('TOOL_ERROR_CURRENT_CODE_MAX_CHARS', '3500'))
 TOOL_ERROR_TEXT_MAX_CHARS = int(os.environ.get('TOOL_ERROR_TEXT_MAX_CHARS', '1800'))
@@ -217,8 +219,6 @@ QUERY_CONSTRAINT_GRAIN_PATTERNS = {
         re.compile(r"分钟"),
     ),
 }
-
-
 def _clip_retry_context_text(text: Any, max_chars: int) -> str:
     """Bound retry feedback so repeated tool failures do not exhaust model context."""
     value = str(text or '')
@@ -1455,6 +1455,8 @@ class StructuredResult(BaseModel):
     analysis_report: str = Field(description="分析报告内容")
     charts: list[dict[str, Any]] = Field(default_factory=list, description="图表产物列表")
     tables: list[dict[str, Any]] = Field(default_factory=list, description="表格产物列表")
+    analysis_parameters_schema: dict[str, Any] = Field(default_factory=dict, description="Reusable parameter schema")
+    analysis_parameters: dict[str, Any] = Field(default_factory=dict, description="Actual parameter values")
 
 
 class RetryResult(BaseModel):
@@ -2435,10 +2437,21 @@ def _normalize_table_items(tables: Optional[list[dict[str, Any]]] = None) -> lis
     return normalized_items
 
 
+def get_analysis_parameters(defaults: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Return generated-code defaults merged with local rerun overrides."""
+    base = dict(defaults or {})
+    override = CURRENT_ANALYSIS_PARAMETERS_OVERRIDE.get() or {}
+    if isinstance(override, dict):
+        base.update(override)
+    return base
+
+
 def save_analysis_result(
     analysis_report: str = '',
     charts: Optional[list[dict[str, Any]]] = None,
     tables: Optional[list[dict[str, Any]]] = None,
+    analysis_parameters_schema: Optional[dict[str, Any]] = None,
+    analysis_parameters: Optional[dict[str, Any]] = None,
 ) -> StructuredResult:
     """
     结束一次由生成代码驱动的分析任务，并返回标准结构化结果。
@@ -2459,6 +2472,8 @@ def save_analysis_result(
         analysis_report=report_text,
         charts=normalized_charts,
         tables=normalized_tables,
+        analysis_parameters_schema=analysis_parameters_schema or {},
+        analysis_parameters=analysis_parameters or {},
     )
 
 
@@ -3101,6 +3116,13 @@ def _sanitize_tool_output(output: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
+def _build_analysis_logic_signature(code: str) -> str:
+    normalized_code = (code or '').replace('\r\n', '\n').strip()
+    if not normalized_code:
+        return ''
+    return hashlib.sha256(normalized_code.encode('utf-8')).hexdigest()
+
+
 def _create_execution_record(
     conversation_id: int,
     turn_id: int,
@@ -3110,6 +3132,10 @@ def _create_execution_record(
     description: str,
     used_datasource_ids: list[int] | None = None,
     analysis_task_id: int | None = None,
+    parent_execution_id: int | None = None,
+    execution_source: str = 'llm_generated',
+    analysis_parameters_schema: dict[str, Any] | None = None,
+    analysis_parameters: dict[str, Any] | None = None,
 ) -> int:
     """在生成代码真正执行前，先创建一条执行记录。"""
     from config.database import SessionLocal
@@ -3126,6 +3152,11 @@ def _create_execution_record(
             generated_code=code or '',
             used_datasource_ids_json=json.dumps(used_datasource_ids or [], ensure_ascii=False),
             execution_status='running',
+            analysis_parameters_schema_json=json.dumps(analysis_parameters_schema or {}, ensure_ascii=False),
+            analysis_parameters_json=json.dumps(analysis_parameters or {}, ensure_ascii=False),
+            analysis_logic_signature=_build_analysis_logic_signature(code),
+            parent_execution_id=parent_execution_id,
+            execution_source=execution_source or 'llm_generated',
             content_enabled=1,
             analysis_task_id=analysis_task_id,
         )
@@ -3148,6 +3179,8 @@ def _update_execution_record(
     execution_seconds: int = 0,
     error_message: str = '',
     used_datasource_ids: list[int] | None = None,
+    analysis_parameters_schema: dict[str, Any] | None = None,
+    analysis_parameters: dict[str, Any] | None = None,
 ) -> None:
     """在成功、失败或结果不合法后，回写执行记录。"""
     if execution_id <= 0:
@@ -3174,6 +3207,10 @@ def _update_execution_record(
         execution.error_message = error_message or ''
         if used_datasource_ids is not None:
             execution.used_datasource_ids_json = json.dumps(used_datasource_ids, ensure_ascii=False)
+        if analysis_parameters_schema is not None:
+            execution.analysis_parameters_schema_json = json.dumps(analysis_parameters_schema or {}, ensure_ascii=False)
+        if analysis_parameters is not None:
+            execution.analysis_parameters_json = json.dumps(analysis_parameters or {}, ensure_ascii=False)
         execution.updated_at = datetime.now()
         execution.finished_at = datetime.now()
         session.commit()
@@ -3260,6 +3297,7 @@ def _build_execution_namespace() -> dict[str, Any]:
         'describe_time_coverage': describe_time_coverage,
         'probe_distinct_values': probe_distinct_values,
         'probe_text_candidates': probe_text_candidates,
+        'get_analysis_parameters': get_analysis_parameters,
         'validate_query_constraints': validate_query_constraints,
         'build_markdown_table': build_markdown_table,
         'build_chart_document': build_chart_document,
@@ -3282,6 +3320,7 @@ def _serialize_runtime_user_context(runtime_context: CustomContext | None) -> di
         'token': getattr(runtime_context, 'auth_token', '') or '',
         'database_conn_info': dict(getattr(runtime_context, 'database_conn_info', {}) or {}),
         'expected_time_range': dict(getattr(runtime_context, 'expected_time_range', {}) or {}),
+        'analysis_parameters_override': dict(getattr(runtime_context, 'analysis_parameters_override', {}) or {}),
     }
 
 
@@ -3290,6 +3329,7 @@ def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -
     payload = runtime_user_context or {}
     CURRENT_EXPECTED_TIME_RANGE.set(dict(payload.get('expected_time_range') or {}))
     CURRENT_TIME_RANGE_GUARD_ACTIVE.set(bool(payload.get('time_range_guard_active')))
+    CURRENT_ANALYSIS_PARAMETERS_OVERRIDE.set(dict(payload.get('analysis_parameters_override') or {}))
     conn_info_payload = payload.get('database_conn_info') or {}
     if conn_info_payload:
         supos_kernel_api._database_conn_info = DatabaseConnInfo(
@@ -3957,6 +3997,185 @@ def _tool_success_message(
     )
 
 
+def run_generated_code_locally(
+    *,
+    conversation_id: int,
+    turn_id: int,
+    username: str,
+    code: str,
+    title: str = '',
+    description: str = '',
+    used_datasource_ids: list[int] | None = None,
+    runtime_user_context: dict[str, Any] | None = None,
+    analysis_task_id: int | None = None,
+    parent_execution_id: int | None = None,
+    execution_source: str = 'manual_param_rerun',
+    analysis_parameters_schema: dict[str, Any] | None = None,
+    analysis_parameters: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run persisted generated code without invoking the LLM."""
+    from config.config import Config
+
+    start_time = time.time()
+    normalized_used_datasource_ids = _normalize_used_datasource_ids(used_datasource_ids)
+    runtime_payload = dict(runtime_user_context or {})
+    runtime_payload['analysis_parameters_override'] = dict(analysis_parameters or {})
+    execution_id = _create_execution_record(
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        tool_call_id='local_rerun',
+        code=code,
+        title=title,
+        description=description,
+        used_datasource_ids=normalized_used_datasource_ids,
+        analysis_task_id=analysis_task_id,
+        parent_execution_id=parent_execution_id,
+        execution_source=execution_source,
+        analysis_parameters_schema=analysis_parameters_schema,
+        analysis_parameters=analysis_parameters,
+    )
+
+    timeout_seconds = max(int(getattr(Config, 'PYTHON_EXEC_TIMEOUT_SECONDS', 90) or 90), 1)
+    result_queue: mp.Queue = mp.Queue()
+    process = mp.Process(
+        target=_execute_generated_code_worker,
+        args=(code, username or 'anonymous', runtime_payload, result_queue),
+        daemon=True,
+    )
+    worker_result: dict[str, Any] | None = None
+    process.start()
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        remaining_seconds = max(deadline - time.time(), 0)
+        try:
+            worker_result = result_queue.get(timeout=min(0.5, remaining_seconds))
+            break
+        except Empty:
+            if not process.is_alive():
+                break
+
+    if worker_result is None and process.is_alive():
+        process.terminate()
+        process.join(5)
+        execution_seconds = int((time.time() - start_time) * 1000)
+        error_message = f'代码执行超时，已超过 {timeout_seconds} 秒'
+        _update_execution_record(
+            execution_id,
+            execution_status='failed',
+            execution_seconds=execution_seconds,
+            error_message=error_message,
+            analysis_parameters_schema=analysis_parameters_schema,
+            analysis_parameters=analysis_parameters,
+        )
+        result_queue.close()
+        result_queue.join_thread()
+        return {'execution_id': execution_id, 'status': 'failed', 'error_message': error_message}
+
+    process.join(5)
+    if process.is_alive():
+        process.terminate()
+        process.join(5)
+    process_exitcode = process.exitcode
+    process.close()
+    result_queue.close()
+    result_queue.join_thread()
+
+    if worker_result is None:
+        error_type, error_message = _classify_process_exit(process_exitcode)
+        _update_execution_record(
+            execution_id,
+            execution_status='failed',
+            execution_seconds=int((time.time() - start_time) * 1000),
+            error_message=error_message,
+            analysis_parameters_schema=analysis_parameters_schema,
+            analysis_parameters=analysis_parameters,
+        )
+        return {'execution_id': execution_id, 'status': 'failed', 'error_type': error_type, 'error_message': error_message}
+
+    result_file_path = str(worker_result.get('result_file_path') or '').strip()
+    try:
+        worker_payload = _read_worker_result_payload(result_file_path) if result_file_path else worker_result
+    finally:
+        _remove_worker_result_payload(result_file_path)
+
+    stdout_text = _sanitize_tool_output(worker_payload.get('stdout_text', ''))
+    stderr_text = _sanitize_tool_output(worker_payload.get('stderr_text', ''))
+    execution_seconds = int((time.time() - start_time) * 1000)
+
+    if worker_payload.get('status') == 'error':
+        error_message = worker_payload.get('error_message') or '代码执行失败'
+        error_type = worker_payload.get('error_type') or 'runtime_error'
+        result_payload_json = json.dumps({
+            'status': 'failed',
+            'error_type': error_type,
+            'error_message': error_message,
+            'error_signature': worker_payload.get('error_signature') or _extract_error_signature(error_type, error_message),
+            'code_error_context': worker_payload.get('code_error_context') or {},
+            'repair_instructions': worker_payload.get('repair_instructions') or _build_repair_instructions(error_type),
+        }, ensure_ascii=False)
+        _update_execution_record(
+            execution_id,
+            execution_status='failed',
+            result_payload_json=result_payload_json,
+            stdout_text=stdout_text,
+            stderr_text=stderr_text,
+            execution_seconds=execution_seconds,
+            error_message=error_message,
+            analysis_parameters_schema=analysis_parameters_schema,
+            analysis_parameters=analysis_parameters,
+        )
+        return {
+            'execution_id': execution_id,
+            'status': 'failed',
+            'error_type': error_type,
+            'error_message': error_message,
+            'stdout_text': stdout_text,
+            'stderr_text': stderr_text,
+        }
+
+    exec_result = _deserialize_exec_result(worker_payload.get('exec_result') or {})
+    if not isinstance(exec_result, StructuredResult):
+        error_message = '生成的代码未按模板产出 result'
+        _update_execution_record(
+            execution_id,
+            execution_status='invalid',
+            stdout_text=stdout_text,
+            stderr_text=stderr_text,
+            execution_seconds=execution_seconds,
+            error_message=error_message,
+            analysis_parameters_schema=analysis_parameters_schema,
+            analysis_parameters=analysis_parameters,
+        )
+        return {'execution_id': execution_id, 'status': 'invalid', 'error_message': error_message}
+
+    result_schema = exec_result.analysis_parameters_schema or analysis_parameters_schema or {}
+    result_parameters = exec_result.analysis_parameters or analysis_parameters or {}
+    _update_execution_record(
+        execution_id,
+        execution_status='success',
+        analysis_report=exec_result.analysis_report,
+        result_payload_json=exec_result.model_dump_json(),
+        stdout_text=stdout_text,
+        stderr_text=stderr_text,
+        execution_seconds=execution_seconds,
+        used_datasource_ids=normalized_used_datasource_ids,
+        analysis_parameters_schema=result_schema,
+        analysis_parameters=result_parameters,
+    )
+    return {
+        'execution_id': execution_id,
+        'status': 'success',
+        'analysis_report': exec_result.analysis_report,
+        'charts': exec_result.charts,
+        'tables': exec_result.tables,
+        'analysis_parameters_schema': result_schema,
+        'analysis_parameters': result_parameters,
+        'stdout_text': stdout_text,
+        'stderr_text': stderr_text,
+        'execution_seconds': execution_seconds,
+    }
+
+
 @tool(description='执行Python代码工具', args_schema=ExePythonCodeInput)
 def execute_python(
     runtime: ToolRuntime[CustomContext],
@@ -4430,6 +4649,8 @@ def execute_python(
             stdout_text=stdout_text,
             stderr_text=stderr_text,
             execution_seconds=execution_seconds,
+            analysis_parameters_schema=exec_result.analysis_parameters_schema,
+            analysis_parameters=exec_result.analysis_parameters,
         )
         emit(
             'status',
