@@ -1186,10 +1186,13 @@ const attachRunningTurn = (task) => {
   currentQuestion.value = task.request?.user_message || currentQuestion.value || '正在分析中...'
   removeHistoryTurn(task.turn_id)
   loading.value = true
+  const resumeMessage = task.status === 'queued'
+    ? '检测到当前会话有排队中的分析任务，正在等待执行...'
+    : '检测到当前会话有正在进行的分析，正在重新订阅实时输出...'
   addProgressItem({
     type: 'status',
     level: 'info',
-    message: '检测到当前会话有正在进行的分析，正在重新订阅实时输出...'
+    message: resumeMessage
   })
   subscribeTurnStream(task.conversation_id, task.turn_id)
   return true
@@ -1928,6 +1931,13 @@ const onSendMessage = async (content) => {
     activeConversationId.value = Number(task.conversation_id)
     currentTaskId.value = task.task_id || ''
     currentTurnId.value = Number(task.turn_id)
+    if (task.status === 'queued') {
+      addProgressItem({
+        type: 'status',
+        level: 'info',
+        message: '问题已进入分析队列，等待执行...'
+      })
+    }
     subscribeTurnStream(task.conversation_id, task.turn_id)
   } catch (error) {
     console.error('Submit analysis task error:', error)
