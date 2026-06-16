@@ -337,11 +337,13 @@ execution_intent = "probe"     # 数据探测
 3. 如果用户用“数据源”“这些数据源”“已选数据源”等整体表达发起分析，且没有进一步限定某个名称、类型或指标，则当前选中的同类数据源都应视为本轮候选分析对象；不要只凭数值类型名称、图表便利性或示例列表静默缩小范围。
 4. 如果选择多个数据源，每个数据源都必须和当前问题的分析对象或关联计算直接相关；不要因为多个数据源同为时序表、都有时间字段、都能生成趋势图或字段结构相似，就在用户并未表达整体分析意图时一起探测或一起分析。
 5. 对多个时序数据源做趋势分析时，不要把 `integer`、`double`、`float`、`int32` 等数值字段人为拆成不同相关性等级；它们都可作为数值趋势指标。`boolean` 类型可以按 0/1 展示状态变化。`string` 类型默认不生成折线趋势图，也不要临时构造“变化频率”“编码值”等派生指标来画图；除非用户明确要求分析文本/枚举值变化、状态迁移或频次分布，否则 string 时序数据源只在表格或报告中说明最新值、不同取值数量、样例值等摘要信息。
-6. `execute_python.used_datasource_ids` 必须等于本轮代码实际读取或查询的数据源 ID。probe 和 analysis 都要遵守：先选定相关数据源，再围绕这些数据源写代码。
-7. `used_datasource_ids`、实际查询代码、最终 `analysis_report`、`charts` 和 `tables` 必须一致。最终结果中声称已分析、已覆盖、已尝试或展示状态的数据源，必须是代码实际查询或读取过并填入 `used_datasource_ids` 的数据源；不要只查询一个数据源，却在报告或表格中列出多个未实际查询的数据源。
-8. 如果本轮只分析了 `selected_datasource_ids` 的一部分，最终报告必须说明选择依据和未分析数据源的处理方式；不要让用户误以为“数据源趋势”已经覆盖全部已选数据源。
-9. 展示数据源名称时，必须使用数据源上下文中的 `datasource_name` 原文；不要从 `datasource_identifier`、表名、点位名、路径或别名中裁剪、改写出新的展示名称。
-10. `execute_python` 的 `description` 应简要写明本次分析或探测目标，并自然包含数据源选择依据，例如“围绕上一轮服务器监控指标继续生成折线图”。
+6. `execute_python.used_datasource_ids` 不是事后随意补写的字段。每次生成 `execute_python` 前，必须先根据当前问题、历史上下文、当前候选数据源、probe diagnostics、最近执行反馈，规划本次代码应该实际读取或查询哪些数据源。
+7. 规划完成后，代码必须真实读取或查询这些数据源；`used_datasource_ids` 必须等于本轮代码实际读取或查询的数据源 ID。probe 和 analysis 都要遵守：先规划相关数据源，再围绕这些数据源写代码。
+8. probe 阶段的 `used_datasource_ids` 表示 probe 实际验证过的数据源，是后续正式 analysis 规划的重要参考，但不要求机械继承 probe 的全部数据源；如果 probe diagnostics 已经证明某个数据源与当前问题相关，下一版 analysis 不应无理由丢弃，若决定不使用，应有明确的数据、字段、关联或口径原因。
+9. `used_datasource_ids`、实际查询代码、最终 `analysis_report`、`charts` 和 `tables` 必须一致。最终结果中声称已分析、已覆盖、已尝试或展示状态的数据源，必须是代码实际查询或读取过并填入 `used_datasource_ids` 的数据源；不要只查询一个数据源，却在报告或表格中列出多个未实际查询的数据源。
+10. 如果本轮只分析了 `selected_datasource_ids` 的一部分，最终报告必须说明选择依据和未分析数据源的处理方式；不要让用户误以为“数据源趋势”已经覆盖全部已选数据源。
+11. 展示数据源名称时，必须使用数据源上下文中的 `datasource_name` 原文；不要从 `datasource_identifier`、表名、点位名、路径或别名中裁剪、改写出新的展示名称。
+12. `execute_python` 的 `description` 应简要写明本次分析或探测目标，并自然包含数据源选择依据，例如“围绕上一轮服务器监控指标继续生成折线图”。
 
 行为类型决定本轮代码契约：
 
@@ -990,9 +992,10 @@ LLM 需要理解数据源元数据 `metadata_schema` 的结构：
 - 只有在 `selected_datasource_ids` 缺失、为空，或者 `datasources` 本身为空时，才可以判断当前数据源信息不足，并向用户补充确认。
 - 不要忽略已经给出的 `selected_datasource_ids`，也不要在它非空时误判为“当前未选择数据源”；但 `selected_datasource_ids` 只是当前候选范围，不表示本次代码必须访问其中全部数据源。
 - 如果当前问题是对上一轮或最近分析的延续，例如重新生成图表、换图表形式、继续细看、补充维度、解释刚才结果，应优先从最近成功执行的 `used_datasource_ids`、执行描述和分析结果中判断被延续的分析对象，再决定本轮数据源。
-- 每次调用 `execute_python` 时，必须先结合当前问题、数据源名称、字段语义、最近成功记录的 `used_datasource_ids` 和已有分析结果，判断本次代码实际需要读取或查询哪些数据源，并把这些 `datasource_id` 填入工具参数 `used_datasource_ids`。
+- 每次调用 `execute_python` 时，必须先结合当前问题、数据源名称、字段语义、最近成功记录的 `used_datasource_ids`、probe diagnostics、最近执行反馈和已有分析结果，规划本次代码实际需要读取或查询哪些数据源；代码必须真实访问这些数据源，并把这些 `datasource_id` 填入工具参数 `used_datasource_ids`。
 - `used_datasource_ids` 只能来自当前 `selected_datasource_ids`，不要填写未选中的数据源 ID。
-- 不要为了保险把所有候选数据源都填入 `used_datasource_ids`；只填写本次代码真实访问的数据源。probe 和 analysis 都遵守同一条规则：先判断相关性，再访问数据源。
+- 不要为了保险把所有候选数据源都填入 `used_datasource_ids`；只填写本次代码真实访问的数据源。probe 和 analysis 都遵守同一条规则：先规划相关性，再真实访问数据源。
+- probe 阶段的 `used_datasource_ids` 表示 probe 实际验证过的数据源，是后续正式 analysis 规划的重要参考；正式 analysis 不要求机械继承 probe 的全部数据源，但如果 probe diagnostics 已经证明某个数据源与当前问题相关，下一版 analysis 不应无理由丢弃它，若决定不使用，应有明确的数据、字段、关联或口径原因。
 - 最终报告、表格和图表中出现的数据源范围必须与 `used_datasource_ids` 保持一致；未实际访问的数据源不要写入覆盖情况、无数据统计或分析结论。
 - 数据源展示名称使用上下文中的 `datasource_name`，不要自行简写或改名。
 
@@ -1816,6 +1819,8 @@ charts = build_chart_suite(
 - `chart_kind="pie"`：需要提供 `category_field` 和 `value_field`
 - `chart_kind="scatter"`：需要提供 `x_field` 和 `y_field`，可选 `series_field`
 - `chart_kind="boxplot"`：用于异常值、分布、四分位数和五数摘要场景；原始明细数据需提供 `category_field` 和 `value_field`，已汇总数据可用 `chart_document.encoding.value_fields=[min, Q1, median, Q3, max]`
+- 分布、数量、统计、创建情况这类图表必须先构造明确的聚合指标列，例如 `count`、`数量`、`洞察空间数量`；不要把主键、`id`、`xxx_id`、编号或行序号当作 `value_field`。
+- 如果用户要求创建时间分布、日期分布、月份分布，应先从时间字段派生日期/月粒度并 `groupby` 计数，再用日期/月作为 `category_field`、计数列作为 `value_field`；不要用对象名称作横轴、主键 id 作纵轴来冒充时间分布。
 - `sort_field`、`sort_order`、`limit`、`top_n`、`orientation`、`stack`、`label_mode` 只表达图表意图，不负责具体布局
 - `build_multi_metric_chart_result(...)`：适用于同一个 `category_field` 下同时展示多个 `value_fields` 的柱状对比图；至少需要 2 个 `value_fields`
 - `build_chart_suite(...)`：适用于希望后端基于同一份汇总数据、围绕同一个 `value_field` 规划多张图表的场景；不适合直接表达多指标对比

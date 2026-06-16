@@ -21,20 +21,34 @@ from utils.datasource_utils import (
 ANALYSIS_SIGNAL_PATTERN = re.compile(
     r"(今天|昨天|前天|最近|本周|上周|本月|上月|今年|去年|季度|Q[1-4]|同比|环比|"
     r"\d{4}[-/年]\d{1,2}([-/月]\d{1,2})?|\d{1,2}月\d{1,2}号|"
-    r"明细|详情|图表|趋势|统计|分析|根因|时间线)"
+    r"明细|详情|图表|报告|趋势|统计|分析|计算|对比|稼动率|开机率|根因|时间线)"
 )
 FOLLOWUP_ANALYSIS_KEYWORDS = (
     "继续", "刚才", "上次", "上一轮", "沿用", "基于刚才", "按刚才",
     "继续上一个", "继续上一轮", "修复一下", "重试", "重新生成", "继续分析",
+    "前面对话", "前面的需求", "前面说的", "上面说的", "刚才说的",
+    "不想再重复", "不想重复", "我已经说过", "已经说过", "自己看前面",
+    "你自己看前面", "接着前面", "按之前的需求", "之前的需求",
     "continue", "previous", "last result", "same logic",
 )
-CHART_FOLLOWUP_ACTION_KEYWORDS = (
-    "分开", "分别", "单独", "各自", "每个", "一张", "拆开", "拆分", "分图",
-    "合并", "换成", "改成", "重新生成", "重画", "再生成",
+OUTPUT_FOLLOWUP_TARGET_WORDS = (
+    "图表报告", "分析图表", "趋势图", "折线图", "柱状图", "饼图", "曲线图",
+    "明细表", "汇总表", "数据表", "图表", "可视化", "报告", "表格",
+    "图形", "图像", "图", "展示", "呈现", "显示",
+    "chart", "charts", "graph", "plot", "report", "table",
 )
-CHART_FOLLOWUP_TARGET_KEYWORDS = (
-    "图表", "图", "趋势图", "折线图", "柱状图", "饼图", "曲线", "可视化",
-    "chart", "charts", "graph", "plot",
+OUTPUT_FOLLOWUP_NEUTRAL_WORDS = (
+    "帮我", "请", "麻烦", "给我", "一下", "一个", "个", "一份", "一版",
+    "的", "地", "得", "吧", "呢", "吗", "成", "为",
+    "一种", "种", "这份", "这个", "当前", "现在", "分析", "数据", "结果", "内容",
+    "类型", "形式", "样式", "样子", "方式",
+    "换", "改", "转", "变", "重新", "再", "另", "另外", "用", "按", "以",
+    "做", "出", "生成", "补充", "整理", "展示", "显示", "呈现", "看看",
+    "看下", "看一下", "画", "绘制", "重画", "输出",
+) + OUTPUT_FOLLOWUP_TARGET_WORDS
+EXPLICIT_TIME_SCOPE_PATTERN = re.compile(
+    r"(今天|昨天|前天|最近|本周|上周|本月|上月|今年|去年|季度|Q[1-4]|"
+    r"\d{4}[-/年]\d{1,2}([-/月]\d{1,2})?|\d{1,2}月\d{1,2}号)"
 )
 
 
@@ -98,14 +112,30 @@ def classify_analysis_context_mode(user_message: str) -> str:
         keyword in lower_text for keyword in FOLLOWUP_ANALYSIS_KEYWORDS
     ):
         return 'followup'
-    if len(text) <= 40 and any(keyword in text for keyword in CHART_FOLLOWUP_ACTION_KEYWORDS) and (
-        any(keyword in text for keyword in CHART_FOLLOWUP_TARGET_KEYWORDS)
-        or any(keyword in lower_text for keyword in CHART_FOLLOWUP_TARGET_KEYWORDS)
-    ):
+    if _is_short_output_followup_request(text, lower_text):
         return 'followup'
     if ANALYSIS_SIGNAL_PATTERN.search(text):
         return 'fresh_analysis'
     return 'general'
+
+
+def _is_short_output_followup_request(text: str, lower_text: str) -> bool:
+    if len(text) > 40:
+        return False
+    if not (
+        any(keyword in text for keyword in OUTPUT_FOLLOWUP_TARGET_WORDS)
+        or any(keyword in lower_text for keyword in OUTPUT_FOLLOWUP_TARGET_WORDS)
+    ):
+        return False
+    if EXPLICIT_TIME_SCOPE_PATTERN.search(text):
+        return False
+
+    remainder = lower_text
+    for word in sorted(OUTPUT_FOLLOWUP_NEUTRAL_WORDS, key=len, reverse=True):
+        if word:
+            remainder = remainder.replace(word.lower(), '')
+    remainder = re.sub(r"[\s,，。.!！?？、;；:：'\"“”‘’（）()【】\[\]{}<>《》/\\|-]+", '', remainder)
+    return not remainder
 
 
 def is_analysis_like_request(user_message: str) -> bool:
@@ -266,7 +296,13 @@ def get_datasource_message(
             f"- `selected_datasource_ids` 当前为 {selected_ids}，表示这些数据源是当前会话已选候选范围，可从中选择本轮真正相关的数据源，不需要再次向用户确认数据源，也不表示必须全部访问。"
         )
         instruction_lines.append(
-            "- 调用 `execute_python` 前，应结合当前问题、数据源名称与字段语义、最近成功执行的 `used_datasource_ids` 和已有分析结果，判断本轮实际访问的数据源，并准确填写 `used_datasource_ids`。"
+            "- 调用 `execute_python` 前，应结合当前问题、数据源名称与字段语义、最近成功执行的 `used_datasource_ids`、probe diagnostics、最近执行反馈和已有分析结果，先规划本轮代码应该实际读取或查询哪些数据源；代码必须真实访问这些数据源，并准确填写 `used_datasource_ids`。"
+        )
+        instruction_lines.append(
+            "- probe 阶段的 `used_datasource_ids` 表示 probe 实际验证过的数据源，是后续正式 analysis 规划的重要参考；正式 analysis 不要求机械继承 probe 的全部数据源，但如果 probe diagnostics 已经证明某个数据源与当前问题相关，下一版 analysis 不应无理由丢弃，若决定不使用，应有明确的数据、字段、关联或口径原因。"
+        )
+        instruction_lines.append(
+            "- 如果当前候选数据源中同时存在实际值口径和计划/目标/标准口径（例如“实际开机时间”和“计划开机时间”），且用户询问“情况、开机情况、运行情况、达成、完成、效率、率”等综合状态类问题，应优先联合这些数据源分析；正式代码实际查询了哪些数据源，就必须把对应 datasource_id 全部填入 `used_datasource_ids`。"
         )
     else:
         instruction_lines.append(
@@ -283,6 +319,7 @@ def get_history_messages(
     conversation_id: int,
     max_turn_no: int | None = None,
     user_message: str = '',
+    context_mode: str | None = None,
 ) -> list[Any]:
     """加载最近的用户问题和最终回答消息，用于历史上下文重放。"""
     if not conversation_id:
@@ -299,7 +336,7 @@ def get_history_messages(
     finally:
         session.close()
 
-    context_mode = classify_analysis_context_mode(user_message)
+    context_mode = context_mode or classify_analysis_context_mode(user_message)
     result: list[Any] = []
     last_human_text = ''
     for item in messages:
@@ -325,6 +362,7 @@ def get_memory_messages(
     user_message: str = '',
     max_turn_no: int | None = None,
     active_snapshot_override: dict[str, Any] | None = None,
+    context_mode: str | None = None,
 ) -> list[SystemMessage]:
     """
     构造下一轮分析使用的压缩记忆消息。
@@ -338,7 +376,7 @@ def get_memory_messages(
     try:
         service = ConversationContextService(session)
         messages: list[SystemMessage] = []
-        context_mode = classify_analysis_context_mode(user_message)
+        context_mode = context_mode or classify_analysis_context_mode(user_message)
 
         summary_text = service.build_runtime_summary_text(conversation_id, max_turn_no=max_turn_no)
         if summary_text:
@@ -481,7 +519,10 @@ def get_datasource_message(
             f"- `selected_datasource_ids` 当前为 {selected_ids}，表示这些数据源是当前会话已选候选范围，可从中选择本轮真正相关的数据源，不需要再次向用户确认数据源，也不表示必须全部访问。"
         )
         instruction_lines.append(
-            "- 调用 `execute_python` 前，应结合当前问题、数据源名称与字段语义、最近成功执行的 `used_datasource_ids` 和已有分析结果，判断本轮实际访问的数据源，并准确填写 `used_datasource_ids`。"
+            "- 调用 `execute_python` 前，应结合当前问题、数据源名称与字段语义、最近成功执行的 `used_datasource_ids`、probe diagnostics、最近执行反馈和已有分析结果，先规划本轮代码应该实际读取或查询哪些数据源；代码必须真实访问这些数据源，并准确填写 `used_datasource_ids`。"
+        )
+        instruction_lines.append(
+            "- probe 阶段的 `used_datasource_ids` 表示 probe 实际验证过的数据源，是后续正式 analysis 规划的重要参考；正式 analysis 不要求机械继承 probe 的全部数据源，但如果 probe diagnostics 已经证明某个数据源与当前问题相关，下一版 analysis 不应无理由丢弃，若决定不使用，应有明确的数据、字段、关联或口径原因。"
         )
     else:
         instruction_lines.append(

@@ -68,6 +68,62 @@ class ChartDocumentUtilsTestCase(unittest.TestCase):
         self.assertEqual(chart_spec["yAxis"]["type"], "category")
         self.assertEqual(chart_spec["yAxis"]["data"][0], "Device-Name-With-Extremely-Long-Label-01")
 
+    def test_distribution_chart_rejects_id_as_value_field(self) -> None:
+        chart_item = build_chart_result(
+            chart_kind="bar",
+            data=[
+                {"name": "默认空间", "id": 1},
+                {"name": "剩下ASD", "id": 2},
+                {"name": "wsz", "id": 3},
+            ],
+            title="洞察空间创建情况",
+            description="展示洞察空间创建时间分布",
+            category_field="name",
+            value_field="id",
+            sort_field="id",
+            sort_order="asc",
+        )
+
+        with self.assertRaisesRegex(ValueError, "chart_semantic_error"):
+            normalize_chart_result_item(chart_item)
+
+    def test_distribution_chart_accepts_grouped_count_value_field(self) -> None:
+        chart_item = build_chart_result(
+            chart_kind="bar",
+            data=[
+                {"创建日期": "2026-05-19", "洞察空间数量": 1},
+                {"创建日期": "2026-05-29", "洞察空间数量": 1},
+                {"创建日期": "2026-06-12", "洞察空间数量": 1},
+            ],
+            title="洞察空间创建时间分布",
+            description="按创建日期统计洞察空间数量",
+            category_field="创建日期",
+            value_field="洞察空间数量",
+            sort_field="创建日期",
+            sort_order="asc",
+            label_mode="always",
+        )
+
+        normalized_item = normalize_chart_result_item(chart_item)
+        self.assertEqual(
+            normalized_item["chart_spec"]["xAxis"]["data"],
+            ["2026-05-19", "2026-05-29", "2026-06-12"],
+        )
+        self.assertEqual(normalized_item["chart_spec"]["series"][0]["data"], [1, 1, 1])
+
+    def test_label_mode_value_alias_shows_series_labels(self) -> None:
+        chart_item = build_chart_result(
+            chart_kind="bar",
+            data=[{"day": "2026-05-19", "count": 1}],
+            title="Creation Count",
+            category_field="day",
+            value_field="count",
+            label_mode="value",
+        )
+
+        normalized_item = normalize_chart_result_item(chart_item)
+        self.assertTrue(normalized_item["chart_spec"]["series"][0]["label"]["show"])
+
     def test_normalize_chart_result_item_keeps_legacy_chart_spec_path(self) -> None:
         chart_item = {
             "title": "Legacy Chart",

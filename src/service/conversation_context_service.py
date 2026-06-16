@@ -86,6 +86,7 @@ class ConversationRunContext:
     history_turn_limit: int | None = None
     analysis_task_id: int | None = None
     short_term_memory: dict[str, Any] = field(default_factory=dict)
+    context_mode: str = ''
 
 
 class ConversationContextService:
@@ -448,14 +449,50 @@ class ConversationContextService:
         self.session.commit()
 
     def _turn_has_active_result(self, conversation: InsightNsConversation, turn: InsightNsTurn) -> bool:
-        if (turn.final_answer or '').strip():
+        if self.session.query(InsightNsMessage.id).filter(
+            InsightNsMessage.insight_conversation_id == conversation.id,
+            InsightNsMessage.turn_id == turn.id,
+            InsightNsMessage.role == 'assistant',
+            InsightNsMessage.message_kind == 'final_answer',
+            InsightNsMessage.is_deleted == 0,
+            InsightNsMessage.content_enabled == 1,
+        ).first() is not None:
             return True
-        return self.session.query(InsightNsArtifact.id).filter(
+        if self.session.query(InsightNsArtifact.id).filter(
             InsightNsArtifact.conversation_id == conversation.id,
             InsightNsArtifact.turn_id == turn.id,
             InsightNsArtifact.is_deleted == 0,
             InsightNsArtifact.content_enabled == 1,
-        ).first() is not None
+        ).first() is not None:
+            return True
+
+        final_answer = (turn.final_answer or '').strip()
+        if not final_answer:
+            return False
+        return not self._looks_like_error_answer(final_answer)
+
+    @staticmethod
+    def _looks_like_error_answer(answer: str) -> bool:
+        text = (answer or '').strip().lower()
+        if not text:
+            return False
+        error_markers = (
+            'operationalerror',
+            'server closed the connection unexpectedly',
+            'background on this error',
+            'traceback',
+            'exception',
+            'error code:',
+            'platform-llm-gateway',
+            '网关超时',
+            '暂无可用渠道',
+            '请切换到其他可用模型后重试',
+            '请重试',
+            '未生成',
+            '执行失败',
+            '分析失败',
+        )
+        return any(marker in text for marker in error_markers)
 
     def _archive_current_rerun_executions(
         self,

@@ -324,6 +324,7 @@ def normalize_chart_result_item(chart: Any, index: int = 1) -> dict[str, Any]:
             fallback_title=str(chart.get("title") or f"Chart {index}").strip(),
             fallback_description=str(chart.get("description") or "").strip(),
         )
+        _validate_chart_semantic_encoding(document)
         compiled_spec = mark_chart_spec_backend_managed(compile_chart_document(document))
         return {
             "title": document.get("title") or str(chart.get("title") or f"Chart {index}").strip(),
@@ -354,6 +355,57 @@ def normalize_chart_result_item(chart: Any, index: int = 1) -> dict[str, Any]:
         "description": description,
         "chart_spec": final_spec,
     }
+
+
+def _validate_chart_semantic_encoding(document: dict[str, Any]) -> None:
+    chart_kind = str(document.get("chart_kind") or "").strip().lower()
+    if chart_kind not in {"bar", "line", "pie"}:
+        return
+
+    encoding = document.get("encoding") if isinstance(document.get("encoding"), dict) else {}
+    value_field = str(encoding.get("value_field") or "").strip()
+    value_fields = [str(item or "").strip() for item in (encoding.get("value_fields") or [])]
+    value_field_candidates = [value_field] + [item for item in value_fields if item != value_field]
+    if not any(_looks_like_identifier_field(item) for item in value_field_candidates):
+        return
+
+    title = str(document.get("title") or "")
+    description = str(document.get("description") or "")
+    intent_text = f"{title} {description}".lower()
+    aggregate_markers = (
+        "分布",
+        "数量",
+        "个数",
+        "总数",
+        "统计",
+        "汇总",
+        "创建情况",
+        "count",
+        "distribution",
+        "summary",
+    )
+    if not any(marker in intent_text for marker in aggregate_markers):
+        return
+
+    raise ValueError(
+        "chart_semantic_error: 图表标题/描述表达的是分布、数量或统计，但 value_field 使用了主键/ID 字段。"
+        "请先按业务维度聚合生成明确的数量列（例如 count、数量、洞察空间数量），"
+        "再用该数量列作为 value_field；如果要展示创建时间分布，应按 created_at 日期/月份分组计数，"
+        "不要把 id、主键或序号当作图表指标。"
+    )
+
+
+def _looks_like_identifier_field(field_name: str) -> bool:
+    normalized = str(field_name or "").strip().lower()
+    if not normalized:
+        return False
+    compact = normalized.replace("_", "").replace("-", "")
+    return (
+        normalized in {"id", "pk", "主键", "编号", "序号"}
+        or compact.endswith("id")
+        or compact.endswith("ids")
+        or "主键" in normalized
+    )
 
 
 def normalize_chart_document(
@@ -984,6 +1036,10 @@ def _normalize_label_mode(value: Any) -> str:
     label_mode = str(value or "auto").strip().lower()
     if label_mode in {"auto", "always", "hidden"}:
         return label_mode
+    if label_mode in {"value", "values", "show", "shown", "visible", "true", "yes"}:
+        return "always"
+    if label_mode in {"none", "hide", "hidden", "false", "no"}:
+        return "hidden"
     return "auto"
 
 
