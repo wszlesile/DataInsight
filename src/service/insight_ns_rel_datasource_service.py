@@ -849,17 +849,16 @@ class InsightNsRelDatasourceService:
         if not isinstance(db_protocol, dict):
             db_protocol = {}
 
-        data_path = str(db_protocol.get('dataPath') or '').strip().rstrip('/')
-        database_suffix = data_path.rsplit('/', 1)[-1].strip() if data_path else ''
+        protocol_alias = str(db_protocol.get('alias') or '').strip()
         schema_name = str(db_protocol.get('schemaName') or '').strip()
         table_name = str(db_protocol.get('tableName') or '').strip()
-        if not database_suffix:
-            raise ValueError('dataType=9 的 UNS 节点 protocol.db.dataPath 缺失或无效')
+        if not protocol_alias:
+            raise ValueError('dataType=9 的 UNS 节点 protocol.db.alias 缺失或无效')
         if not schema_name or not table_name:
             raise ValueError('dataType=9 的 UNS 节点 protocol.db.schemaName/tableName 缺失')
 
         return {
-            "database_name": f"fqe_{database_suffix}",
+            "database_name": f"fqe_{protocol_alias}",
             "table_name": f"{schema_name}.{table_name}",
             "uns_alias": alias,
             "uns_data_type": UNS_PROTOCOL_TABLE_DATA_TYPE,
