@@ -34,6 +34,7 @@ from utils import (
     normalize_chart_result_item,
     normalize_ts_query_source,
 )
+from utils.analysis_task_cancel import AnalysisTaskCancelled, CANCELLED_MESSAGE, is_analysis_task_cancelled
 
 CURRENT_USERNAME = ContextVar('current_username', default='anonymous')
 CURRENT_EXPECTED_TIME_RANGE = ContextVar('current_expected_time_range', default={})
@@ -3148,6 +3149,7 @@ def _update_execution_record(
     execution_seconds: int = 0,
     error_message: str = '',
     used_datasource_ids: list[int] | None = None,
+    content_enabled: int | None = None,
 ) -> None:
     """在成功、失败或结果不合法后，回写执行记录。"""
     if execution_id <= 0:
@@ -3165,6 +3167,19 @@ def _update_execution_record(
         if execution is None:
             return
 
+        if (
+            execution_status == 'success'
+            and int(getattr(execution, 'analysis_task_id', 0) or 0) > 0
+            and is_analysis_task_cancelled(task_pk=int(execution.analysis_task_id or 0))
+        ):
+            execution.execution_status = 'failed'
+            execution.error_message = CANCELLED_MESSAGE
+            execution.content_enabled = 0
+            execution.updated_at = datetime.now()
+            execution.finished_at = datetime.now()
+            session.commit()
+            raise AnalysisTaskCancelled(CANCELLED_MESSAGE)
+
         execution.execution_status = execution_status
         execution.analysis_report = analysis_report or ''
         execution.result_payload_json = result_payload_json or '{}'
@@ -3172,6 +3187,8 @@ def _update_execution_record(
         execution.stderr_text = stderr_text or ''
         execution.execution_seconds = int(execution_seconds or 0)
         execution.error_message = error_message or ''
+        if content_enabled is not None:
+            execution.content_enabled = int(content_enabled or 0)
         if used_datasource_ids is not None:
             execution.used_datasource_ids_json = json.dumps(used_datasource_ids, ensure_ascii=False)
         execution.updated_at = datetime.now()
@@ -3179,6 +3196,26 @@ def _update_execution_record(
         session.commit()
     finally:
         session.close()
+
+
+def _is_runtime_task_cancelled(context: Any) -> bool:
+    analysis_task_id = int(getattr(context, 'analysis_task_id', 0) or 0)
+    return analysis_task_id > 0 and is_analysis_task_cancelled(task_pk=analysis_task_id)
+
+
+def _raise_if_runtime_task_cancelled(context: Any, execution_id: int = 0, start_time: float | None = None) -> None:
+    if not _is_runtime_task_cancelled(context):
+        return
+    if execution_id > 0:
+        elapsed_ms = int((time.time() - (start_time or time.time())) * 1000)
+        _update_execution_record(
+            execution_id,
+            execution_status='failed',
+            execution_seconds=max(elapsed_ms, 0),
+            error_message=CANCELLED_MESSAGE,
+            content_enabled=0,
+        )
+    raise AnalysisTaskCancelled(CANCELLED_MESSAGE)
 
 
 def _normalize_used_datasource_ids(value: Any) -> list[int]:
@@ -3974,6 +4011,7 @@ def execute_python(
     """
     emit = _get_stream_emitter()
     start_time = time.time()
+    _raise_if_runtime_task_cancelled(runtime.context)
     normalized_used_datasource_ids = _normalize_used_datasource_ids(used_datasource_ids)
     execution_id = _create_execution_record(
         conversation_id=int(getattr(runtime.context, 'conversation_id', 0) or 0),
@@ -3985,6 +4023,7 @@ def execute_python(
         used_datasource_ids=normalized_used_datasource_ids,
         analysis_task_id=getattr(runtime.context, 'analysis_task_id', None),
     )
+    _raise_if_runtime_task_cancelled(runtime.context, execution_id=execution_id, start_time=start_time)
     execution_log_context = {
         'username': getattr(runtime.context, 'username', 'anonymous'),
         'namespace_id': int(getattr(runtime.context, 'namespace_id', 0) or 0),
@@ -4091,6 +4130,27 @@ def execute_python(
     deadline = time.time() + timeout_seconds
 
     while time.time() < deadline:
+        if _is_runtime_task_cancelled(runtime.context):
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+            _update_execution_record(
+                execution_id,
+                execution_status='failed',
+                stdout_text='',
+                stderr_text='',
+                execution_seconds=int((time.time() - start_time) * 1000),
+                error_message=CANCELLED_MESSAGE,
+                content_enabled=0,
+            )
+            emit(
+                'status',
+                stage='cancelled',
+                level='warning',
+                tool='execute_python',
+                message=CANCELLED_MESSAGE,
+            )
+            raise AnalysisTaskCancelled(CANCELLED_MESSAGE)
         remaining_seconds = max(deadline - time.time(), 0)
         try:
             worker_result = result_queue.get(timeout=min(0.5, remaining_seconds))
@@ -4146,6 +4206,7 @@ def execute_python(
     process.close()
     result_queue.close()
     result_queue.join_thread()
+    _raise_if_runtime_task_cancelled(runtime.context, execution_id=execution_id, start_time=start_time)
 
     if worker_result is None:
         error_type, error_message = _classify_process_exit(process_exitcode)
@@ -4422,6 +4483,7 @@ def execute_python(
             )
 
         # 对外继续保持 ToolMessage JSON 结构，对内持久化完整结构化执行结果。
+        _raise_if_runtime_task_cancelled(runtime.context, execution_id=execution_id, start_time=start_time)
         _update_execution_record(
             execution_id,
             execution_status='success',

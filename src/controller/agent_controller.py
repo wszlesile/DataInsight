@@ -5,11 +5,13 @@ from flask import Blueprint, Response, jsonify
 from controller.base_controller import BaseController
 from dto import get_current_user_context
 from service.analysis_task_runner import get_analysis_task_runner
+from service.analysis_stream_queue import AnalysisStreamQueue
 from service.analysis_task_service import AnalysisTaskService
 from service.conversation_context_service import ConversationContextService
 from config import Config
 from config.database import SessionLocal
 from utils.llm_error_utils import get_user_facing_agent_error
+from utils.analysis_task_cancel import CANCELLED_MESSAGE
 from utils.redis_client import get_redis_client
 from utils.response import Result
 
@@ -22,6 +24,7 @@ def create_agent_controller() -> Blueprint:
     blueprint.route('/stream', methods=['POST'])(controller.stream_invoke)
     blueprint.route('/tasks', methods=['POST'])(controller.create_task)
     blueprint.route('/tasks/<task_id>', methods=['GET'])(controller.get_task)
+    blueprint.route('/tasks/<task_id>/cancel', methods=['POST'])(controller.cancel_task)
     return blueprint
 
 
@@ -176,3 +179,51 @@ class AgentController(BaseController):
             return jsonify(Result.success(data=task_service.serialize_task(task)).to_dict())
         finally:
             session.close()
+
+    def cancel_task(self, task_id: str):
+        username = _get_username()
+        session = SessionLocal()
+        try:
+            task_service = AnalysisTaskService(session)
+            task = task_service.cancel_task(task_id, username=username, reason=CANCELLED_MESSAGE)
+            if task is None:
+                existing_task = task_service.get_task(task_id, username=username)
+                if existing_task is None:
+                    return self.error_response('分析任务不存在', 404)
+                return jsonify(Result.success(data=task_service.serialize_task(existing_task), message='分析任务已结束').to_dict())
+
+            ConversationContextService(session).fail_run(
+                int(task.conversation_id or 0),
+                int(task.turn_id or 0),
+                CANCELLED_MESSAGE,
+                preserve_existing_results=(task.task_type == 'rerun'),
+            )
+            session.commit()
+            get_analysis_task_runner().cancel(task.task_id)
+            self._publish_cancelled_event(task)
+            return jsonify(Result.success(data=task_service.serialize_task(task), message='分析任务已停止').to_dict())
+        except Exception as exc:
+            session.rollback()
+            return self.error_response(f'停止分析任务失败: {get_user_facing_agent_error(exc)}')
+        finally:
+            session.close()
+
+    def _publish_cancelled_event(self, task) -> None:
+        try:
+            queue = AnalysisStreamQueue(
+                get_redis_client(),
+                max_len=Config.STREAM_QUEUE_MAX_LEN,
+                event_max_bytes=Config.STREAM_EVENT_MAX_BYTES,
+                ttl_seconds=Config.STREAM_QUEUE_TTL_SECONDS,
+            )
+            queue.push_event(int(task.turn_id or 0), {
+                'type': 'error',
+                'task_id': task.task_id,
+                'turn_id': int(task.turn_id or 0),
+                'conversation_id': int(task.conversation_id or 0),
+                'stage': 'cancelled',
+                'level': 'warning',
+                'message': CANCELLED_MESSAGE,
+            })
+        except Exception:
+            pass

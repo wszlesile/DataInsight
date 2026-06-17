@@ -34,6 +34,7 @@ from utils.datasource_utils import (
     safe_json_loads,
     to_int,
 )
+from utils.analysis_task_cancel import AnalysisTaskCancelled, CANCELLED_MESSAGE, is_analysis_task_cancelled
 
 ROLE_TO_TYPE = {
     'system': 0,
@@ -267,6 +268,9 @@ class ConversationContextService:
         analysis_task_id: int | None = None,
     ) -> dict[str, Any]:
         """结束一次成功轮次，并刷新会话记忆。"""
+        if analysis_task_id and is_analysis_task_cancelled(task_pk=int(analysis_task_id or 0)):
+            raise AnalysisTaskCancelled(CANCELLED_MESSAGE)
+
         conversation = self._get_conversation_by_id(conversation_id)
         turn = self._get_turn_by_id(turn_id)
         if not conversation or not turn:
@@ -364,6 +368,9 @@ class ConversationContextService:
                 sort_no=100 + index,
             ))
 
+        if analysis_task_id and is_analysis_task_cancelled(task_pk=int(analysis_task_id or 0)):
+            raise AnalysisTaskCancelled(CANCELLED_MESSAGE)
+
         self._refresh_memories(conversation)
         self.session.commit()
         chart_artifacts = [artifact for artifact in artifacts if artifact.get('artifact_type') == 'chart']
@@ -415,6 +422,12 @@ class ConversationContextService:
         conversation = self._get_conversation_by_id(conversation_id)
         turn = self._get_turn_by_id(turn_id)
         if not conversation or not turn:
+            return
+
+        if (
+            turn.status == 'failed'
+            and (turn.final_answer or '').strip() == (error_message or '').strip()
+        ):
             return
 
         if preserve_existing_results and self._turn_has_active_result(conversation, turn):
@@ -491,6 +504,9 @@ class ConversationContextService:
             '未生成',
             '执行失败',
             '分析失败',
+            '用户已停止',
+            '已停止本轮分析',
+            '停止本轮分析',
         )
         return any(marker in text for marker in error_markers)
 

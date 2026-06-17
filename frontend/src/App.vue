@@ -374,7 +374,7 @@
             </template>
           </div>
 
-          <ChatInput :loading="loading" @send="onSendMessage" />
+          <ChatInput :loading="loading" @send="onSendMessage" @stop="onStopAnalysis" />
         </section>
       </div>
     </div>
@@ -593,6 +593,7 @@ import {
   createConversation,
   createNamespace,
   createCollect,
+  cancelAnalysisTask,
   deleteConversation,
   deleteNamespace,
   exportTurnPdf,
@@ -1943,6 +1944,25 @@ const onSendMessage = async (content) => {
     console.error('Submit analysis task error:', error)
     ElMessage.error(error?.message || '提交分析任务失败')
     loading.value = false
+  }
+}
+
+const onStopAnalysis = async () => {
+  if (!loading.value || !currentTaskId.value) return
+  try {
+    await cancelAnalysisTask(currentTaskId.value)
+    stopCurrentStream()
+    addProgressItem({
+      type: 'status',
+      level: 'warning',
+      message: '用户已停止本轮分析。'
+    })
+    currentReport.value = '用户已停止本轮分析。'
+    ElMessage.success('已停止分析')
+    await finalizeStreamRound()
+  } catch (error) {
+    console.error('Cancel analysis task error:', error)
+    ElMessage.error(error?.message || '停止分析失败')
   }
 }
 

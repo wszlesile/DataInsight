@@ -24,3 +24,4 @@ uploads/
 /logs/
 /data-insight-agent_v1/
 /data-insight-agent_v1/images/
+/.claude/settings.local.json

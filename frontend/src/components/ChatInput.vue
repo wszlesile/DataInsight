@@ -11,11 +11,13 @@
       />
       <button
         class="chat-send-btn"
+        :class="{ stopping: loading }"
         type="button"
-        :disabled="loading || !message.trim()"
-        @click="sendMessage"
+        :disabled="!loading && !message.trim()"
+        :title="loading ? '停止分析' : '发送'"
+        @click="loading ? stopMessage() : sendMessage()"
       >
-        <span v-if="loading">…</span>
+        <span v-if="loading">■</span>
         <span v-else>➤</span>
       </button>
     </div>
@@ -33,7 +35,7 @@ const props = defineProps({
   }
 })
 
-const emit = defineEmits(['send'])
+const emit = defineEmits(['send', 'stop'])
 
 const message = ref('')
 
@@ -42,6 +44,11 @@ const sendMessage = () => {
   if (!value || props.loading) return
   emit('send', value)
   message.value = ''
+}
+
+const stopMessage = () => {
+  if (!props.loading) return
+  emit('stop')
 }
 </script>
 
@@ -99,6 +106,10 @@ const sendMessage = () => {
   align-items: center;
   justify-content: center;
   transition: transform 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease;
+}
+
+.chat-send-btn.stopping {
+  background: linear-gradient(135deg, #dc2626, #f97316);
 }
 
 .chat-send-btn:hover:not(:disabled) {

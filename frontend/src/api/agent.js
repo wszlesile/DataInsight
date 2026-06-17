@@ -50,6 +50,10 @@ export function getAnalysisTask(taskId) {
   return api.get(`/agent/tasks/${taskId}`)
 }
 
+export function cancelAnalysisTask(taskId) {
+  return api.post(`/agent/tasks/${taskId}/cancel`)
+}
+
 export function listLlmModels() {
   return api.get('/llm/models')
 }

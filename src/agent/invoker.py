@@ -17,6 +17,7 @@ from config.database import session_scope
 from service.conversation_context_service import ConversationContextService, ConversationRunContext
 from utils import logger
 from utils.datasource_utils import safe_json_loads
+from utils.analysis_task_cancel import AnalysisTaskCancelled, CANCELLED_MESSAGE, is_analysis_task_cancelled
 from utils.llm_error_utils import get_user_facing_agent_error
 from utils.llm_model_factory import bind_selected_model_id, create_runtime_config, reset_selected_model_id
 
@@ -58,7 +59,9 @@ CHART_CONTRACT_ERROR_MARKERS = (
     'yaxis',
     'series',
 )
-REGENERATE_REQUEST_PATTERN = re.compile(r'^(重新生成|重试|重新执行|重新跑一次|再生成一次|再来一次)$')
+REGENERATE_REQUEST_PATTERN = re.compile(
+    r'^(重新生成|重试|重新执行|重新分析|重新分析一下|重新分析一次|重新分析一遍|重新跑一次|再生成一次|再来一次)$'
+)
 HISTORY_REQUIREMENT_RECOVERY_KEYWORDS = (
     '前面对话',
     '前面的需求',
@@ -493,6 +496,12 @@ def _build_agent_context(agent_request: AgentRequest, runtime: ConversationRunCo
     )
 
 
+def _raise_if_analysis_task_cancelled(runtime: ConversationRunContext) -> None:
+    analysis_task_id = int(getattr(runtime, 'analysis_task_id', 0) or 0)
+    if analysis_task_id > 0 and is_analysis_task_cancelled(task_pk=analysis_task_id):
+        raise AnalysisTaskCancelled(CANCELLED_MESSAGE)
+
+
 def _build_agent_input_with_runtime_instruction(
     agent_request: AgentRequest,
     runtime: ConversationRunContext,
@@ -542,6 +551,8 @@ def _resolve_runtime_context_mode(runtime: ConversationRunContext, user_message:
 
 
 def _is_analysis_request_expected(runtime: ConversationRunContext, user_message: str) -> bool:
+    if _is_regenerate_request(user_message):
+        return True
     context_mode = getattr(runtime, 'context_mode', '') or classify_analysis_context_mode(user_message)
     return context_mode in {'followup', 'fresh_analysis'}
 
@@ -1026,6 +1037,22 @@ def _build_rerun_instruction(
     if not runtime.is_rerun:
         return ''
 
+    original_user_query = getattr(runtime.turn, 'user_query', '') or ''
+    if _is_regenerate_request(original_user_query):
+        with session_scope(expire_on_commit=False) as session:
+            latest_turn = ConversationContextService(session).get_latest_successful_analysis_turn(
+                runtime.conversation.id,
+                max_turn_no=runtime.history_turn_limit,
+            )
+        if latest_turn is not None and (latest_turn.user_query or '').strip():
+            return (
+                '当前操作是“刷新分析”，但本轮原始问题本身是“重新分析/重试”这类省略指令。'
+                f'请把本次刷新目标还原为最近一次成功分析任务：第 {latest_turn.turn_no} 轮'
+                f'「{(latest_turn.user_query or "").strip()}」。'
+                '不要把“重新分析”本身当作分析对象，也不要复述历史结论；'
+                '必须重新调用 execute_python，基于当前会话数据源重新完成该分析目标并生成新的分析结果。'
+            )
+
     if not _rerun_has_prior_analysis_result(service, runtime):
         return (
             '当前操作是“刷新回复”，需要基于本轮原始问题重新生成回答。'
@@ -1224,7 +1251,9 @@ def _finalize_run_with_fresh_session(
     allow_report_only: bool = False,
 ) -> AgentResponse:
     def _operation(session):
+        _raise_if_analysis_task_cancelled(runtime)
         service, fresh_runtime = _open_fresh_persistence_context(session, runtime)
+        _raise_if_analysis_task_cancelled(fresh_runtime)
         return _finalize_run(
             service=service,
             runtime=fresh_runtime,
@@ -2003,6 +2032,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
         agent = get_data_insight_agent(runtime_config)
 
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
+            _raise_if_analysis_task_cancelled(runtime)
             runtime_instruction = ''
             if analysis_flow_started:
                 runtime_instruction = _build_analysis_recovery_instruction(
@@ -2041,6 +2071,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 ),
                 context=_build_agent_context(agent_request, runtime),
             )
+            _raise_if_analysis_task_cancelled(runtime)
             _update_short_term_memory_from_messages(runtime, agent_response.get('messages', []))
             assistant_message, analysis_report, charts, tables, raw_tool_call_detected = _extract_invoke_result(
                 agent_response.get('messages', [])
@@ -2130,6 +2161,13 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
             tables=tables,
             allow_report_only=allow_report_only,
         )
+    except AnalysisTaskCancelled as exc:
+        _fail_run_with_fresh_session(
+            runtime,
+            CANCELLED_MESSAGE,
+            preserve_existing_results=runtime.is_rerun,
+        )
+        raise RuntimeError(CANCELLED_MESSAGE) from exc
     except Exception as exc:
         user_error_message = get_user_facing_agent_error(exc)
         logger.error(
@@ -2257,6 +2295,7 @@ def _stream_with_runtime(
         agent = get_data_insight_agent(runtime_config)
 
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
+            _raise_if_analysis_task_cancelled(runtime)
             raw_tool_call_detected = False
             runtime_instruction = ''
             tool_result_ready = False
@@ -2314,6 +2353,7 @@ def _stream_with_runtime(
                 context=_build_agent_context(agent_request, runtime),
                 stream_mode=["updates", "custom"],
             ):
+                _raise_if_analysis_task_cancelled(runtime)
                 if stream_mode == "updates":
                     for _, payload in chunk.items():
                         messages = payload.get("messages", [])
@@ -2518,6 +2558,20 @@ def _stream_with_runtime(
             'done',
             conversation_id=runtime.conversation.id,
             turn_id=runtime.turn.id,
+        )
+    except AnalysisTaskCancelled:
+        _fail_run_with_fresh_session(
+            runtime,
+            CANCELLED_MESSAGE,
+            preserve_existing_results=runtime.is_rerun,
+        )
+        yield _build_progress_event(
+            'error',
+            conversation_id=runtime.conversation.id,
+            turn_id=runtime.turn.id,
+            stage='cancelled',
+            level='warning',
+            message=CANCELLED_MESSAGE,
         )
     except Exception as exc:
         user_error_message = get_user_facing_agent_error(exc)

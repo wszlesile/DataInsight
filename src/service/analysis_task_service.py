@@ -101,31 +101,73 @@ class AnalysisTaskService:
             InsightAnalysisTask.id.desc(),
         ).first()
 
-    def mark_running(self, task_id: str, worker_id: str = "") -> None:
-        task = self.get_task(task_id)
-        if task is None:
-            return
+    def mark_running(self, task_id: str, worker_id: str = "") -> bool:
         now = _now()
-        task.status = "running"
-        task.worker_id = worker_id or ""
-        task.started_at = task.started_at or now
-        task.heartbeat_at = now
-        task.updated_at = now
+        updated = self.session.query(InsightAnalysisTask).filter(
+            InsightAnalysisTask.task_id == task_id,
+            InsightAnalysisTask.status == "queued",
+        ).update({
+            InsightAnalysisTask.status: "running",
+            InsightAnalysisTask.worker_id: worker_id or "",
+            InsightAnalysisTask.started_at: now,
+            InsightAnalysisTask.heartbeat_at: now,
+            InsightAnalysisTask.updated_at: now,
+        }, synchronize_session=False)
         self.session.flush()
+        return bool(updated)
 
-    def mark_finished(self, task_id: str, *, status: str, error_message: str = "") -> None:
-        if status not in TERMINAL_TASK_STATUSES:
-            raise ValueError(f"invalid terminal task status: {status}")
-        task = self.get_task(task_id)
+    def cancel_task(self, task_id: str, username: str | None = None, reason: str = "") -> InsightAnalysisTask | None:
+        query = self.session.query(InsightAnalysisTask).filter(
+            InsightAnalysisTask.task_id == task_id,
+            InsightAnalysisTask.status.in_(ACTIVE_TASK_STATUSES),
+        )
+        if username is not None:
+            query = query.filter(InsightAnalysisTask.username == (username or "anonymous"))
+        task = query.first()
         if task is None:
-            return
+            return None
         now = _now()
-        task.status = status
-        task.error_message = error_message or ""
+        task.status = "cancelled"
+        task.error_message = reason or "用户已停止本轮分析。"
         task.finished_at = now
         task.updated_at = now
         task.heartbeat_at = now
         self.session.flush()
+        return task
+
+    def is_cancelled(self, task_id: str | None = None, task_pk: int | None = None) -> bool:
+        query = self.session.query(InsightAnalysisTask.status)
+        if task_pk:
+            query = query.filter(InsightAnalysisTask.id == int(task_pk or 0))
+        elif task_id:
+            query = query.filter(InsightAnalysisTask.task_id == task_id)
+        else:
+            return False
+        row = query.first()
+        return bool(row and row[0] == "cancelled")
+
+    def get_task_status(self, task_id: str) -> str:
+        row = self.session.query(InsightAnalysisTask.status).filter(
+            InsightAnalysisTask.task_id == task_id,
+        ).first()
+        return str(row[0] or '') if row else ''
+
+    def mark_finished(self, task_id: str, *, status: str, error_message: str = "") -> bool:
+        if status not in TERMINAL_TASK_STATUSES:
+            raise ValueError(f"invalid terminal task status: {status}")
+        now = _now()
+        updated = self.session.query(InsightAnalysisTask).filter(
+            InsightAnalysisTask.task_id == task_id,
+            InsightAnalysisTask.status == "running",
+        ).update({
+            InsightAnalysisTask.status: status,
+            InsightAnalysisTask.error_message: error_message or "",
+            InsightAnalysisTask.finished_at: now,
+            InsightAnalysisTask.updated_at: now,
+            InsightAnalysisTask.heartbeat_at: now,
+        }, synchronize_session=False)
+        self.session.flush()
+        return bool(updated)
 
     def heartbeat(self, task_id: str) -> None:
         task = self.get_task(task_id)
