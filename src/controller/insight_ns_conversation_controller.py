@@ -319,6 +319,7 @@ class InsightNsConversationController(BaseController):
         """从 Redis List 临时队列消费指定轮次的流式事件并输出 SSE。"""
         username = self._get_username()
         session = SessionLocal()
+        task_status = ''
         try:
             task = AnalysisTaskService(session).get_latest_task_for_turn(
                 username=username,
@@ -327,6 +328,7 @@ class InsightNsConversationController(BaseController):
             )
             if task is None:
                 return self.error_response('当前轮次没有可订阅的分析任务', 404)
+            task_status = task.status or ''
         finally:
             session.close()
 
@@ -350,6 +352,16 @@ class InsightNsConversationController(BaseController):
                     'message': f'Redis 流式队列不可用: {get_user_facing_agent_error(exc)}',
                 })
                 return
+
+            if task_status == 'queued':
+                yield encode_sse({
+                    'type': 'status',
+                    'stage': 'queued',
+                    'level': 'info',
+                    'conversation_id': conversation_id,
+                    'turn_id': turn_id,
+                    'message': '问题已进入分析队列，等待执行...',
+                })
 
             while True:
                 event = queue.pop_event(turn_id, timeout_seconds=Config.STREAM_BLPOP_TIMEOUT_SECONDS)

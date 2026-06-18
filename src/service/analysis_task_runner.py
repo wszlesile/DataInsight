@@ -1,7 +1,8 @@
 import json
 import socket
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from threading import Lock
 from typing import Any
 
 from agent.invoker import AgentRequest, stream_existing_turn_events
@@ -10,6 +11,7 @@ from config.database import session_scope
 from service.analysis_stream_queue import AnalysisStreamQueue
 from service.analysis_task_service import AnalysisTaskService
 from utils import logger
+from utils.analysis_task_cancel import AnalysisTaskCancelled, CANCELLED_MESSAGE
 from utils.redis_client import get_redis_client
 
 
@@ -19,6 +21,8 @@ class AnalysisTaskRunner:
     def __init__(self):
         self._executor = ThreadPoolExecutor(max_workers=max(1, Config.ANALYSIS_TASK_MAX_WORKERS))
         self._worker_id = f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
+        self._futures: dict[str, Future] = {}
+        self._futures_lock = Lock()
 
     def submit(
         self,
@@ -29,7 +33,7 @@ class AnalysisTaskRunner:
         turn_id: int,
         is_rerun: bool = False,
     ) -> None:
-        self._executor.submit(
+        future = self._executor.submit(
             self._run_task,
             task_id,
             analysis_task_id,
@@ -37,6 +41,16 @@ class AnalysisTaskRunner:
             int(turn_id),
             bool(is_rerun),
         )
+        with self._futures_lock:
+            self._futures[task_id] = future
+
+    def cancel(self, task_id: str) -> bool:
+        """Best-effort cancellation for tasks that are still waiting in this process."""
+        with self._futures_lock:
+            future = self._futures.get(task_id)
+        if future is None:
+            return False
+        return future.cancel()
 
     def _run_task(
         self,
@@ -50,6 +64,8 @@ class AnalysisTaskRunner:
         final_status = "success"
         error_message = ""
         try:
+            if not self._mark_task_running(task_id):
+                return
             redis_client = get_redis_client()
             queue = AnalysisStreamQueue(
                 redis_client,
@@ -57,7 +73,6 @@ class AnalysisTaskRunner:
                 event_max_bytes=Config.STREAM_EVENT_MAX_BYTES,
                 ttl_seconds=Config.STREAM_QUEUE_TTL_SECONDS,
             )
-            self._mark_task_running(task_id)
             for event in stream_existing_turn_events(
                 agent_request,
                 turn_id=turn_id,
@@ -67,12 +82,25 @@ class AnalysisTaskRunner:
                 event.setdefault("task_id", task_id)
                 queue.push_event(turn_id, event)
                 self._heartbeat_task(task_id)
+                if self._is_task_cancelled(task_id):
+                    raise AnalysisTaskCancelled(CANCELLED_MESSAGE)
                 if event.get("type") == "error":
                     final_status = "failed"
                     error_message = str(event.get("message") or "")
                 elif event.get("type") == "done":
                     final_status = "success"
             self._mark_task_finished(task_id, status=final_status, error_message=error_message)
+        except AnalysisTaskCancelled:
+            final_status = "cancelled"
+            error_message = CANCELLED_MESSAGE
+            if queue is not None:
+                self._publish_cancelled(queue, turn_id, task_id)
+            self._fail_turn_if_possible(
+                agent_request,
+                turn_id,
+                error_message,
+                preserve_existing_results=is_rerun,
+            )
         except Exception as exc:
             final_status = "failed"
             error_message = str(exc)
@@ -93,9 +121,16 @@ class AnalysisTaskRunner:
                 return
             if queue is not None:
                 self._publish_error(queue, turn_id, task_id, error_message)
-            self._fail_turn_if_possible(agent_request, turn_id, error_message)
+            self._fail_turn_if_possible(
+                agent_request,
+                turn_id,
+                error_message,
+                preserve_existing_results=is_rerun,
+            )
             self._mark_task_finished(task_id, status="failed", error_message=error_message)
         finally:
+            with self._futures_lock:
+                self._futures.pop(task_id, None)
             if queue is not None:
                 try:
                     queue.expire_turn(turn_id, Config.STREAM_FINISHED_TTL_SECONDS)
@@ -118,15 +153,30 @@ class AnalysisTaskRunner:
             "message": message,
         })
 
-    def _mark_task_running(self, task_id: str) -> None:
+    def _publish_cancelled(self, queue: AnalysisStreamQueue, turn_id: int, task_id: str) -> None:
+        queue.push_event(turn_id, {
+            "type": "error",
+            "task_id": task_id,
+            "turn_id": turn_id,
+            "stage": "cancelled",
+            "level": "warning",
+            "message": CANCELLED_MESSAGE,
+        })
+
+    def _mark_task_running(self, task_id: str) -> bool:
         with session_scope(expire_on_commit=False) as session:
-            AnalysisTaskService(session).mark_running(task_id, worker_id=self._worker_id)
+            marked = AnalysisTaskService(session).mark_running(task_id, worker_id=self._worker_id)
             session.commit()
+            return marked
 
     def _heartbeat_task(self, task_id: str) -> None:
         with session_scope(expire_on_commit=False) as session:
             AnalysisTaskService(session).heartbeat(task_id)
             session.commit()
+
+    def _is_task_cancelled(self, task_id: str) -> bool:
+        with session_scope(expire_on_commit=False) as session:
+            return AnalysisTaskService(session).is_cancelled(task_id=task_id)
 
     def _mark_task_finished(self, task_id: str, *, status: str, error_message: str = "") -> None:
         with session_scope(expire_on_commit=False) as session:
@@ -138,6 +188,7 @@ class AnalysisTaskRunner:
         agent_request: AgentRequest,
         turn_id: int,
         error_message: str,
+        preserve_existing_results: bool = False,
     ) -> None:
         try:
             from service.conversation_context_service import ConversationContextService
@@ -147,7 +198,7 @@ class AnalysisTaskRunner:
                     int(agent_request.conversation_id or 0),
                     int(turn_id or 0),
                     error_message,
-                    preserve_existing_results=False,
+                    preserve_existing_results=preserve_existing_results,
                 )
 
         except Exception:

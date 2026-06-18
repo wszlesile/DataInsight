@@ -5,8 +5,8 @@ import os
 # Gunicorn 绑定地址，默认监听容器内 5000 端口。
 bind = os.getenv('GUNICORN_BIND', '0.0.0.0:5000')
 
-# worker 数量默认按 CPU 粗略折中计算，最低保留 2 个。
-workers = int(os.getenv('WEB_CONCURRENCY', max(2, multiprocessing.cpu_count() // 2)))
+# worker 数量默认2 个。
+workers = int(os.getenv('WEB_CONCURRENCY', 2))
 
 # 线程数适合当前 Flask + I/O 型请求场景。
 threads = int(os.getenv('GUNICORN_THREADS', '4'))

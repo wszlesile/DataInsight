@@ -12,7 +12,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from config.database import Base
-from model import InsightNsExecution, InsightNsMessage, InsightNsTurn
+from model import InsightNsConversation, InsightNsExecution, InsightNsMessage, InsightNsTurn
 from service.conversation_context_service import ConversationContextService, _attach_chart_artifact_refs
 
 
@@ -178,6 +178,99 @@ class ConversationContextServiceTestCase(unittest.TestCase):
         self.assertEqual(merged[0]["description"], "desc")
         self.assertEqual(merged[0]["chart_spec"], {"series": [1]})
         self.assertEqual(merged[0]["id"], 201)
+
+    def test_fail_run_does_not_preserve_prior_error_as_active_result(self) -> None:
+        prior_error = (
+            '(psycopg2.OperationalError) server closed the connection unexpectedly\n'
+            '(Background on this error at: https://sqlalche.me/e/20/e3q8)'
+        )
+        self.session.add(InsightNsConversation(
+            id=41,
+            insight_namespace_id=4,
+            title='analysis',
+            status='active',
+            summary_text='',
+            active_datasource_snapshot='{}',
+            last_turn_no=1,
+            user_message='analyze',
+            insight_result=prior_error,
+        ))
+        self.session.add(InsightNsTurn(
+            id=71,
+            conversation_id=41,
+            turn_no=1,
+            user_query='analyze',
+            selected_datasource_ids_json='[]',
+            selected_datasource_snapshot_json='[]',
+            final_answer=prior_error,
+            status='running',
+            error_message='',
+            is_deleted=0,
+        ))
+        self.session.add(InsightNsMessage(
+            id=7101,
+            insight_namespace_id=4,
+            insight_conversation_id=41,
+            turn_id=71,
+            turn_no=1,
+            seq_no=1,
+            role='assistant',
+            message_kind='error',
+            content=prior_error,
+            content_json='{}',
+            is_deleted=0,
+        ))
+        self.session.commit()
+
+        ConversationContextService(self.session).fail_run(
+            conversation_id=41,
+            turn_id=71,
+            error_message='llm gateway timeout',
+            preserve_existing_results=True,
+        )
+
+        turn = self.session.query(InsightNsTurn).filter_by(id=71).one()
+        self.assertEqual('failed', turn.status)
+        self.assertEqual('llm gateway timeout', turn.final_answer)
+        self.assertEqual('llm gateway timeout', turn.error_message)
+
+    def test_fail_run_preserves_legacy_final_answer_result(self) -> None:
+        self.session.add(InsightNsConversation(
+            id=42,
+            insight_namespace_id=4,
+            title='analysis',
+            status='active',
+            summary_text='',
+            active_datasource_snapshot='{}',
+            last_turn_no=1,
+            user_message='analyze',
+            insight_result='legacy report',
+        ))
+        self.session.add(InsightNsTurn(
+            id=72,
+            conversation_id=42,
+            turn_no=1,
+            user_query='analyze',
+            selected_datasource_ids_json='[]',
+            selected_datasource_snapshot_json='[]',
+            final_answer='legacy report',
+            status='running',
+            error_message='',
+            is_deleted=0,
+        ))
+        self.session.commit()
+
+        ConversationContextService(self.session).fail_run(
+            conversation_id=42,
+            turn_id=72,
+            error_message='llm gateway timeout',
+            preserve_existing_results=True,
+        )
+
+        turn = self.session.query(InsightNsTurn).filter_by(id=72).one()
+        self.assertEqual('success', turn.status)
+        self.assertEqual('legacy report', turn.final_answer)
+        self.assertEqual('', turn.error_message)
 
 
 if __name__ == "__main__":

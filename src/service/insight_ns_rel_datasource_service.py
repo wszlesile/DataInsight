@@ -371,15 +371,14 @@ class InsightNsRelDatasourceService:
                         }
 
                     existing_datasources = self._find_uns_datasources_by_node_ids(desired_file_node_ids)
-                    missing_node_ids = [
+                    sync_node_ids = [
                         node_id
                         for node_id in desired_file_node_ids
-                        if node_id not in existing_datasources
                     ]
-                    if missing_node_ids:
+                    if sync_node_ids:
                         release_clean_session_connection(self.session)
                         detail_results = self._fetch_uns_details_in_parallel(
-                            missing_node_ids,
+                            sync_node_ids,
                             authorization,
                         )
                         failed_rows.extend([
@@ -418,7 +417,8 @@ class InsightNsRelDatasourceService:
                                 datasource_id=datasource.id,
                                 bind_source=BIND_SOURCE_SYSTEM_DEFAULT,
                             )
-                            imported_rows.append(self._datasource_to_dict(datasource))
+                            if node_id not in existing_datasources:
+                                imported_rows.append(self._datasource_to_dict(datasource))
 
                     desired_datasource_ids = self._find_datasource_ids_by_uns_node_ids(desired_file_node_ids)
 
@@ -849,17 +849,16 @@ class InsightNsRelDatasourceService:
         if not isinstance(db_protocol, dict):
             db_protocol = {}
 
-        data_path = str(db_protocol.get('dataPath') or '').strip().rstrip('/')
-        database_suffix = data_path.rsplit('/', 1)[-1].strip() if data_path else ''
+        protocol_alias = str(db_protocol.get('alias') or '').strip()
         schema_name = str(db_protocol.get('schemaName') or '').strip()
         table_name = str(db_protocol.get('tableName') or '').strip()
-        if not database_suffix:
-            raise ValueError('dataType=9 的 UNS 节点 protocol.db.dataPath 缺失或无效')
+        if not protocol_alias:
+            raise ValueError('dataType=9 的 UNS 节点 protocol.db.alias 缺失或无效')
         if not schema_name or not table_name:
             raise ValueError('dataType=9 的 UNS 节点 protocol.db.schemaName/tableName 缺失')
 
         return {
-            "database_name": f"feq_{database_suffix}",
+            "database_name": f"fqe_{protocol_alias}",
             "table_name": f"{schema_name}.{table_name}",
             "uns_alias": alias,
             "uns_data_type": UNS_PROTOCOL_TABLE_DATA_TYPE,

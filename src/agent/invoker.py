@@ -10,12 +10,14 @@ from zoneinfo import ZoneInfo
 from sqlalchemy.exc import SQLAlchemyError
 
 from agent import CustomContext, get_data_insight_agent, get_input
-from agent.context_engineering_runtime import is_analysis_like_request
+from agent.context_engineering_runtime import classify_analysis_context_mode, is_analysis_like_request
+from agent.intent_classifier import resolve_context_mode_with_llm
 from config import Config
 from config.database import session_scope
 from service.conversation_context_service import ConversationContextService, ConversationRunContext
 from utils import logger
 from utils.datasource_utils import safe_json_loads
+from utils.analysis_task_cancel import AnalysisTaskCancelled, CANCELLED_MESSAGE, is_analysis_task_cancelled
 from utils.llm_error_utils import get_user_facing_agent_error
 from utils.llm_model_factory import bind_selected_model_id, create_runtime_config, reset_selected_model_id
 
@@ -61,7 +63,25 @@ CHART_CONTRACT_ERROR_MARKERS = (
     'yaxis',
     'series',
 )
-REGENERATE_REQUEST_PATTERN = re.compile(r'^(重新生成|重试|重新执行|重新跑一次|再生成一次|再来一次)$')
+REGENERATE_REQUEST_PATTERN = re.compile(
+    r'^(重新生成|重试|重新执行|重新分析|重新分析一下|重新分析一次|重新分析一遍|重新跑一次|再生成一次|再来一次)$'
+)
+HISTORY_REQUIREMENT_RECOVERY_KEYWORDS = (
+    '前面对话',
+    '前面的需求',
+    '前面说的',
+    '上面说的',
+    '刚才说的',
+    '不想再重复',
+    '不想重复',
+    '我已经说过',
+    '已经说过',
+    '自己看前面',
+    '你自己看前面',
+    '接着前面',
+    '按之前的需求',
+    '之前的需求',
+)
 NO_DATASOURCE_ANALYSIS_REPLY = (
     '当前会话还没有关联任何数据源，暂时无法执行数据分析。'
     '请先在当前会话中关联相关数据源，然后再发起分析。'
@@ -552,6 +572,12 @@ def _build_agent_context(agent_request: AgentRequest, runtime: ConversationRunCo
     )
 
 
+def _raise_if_analysis_task_cancelled(runtime: ConversationRunContext) -> None:
+    analysis_task_id = int(getattr(runtime, 'analysis_task_id', 0) or 0)
+    if analysis_task_id > 0 and is_analysis_task_cancelled(task_pk=analysis_task_id):
+        raise AnalysisTaskCancelled(CANCELLED_MESSAGE)
+
+
 def _build_agent_input_with_runtime_instruction(
     agent_request: AgentRequest,
     runtime: ConversationRunContext,
@@ -566,11 +592,45 @@ def _build_agent_input_with_runtime_instruction(
         extra_system_messages=extra_system_messages,
         history_turn_limit=runtime.history_turn_limit,
         datasource_snapshot_override=runtime.active_datasource_snapshot,
+        context_mode=getattr(runtime, 'context_mode', None),
     )
 
 
 def _resolve_agent_runtime_config(agent_request: AgentRequest):
     return create_runtime_config(selected_model_id=agent_request.selected_llm_model_id)
+
+
+def _resolve_runtime_context_mode(runtime: ConversationRunContext, user_message: str) -> str:
+    if runtime.is_rerun:
+        context_mode = classify_analysis_context_mode(user_message)
+        runtime.context_mode = context_mode
+        logger.info(
+            "Resolved analysis context mode for rerun locally: conversation_id=%s turn_id=%s mode=%s",
+            getattr(runtime.conversation, 'id', ''),
+            getattr(runtime.turn, 'id', ''),
+            context_mode,
+        )
+        return context_mode
+
+    classification = resolve_context_mode_with_llm(runtime, user_message)
+    runtime.context_mode = classification.mode
+    logger.info(
+        "Resolved analysis context mode: conversation_id=%s turn_id=%s mode=%s source=%s confidence=%s reason=%s",
+        getattr(runtime.conversation, 'id', ''),
+        getattr(runtime.turn, 'id', ''),
+        classification.mode,
+        classification.source,
+        classification.confidence,
+        classification.reason,
+    )
+    return classification.mode
+
+
+def _is_analysis_request_expected(runtime: ConversationRunContext, user_message: str) -> bool:
+    if _is_regenerate_request(user_message):
+        return True
+    context_mode = getattr(runtime, 'context_mode', '') or classify_analysis_context_mode(user_message)
+    return context_mode in {'followup', 'fresh_analysis'}
 
 
 def _is_regenerate_request(user_message: str) -> bool:
@@ -612,6 +672,385 @@ def _build_regenerate_instruction(
     )
 
 
+def _is_history_requirement_recovery_request(user_message: str) -> bool:
+    text = re.sub(r'\s+', '', (user_message or '').strip())
+    if not text:
+        return False
+    return any(keyword in text for keyword in HISTORY_REQUIREMENT_RECOVERY_KEYWORDS)
+
+
+def _clip_inline_text(value: Any, max_chars: int = 240) -> str:
+    text = re.sub(r'\s+', ' ', str(value or '').strip())
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars] + '...'
+
+
+def _build_datasource_reference_lines(runtime: ConversationRunContext) -> list[str]:
+    snapshot = runtime.active_datasource_snapshot if isinstance(runtime.active_datasource_snapshot, dict) else {}
+    rows = snapshot.get('selected_datasource_snapshot') or []
+    lines: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        datasource_id = row.get('datasource_id') or row.get('id') or ''
+        datasource_name = str(row.get('datasource_name') or '').strip()
+        datasource_identifier = str(row.get('datasource_identifier') or '').strip()
+        if not datasource_id or not datasource_name:
+            continue
+        if datasource_identifier:
+            lines.append(f'- datasource_id={datasource_id}，datasource_name="{datasource_name}"，datasource_identifier="{datasource_identifier}"')
+        else:
+            lines.append(f'- datasource_id={datasource_id}，datasource_name="{datasource_name}"')
+    return lines
+
+
+def _normalize_match_text(value: Any) -> str:
+    return re.sub(r'\s+', '', str(value or '').lower())
+
+
+def _datasource_match_tokens(item: dict[str, Any]) -> list[str]:
+    raw_values = [
+        item.get('datasource_name'),
+        item.get('datasource_identifier'),
+        item.get('table_name'),
+        item.get('sheet_name'),
+    ]
+    metadata = item.get('metadata_schema') if isinstance(item.get('metadata_schema'), dict) else {}
+    raw_values.append(metadata.get('name'))
+
+    tokens: list[str] = []
+    for value in raw_values:
+        text = str(value or '').strip()
+        if not text:
+            continue
+        candidates = {text}
+        for sep in ('/', '\\', '.', ':'):
+            if sep in text:
+                tail = text.rstrip('/\\').split(sep)[-1].strip()
+                if tail:
+                    candidates.add(tail)
+        for candidate in candidates:
+            normalized = _normalize_match_text(candidate)
+            if len(normalized) >= 3 and normalized not in tokens:
+                tokens.append(normalized)
+    return tokens
+
+
+def _build_possible_datasource_selection_hints(
+    runtime: ConversationRunContext,
+    executions: list[Any],
+) -> list[str]:
+    """提示模型可能漏选了语义相关的数据源；不做 SQL 静态访问校验。"""
+    snapshot = runtime.active_datasource_snapshot if isinstance(runtime.active_datasource_snapshot, dict) else {}
+    rows = snapshot.get('selected_datasource_snapshot') or []
+    selected_items = [item for item in rows if isinstance(item, dict)]
+    if not selected_items:
+        return []
+
+    analysis_used_ids: set[int] = set()
+    scan_parts = [getattr(runtime.turn, 'user_query', '') or '']
+    untracked_mentions_by_id: dict[int, dict[str, Any]] = {}
+    for execution in executions:
+        generated_code = getattr(execution, 'generated_code', '') or ''
+        payload = _extract_execution_payload(execution)
+        is_probe = 'execution_intent = "probe"' in generated_code or payload.get('retry_type') == 'probe_feedback'
+        if not is_probe:
+            analysis_used_ids.update(
+                int(item)
+                for item in safe_json_loads(getattr(execution, 'used_datasource_ids_json', ''), [])
+                if isinstance(item, int) or str(item).isdigit()
+            )
+        diagnostics = payload.get('diagnostics') if isinstance(payload.get('diagnostics'), dict) else {}
+        for mention in diagnostics.get('untracked_datasource_mentions') or []:
+            if not isinstance(mention, dict):
+                continue
+            datasource_id = int(mention.get('datasource_id') or 0)
+            if datasource_id > 0:
+                untracked_mentions_by_id[datasource_id] = mention
+        scan_parts.extend([
+            getattr(execution, 'error_message', '') or '',
+            generated_code,
+            getattr(execution, 'analysis_report', '') or '',
+            json.dumps(payload, ensure_ascii=False) if payload else '',
+        ])
+
+    scan_text = _normalize_match_text('\n'.join(str(part or '') for part in scan_parts))
+    user_text = _normalize_match_text(getattr(runtime.turn, 'user_query', '') or '')
+    hints: list[str] = []
+    for item in selected_items:
+        datasource_id = int(item.get('datasource_id') or item.get('id') or 0)
+        if datasource_id <= 0 or datasource_id in analysis_used_ids:
+            continue
+        matched_tokens = [token for token in _datasource_match_tokens(item) if token and token in scan_text]
+        untracked_mention = untracked_mentions_by_id.get(datasource_id)
+        if not matched_tokens and not untracked_mention:
+            continue
+        datasource_name = str(item.get('datasource_name') or '').strip()
+        datasource_identifier = str(item.get('datasource_identifier') or '').strip()
+        name_match_text = _normalize_match_text(datasource_name)
+        looks_like_plan_or_target = any(token in name_match_text for token in ('计划', '目标', '标准', '额定'))
+        looks_like_status_or_rate_question = any(token in user_text for token in ('情况', '开机', '运行', '稼动', '效率', '率', '达成', '完成'))
+        if untracked_mention and looks_like_plan_or_target and looks_like_status_or_rate_question:
+            hint = (
+                f'此前正式分析结果已经提到已选数据源 datasource_id={datasource_id}'
+                f'（datasource_name="{datasource_name}"），且该数据源语义上是计划/目标口径。'
+                '当前用户问题属于设备开机情况/运行情况类分析，下一版正式 analysis 应优先把实际数据源与该计划/目标数据源联合查询或对齐，'
+                f'并把 datasource_id={datasource_id} 加入 used_datasource_ids。'
+            )
+        else:
+            hint = (
+                f'用户问题或失败记录命中了已选数据源 datasource_id={datasource_id}'
+                f'（datasource_name="{datasource_name}"），但本轮正式 analysis 的 used_datasource_ids 未包含它。'
+                '下一版请重新规划数据源选择；如果该数据源与问题相关，应实际查询它并加入 used_datasource_ids。'
+            )
+        if datasource_identifier:
+            hint += f' 访问时必须使用 datasource_identifier="{datasource_identifier}"，不要把 datasource_name 当作 SQL 表名。'
+        hints.append(hint)
+        if len(hints) >= 5:
+            break
+    return hints
+
+
+def _load_recent_prompt_messages_fresh(
+    runtime: ConversationRunContext,
+    *,
+    limit_messages: int,
+    max_turn_no: int | None,
+) -> list[Any]:
+    try:
+        with session_scope(expire_on_commit=False) as session:
+            return ConversationContextService(session).get_recent_prompt_messages(
+                runtime.conversation.id,
+                limit_messages=limit_messages,
+                max_turn_no=max_turn_no,
+            )
+    except SQLAlchemyError:
+        logger.warning(
+            "读取历史消息失败，跳过历史需求恢复上下文: conversation_id=%s turn_id=%s",
+            getattr(runtime.conversation, 'id', ''),
+            getattr(runtime.turn, 'id', ''),
+            exc_info=True,
+        )
+        return []
+
+
+def _build_history_requirement_recovery_instruction(
+    service: ConversationContextService,
+    runtime: ConversationRunContext,
+    user_message: str,
+) -> str:
+    """把“看前面对话/不想重复”这类省略请求恢复成可执行分析任务。"""
+    if not _is_history_requirement_recovery_request(user_message):
+        return ''
+    if (getattr(runtime, 'context_mode', '') or classify_analysis_context_mode(user_message)) != 'followup':
+        return ''
+
+    max_turn_no = max(int(getattr(runtime.turn, 'turn_no', 0) or 0) - 1, 0)
+    if service is not None:
+        rows = service.get_recent_prompt_messages(
+            runtime.conversation.id,
+            limit_messages=12,
+            max_turn_no=max_turn_no,
+        )
+    else:
+        rows = _load_recent_prompt_messages_fresh(runtime, limit_messages=12, max_turn_no=max_turn_no)
+    if not rows:
+        return ''
+
+    user_rows = [
+        row for row in rows
+        if getattr(row, 'role', '') == 'user' and (getattr(row, 'content', '') or '').strip()
+    ]
+    if not user_rows:
+        return ''
+
+    latest_analysis_user = next(
+        (
+            row for row in reversed(user_rows)
+            if is_analysis_like_request(getattr(row, 'content', '') or '')
+            and not _is_history_requirement_recovery_request(getattr(row, 'content', '') or '')
+        ),
+        None,
+    )
+    latest_user_correction = next(
+        (
+            row for row in reversed(user_rows)
+            if row is not latest_analysis_user
+            and not _is_history_requirement_recovery_request(getattr(row, 'content', '') or '')
+        ),
+        None,
+    )
+
+    lines = [
+        '当前用户输入是在要求你查看并承接前面对话需求，不是普通闲聊，也不是让用户重新复述。',
+        '请先从历史消息中恢复本轮真实分析目标，再基于当前会话已关联的数据源重新执行分析。',
+    ]
+    if latest_analysis_user is not None:
+        lines.append(
+            f'最近一个明确分析需求来自第 {getattr(latest_analysis_user, "turn_no", "")} 轮：'
+            f'{_clip_inline_text(getattr(latest_analysis_user, "content", ""), 500)}'
+        )
+    if latest_user_correction is not None:
+        lines.append(
+            f'最近的用户补充/纠错来自第 {getattr(latest_user_correction, "turn_no", "")} 轮：'
+            f'{_clip_inline_text(getattr(latest_user_correction, "content", ""), 500)}'
+        )
+    lines.extend([
+        '如果最近补充/纠错指出了遗漏的数据源、字段、关联键或计算口径，必须合并进本轮恢复后的分析目标。',
+        '不要回答“没有历史对话上下文”，也不要要求用户重新描述完整需求；当前链路已经提供了历史消息、历史摘要和当前数据源快照。',
+        '如果恢复出的目标需要数据分析、统计、联表、图表或报告，必须调用 execute_python 重新执行，而不是复述历史结论。',
+        '访问表型数据源时，datasource_name 只用于语义匹配；真正写 SQL 必须使用 datasource_identifier。',
+    ])
+    datasource_lines = _build_datasource_reference_lines(runtime)
+    if datasource_lines:
+        lines.append('当前已选数据源如下，请按用户语义选择真正相关的数据源：')
+        lines.extend(datasource_lines)
+    return '\n'.join(lines)
+
+
+def _load_latest_successful_followup_anchor(
+    runtime: ConversationRunContext,
+) -> dict[str, Any]:
+    max_turn_no = max(int(getattr(runtime.turn, 'turn_no', 0) or 0) - 1, 0)
+    try:
+        with session_scope(expire_on_commit=False) as session:
+            service = ConversationContextService(session)
+            latest_turn = service.get_latest_successful_analysis_turn(
+                runtime.conversation.id,
+                max_turn_no=max_turn_no,
+            )
+            if latest_turn is None:
+                return {}
+
+            from model import InsightNsExecution
+
+            latest_execution = session.query(InsightNsExecution).filter(
+                InsightNsExecution.conversation_id == runtime.conversation.id,
+                InsightNsExecution.turn_id == latest_turn.id,
+                InsightNsExecution.execution_status == 'success',
+                InsightNsExecution.is_deleted == 0,
+                InsightNsExecution.content_enabled == 1,
+            ).order_by(
+                InsightNsExecution.created_at.desc(),
+                InsightNsExecution.id.desc(),
+            ).first()
+            if latest_execution is None:
+                return {}
+
+            result_payload = safe_json_loads(latest_execution.result_payload_json, {})
+            if not isinstance(result_payload, dict):
+                result_payload = {}
+            return {
+                "turn_no": getattr(latest_turn, 'turn_no', 0) or 0,
+                "turn_id": getattr(latest_turn, 'id', 0) or 0,
+                "question": getattr(latest_turn, 'user_query', '') or '',
+                "execution_id": getattr(latest_execution, 'id', 0) or 0,
+                "title": getattr(latest_execution, 'title', '') or '',
+                "used_datasource_ids": safe_json_loads(
+                    getattr(latest_execution, 'used_datasource_ids_json', ''),
+                    [],
+                ),
+                "analysis_report": (
+                    getattr(latest_execution, 'analysis_report', '') or result_payload.get('analysis_report', '') or ''
+                ),
+                "chart_count": len(result_payload.get('charts') or []),
+                "table_count": len(result_payload.get('tables') or []),
+            }
+    except Exception:
+        logger.warning(
+            "读取 followup 承接锚点失败: conversation_id=%s turn_id=%s",
+            getattr(runtime.conversation, 'id', ''),
+            getattr(runtime.turn, 'id', ''),
+            exc_info=True,
+        )
+        return {}
+
+
+def _build_followup_used_datasource_lines(
+    runtime: ConversationRunContext,
+    used_datasource_ids: list[Any],
+) -> list[str]:
+    used_ids = {int(item) for item in used_datasource_ids if str(item).isdigit()}
+    if not used_ids:
+        return []
+    snapshot = runtime.active_datasource_snapshot if isinstance(runtime.active_datasource_snapshot, dict) else {}
+    selected_items = snapshot.get('selected_datasource_snapshot') or []
+    lines: list[str] = []
+    for item in selected_items:
+        if not isinstance(item, dict):
+            continue
+        datasource_id = int(item.get('datasource_id') or item.get('id') or 0)
+        if datasource_id not in used_ids:
+            continue
+        datasource_name = str(item.get('datasource_name') or '').strip()
+        datasource_identifier = str(item.get('datasource_identifier') or '').strip()
+        if datasource_identifier:
+            lines.append(
+                f'- datasource_id={datasource_id}, datasource_name="{datasource_name}", '
+                f'datasource_identifier="{datasource_identifier}"'
+            )
+        else:
+            lines.append(f'- datasource_id={datasource_id}, datasource_name="{datasource_name}"')
+    return lines
+
+
+def _build_followup_hint_instruction(
+    user_message: str,
+    context_mode: str | None = None,
+    runtime: ConversationRunContext | None = None,
+) -> str:
+    """给 LLM 一个弱提示：本地分类认为本轮可能在承接上文。"""
+    if (context_mode or classify_analysis_context_mode(user_message)) != 'followup':
+        return ''
+    lines = [
+        '系统前置判断：当前用户输入可能是在承接上一轮或最近一次分析结果；该判断只是启发式提示，不一定完全准确。',
+        '请结合历史消息、最近执行记录、当前问题和数据源上下文，自行确认本轮是否确实属于 followup。',
+        '如果确认是承接问题，应优先参考最近成功执行的 used_datasource_ids、分析报告、图表/表格产物和代码。',
+        '如果当前问题明确提出新的分析对象、新数据源、新时间范围、新指标，或要求覆盖全部/所有数据源，则应按新的分析目标重新规划。',
+        '不要因为本提示而机械沿用上一轮数据源；也不要在没有明确新范围时无理由扩展到全部 selected_datasource_ids。',
+    ]
+    if runtime is None:
+        return '\n'.join(lines)
+
+    anchor_lines = _build_followup_anchor_instruction_lines(runtime)
+    if anchor_lines:
+        lines.extend(anchor_lines)
+        lines.extend([
+            '',
+            '本轮 followup 规划要求：',
+            '- 如果当前用户只是要求换图表、补图表、补报告、换展示方式、继续展示，且没有明确新增数据源/对象/时间范围/指标，优先围绕上述最近成功 used_datasource_ids 重新生成结果。',
+            '- selected_datasource_ids 只是当前会话候选全集；不在最近成功 used_datasource_ids 中的数据源，只有在当前用户明确点名、历史纠错明确要求补充，或最近成功结果无法满足当前追问时才需要探测或分析。',
+            '- 对于表型数据源，SQL 必须使用 datasource_identifier；不要根据其它 selected 数据源名称自行猜 catalog、schema 或表名。',
+        ])
+    return '\n'.join(lines)
+
+
+def _build_followup_anchor_instruction_lines(runtime: ConversationRunContext) -> list[str]:
+    anchor = _load_latest_successful_followup_anchor(runtime)
+    used_ids = anchor.get('used_datasource_ids') if isinstance(anchor, dict) else []
+    if not anchor or not used_ids:
+        return []
+
+    lines = [
+        '',
+        '最近成功分析承接锚点：',
+        f'- 最近成功轮次：第 {anchor.get("turn_no", "")} 轮，turn_id={anchor.get("turn_id", "")}',
+        f'- 最近成功问题：{_clip_inline_text(anchor.get("question", ""), 260)}',
+        f'- 最近成功执行：execution_id={anchor.get("execution_id", "")}, title="{_clip_inline_text(anchor.get("title", ""), 120)}"',
+        f'- 最近成功执行实际 used_datasource_ids={used_ids}',
+        f'- 最近成功结果规模：charts={anchor.get("chart_count", 0)}, tables={anchor.get("table_count", 0)}',
+    ]
+    datasource_lines = _build_followup_used_datasource_lines(runtime, used_ids)
+    if datasource_lines:
+        lines.append('- 最近成功执行实际访问的数据源：')
+        lines.extend(datasource_lines)
+    report_preview = _clip_inline_text(anchor.get('analysis_report', ''), 500)
+    if report_preview:
+        lines.append(f'- 最近成功分析报告摘要：{report_preview}')
+    return lines
+
+
 def _rerun_has_prior_analysis_result(
     service: ConversationContextService,
     runtime: ConversationRunContext,
@@ -627,8 +1066,8 @@ def _rerun_has_prior_analysis_result(
         execution_query = session.query(InsightNsExecution.id).filter(
             InsightNsExecution.conversation_id == runtime.conversation.id,
             InsightNsExecution.turn_id == runtime.turn.id,
+            InsightNsExecution.execution_status == 'success',
             InsightNsExecution.is_deleted == 0,
-            InsightNsExecution.content_enabled == 1,
         )
         if started_at is not None:
             execution_query = execution_query.filter(InsightNsExecution.created_at < started_at)
@@ -639,7 +1078,6 @@ def _rerun_has_prior_analysis_result(
             InsightNsArtifact.conversation_id == runtime.conversation.id,
             InsightNsArtifact.turn_id == runtime.turn.id,
             InsightNsArtifact.is_deleted == 0,
-            InsightNsArtifact.content_enabled == 1,
         )
         if started_at is not None:
             artifact_query = artifact_query.filter(InsightNsArtifact.created_at < started_at)
@@ -675,6 +1113,22 @@ def _build_rerun_instruction(
     if not runtime.is_rerun:
         return ''
 
+    original_user_query = getattr(runtime.turn, 'user_query', '') or ''
+    if _is_regenerate_request(original_user_query):
+        with session_scope(expire_on_commit=False) as session:
+            latest_turn = ConversationContextService(session).get_latest_successful_analysis_turn(
+                runtime.conversation.id,
+                max_turn_no=runtime.history_turn_limit,
+            )
+        if latest_turn is not None and (latest_turn.user_query or '').strip():
+            return (
+                '当前操作是“刷新分析”，但本轮原始问题本身是“重新分析/重试”这类省略指令。'
+                f'请把本次刷新目标还原为最近一次成功分析任务：第 {latest_turn.turn_no} 轮'
+                f'「{(latest_turn.user_query or "").strip()}」。'
+                '不要把“重新分析”本身当作分析对象，也不要复述历史结论；'
+                '必须重新调用 execute_python，基于当前会话数据源重新完成该分析目标并生成新的分析结果。'
+            )
+
     if not _rerun_has_prior_analysis_result(service, runtime):
         return (
             '当前操作是“刷新回复”，需要基于本轮原始问题重新生成回答。'
@@ -682,13 +1136,29 @@ def _build_rerun_instruction(
             '如果只是问候、闲聊、概念解释或普通问答，可以直接用自然语言回答并结束。'
         )
 
-    return (
-        '当前操作是“刷新分析”，需要在同一轮内重新执行这条分析请求。'
-        '本轮分析目标只能来自本轮原始问题；历史上下文只能用于理解背景、数据口径和歧义消解，'
-        '不得把历史轮次的问题、结论、图表或表格追加、合并成本轮新的分析目标。'
-        '请基于本轮原始问题和当前会话数据源重新完成分析，'
-        '不要直接复述之前的结论，必须重新调用 execute_python 生成新的分析结果。'
+    lines = [
+        '当前操作是“刷新分析”，需要在同一轮内重新执行这条分析请求。',
+        '刷新分析不是用户发起的新问题，也不是新的普通追问；不要重新判断成全新分析目标。',
+        '本轮分析目标只能来自本轮原始问题；历史上下文只能用于理解背景、数据口径和歧义消解，',
+        '不得把历史轮次的问题、结论、图表或表格追加、合并成本轮新的分析目标。',
+        '请基于本轮原始问题和当前会话数据源重新完成分析，',
+        '不要直接复述之前的结论，必须重新调用 execute_python 生成新的分析结果。',
+    ]
+    original_context_mode = getattr(runtime, 'context_mode', '') or classify_analysis_context_mode(
+        getattr(runtime.turn, 'user_query', '') or ''
     )
+    if original_context_mode == 'followup':
+        anchor_lines = _build_followup_anchor_instruction_lines(runtime)
+        if anchor_lines:
+            lines.extend(anchor_lines)
+            lines.extend([
+                '',
+                '本轮是刷新一个 followup 分析结果：',
+                '- 如果本轮原始问题只是换图表、补图表、补报告、换展示方式或继续展示，刷新时必须优先围绕上述最近成功 used_datasource_ids 重新生成结果。',
+                '- selected_datasource_ids 只是当前会话候选全集；不在最近成功 used_datasource_ids 中的数据源，不应在刷新时被当作新目标重新探测或分析。',
+                '- 只有本轮原始问题明确新增数据源、对象、时间范围或指标时，才允许扩展到其它候选数据源。',
+            ])
+    return '\n'.join(lines)
 
 
 def _has_bound_datasource(runtime: ConversationRunContext) -> bool:
@@ -732,7 +1202,7 @@ def _get_too_many_datasource_policy(runtime: ConversationRunContext) -> dict[str
 
 def _should_finish_with_too_many_datasources(runtime: ConversationRunContext, user_message: str) -> bool:
     """分析型请求在数据源过多时，不进入 execute_python。"""
-    return is_analysis_like_request(user_message) and bool(_get_too_many_datasource_policy(runtime))
+    return _is_analysis_request_expected(runtime, user_message) and bool(_get_too_many_datasource_policy(runtime))
 
 
 def _build_too_many_datasources_reply(runtime: ConversationRunContext) -> str:
@@ -745,7 +1215,7 @@ def _build_too_many_datasources_reply(runtime: ConversationRunContext) -> str:
 
 def _should_finish_without_datasource(runtime: ConversationRunContext, user_message: str) -> bool:
     """分析型请求在当前会话无绑定数据源时，不进入 execute_python。"""
-    return is_analysis_like_request(user_message) and not _has_bound_datasource(runtime)
+    return _is_analysis_request_expected(runtime, user_message) and not _has_bound_datasource(runtime)
 
 
 def _finalize_run(
@@ -763,8 +1233,8 @@ def _finalize_run(
     """写回最终结果并转换成控制器层可直接使用的响应对象。"""
     has_visible_output = bool((assistant_message or '').strip() or (analysis_report or '').strip() or charts or tables)
     if not has_visible_output:
-        raise ValueError(_build_empty_response_error(user_message, analysis_flow_started))
-    if is_analysis_like_request(user_message) and not analysis_flow_started and not allow_report_only:
+        raise ValueError(_build_empty_response_error(runtime, user_message, analysis_flow_started))
+    if _is_analysis_request_expected(runtime, user_message) and not analysis_flow_started and not allow_report_only:
         raise ValueError('本轮未进入分析执行阶段，未生成分析图表或分析报告，请重试。')
 
     run_result = service.complete_run(
@@ -840,6 +1310,7 @@ def _open_fresh_persistence_context(
         is_rerun=runtime.is_rerun,
         history_turn_limit=runtime.history_turn_limit,
         analysis_task_id=runtime.analysis_task_id,
+        context_mode=getattr(runtime, 'context_mode', '') or '',
     )
     return ConversationContextService(session), fresh_runtime
 
@@ -856,7 +1327,9 @@ def _finalize_run_with_fresh_session(
     allow_report_only: bool = False,
 ) -> AgentResponse:
     def _operation(session):
+        _raise_if_analysis_task_cancelled(runtime)
         service, fresh_runtime = _open_fresh_persistence_context(session, runtime)
+        _raise_if_analysis_task_cancelled(fresh_runtime)
         return _finalize_run(
             service=service,
             runtime=fresh_runtime,
@@ -892,11 +1365,15 @@ def _fail_run_with_fresh_session(
         _operation(session)
 
 
-def _build_empty_response_error(user_message: str, analysis_flow_started: bool) -> str:
+def _build_empty_response_error(
+    runtime: ConversationRunContext,
+    user_message: str,
+    analysis_flow_started: bool,
+) -> str:
     """按请求类型生成更准确的兜底错误。"""
     if analysis_flow_started:
         return '本轮分析已启动，但未生成可展示结果，请重试。'
-    if is_analysis_like_request(user_message):
+    if _is_analysis_request_expected(runtime, user_message):
         return '本轮未进入分析执行阶段，未生成分析图表或分析报告，请重试。'
     return '模型本轮没有返回有效回复，请重试。'
 
@@ -1228,6 +1705,18 @@ def _extract_execution_error_type(execution: Any) -> str:
     return ''
 
 
+def _latest_failed_execution_error_type(runtime: ConversationRunContext) -> str:
+    """读取本轮最后一次失败执行的结构化错误类型。"""
+    executions = _load_turn_executions_fresh(runtime)
+    for execution in reversed(executions):
+        if getattr(execution, 'execution_status', '') == 'success':
+            continue
+        error_type = _extract_execution_error_type(execution)
+        if error_type:
+            return error_type
+    return ''
+
+
 def _user_query_has_explicit_time_range(user_query: str) -> bool:
     text = str(user_query or '')
     return bool(
@@ -1429,9 +1918,23 @@ def _build_analysis_recovery_instruction(
     if latest_error_types:
         lines.append(f'最近的结构化错误类型：{", ".join(latest_error_types)}。')
 
+    latest_error_type = latest_error_types[-1] if latest_error_types else ''
+    if latest_error_type in {'contract_error', 'missing_query_constraints', 'invalid_query_constraints'}:
+        lines.extend([
+            '最近失败发生在 execute_python 的静态契约检查阶段，上一版代码没有真正进入数据执行。',
+            '下一步必须重新调用 execute_python，并提交一份完整的新代码；不能只用自然语言说明，也不能直接结束本轮。',
+            '如果继续按分析执行：代码顶部必须声明 execution_intent = "analysis"，并一次性包含 query_constraints、validate_query_constraints(...)、数据加载、空数据检查、图表/表格构造和 result = save_analysis_result(...)。',
+            '如果只是探测字段、样例、候选值或数据覆盖：代码顶部必须声明 execution_intent = "probe"，并以 result = request_retry(...) 返回结构化探测反馈。',
+        ])
+
     if failure_summary:
         lines.append('本轮重复失败摘要如下，优先修复出现次数最多的问题，不要沿着同一错误反复试错：')
         lines.extend(f'- {_clip_retry_text(item, RETRY_ERROR_MAX_CHARS)}' for item in failure_summary)
+
+    datasource_selection_hints = _build_possible_datasource_selection_hints(runtime, executions)
+    if datasource_selection_hints:
+        lines.append('本轮可能存在正式 analysis 数据源规划遗漏，请重新规划 used_datasource_ids：')
+        lines.extend(f'- {item}' for item in datasource_selection_hints)
 
     if failed_pattern_hints:
         lines.append('本轮已经确认的失败写法如下，新的修复代码中不要再次出现：')
@@ -1464,7 +1967,6 @@ def _build_analysis_recovery_instruction(
             lines.append(
                 '如果 diagnostics 中候选值已经足够明确，应从中选择单个真实值收敛成精确筛选条件；不要把 probe 中的 LIKE/contains 直接延续到正式分析。'
             )
-    latest_error_type = latest_error_types[-1] if latest_error_types else ''
     if latest_error_type == 'chart_contract_error' or any(_is_chart_contract_error_text(item) for item in failed_errors):
         lines.extend([
             '本轮已出现图表产物契约错误。下一版必须把修复重点放在 charts 构造，不要重新发散数据查询逻辑。',
@@ -1563,12 +2065,13 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
 
     selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)
     try:
+        _resolve_runtime_context_mode(runtime, agent_request.user_message)
         assistant_message = ''
         analysis_report = ''
         charts: list[dict[str, Any]] = []
         tables: list[dict[str, Any]] = []
         analysis_flow_started = False
-        analysis_request_expected = is_analysis_like_request(agent_request.user_message)
+        analysis_request_expected = _is_analysis_request_expected(runtime, agent_request.user_message)
         allow_report_only = False
 
         if _should_finish_without_datasource(runtime, agent_request.user_message):
@@ -1605,6 +2108,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
         agent = get_data_insight_agent(runtime_config)
 
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
+            _raise_if_analysis_task_cancelled(runtime)
             runtime_instruction = ''
             if analysis_flow_started:
                 runtime_instruction = _build_analysis_recovery_instruction(
@@ -1620,6 +2124,18 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                     runtime=runtime,
                     user_message=agent_request.user_message,
                 )
+                if not runtime_instruction:
+                    runtime_instruction = _build_history_requirement_recovery_instruction(
+                        service=service,
+                        runtime=runtime,
+                        user_message=agent_request.user_message,
+                    )
+                if not runtime_instruction:
+                    runtime_instruction = _build_followup_hint_instruction(
+                        agent_request.user_message,
+                        context_mode=getattr(runtime, 'context_mode', None),
+                        runtime=runtime,
+                    )
             elif analysis_request_expected:
                 runtime_instruction = _build_analysis_start_instruction(agent_request.user_message)
 
@@ -1631,6 +2147,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 ),
                 context=_build_agent_context(agent_request, runtime),
             )
+            _raise_if_analysis_task_cancelled(runtime)
             _update_short_term_memory_from_messages(runtime, agent_response.get('messages', []))
             assistant_message, analysis_report, charts, tables, raw_tool_call_detected = _extract_invoke_result(
                 agent_response.get('messages', [])
@@ -1691,6 +2208,9 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                     break
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
+                latest_failed_error_type = _latest_failed_execution_error_type(runtime)
+                if latest_failed_error_type in {'contract_error', 'missing_query_constraints', 'invalid_query_constraints'}:
+                    raise ValueError('生成的分析代码未通过静态契约检查，且模型未按反馈重新生成可执行代码，请重试。')
                 _ensure_analysis_result_ready(analysis_report=analysis_report, charts=charts, tables=tables)
                 break
 
@@ -1717,6 +2237,13 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
             tables=tables,
             allow_report_only=allow_report_only,
         )
+    except AnalysisTaskCancelled as exc:
+        _fail_run_with_fresh_session(
+            runtime,
+            CANCELLED_MESSAGE,
+            preserve_existing_results=runtime.is_rerun,
+        )
+        raise RuntimeError(CANCELLED_MESSAGE) from exc
     except Exception as exc:
         user_error_message = get_user_facing_agent_error(exc)
         logger.error(
@@ -1755,7 +2282,7 @@ def _stream_with_runtime(
     # “原轮次重跑”并不等于“已经进入失败后的修复回合”。
     # 只有当前这次重跑真的执行过分析、且尚未成功收口时，才进入 retry 分支。
     analysis_flow_started = False
-    analysis_request_expected = is_analysis_like_request(agent_request.user_message)
+    analysis_request_expected = _is_analysis_request_expected(runtime, agent_request.user_message)
     allow_report_only = False
 
     yield _build_progress_event(
@@ -1844,6 +2371,7 @@ def _stream_with_runtime(
         agent = get_data_insight_agent(runtime_config)
 
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
+            _raise_if_analysis_task_cancelled(runtime)
             raw_tool_call_detected = False
             runtime_instruction = ''
             tool_result_ready = False
@@ -1869,6 +2397,18 @@ def _stream_with_runtime(
                     runtime=runtime,
                     user_message=agent_request.user_message,
                 )
+                if not runtime_instruction:
+                    runtime_instruction = _build_history_requirement_recovery_instruction(
+                        service=service,
+                        runtime=runtime,
+                        user_message=agent_request.user_message,
+                    )
+                if not runtime_instruction:
+                    runtime_instruction = _build_followup_hint_instruction(
+                        agent_request.user_message,
+                        context_mode=getattr(runtime, 'context_mode', None),
+                        runtime=runtime,
+                    )
             elif analysis_request_expected:
                 runtime_instruction = _build_analysis_start_instruction(agent_request.user_message)
                 yield _build_progress_event(
@@ -1889,6 +2429,7 @@ def _stream_with_runtime(
                 context=_build_agent_context(agent_request, runtime),
                 stream_mode=["updates", "custom"],
             ):
+                _raise_if_analysis_task_cancelled(runtime)
                 if stream_mode == "updates":
                     for _, payload in chunk.items():
                         messages = payload.get("messages", [])
@@ -2048,6 +2589,9 @@ def _stream_with_runtime(
                     break
                 if round_index < MAX_ANALYSIS_AGENT_ROUNDS - 1:
                     continue
+                latest_failed_error_type = _latest_failed_execution_error_type(runtime)
+                if latest_failed_error_type in {'contract_error', 'missing_query_constraints', 'invalid_query_constraints'}:
+                    raise ValueError('生成的分析代码未通过静态契约检查，且模型未按反馈重新生成可执行代码，请重试。')
                 _ensure_analysis_result_ready(analysis_report=analysis_report, charts=charts, tables=tables)
                 break
 
@@ -2091,6 +2635,20 @@ def _stream_with_runtime(
             conversation_id=runtime.conversation.id,
             turn_id=runtime.turn.id,
         )
+    except AnalysisTaskCancelled:
+        _fail_run_with_fresh_session(
+            runtime,
+            CANCELLED_MESSAGE,
+            preserve_existing_results=runtime.is_rerun,
+        )
+        yield _build_progress_event(
+            'error',
+            conversation_id=runtime.conversation.id,
+            turn_id=runtime.turn.id,
+            stage='cancelled',
+            level='warning',
+            message=CANCELLED_MESSAGE,
+        )
     except Exception as exc:
         user_error_message = get_user_facing_agent_error(exc)
         logger.error(
@@ -2130,6 +2688,7 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]
 
     selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)
     try:
+        _resolve_runtime_context_mode(runtime, agent_request.user_message)
         yield from _stream_with_runtime(service, runtime, agent_request)
     finally:
         reset_selected_model_id(selected_model_token)
@@ -2186,6 +2745,7 @@ def stream_rerun_turn(
 
     selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)
     try:
+        _resolve_runtime_context_mode(runtime, agent_request.user_message)
         yield from _stream_with_runtime(service, runtime, agent_request)
     finally:
         reset_selected_model_id(selected_model_token)
@@ -2234,6 +2794,7 @@ def stream_existing_turn_events(
         runtime = _load_runtime(session)
     selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)
     try:
+        _resolve_runtime_context_mode(runtime, agent_request.user_message)
         yield from _stream_with_runtime(None, runtime, agent_request)
     finally:
         reset_selected_model_id(selected_model_token)

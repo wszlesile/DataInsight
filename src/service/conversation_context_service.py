@@ -34,6 +34,7 @@ from utils.datasource_utils import (
     safe_json_loads,
     to_int,
 )
+from utils.analysis_task_cancel import AnalysisTaskCancelled, CANCELLED_MESSAGE, is_analysis_task_cancelled
 
 ROLE_TO_TYPE = {
     'system': 0,
@@ -86,6 +87,7 @@ class ConversationRunContext:
     history_turn_limit: int | None = None
     analysis_task_id: int | None = None
     short_term_memory: dict[str, Any] = field(default_factory=dict)
+    context_mode: str = ''
 
 
 class ConversationContextService:
@@ -266,6 +268,9 @@ class ConversationContextService:
         analysis_task_id: int | None = None,
     ) -> dict[str, Any]:
         """结束一次成功轮次，并刷新会话记忆。"""
+        if analysis_task_id and is_analysis_task_cancelled(task_pk=int(analysis_task_id or 0)):
+            raise AnalysisTaskCancelled(CANCELLED_MESSAGE)
+
         conversation = self._get_conversation_by_id(conversation_id)
         turn = self._get_turn_by_id(turn_id)
         if not conversation or not turn:
@@ -363,6 +368,9 @@ class ConversationContextService:
                 sort_no=100 + index,
             ))
 
+        if analysis_task_id and is_analysis_task_cancelled(task_pk=int(analysis_task_id or 0)):
+            raise AnalysisTaskCancelled(CANCELLED_MESSAGE)
+
         self._refresh_memories(conversation)
         self.session.commit()
         chart_artifacts = [artifact for artifact in artifacts if artifact.get('artifact_type') == 'chart']
@@ -416,6 +424,12 @@ class ConversationContextService:
         if not conversation or not turn:
             return
 
+        if (
+            turn.status == 'failed'
+            and (turn.final_answer or '').strip() == (error_message or '').strip()
+        ):
+            return
+
         if preserve_existing_results and self._turn_has_active_result(conversation, turn):
             self._archive_current_rerun_executions(conversation, turn)
             turn.status = 'success'
@@ -448,14 +462,53 @@ class ConversationContextService:
         self.session.commit()
 
     def _turn_has_active_result(self, conversation: InsightNsConversation, turn: InsightNsTurn) -> bool:
-        if (turn.final_answer or '').strip():
+        if self.session.query(InsightNsMessage.id).filter(
+            InsightNsMessage.insight_conversation_id == conversation.id,
+            InsightNsMessage.turn_id == turn.id,
+            InsightNsMessage.role == 'assistant',
+            InsightNsMessage.message_kind == 'final_answer',
+            InsightNsMessage.is_deleted == 0,
+            InsightNsMessage.content_enabled == 1,
+        ).first() is not None:
             return True
-        return self.session.query(InsightNsArtifact.id).filter(
+        if self.session.query(InsightNsArtifact.id).filter(
             InsightNsArtifact.conversation_id == conversation.id,
             InsightNsArtifact.turn_id == turn.id,
             InsightNsArtifact.is_deleted == 0,
             InsightNsArtifact.content_enabled == 1,
-        ).first() is not None
+        ).first() is not None:
+            return True
+
+        final_answer = (turn.final_answer or '').strip()
+        if not final_answer:
+            return False
+        return not self._looks_like_error_answer(final_answer)
+
+    @staticmethod
+    def _looks_like_error_answer(answer: str) -> bool:
+        text = (answer or '').strip().lower()
+        if not text:
+            return False
+        error_markers = (
+            'operationalerror',
+            'server closed the connection unexpectedly',
+            'background on this error',
+            'traceback',
+            'exception',
+            'error code:',
+            'platform-llm-gateway',
+            '网关超时',
+            '暂无可用渠道',
+            '请切换到其他可用模型后重试',
+            '请重试',
+            '未生成',
+            '执行失败',
+            '分析失败',
+            '用户已停止',
+            '已停止本轮分析',
+            '停止本轮分析',
+        )
+        return any(marker in text for marker in error_markers)
 
     def _archive_current_rerun_executions(
         self,

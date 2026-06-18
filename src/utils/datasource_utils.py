@@ -105,6 +105,13 @@ def _normalize_string_list(value: Any) -> list[str]:
     return normalized
 
 
+def normalize_fedquery_database_name(value: Any) -> str:
+    normalized = str(value or '').strip()
+    if normalized.startswith('feq_'):
+        return f"fqe_{normalized[4:]}"
+    return normalized
+
+
 def build_table_runtime_metadata(config_json: dict[str, Any] | None) -> dict[str, Any]:
     """Build prompt-safe metadata for table datasources with backwards compatibility."""
     config = config_json if isinstance(config_json, dict) else {}
@@ -153,8 +160,12 @@ def extract_datasource_identifier(datasource: Any, config_json: dict[str, Any]) 
                 or config_json.get('identify')
                 or getattr(datasource, 'datasource_name', '')
             )
+        database_name = normalize_fedquery_database_name(config_json.get('database_name'))
+        table_name = str(config_json.get('table_name') or '').strip()
+        if str(config_json.get('uns_data_type') or '').strip() == '9' and database_name and table_name:
+            return f"{database_name}.{table_name}"
         return (
-            config_json.get('table_name')
+            table_name
             or config_json.get('identify')
             or getattr(datasource, 'datasource_name', '')
         )

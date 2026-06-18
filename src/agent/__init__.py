@@ -249,6 +249,7 @@ def build_prompt_messages(
     extra_system_messages: list[str] | None = None,
     history_turn_limit: int | None = None,
     datasource_snapshot_override: dict[str, Any] | None = None,
+    context_mode: str | None = None,
 ) -> list[BaseMessage]:
     """
     为单次分析请求组装完整 Prompt 上下文。
@@ -309,6 +310,7 @@ def build_prompt_messages(
             max_turn_no=history_turn_limit,
             active_snapshot_override=datasource_snapshot_override,
             token_budget=budget_split["memory_budget"],
+            context_mode=context_mode,
         )
         if budget_split["memory_budget"] > 0
         else []
@@ -333,6 +335,7 @@ def build_prompt_messages(
             max_turn_no=history_turn_limit,
             user_message=user_message,
             token_budget=budget_split["history_budget"],
+            context_mode=context_mode,
         )
         messages.extend(_fit_optional_messages_within_budget(
             history_messages,
@@ -349,6 +352,7 @@ def get_input(
     extra_system_messages: list[str] | None = None,
     history_turn_limit: int | None = None,
     datasource_snapshot_override: dict[str, Any] | None = None,
+    context_mode: str | None = None,
 ) -> Any:
     """构建供 invoke/stream 调用使用的 Agent 输入载荷。"""
     return InputMessage(
@@ -359,6 +363,7 @@ def get_input(
             extra_system_messages=extra_system_messages,
             history_turn_limit=history_turn_limit,
             datasource_snapshot_override=datasource_snapshot_override,
+            context_mode=context_mode,
         )
     )
 

@@ -383,7 +383,7 @@
             </template>
           </div>
 
-          <ChatInput :loading="loading" @send="onSendMessage" />
+          <ChatInput :loading="loading" @send="onSendMessage" @stop="onStopAnalysis" />
         </section>
       </div>
     </div>
@@ -725,6 +725,7 @@ import {
   createConversation,
   createNamespace,
   createCollect,
+  cancelAnalysisTask,
   deleteConversation,
   deleteNamespace,
   exportTurnPdf,
@@ -1330,10 +1331,13 @@ const attachRunningTurn = (task) => {
   currentQuestion.value = task.request?.user_message || currentQuestion.value || '正在分析中...'
   removeHistoryTurn(task.turn_id)
   loading.value = true
+  const resumeMessage = task.status === 'queued'
+    ? '检测到当前会话有排队中的分析任务，正在等待执行...'
+    : '检测到当前会话有正在进行的分析，正在重新订阅实时输出...'
   addProgressItem({
     type: 'status',
     level: 'info',
-    message: '检测到当前会话有正在进行的分析，正在重新订阅实时输出...'
+    message: resumeMessage
   })
   subscribeTurnStream(task.conversation_id, task.turn_id)
   return true
@@ -2341,11 +2345,37 @@ const onSendMessage = async (content) => {
     activeConversationId.value = Number(task.conversation_id)
     currentTaskId.value = task.task_id || ''
     currentTurnId.value = Number(task.turn_id)
+    if (task.status === 'queued') {
+      addProgressItem({
+        type: 'status',
+        level: 'info',
+        message: '问题已进入分析队列，等待执行...'
+      })
+    }
     subscribeTurnStream(task.conversation_id, task.turn_id)
   } catch (error) {
     console.error('Submit analysis task error:', error)
     ElMessage.error(error?.message || '提交分析任务失败')
     loading.value = false
+  }
+}
+
+const onStopAnalysis = async () => {
+  if (!loading.value || !currentTaskId.value) return
+  try {
+    await cancelAnalysisTask(currentTaskId.value)
+    stopCurrentStream()
+    addProgressItem({
+      type: 'status',
+      level: 'warning',
+      message: '用户已停止本轮分析。'
+    })
+    currentReport.value = '用户已停止本轮分析。'
+    ElMessage.success('已停止分析')
+    await finalizeStreamRound()
+  } catch (error) {
+    console.error('Cancel analysis task error:', error)
+    ElMessage.error(error?.message || '停止分析失败')
   }
 }
 
