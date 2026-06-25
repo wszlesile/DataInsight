@@ -415,6 +415,7 @@ class InsightNsConversationService:
                 "message": "当前产物位置未关联该 Evidence。",
             }
         selected_context = self._build_selected_context(artifact_view, payload.get('selection') or {})
+        selected_context = self._normalize_selected_context_value(selected_context, evidence)
         detail_level = str(payload.get('detail_level') or 'summary').strip().lower()
         execution = self.session.query(InsightNsExecution).filter(
             InsightNsExecution.id == artifact.execution_id,
@@ -500,6 +501,9 @@ class InsightNsConversationService:
                 context["dimensions"] = {
                     key: value for key, value in rows[data_index].items() if key != value_field
                 }
+            elif isinstance(selection, dict) and selection.get('raw_value') not in (None, ''):
+                context["raw_value"] = selection.get('raw_value')
+                context["display_value"] = str(selection.get('raw_value'))
         elif artifact_type == 'report':
             start = to_int(selection.get('start'), -1) if isinstance(selection, dict) else -1
             end = to_int(selection.get('end'), -1) if isinstance(selection, dict) else -1
@@ -542,6 +546,7 @@ class InsightNsConversationService:
         quality_notes = evidence.get('quality_notes') or []
         relevant_source_refs = InsightNsConversationService._relevant_source_refs(source_refs, query_refs, queries)
         code_transformations = InsightNsConversationService._code_transformations(transformations)
+        selected_context = InsightNsConversationService._normalize_selected_context_value(selected_context, evidence)
 
         steps = [
             {
@@ -672,9 +677,23 @@ class InsightNsConversationService:
             'max': '最大值',
             'ratio': '比例',
             'percentage': '占比',
+            'count_distinct': '去重计数',
+            'distinct_count': '去重计数',
         }
         key = str(value or '').strip().lower()
         return mapping.get(key, str(value or '聚合'))
+
+    @staticmethod
+    def _business_formula_text(evidence: dict[str, Any], calculation: dict[str, Any]) -> str:
+        metric_name = str(evidence.get('metric_name') or '').strip()
+        metric_fields = " ".join(str(item) for item in calculation.get('metric_fields') or [])
+        formula = str(calculation.get('formula') or '').strip()
+        combined = f"{metric_name} {metric_fields} {formula}"
+        if '毛利率' in combined and not all(part in formula for part in ('毛利', '销售收入')):
+            return "毛利率 = 毛利 / 销售收入 × 100%"
+        if ('利润率' in combined or '收益率' in combined) and '/' not in formula:
+            return f"{metric_name} = 利润 / 收入 × 100%"
+        return ''
 
     @staticmethod
     def _friendly_metric(value: Any) -> str:
@@ -890,6 +909,19 @@ class InsightNsConversationService:
         ))
 
     @staticmethod
+    def _normalize_selected_context_value(selected_context: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
+        context = dict(selected_context or {})
+        value = context.get('display_value')
+        if value is None:
+            value = context.get('raw_value')
+        unit = str(evidence.get('unit') or '').strip()
+        if value not in (None, '') and unit:
+            text = str(value)
+            if unit not in text:
+                context['display_value'] = f"{text}{unit}" if unit == '%' else f"{text} {unit}"
+        return context
+
+    @staticmethod
     def _describe_sources(source_refs: Any, query_refs: list[str]) -> str:
         if isinstance(source_refs, list) and source_refs:
             names = [str(item.get('datasource_name') or item.get('datasource_identifier') or '数据源') for item in source_refs[:2] if isinstance(item, dict)]
@@ -1055,11 +1087,14 @@ class InsightNsConversationService:
     ) -> str:
         method = InsightNsConversationService._describe_calculation_method(calculation, derivation).rstrip('。')
         detail = InsightNsConversationService._describe_calculation(calculation, derivation, transformations).rstrip('。')
+        business_formula = InsightNsConversationService._business_formula_text(evidence, calculation)
         value = selected_context.get('display_value') or selected_context.get('raw_value')
         metric_name = evidence.get('metric_name') or '当前指标'
         parts = []
         if detail and detail not in method and not InsightNsConversationService._looks_like_query_scope_text(derivation.get('description')):
             parts.append(detail)
+        if business_formula:
+            parts.append(f"业务公式：{business_formula}")
         if method:
             parts.append(method)
         if value is not None:
@@ -1158,6 +1193,11 @@ class InsightNsConversationService:
         value = selected_context.get('display_value') or selected_context.get('raw_value')
         if value is not None:
             items.append({"label": "当前值", "value": value})
+        business_formula = InsightNsConversationService._business_formula_text(evidence, calculation)
+        if business_formula:
+            items.append({"label": "业务公式", "value": business_formula})
+        if calculation.get('formula'):
+            items.append({"label": "计算公式", "value": calculation.get('formula')})
         items.extend(InsightNsConversationService._calculation_items(
             calculation,
             intermediate_outputs,

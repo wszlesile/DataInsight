@@ -521,7 +521,7 @@ evidence_definitions = [
 - `query_refs` 必须引用本轮 `validate_query_constraints(query_key=...)` 使用过的真实 `query_key`；多查询计算可以引用多个 query key。
 - `calculation.metric_fields` 必须覆盖绑定的图表 `value_field/value_fields` 或表格指标列。
 - `derivation.description` 写给用户看，说明这个指标为什么这样算，例如“从筛选后的记录中取额定功率字段，分别计算平均值、最小值和最大值”，不要只写底层变量名。
-- `calculation` 记录算法和公式：聚合类写清 `aggregation`、`group_by`、`formula`；比例/完成率/差值/同比环比等复合指标必须在 `formula` 中说明分子、分母或前后项。
+- `calculation` 记录算法和公式：聚合类写清 `aggregation`、`group_by`、`formula`；比例、毛利率、利润率、完成率、占比、差值、同比环比等复合指标必须在 `formula` 中说明分子、分母或前后项，例如 `毛利率 = 毛利_元 / 销售收入_元 * 100`，不能只写 `AVG(毛利率_百分比)` 这类无法解释业务算法的字段聚合。
 - `transformations` 只记录查询之后、计算之前在 Python 中做的数据清洗、类型转换、排除、补齐、去重、二次过滤等动作；不要把 SQL `WHERE`、`ILIKE/LIKE`、时间范围、target_filters 这类查询口径过滤写到这里，也不要把最终聚合公式重复写到这里。如果查询结果直接进入计算，使用空列表。
 - 如果使用 `LIMIT`、TopN、抽样、采样、`head(...)`、`tail(...)`、`sample(...)`、`iloc[...]` 等缩减结果的策略，`quality_notes` 必须披露该策略及影响。
 - `intermediate_outputs` 只放小体量摘要，例如分子、分母、参与统计行数、过滤后行数、聚合后行数、最大/最小值、当前点击值对应的基础指标；不要放完整 DataFrame、明细行、大数组或敏感信息。

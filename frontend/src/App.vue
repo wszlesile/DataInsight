@@ -1304,6 +1304,9 @@ const findChartEvidenceRef = (chart, chartIndex, params = {}) => {
     const refIndex = Number(ref.chart_index || 0)
     const refField = getRefValueField(ref)
     return refIndex === Number(chartIndex || 0) && (!refField || valueFields.includes(refField))
+  }) || refs.find((ref, refIndex) => {
+    const refChartIndex = Number(ref.chart_index || 0)
+    return refChartIndex === Number(chartIndex || 0) && refIndex === Number(params?.seriesIndex ?? -1)
   }) || refs.find((ref) => Number(ref.chart_index || 0) === Number(chartIndex || 0))
 }
 
