@@ -37,6 +37,7 @@ def create_insight_ns_conversation_controller() -> Blueprint:
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/versions', methods=['GET'])(controller.list_turn_versions)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/versions/initial', methods=['GET'])(controller.get_initial_turn_version)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/versions/<int:analysis_task_id>', methods=['GET'])(controller.get_turn_version_detail)
+    blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/evidence/resolve', methods=['POST'])(controller.resolve_evidence)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/executions/<int:execution_id>/rerun', methods=['POST'])(controller.rerun_execution)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/stream', methods=['GET'])(controller.stream_turn_events)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/export/pdf', methods=['POST'])(controller.export_turn_pdf)
@@ -264,6 +265,24 @@ class InsightNsConversationController(BaseController):
             if detail is None:
                 return self.error_response('轮次版本不存在', 404)
             return jsonify(Result.success(data=detail).to_dict())
+        finally:
+            session.close()
+
+    def resolve_evidence(self, conversation_id: int, turn_id: int):
+        """解析产物位置对应的证据链详情。"""
+        data = self.get_json_data()
+        session = SessionLocal()
+        try:
+            service = InsightNsConversationService(session)
+            result = service.resolve_evidence(
+                username=self._get_username(),
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                payload=data,
+            )
+            if result is None:
+                return self.error_response('证据链不存在', 404)
+            return jsonify(Result.success(data=result).to_dict())
         finally:
             session.close()
 

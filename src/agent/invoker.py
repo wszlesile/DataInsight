@@ -1551,6 +1551,7 @@ def _is_chart_contract_error_text(text: str) -> bool:
     lowered = (text or '').lower()
     if any(marker in lowered for marker in (
         'chart_contract_error',
+        'chart_semantic_error',
         'structured chart item',
         'chart_document',
         'chart_spec',

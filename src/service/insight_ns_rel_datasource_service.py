@@ -244,9 +244,14 @@ class InsightNsRelDatasourceService:
         except ValueError as exc:
             return {"success": False, "message": str(exc)}
 
+        schema_payload = safe_json_loads(datasource.datasource_schema, {})
+        if not isinstance(schema_payload, dict):
+            schema_payload = {}
+
         page_data.update({
             "datasource_id": datasource.id,
             "datasource_name": datasource.datasource_name,
+            "datasource_description": str(schema_payload.get('description') or '').strip(),
             "file_name": str(config_payload.get('original_filename') or file_path.name),
             "sheet_name": sheet_name or '',
             "page_no": normalized_page_no,

@@ -41,6 +41,8 @@ CURRENT_USERNAME = ContextVar('current_username', default='anonymous')
 CURRENT_EXPECTED_TIME_RANGE = ContextVar('current_expected_time_range', default={})
 CURRENT_TIME_RANGE_GUARD_ACTIVE = ContextVar('current_time_range_guard_active', default=False)
 CURRENT_ANALYSIS_PARAMETERS_OVERRIDE = ContextVar('current_analysis_parameters_override', default={})
+CURRENT_QUERY_SNAPSHOTS = ContextVar('current_query_snapshots', default={})
+CURRENT_LAST_QUERY_KEY = ContextVar('current_last_query_key', default='')
 
 TOOL_ERROR_CURRENT_CODE_MAX_CHARS = int(os.environ.get('TOOL_ERROR_CURRENT_CODE_MAX_CHARS', '3500'))
 TOOL_ERROR_TEXT_MAX_CHARS = int(os.environ.get('TOOL_ERROR_TEXT_MAX_CHARS', '1800'))
@@ -55,6 +57,8 @@ GENERATED_CODE_CONTEXT_RADIUS = 2
 FRONTEND_TOOL_RETRY_MESSAGE = '分析代码规范需要调整，正在反馈给大模型重新生成。'
 FRONTEND_TOOL_ERROR_MESSAGE = '分析代码逻辑需要调整，正在反馈给大模型重新生成。'
 FRONTEND_TOOL_TIMEOUT_MESSAGE = '分析代码执行时间较长，正在反馈给大模型优化后重试。'
+QUERY_SNAPSHOT_SQL_MAX_CHARS = int(os.environ.get('QUERY_SNAPSHOT_SQL_MAX_CHARS', '8000'))
+QUERY_SNAPSHOT_CONTEXT_MAX_CHARS = int(os.environ.get('QUERY_SNAPSHOT_CONTEXT_MAX_CHARS', '12000'))
 
 CHART_CONTRACT_ERROR_MARKERS = (
     'structured chart item',
@@ -1160,7 +1164,18 @@ def load_minio_file(bucket: str, object_name: str, sheet_name: Optional[str] = N
 
 
 def load_data_with_sql(sql: str, params: Optional[list[Any]] = None):
-   return _load_data_with_fed_query(sql=sql,params=params)
+    start_time = time.time()
+    try:
+        data = _load_data_with_fed_query(sql=sql, params=params)
+    except Exception:
+        _mark_latest_query_snapshot_execution(status='failed', duration_ms=int((time.time() - start_time) * 1000))
+        raise
+    _mark_latest_query_snapshot_execution(
+        status='success',
+        duration_ms=int((time.time() - start_time) * 1000),
+        data=data,
+    )
+    return data
 
 def load_local_data_with_sql(sql: str, params: Optional[list[Any]] = None):
     """通过 SQL 从当前配置的数据源中加载表格数据。"""
@@ -1170,6 +1185,125 @@ def load_local_data_with_sql(sql: str, params: Optional[list[Any]] = None):
 
     with engine.connect() as connection:
         return pd.read_sql(sql, connection, params=params if params else None)
+
+
+def _copy_jsonable(value: Any, fallback: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    except Exception:
+        return fallback
+
+
+def _clip_snapshot_text(value: Any, max_chars: int) -> tuple[str, bool]:
+    text = str(value or '')
+    if len(text) <= max_chars:
+        return text, False
+    return text[:max_chars], True
+
+
+def _clip_snapshot_json(value: Any, max_chars: int) -> tuple[Any, bool]:
+    jsonable = _copy_jsonable(value, {})
+    text = json.dumps(jsonable, ensure_ascii=False, default=str)
+    if len(text) <= max_chars:
+        return jsonable, False
+    return {"truncated_preview": text[:max_chars]}, True
+
+
+def _normalize_query_key(query_key: str | None = None) -> str:
+    normalized = re.sub(r'[^A-Za-z0-9_-]+', '_', str(query_key or '').strip()).strip('_')
+    if normalized:
+        return normalized[:80]
+    snapshots = CURRENT_QUERY_SNAPSHOTS.get() or {}
+    return f"query_{len(snapshots) + 1}"
+
+
+def _register_query_snapshot(
+    *,
+    query_key: str,
+    query_constraints: Any,
+    sql: str = '',
+    filter_expressions: Optional[list[str]] = None,
+    aggregation_hints: Optional[list[str]] = None,
+    sql_context: Optional[dict[str, Any]] = None,
+) -> "RetryResult | None":
+    snapshots = dict(CURRENT_QUERY_SNAPSHOTS.get() or {})
+    sql_text, sql_truncated = _clip_snapshot_text(sql, QUERY_SNAPSHOT_SQL_MAX_CHARS)
+    sql_context_json, sql_context_truncated = _clip_snapshot_json(sql_context or {}, QUERY_SNAPSHOT_CONTEXT_MAX_CHARS)
+    snapshot = {
+        "query_key": query_key,
+        "query_constraints": _copy_jsonable(query_constraints, {}),
+        "implementation": {
+            "sql": sql_text,
+            "sql_hash": hashlib.sha256(str(sql or '').encode('utf-8')).hexdigest() if str(sql or '').strip() else '',
+            "sql_truncated": sql_truncated,
+            "filter_expressions": _copy_jsonable(filter_expressions or [], []),
+            "aggregation_hints": _copy_jsonable(aggregation_hints or [], []),
+            "sql_context": sql_context_json,
+            "sql_context_truncated": sql_context_truncated,
+        },
+        "execution": {
+            "status": "validated",
+        },
+    }
+    existing = snapshots.get(query_key)
+    if isinstance(existing, dict):
+        comparable_existing = {
+            "query_constraints": existing.get("query_constraints") or {},
+            "implementation": existing.get("implementation") or {},
+        }
+        comparable_new = {
+            "query_constraints": snapshot["query_constraints"],
+            "implementation": snapshot["implementation"],
+        }
+        if comparable_existing != comparable_new:
+            return request_retry(
+                retry_type="invalid_query_constraints",
+                message=f"query_key={query_key} 被重复用于不同查询，请为不同查询使用不同 query_key。",
+                diagnostics={"query_key": query_key},
+                repair_instructions=[
+                    "同一个 query_key 只能表示同一条逻辑查询。",
+                    "如果存在多条 SQL 或过滤逻辑，请分别使用不同的 query_key。",
+                ],
+            )
+        snapshot["execution"] = existing.get("execution") or snapshot["execution"]
+    snapshots[query_key] = snapshot
+    CURRENT_QUERY_SNAPSHOTS.set(snapshots)
+    CURRENT_LAST_QUERY_KEY.set(query_key)
+    return None
+
+
+def _mark_latest_query_snapshot_execution(
+    *,
+    status: str,
+    duration_ms: int = 0,
+    data: Any = None,
+) -> None:
+    query_key = str(CURRENT_LAST_QUERY_KEY.get() or '').strip()
+    if not query_key:
+        return
+    snapshots = dict(CURRENT_QUERY_SNAPSHOTS.get() or {})
+    snapshot = snapshots.get(query_key)
+    if not isinstance(snapshot, dict):
+        return
+    execution = dict(snapshot.get("execution") or {})
+    execution["status"] = status
+    if duration_ms >= 0:
+        execution["duration_ms"] = int(duration_ms)
+    if data is not None:
+        try:
+            execution["row_count"] = int(len(data))
+        except Exception:
+            pass
+        columns = getattr(data, "columns", None)
+        if columns is not None:
+            try:
+                execution["columns"] = [str(column) for column in list(columns)]
+            except Exception:
+                pass
+    execution["executed_at"] = datetime.now().isoformat()
+    snapshot["execution"] = execution
+    snapshots[query_key] = snapshot
+    CURRENT_QUERY_SNAPSHOTS.set(snapshots)
 
 def load_data_with_api(
     endpoint: str,
@@ -1458,6 +1592,12 @@ class StructuredResult(BaseModel):
     tables: list[dict[str, Any]] = Field(default_factory=list, description="表格产物列表")
     analysis_parameters_schema: dict[str, Any] = Field(default_factory=dict, description="Reusable parameter schema")
     analysis_parameters: dict[str, Any] = Field(default_factory=dict, description="Actual parameter values")
+    evidence_definitions: list[dict[str, Any]] = Field(default_factory=list, description="Evidence definitions keyed by calculation logic")
+    chart_trace_refs: list[dict[str, Any]] = Field(default_factory=list, description="Chart position refs to evidence definitions")
+    table_trace_refs: list[dict[str, Any]] = Field(default_factory=list, description="Table position refs to evidence definitions")
+    report_trace_refs: list[dict[str, Any]] = Field(default_factory=list, description="Report text refs to evidence definitions")
+    table_trace_metadata: dict[str, Any] = Field(default_factory=dict, description="Sidecar metadata for table trace validation")
+    query_snapshots: dict[str, Any] = Field(default_factory=dict, description="Runtime query snapshots collected by backend")
 
 
 class RetryResult(BaseModel):
@@ -1470,7 +1610,15 @@ class RetryResult(BaseModel):
         "missing_report",
         "incomplete_result",
         "contract_error",
+        "result_contract_error",
         "chart_contract_error",
+        "missing_evidence_contract",
+        "invalid_evidence_definition",
+        "invalid_evidence_query_ref",
+        "invalid_chart_trace_ref",
+        "invalid_table_trace_ref",
+        "invalid_report_trace_ref",
+        "evidence_over_expansion",
         "missing_query_constraints",
         "invalid_query_constraints",
         "query_constraint_violation",
@@ -1558,7 +1706,15 @@ def request_retry(
         "missing_report",
         "incomplete_result",
         "contract_error",
+        "result_contract_error",
         "chart_contract_error",
+        "missing_evidence_contract",
+        "invalid_evidence_definition",
+        "invalid_evidence_query_ref",
+        "invalid_chart_trace_ref",
+        "invalid_table_trace_ref",
+        "invalid_report_trace_ref",
+        "evidence_over_expansion",
         "missing_query_constraints",
         "invalid_query_constraints",
         "query_constraint_violation",
@@ -2237,6 +2393,7 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
 
 def validate_query_constraints(
     query_constraints: Any,
+    query_key: str = '',
     sql: str = '',
     filter_expressions: Optional[list[str]] = None,
     aggregation_hints: Optional[list[str]] = None,
@@ -2362,7 +2519,15 @@ def validate_query_constraints(
                     '如果需要先探测候选值，请改成 execution_intent = "probe"，不要在 analysis 阶段继续放宽口径。',
                 ],
             )
-    return None
+    normalized_query_key = _normalize_query_key(query_key)
+    return _register_query_snapshot(
+        query_key=normalized_query_key,
+        query_constraints=query_constraints,
+        sql=sql,
+        filter_expressions=filter_expressions,
+        aggregation_hints=aggregation_hints,
+        sql_context=sql_context,
+    )
 
 
 def save_empty_analysis_result(
@@ -2438,6 +2603,105 @@ def _normalize_table_items(tables: Optional[list[dict[str, Any]]] = None) -> lis
     return normalized_items
 
 
+def build_table_result(
+    title: str,
+    description: str = '',
+    columns: Optional[list[dict[str, Any]]] = None,
+    rows: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Build a clean table artifact plus sidecar trace metadata."""
+    clean_columns: list[dict[str, Any]] = []
+    column_roles: dict[str, str] = {}
+    column_value_types: dict[str, str] = {}
+    column_units: dict[str, str] = {}
+    for index, column in enumerate(columns or [], start=1):
+        if not isinstance(column, dict):
+            raise ValueError('build_table_result.columns 中的每一项都必须是 dict。')
+        key = str(column.get('key') or column.get('dataIndex') or column.get('label') or f'col_{index}').strip()
+        label = str(column.get('label') or column.get('title') or key).strip()
+        clean_columns.append({"key": key, "label": label})
+        role = str(column.get('role') or '').strip()
+        if role:
+            column_roles[key] = role
+        value_type = str(column.get('value_type') or '').strip()
+        if value_type:
+            column_value_types[key] = value_type
+        unit = str(column.get('unit') or '').strip()
+        if unit:
+            column_units[key] = unit
+
+    clean_rows = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            raise ValueError('build_table_result.rows 中的每一项都必须是 dict。')
+        clean_rows.append(dict(row))
+
+    return {
+        "table": {
+            "title": str(title or '表格').strip() or '表格',
+            "description": str(description or '').strip(),
+            "columns": clean_columns,
+            "rows": clean_rows,
+        },
+        "trace_metadata": {
+            "column_roles": column_roles,
+            "column_value_types": column_value_types,
+            "column_units": column_units,
+        },
+    }
+
+
+REPORT_TRACE_PATTERN = re.compile(
+    r"\[\[trace:evidence_key=(?P<key>[A-Za-z0-9_-]+)\]\](?P<text>.*?)\[\[/trace\]\]",
+    re.DOTALL,
+)
+
+
+def build_report_result(report_markdown_with_trace_tags: str) -> dict[str, Any]:
+    """Strip report trace tags and return clean Markdown plus report trace refs."""
+    source = str(report_markdown_with_trace_tags or '')
+    if not source.strip():
+        raise ValueError('报告内容不能为空。')
+    if '[[trace:' in source and '[[/trace]]' not in source:
+        raise ValueError('报告 trace 标签未闭合。')
+
+    output_parts: list[str] = []
+    refs: list[dict[str, Any]] = []
+    cursor = 0
+    clean_length = 0
+    for match in REPORT_TRACE_PATTERN.finditer(source):
+        prefix = source[cursor:match.start()]
+        output_parts.append(prefix)
+        clean_length += len(prefix)
+        evidence_key = str(match.group('key') or '').strip()
+        text = str(match.group('text') or '')
+        if not evidence_key or not text:
+            raise ValueError('报告 trace 标签必须包含 evidence_key 和非空文本。')
+        if '[[trace:' in text or '[[/trace]]' in text:
+            raise ValueError('报告 trace 标签不允许嵌套。')
+        start = clean_length
+        output_parts.append(text)
+        clean_length += len(text)
+        refs.append({
+            "evidence_key": evidence_key,
+            "start": start,
+            "end": clean_length,
+            "text": text,
+        })
+        cursor = match.end()
+    output_parts.append(source[cursor:])
+    clean_report = ''.join(output_parts)
+    if '[[trace:' in clean_report or '[[/trace]]' in clean_report:
+        raise ValueError('报告 trace 标签格式不合法或未被完整清洗。')
+    for ref in refs:
+        if clean_report[int(ref["start"]):int(ref["end"])] != ref["text"]:
+            raise ValueError('报告 trace ref 字符区间校验失败。')
+    return {
+        "analysis_report": clean_report.strip(),
+        "report_trace_refs": refs,
+    }
+
+
 def get_analysis_parameters(defaults: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Return generated-code defaults merged with local rerun overrides."""
     base = dict(defaults or {})
@@ -2453,6 +2717,11 @@ def save_analysis_result(
     tables: Optional[list[dict[str, Any]]] = None,
     analysis_parameters_schema: Optional[dict[str, Any]] = None,
     analysis_parameters: Optional[dict[str, Any]] = None,
+    evidence_definitions: Optional[list[dict[str, Any]]] = None,
+    chart_trace_refs: Optional[list[dict[str, Any]]] = None,
+    table_trace_refs: Optional[list[dict[str, Any]]] = None,
+    report_trace_refs: Optional[list[dict[str, Any]]] = None,
+    table_trace_metadata: Optional[dict[str, Any]] = None,
 ) -> StructuredResult:
     """
     结束一次由生成代码驱动的分析任务，并返回标准结构化结果。
@@ -2475,6 +2744,12 @@ def save_analysis_result(
         tables=normalized_tables,
         analysis_parameters_schema=analysis_parameters_schema or {},
         analysis_parameters=analysis_parameters or {},
+        evidence_definitions=_copy_jsonable(evidence_definitions or [], []),
+        chart_trace_refs=_copy_jsonable(chart_trace_refs or [], []),
+        table_trace_refs=_copy_jsonable(table_trace_refs or [], []),
+        report_trace_refs=_copy_jsonable(report_trace_refs or [], []),
+        table_trace_metadata=_copy_jsonable(table_trace_metadata or {}, {}),
+        query_snapshots=_copy_jsonable(CURRENT_QUERY_SNAPSHOTS.get() or {}, {}),
     )
 
 
@@ -2896,6 +3171,527 @@ def _find_untracked_datasource_mentions(
     return mentions
 
 
+SYSTEM_EVIDENCE_FIELDS = {
+    'turn_id',
+    'execution_id',
+    'artifact_id',
+    'evidence_id',
+    'datasource_id',
+    'datasource_ids',
+    'analysis_parameters',
+    'query_constraints',
+    'sql',
+}
+
+
+def _report_has_traceable_numeric_value(analysis_report: str) -> bool:
+    text = str(analysis_report or '')
+    if not text.strip():
+        return False
+    return re.search(r'(?<![A-Za-z0-9_])\d+(?:\.\d+)?\s*(?:%|台|个|家|种|年|月|日|kW|KW|kw)?', text) is not None
+
+
+_REPORT_TRACEABLE_NUMBER_PATTERN = re.compile(
+    r'(?<![A-Za-z0-9_])\d+(?:\.\d+)?\s*(?:%|台|个|家|种|条|次|kW|KW|kw|元|万元|小时|分钟)'
+)
+
+
+def _uncovered_report_numeric_values(analysis_report: str, report_trace_refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    text = str(analysis_report or '')
+    if not text.strip():
+        return []
+    ranges: list[tuple[int, int]] = []
+    for ref in report_trace_refs or []:
+        if not isinstance(ref, dict):
+            continue
+        try:
+            start = int(ref.get('start'))
+            end = int(ref.get('end'))
+        except Exception:
+            continue
+        ranges.append((start, end))
+    uncovered: list[dict[str, Any]] = []
+    for match in _REPORT_TRACEABLE_NUMBER_PATTERN.finditer(text):
+        start, end = match.span()
+        if any(start >= ref_start and end <= ref_end for ref_start, ref_end in ranges):
+            continue
+        context_start = max(0, start - 30)
+        context_end = min(len(text), end + 30)
+        uncovered.append({
+            "text": match.group(0),
+            "start": start,
+            "end": end,
+            "context": text[context_start:context_end],
+        })
+        if len(uncovered) >= 20:
+            break
+    return uncovered
+
+
+def _chart_document_columns(chart: dict[str, Any]) -> set[str]:
+    document = chart.get('chart_document') if isinstance(chart, dict) else None
+    if not isinstance(document, dict):
+        return set()
+    dataset = document.get('dataset') if isinstance(document.get('dataset'), dict) else {}
+    columns = dataset.get('columns') or []
+    if not columns and isinstance(dataset.get('rows'), list) and dataset.get('rows') and isinstance(dataset['rows'][0], dict):
+        columns = list(dataset['rows'][0].keys())
+    return {str(column) for column in columns}
+
+
+def _expected_chart_trace_refs(charts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    expected: list[dict[str, Any]] = []
+    for chart_index, chart in enumerate(charts or []):
+        if not isinstance(chart, dict):
+            continue
+        document = chart.get('chart_document') or {}
+        if not isinstance(document, dict):
+            continue
+        encoding = document.get('encoding') or {}
+        if not isinstance(encoding, dict):
+            continue
+        chart_kind = str(document.get('chart_kind') or chart.get('chart_type') or '').strip().lower()
+        value_fields = [str(item) for item in (encoding.get('value_fields') or []) if str(item).strip()]
+        if value_fields:
+            for value_field in value_fields:
+                expected.append({"chart_index": chart_index, "value_field": value_field, "chart_kind": chart_kind})
+            continue
+        value_field = str(encoding.get('value_field') or '').strip()
+        if value_field:
+            expected.append({"chart_index": chart_index, "value_field": value_field, "chart_kind": chart_kind})
+            continue
+        if chart_kind == 'scatter':
+            for field_name in ('x_field', 'y_field'):
+                field_value = str(encoding.get(field_name) or '').strip()
+                if field_value:
+                    expected.append({"chart_index": chart_index, "value_field": field_value, "chart_kind": chart_kind})
+    return expected
+
+
+def _normalize_ref_chart_index(ref: dict[str, Any]) -> int:
+    try:
+        return int(ref.get('chart_index') or 0)
+    except Exception:
+        return 0
+
+
+def _normalize_ref_table_index(ref: dict[str, Any]) -> int:
+    try:
+        return int(ref.get('table_index') or 0)
+    except Exception:
+        return 0
+
+
+def _ref_value_field(ref: dict[str, Any]) -> str:
+    return str(ref.get('value_field') or ref.get('field') or ref.get('x_field') or ref.get('y_field') or '').strip()
+
+
+def _normalize_table_trace_metadata(table_trace_metadata: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    if not isinstance(table_trace_metadata, dict) or not table_trace_metadata:
+        return {}
+    if isinstance(table_trace_metadata.get('tables'), list):
+        return {
+            index: item for index, item in enumerate(table_trace_metadata.get('tables') or [])
+            if isinstance(item, dict)
+        }
+    if isinstance(table_trace_metadata.get('by_table'), dict):
+        result: dict[int, dict[str, Any]] = {}
+        for key, value in table_trace_metadata.get('by_table', {}).items():
+            if isinstance(value, dict):
+                try:
+                    result[int(key)] = value
+                except Exception:
+                    continue
+        return result
+    return {0: table_trace_metadata}
+
+
+def _table_column_keys(table: dict[str, Any]) -> set[str]:
+    columns = table.get('columns') if isinstance(table, dict) else []
+    keys: set[str] = set()
+    for column in columns or []:
+        if isinstance(column, dict):
+            key = str(column.get('key') or column.get('dataIndex') or '').strip()
+            label = str(column.get('label') or column.get('title') or '').strip()
+            if key:
+                keys.add(key)
+            if label:
+                keys.add(label)
+        else:
+            text = str(column or '').strip()
+            if text:
+                keys.add(text)
+    return keys
+
+
+def _expected_table_trace_refs(tables: list[dict[str, Any]], table_trace_metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    metadata_by_table = _normalize_table_trace_metadata(table_trace_metadata)
+    expected: list[dict[str, Any]] = []
+    for table_index, table in enumerate(tables or []):
+        metadata = metadata_by_table.get(table_index) or (metadata_by_table.get(0) if len(tables or []) == 1 else {})
+        column_roles = metadata.get('column_roles') if isinstance(metadata, dict) else {}
+        if not isinstance(column_roles, dict):
+            continue
+        for column_key, role in column_roles.items():
+            if str(role).strip().lower() == 'metric':
+                expected.append({"table_index": table_index, "column_key": str(column_key)})
+    return expected
+
+
+def _ref_table_column(ref: dict[str, Any]) -> str:
+    return str(ref.get('column_key') or ref.get('value_column') or ref.get('column') or '').strip()
+
+
+def _serialized_size(value: Any) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False, default=str))
+    except Exception:
+        return len(str(value))
+
+
+def _find_intermediate_output_issue(evidence_key: str, intermediate_outputs: Any) -> dict[str, Any] | None:
+    if intermediate_outputs in (None, []):
+        return None
+    if not isinstance(intermediate_outputs, list):
+        return {"evidence_key": evidence_key, "reason": "intermediate_outputs 必须是 list"}
+    if len(intermediate_outputs) > 20:
+        return {"evidence_key": evidence_key, "reason": "intermediate_outputs 数量过多", "count": len(intermediate_outputs)}
+    if _serialized_size(intermediate_outputs) > 8000:
+        return {"evidence_key": evidence_key, "reason": "intermediate_outputs 体积过大"}
+    for index, item in enumerate(intermediate_outputs):
+        if _serialized_size(item) > 1200:
+            return {"evidence_key": evidence_key, "index": index, "reason": "单个中间结果过大"}
+        if isinstance(item, list) and len(item) > 20:
+            return {"evidence_key": evidence_key, "index": index, "reason": "中间结果不能保存大数组"}
+        if isinstance(item, dict):
+            if len(item) > 12:
+                return {"evidence_key": evidence_key, "index": index, "reason": "中间结果字段过多"}
+            lowered_keys = {str(key).lower() for key in item.keys()}
+            if {'rows', 'dataframe', 'records', 'details'} & lowered_keys:
+                return {"evidence_key": evidence_key, "index": index, "reason": "中间结果疑似包含明细数据"}
+    return None
+
+
+def _validate_evidence_contract(exec_result: StructuredResult, *, generated_code: str = '') -> RetryResult | None:
+    evidence_definitions = exec_result.evidence_definitions or []
+    trace_ref_groups = {
+        'chart_trace_refs': exec_result.chart_trace_refs or [],
+        'table_trace_refs': exec_result.table_trace_refs or [],
+        'report_trace_refs': exec_result.report_trace_refs or [],
+    }
+    has_evidence_payload = bool(evidence_definitions or any(trace_ref_groups.values()))
+    if not has_evidence_payload:
+        if exec_result.charts or exec_result.tables or _report_has_traceable_numeric_value(exec_result.analysis_report):
+            return request_retry(
+                retry_type="missing_evidence_contract",
+                message="当前分析结果包含图表、表格或报告数值，但没有提供 evidence_definitions 和 trace refs。",
+                diagnostics={
+                    "chart_count": len(exec_result.charts or []),
+                    "table_count": len(exec_result.tables or []),
+                    "report_has_numeric_value": _report_has_traceable_numeric_value(exec_result.analysis_report),
+                },
+                repair_instructions=[
+                    "按计算逻辑边界补充 evidence_definitions，不要按每个数据点生成 Evidence。",
+                    "图表补充 chart_trace_refs，表格补充 table_trace_refs。",
+                    "报告中的核心计算数值使用 [[trace:evidence_key=xxx]]数值[[/trace]] 包裹，并通过 build_report_result(...) 生成 report_trace_refs。",
+                ],
+                analysis_report=exec_result.analysis_report,
+            )
+        return None
+    if not evidence_definitions:
+        return request_retry(
+            retry_type="missing_evidence_contract",
+            message="当前结果声明了 trace refs，但没有提供 evidence_definitions。",
+            diagnostics={name: len(items) for name, items in trace_ref_groups.items()},
+            repair_instructions=[
+                "补充 evidence_definitions，并让每个 trace ref 的 evidence_key 能命中对应 EvidenceDefinition。",
+                "EvidenceDefinition 按计算逻辑边界生成，不要按数据点或表格行逐个生成。",
+            ],
+            analysis_report=exec_result.analysis_report,
+        )
+
+    evidence_by_key: dict[str, dict[str, Any]] = {}
+    for index, item in enumerate(evidence_definitions):
+        if not isinstance(item, dict):
+            return request_retry(
+                retry_type="invalid_evidence_definition",
+                message="evidence_definitions 中的每一项都必须是 dict。",
+                diagnostics={"index": index},
+                repair_instructions=["按 EvidenceDefinition 结构重写 evidence_definitions。"],
+                analysis_report=exec_result.analysis_report,
+            )
+        evidence_key = str(item.get('evidence_key') or '').strip()
+        if not evidence_key:
+            return request_retry(
+                retry_type="invalid_evidence_definition",
+                message="EvidenceDefinition 缺少 evidence_key。",
+                diagnostics={"index": index},
+                repair_instructions=["为每条 EvidenceDefinition 提供 execution 内唯一的 evidence_key。"],
+                analysis_report=exec_result.analysis_report,
+            )
+        if evidence_key in evidence_by_key:
+            return request_retry(
+                retry_type="invalid_evidence_definition",
+                message=f"EvidenceDefinition.evidence_key={evidence_key} 重复。",
+                diagnostics={"evidence_key": evidence_key},
+                repair_instructions=["合并重复 Evidence，或为不同计算逻辑使用不同 evidence_key。"],
+                analysis_report=exec_result.analysis_report,
+            )
+        forbidden_fields = sorted(field for field in SYSTEM_EVIDENCE_FIELDS if field in item)
+        if forbidden_fields:
+            return request_retry(
+                retry_type="invalid_evidence_definition",
+                message="EvidenceDefinition 包含应由后端注入的系统事实字段。",
+                diagnostics={"evidence_key": evidence_key, "forbidden_fields": forbidden_fields},
+                repair_instructions=[
+                    "移除 turn_id、execution_id、artifact_id、evidence_id、datasource_id、sql、query_constraints 等系统字段。",
+                    "EvidenceDefinition 只保留指标名、单位、query_refs、计算说明、转换步骤和必要中间结果。",
+                ],
+                analysis_report=exec_result.analysis_report,
+            )
+        intermediate_issue = _find_intermediate_output_issue(evidence_key, item.get('intermediate_outputs'))
+        if intermediate_issue is not None:
+            return request_retry(
+                retry_type="invalid_evidence_definition",
+                message="EvidenceDefinition.intermediate_outputs 只能保存小体量摘要，不能保存明细或大对象。",
+                diagnostics=intermediate_issue,
+                repair_instructions=[
+                    "删除完整 DataFrame、明细行数组、大列表和调试变量。",
+                    "只保留用户理解指标必要的分子、分母、聚合行数、样本数等小体量摘要。",
+                ],
+                analysis_report=exec_result.analysis_report,
+            )
+        query_refs = item.get('query_refs') or []
+        if not isinstance(query_refs, list) or not query_refs:
+            return request_retry(
+                retry_type="invalid_evidence_query_ref",
+                message="EvidenceDefinition.query_refs 不能为空。",
+                diagnostics={"evidence_key": evidence_key},
+                repair_instructions=["每条 EvidenceDefinition 至少引用一个真实 query_key。"],
+                analysis_report=exec_result.analysis_report,
+            )
+        evidence_by_key[evidence_key] = item
+
+    query_snapshots = exec_result.query_snapshots or {}
+    missing_query_refs: list[dict[str, Any]] = []
+    for evidence_key, item in evidence_by_key.items():
+        for query_ref in item.get('query_refs') or []:
+            if str(query_ref) not in query_snapshots:
+                missing_query_refs.append({"evidence_key": evidence_key, "query_ref": query_ref})
+    if missing_query_refs:
+        return request_retry(
+            retry_type="invalid_evidence_query_ref",
+            message="EvidenceDefinition.query_refs 引用了不存在的 query snapshot。",
+            diagnostics={
+                "missing_query_refs": missing_query_refs[:20],
+                "available_query_keys": sorted(query_snapshots.keys()),
+            },
+            repair_instructions=[
+                "query_refs 只能引用 validate_query_constraints(...) 成功采集到的 query_key。",
+                "如果是多查询场景，请在 validate_query_constraints(query_key=...) 中显式声明稳定 query_key。",
+            ],
+            analysis_report=exec_result.analysis_report,
+        )
+
+    reduction_clauses = _extract_sql_limit_clauses(generated_code) + _extract_dataframe_reduction_clauses(generated_code)
+    if reduction_clauses:
+        missing_quality_notes = []
+        for evidence_key, item in evidence_by_key.items():
+            quality_text = json.dumps(item.get('quality_notes') or [], ensure_ascii=False, default=str)
+            if not _text_discloses_limit_usage(quality_text):
+                missing_quality_notes.append(evidence_key)
+        if missing_quality_notes:
+            return request_retry(
+                retry_type="invalid_evidence_definition",
+                message="代码使用了 LIMIT/采样/截取策略，但部分 Evidence.quality_notes 没有披露该风险。",
+                diagnostics={
+                    "reduction_clauses": reduction_clauses[:10],
+                    "missing_quality_notes": missing_quality_notes[:20],
+                },
+                repair_instructions=[
+                    "保留已通过的查询和产物结构，在对应 EvidenceDefinition.quality_notes 中说明 LIMIT、TopN、采样或截取口径。",
+                    "如果当前指标未受截取影响，请在 quality_notes 中明确说明原因。",
+                ],
+                analysis_report=exec_result.analysis_report,
+            )
+
+    used_evidence_keys: set[str] = set()
+    for group_name, refs in trace_ref_groups.items():
+        for index, ref in enumerate(refs):
+            if not isinstance(ref, dict):
+                return request_retry(
+                    retry_type="invalid_evidence_definition",
+                    message=f"{group_name} 中的每一项都必须是 dict。",
+                    diagnostics={"group": group_name, "index": index},
+                    repair_instructions=["按 trace ref 结构重写 refs。"],
+                    analysis_report=exec_result.analysis_report,
+                )
+            evidence_key = str(ref.get('evidence_key') or '').strip()
+            if evidence_key not in evidence_by_key:
+                return request_retry(
+                    retry_type="invalid_evidence_definition",
+                    message=f"{group_name} 引用了不存在的 evidence_key。",
+                    diagnostics={"group": group_name, "index": index, "evidence_key": evidence_key},
+                    repair_instructions=["修正 trace ref 的 evidence_key，使其命中 evidence_definitions。"],
+                    analysis_report=exec_result.analysis_report,
+                )
+            used_evidence_keys.add(evidence_key)
+
+    for index, ref in enumerate(exec_result.report_trace_refs or []):
+        try:
+            start = int(ref.get('start'))
+            end = int(ref.get('end'))
+        except Exception:
+            return request_retry(
+                retry_type="invalid_report_trace_ref",
+                message="report_trace_refs 的 start/end 必须是整数。",
+                diagnostics={"index": index, "ref": ref},
+                repair_instructions=["优先使用 build_report_result(...) 生成 report_trace_refs，不要手写字符区间。"],
+                analysis_report=exec_result.analysis_report,
+            )
+        text = str(ref.get('text') or '')
+        if start < 0 or end < start or exec_result.analysis_report[start:end] != text:
+            return request_retry(
+                retry_type="invalid_report_trace_ref",
+                message="report_trace_refs 的字符区间与最终 Markdown 不一致。",
+                diagnostics={"index": index, "ref": ref},
+                repair_instructions=["使用 build_report_result(...) 从 trace 标签生成干净 Markdown 和 report_trace_refs。"],
+                analysis_report=exec_result.analysis_report,
+            )
+
+    if _report_has_traceable_numeric_value(exec_result.analysis_report) and not exec_result.report_trace_refs:
+        return request_retry(
+            retry_type="invalid_report_trace_ref",
+            message="报告中包含计算数值，但缺少 report_trace_refs，报告数值无法点击查看证据链。",
+            diagnostics={"analysis_report_preview": str(exec_result.analysis_report or '')[:500]},
+            repair_instructions=[
+                "将报告中的核心计算数值用 [[trace:evidence_key=xxx]]数值[[/trace]] 包裹。",
+                "调用 build_report_result(...) 生成干净 analysis_report 和 report_trace_refs。",
+                "把 report_trace_refs 传给 save_analysis_result(...)。",
+            ],
+            analysis_report=exec_result.analysis_report,
+        )
+
+    uncovered_report_values = _uncovered_report_numeric_values(
+        exec_result.analysis_report,
+        exec_result.report_trace_refs or [],
+    )
+    if uncovered_report_values:
+        return request_retry(
+            retry_type="invalid_report_trace_ref",
+            message="报告中仍有计算数值没有被 report_trace_refs 覆盖，无法点击查看证据链。",
+            diagnostics={
+                "uncovered_numeric_values": uncovered_report_values[:12],
+                "report_trace_ref_count": len(exec_result.report_trace_refs or []),
+            },
+            repair_instructions=[
+                "将报告正文中所有由代码计算、聚合、统计或格式化得到的数值都用 [[trace:evidence_key=xxx]]数值[[/trace]] 包裹。",
+                "同一计算逻辑下的多个报告数值可以复用同一个 evidence_key，例如分布数量和占比可绑定到对应分布 EvidenceDefinition。",
+                "章节编号、普通序号、非计算性的日期参数不需要 trace；但概览数值、分布数量/占比、平均值、最大值、最小值、总数、TopN 数值都必须 trace。",
+                "调用 build_report_result(...) 生成干净 analysis_report 和完整 report_trace_refs，并传给 save_analysis_result(...)。",
+            ],
+            analysis_report=exec_result.analysis_report,
+        )
+
+    expected_chart_refs = _expected_chart_trace_refs(exec_result.charts or [])
+    actual_chart_ref_keys = {
+        (_normalize_ref_chart_index(ref), _ref_value_field(ref))
+        for ref in (exec_result.chart_trace_refs or [])
+        if isinstance(ref, dict)
+    }
+    missing_chart_refs = [
+        item for item in expected_chart_refs
+        if (int(item["chart_index"]), str(item["value_field"])) not in actual_chart_ref_keys
+    ]
+    if expected_chart_refs and missing_chart_refs:
+        return request_retry(
+            retry_type="invalid_chart_trace_ref",
+            message="图表中的指标字段缺少 chart_trace_refs，无法定位到 Evidence。",
+            diagnostics={"missing_chart_refs": missing_chart_refs[:20]},
+            repair_instructions=[
+                "为每个 chart_document.encoding.value_field 或 value_fields[*] 补充 chart_trace_refs。",
+                "chart_trace_refs 使用 chart_index、value_field 和 evidence_key；同一计算逻辑可以共享同一个 evidence_key。",
+            ],
+            analysis_report=exec_result.analysis_report,
+        )
+    invalid_chart_refs = []
+    for index, ref in enumerate(exec_result.chart_trace_refs or []):
+        if not isinstance(ref, dict):
+            continue
+        chart_index = _normalize_ref_chart_index(ref)
+        value_field = _ref_value_field(ref)
+        if chart_index < 0 or chart_index >= len(exec_result.charts or []):
+            invalid_chart_refs.append({"index": index, "reason": "chart_index 越界", "ref": ref})
+            continue
+        columns = _chart_document_columns((exec_result.charts or [])[chart_index])
+        if columns and value_field and value_field not in columns:
+            invalid_chart_refs.append({"index": index, "reason": "value_field 不存在于 chart_document.dataset", "ref": ref})
+    if invalid_chart_refs:
+        return request_retry(
+            retry_type="invalid_chart_trace_ref",
+            message="chart_trace_refs 指向了不存在的图表或字段。",
+            diagnostics={"invalid_chart_refs": invalid_chart_refs[:20]},
+            repair_instructions=["按 chart_document.dataset.columns 和 encoding 字段修正 chart_trace_refs。"],
+            analysis_report=exec_result.analysis_report,
+        )
+
+    expected_table_refs = _expected_table_trace_refs(exec_result.tables or [], exec_result.table_trace_metadata or {})
+    actual_table_ref_keys = {
+        (_normalize_ref_table_index(ref), _ref_table_column(ref))
+        for ref in (exec_result.table_trace_refs or [])
+        if isinstance(ref, dict)
+    }
+    missing_table_refs = [
+        item for item in expected_table_refs
+        if (int(item["table_index"]), str(item["column_key"])) not in actual_table_ref_keys
+    ]
+    if expected_table_refs and missing_table_refs:
+        return request_retry(
+            retry_type="invalid_table_trace_ref",
+            message="表格 metric 列缺少 table_trace_refs，无法定位到 Evidence。",
+            diagnostics={"missing_table_refs": missing_table_refs[:20]},
+            repair_instructions=[
+                "通过 build_table_result(...) 声明 metric 列，并为每个 metric 列补充 table_trace_refs。",
+                "table_trace_refs 使用 table_index、column_key 或 value_column、evidence_key；列级 Evidence 优先 row_scope=all。",
+            ],
+            analysis_report=exec_result.analysis_report,
+        )
+    invalid_table_refs = []
+    for index, ref in enumerate(exec_result.table_trace_refs or []):
+        if not isinstance(ref, dict):
+            continue
+        table_index = _normalize_ref_table_index(ref)
+        column_key = _ref_table_column(ref)
+        if table_index < 0 or table_index >= len(exec_result.tables or []):
+            invalid_table_refs.append({"index": index, "reason": "table_index 越界", "ref": ref})
+            continue
+        column_keys = _table_column_keys((exec_result.tables or [])[table_index])
+        if column_keys and column_key and column_key not in column_keys:
+            invalid_table_refs.append({"index": index, "reason": "列不存在于表格 columns", "ref": ref})
+    if invalid_table_refs:
+        return request_retry(
+            retry_type="invalid_table_trace_ref",
+            message="table_trace_refs 指向了不存在的表格或列。",
+            diagnostics={"invalid_table_refs": invalid_table_refs[:20]},
+            repair_instructions=["按表格 columns 中的 key/label 修正 table_trace_refs。"],
+            analysis_report=exec_result.analysis_report,
+        )
+
+    unused_evidence_keys = sorted(set(evidence_by_key) - used_evidence_keys)
+    if unused_evidence_keys:
+        return request_retry(
+            retry_type="invalid_evidence_definition",
+            message="存在未被任何 trace ref 使用的 EvidenceDefinition。",
+            diagnostics={"unused_evidence_keys": unused_evidence_keys[:20]},
+            repair_instructions=[
+                "删除未使用的 EvidenceDefinition，或补充对应 chart/table/report trace refs。",
+            ],
+            analysis_report=exec_result.analysis_report,
+        )
+
+    return None
+
+
 def _validate_structured_result_contract(
     exec_result: StructuredResult,
     *,
@@ -3045,6 +3841,10 @@ def _validate_structured_result_contract(
             ],
             analysis_report=report_text,
         )
+
+    evidence_retry = _validate_evidence_contract(exec_result, generated_code=generated_code)
+    if evidence_retry is not None:
+        return evidence_retry
 
     return None
 
@@ -3337,6 +4137,8 @@ def _build_execution_namespace() -> dict[str, Any]:
         'get_analysis_parameters': get_analysis_parameters,
         'validate_query_constraints': validate_query_constraints,
         'build_markdown_table': build_markdown_table,
+        'build_table_result': build_table_result,
+        'build_report_result': build_report_result,
         'build_chart_document': build_chart_document,
         'build_chart_result': build_chart_result,
         'build_chart_suite': build_chart_suite,
@@ -3367,6 +4169,8 @@ def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -
     CURRENT_EXPECTED_TIME_RANGE.set(dict(payload.get('expected_time_range') or {}))
     CURRENT_TIME_RANGE_GUARD_ACTIVE.set(bool(payload.get('time_range_guard_active')))
     CURRENT_ANALYSIS_PARAMETERS_OVERRIDE.set(dict(payload.get('analysis_parameters_override') or {}))
+    CURRENT_QUERY_SNAPSHOTS.set({})
+    CURRENT_LAST_QUERY_KEY.set('')
     conn_info_payload = payload.get('database_conn_info') or {}
     if conn_info_payload:
         supos_kernel_api._database_conn_info = DatabaseConnInfo(
@@ -3861,6 +4665,7 @@ def _build_repair_instructions(error_type: str) -> list[str]:
             '如果本轮是探测，请返回 request_retry(...)；如果本轮是正式分析，请返回 save_analysis_result(...)。',
         ],
         'chart_contract_error': [
+            '如果错误提示 bar/line 存在 duplicate plotting keys，必须自行按业务语义选择一种修复：先聚合到每个绘图键一行、补充 series_field 使 (category_field, series_field) 唯一，或构造唯一复合类别；禁止丢弃重复行或依赖后写覆盖前写。',
             '当前失败是图表产物契约错误，不是数据查询失败；不要改成 no_data_found，也不要只输出自然语言报告。',
             '下一版禁止继续使用 matplotlib/base64 图片、手写 chart_spec 或自造 chart_type/chart_kind 结构。',
             '必须优先用 build_chart_result(...)、build_multi_metric_chart_result(...) 或 build_chart_suite(...) 生成 charts；bar/line 需要 category_field 和 value_field，多指标柱图需要 category_field 和 value_fields，pie 需要 category_field 和 value_field，scatter 需要 x_field 和 y_field，boxplot 用于异常值/分布/四分位数场景，需要 category_field 和 value_field。',

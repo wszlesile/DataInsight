@@ -128,6 +128,42 @@ class ExcelMultiSheetDatasourceBackendTestCase(unittest.TestCase):
         self.assertIn("sheet_name", message.content)
         self.assertIn("load_local_file", message.content)
 
+    def test_file_content_returns_datasource_description_without_schema(self):
+        service = InsightNsRelDatasourceService(self.session)
+        upload = self._build_excel_upload()
+
+        with tempfile.TemporaryDirectory() as upload_dir:
+            upload_result = service.upload_file_datasource_to_namespace(
+                insight_namespace_id=self.namespace.id,
+                upload_file=upload,
+                upload_dir=upload_dir,
+            )
+            self.assertTrue(upload_result["success"])
+
+            datasource = self.session.query(InsightDatasource).filter(
+                InsightDatasource.insight_namespace_id == self.namespace.id,
+                InsightDatasource.datasource_name.like('%detail%'),
+                InsightDatasource.is_deleted == 0,
+            ).first()
+            self.assertIsNotNone(datasource)
+
+            schema = json.loads(datasource.datasource_schema)
+            schema["description"] = "订单销售明细数据源描述"
+            datasource.datasource_schema = json.dumps(schema, ensure_ascii=False)
+            self.session.commit()
+
+            content_result = service.get_uploaded_file_datasource_content(
+                insight_namespace_id=self.namespace.id,
+                datasource_id=datasource.id,
+                page_no=1,
+                page_size=10,
+            )
+
+        self.assertTrue(content_result["success"])
+        self.assertEqual(content_result["data"]["datasource_description"], "订单销售明细数据源描述")
+        self.assertNotIn("schema", content_result["data"])
+        self.assertEqual(len(content_result["data"]["rows"]), 2)
+
     def test_file_upload_records_size_but_prompt_only_exposes_recommended_loader(self):
         original_threshold = Config.LOCAL_FILE_LOW_MEMORY_THRESHOLD_BYTES
         Config.LOCAL_FILE_LOW_MEMORY_THRESHOLD_BYTES = 1

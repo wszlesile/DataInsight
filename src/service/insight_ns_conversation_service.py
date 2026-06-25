@@ -17,6 +17,7 @@ from model import (
     InsightNsArtifact,
     InsightNsConversation,
     InsightNsConversationPrompt,
+    InsightNsExecutionEvidence,
     InsightNsExecution,
     InsightNsMemory,
     InsightNsMessage,
@@ -287,6 +288,7 @@ class InsightNsConversationService:
                 "selected_datasource_ids": turn_dict.get("selected_datasource_ids", []),
                 "selected_datasource_snapshot": turn_dict.get("selected_datasource_snapshot", []),
                 "report": turn_artifacts.get('analysis_report') or turn.final_answer,
+                "report_evidence_refs": turn_artifacts.get('report_evidence_refs', {}),
                 "charts": turn_artifacts.get('charts', []),
                 "tables": turn_artifacts.get('tables', []),
                 "chart_artifact_id": primary_chart.get('id', 0),
@@ -355,6 +357,922 @@ class InsightNsConversationService:
             "latest_execution": executions[-1].to_dict() if executions else None,
             "artifacts": [self._artifact_to_view(artifact) for artifact in artifacts],
         }
+
+    def resolve_evidence(
+        self,
+        username: str,
+        conversation_id: Any,
+        turn_id: Any,
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        conversation = self._get_accessible_conversation(username, conversation_id)
+        if conversation is None:
+            return None
+        turn = self._get_turn(conversation, turn_id)
+        if turn is None:
+            return None
+
+        artifact_id = to_int(payload.get('artifact_id'), 0)
+        evidence_id = str(payload.get('evidence_id') or '').strip()
+        if artifact_id <= 0 or not evidence_id:
+            return {
+                "traceability_status": "invalid_request",
+                "message": "artifact_id 和 evidence_id 不能为空。",
+            }
+
+        artifact = self.session.query(InsightNsArtifact).filter(
+            InsightNsArtifact.id == artifact_id,
+            InsightNsArtifact.conversation_id == conversation.id,
+            InsightNsArtifact.turn_id == turn.id,
+            InsightNsArtifact.is_deleted == 0,
+        ).first()
+        if artifact is None:
+            return None
+
+        evidence_bundle = self.session.query(InsightNsExecutionEvidence).filter(
+            InsightNsExecutionEvidence.execution_id == artifact.execution_id,
+            InsightNsExecutionEvidence.is_deleted == 0,
+        ).first()
+        if evidence_bundle is None:
+            return {
+                "traceability_status": "unavailable",
+                "message": "当前产物没有可用证据链。",
+            }
+
+        evidence_map = self._safe_json_loads(evidence_bundle.evidence_map_json, {})
+        query_snapshots = self._safe_json_loads(evidence_bundle.query_snapshots_json, {})
+        evidence = evidence_map.get(evidence_id) if isinstance(evidence_map, dict) else None
+        if not isinstance(evidence, dict):
+            return {
+                "traceability_status": "not_found",
+                "message": "未找到对应 Evidence。",
+            }
+
+        artifact_view = self._artifact_to_view(artifact)
+        if not self._artifact_has_evidence_id(artifact_view, evidence_id):
+            return {
+                "traceability_status": "not_found",
+                "message": "当前产物位置未关联该 Evidence。",
+            }
+        selected_context = self._build_selected_context(artifact_view, payload.get('selection') or {})
+        detail_level = str(payload.get('detail_level') or 'summary').strip().lower()
+        execution = self.session.query(InsightNsExecution).filter(
+            InsightNsExecution.id == artifact.execution_id,
+            InsightNsExecution.conversation_id == conversation.id,
+            InsightNsExecution.turn_id == turn.id,
+            InsightNsExecution.is_deleted == 0,
+        ).first()
+        safe_query_snapshots = query_snapshots if isinstance(query_snapshots, dict) else {}
+        return {
+            "traceability_status": "available",
+            "metric_name": evidence.get("metric_name") or '',
+            "selected_context": selected_context,
+            "chain_steps": self._filter_chain_steps(
+                self._build_evidence_chain_steps(
+                evidence=evidence,
+                query_snapshots=safe_query_snapshots,
+                selected_context=selected_context,
+                ),
+                detail_level=detail_level,
+            ),
+            "execution_ref": evidence.get("execution_ref") or {
+                "turn_id": turn.id,
+                "execution_id": artifact.execution_id,
+            },
+            "debug_sql": self._extract_debug_sql(safe_query_snapshots, evidence),
+            "generated_code": execution.generated_code if execution is not None else '',
+        }
+
+    @staticmethod
+    def _safe_json_loads(value: Any, fallback: Any) -> Any:
+        if isinstance(value, (dict, list)):
+            return value
+        try:
+            return json.loads(value or '')
+        except Exception:
+            return fallback
+
+    @staticmethod
+    def _extract_debug_sql(query_snapshots: dict[str, Any], evidence: dict[str, Any]) -> str:
+        query_refs = [str(item) for item in (evidence.get('query_refs') or [])]
+        sql_parts: list[str] = []
+        for query_ref in query_refs:
+            snapshot = query_snapshots.get(query_ref)
+            if not isinstance(snapshot, dict):
+                continue
+            implementation = snapshot.get('implementation') if isinstance(snapshot.get('implementation'), dict) else {}
+            sql = str(implementation.get('sql') or '').strip()
+            if sql:
+                sql_parts.append(sql)
+        if not sql_parts:
+            for snapshot in query_snapshots.values():
+                if not isinstance(snapshot, dict):
+                    continue
+                implementation = snapshot.get('implementation') if isinstance(snapshot.get('implementation'), dict) else {}
+                sql = str(implementation.get('sql') or '').strip()
+                if sql:
+                    sql_parts.append(sql)
+        return "\n\n-- next query --\n\n".join(sql_parts)
+
+    def _build_selected_context(self, artifact_view: dict[str, Any], selection: dict[str, Any]) -> dict[str, Any]:
+        content = artifact_view.get('content_json') if isinstance(artifact_view.get('content_json'), dict) else {}
+        artifact_type = artifact_view.get('artifact_type')
+        context: dict[str, Any] = {
+            "artifact_id": artifact_view.get("id"),
+            "artifact_type": artifact_type,
+            "selection": selection if isinstance(selection, dict) else {},
+        }
+        if artifact_type == 'table':
+            row_index = to_int(selection.get('row_index'), -1) if isinstance(selection, dict) else -1
+            column_key = str(selection.get('column_key') or selection.get('value_column') or '').strip() if isinstance(selection, dict) else ''
+            rows = content.get('rows') or []
+            if 0 <= row_index < len(rows) and isinstance(rows[row_index], dict) and column_key:
+                context["raw_value"] = rows[row_index].get(column_key)
+                context["display_value"] = str(rows[row_index].get(column_key))
+        elif artifact_type == 'chart':
+            data_index = to_int(selection.get('data_index'), -1) if isinstance(selection, dict) else -1
+            value_field = str(selection.get('value_field') or '').strip() if isinstance(selection, dict) else ''
+            dataset = ((content.get('chart_document') or {}).get('dataset') or {})
+            rows = dataset.get('rows') if isinstance(dataset, dict) else None
+            if isinstance(rows, list) and 0 <= data_index < len(rows) and isinstance(rows[data_index], dict) and value_field:
+                context["raw_value"] = rows[data_index].get(value_field)
+                context["display_value"] = str(rows[data_index].get(value_field))
+                context["dimensions"] = {
+                    key: value for key, value in rows[data_index].items() if key != value_field
+                }
+        elif artifact_type == 'report':
+            start = to_int(selection.get('start'), -1) if isinstance(selection, dict) else -1
+            end = to_int(selection.get('end'), -1) if isinstance(selection, dict) else -1
+            report = str(content.get('report_markdown') or artifact_view.get('summary_text') or '')
+            if 0 <= start <= end <= len(report):
+                context["raw_value"] = report[start:end]
+                context["display_value"] = report[start:end]
+        return context
+
+    @staticmethod
+    def _artifact_has_evidence_id(artifact_view: dict[str, Any], evidence_id: str) -> bool:
+        metadata = artifact_view.get('metadata_json') if isinstance(artifact_view.get('metadata_json'), dict) else {}
+        evidence_refs = metadata.get('evidence_refs') if isinstance(metadata.get('evidence_refs'), dict) else {}
+        for refs in evidence_refs.values():
+            if not isinstance(refs, list):
+                continue
+            if any(isinstance(ref, dict) and ref.get('evidence_id') == evidence_id for ref in refs):
+                return True
+        return False
+
+    @staticmethod
+    def _build_evidence_chain_steps(
+        *,
+        evidence: dict[str, Any],
+        query_snapshots: dict[str, Any],
+        selected_context: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        query_refs = [str(item) for item in (evidence.get('query_refs') or [])]
+        queries = [query_snapshots.get(query_ref) for query_ref in query_refs if isinstance(query_snapshots.get(query_ref), dict)]
+        first_query = queries[0] if queries else {}
+        calculation = evidence.get('calculation') if isinstance(evidence.get('calculation'), dict) else {}
+        derivation = evidence.get('derivation') if isinstance(evidence.get('derivation'), dict) else {}
+        transformations = evidence.get('transformations') or []
+        intermediate_outputs = evidence.get('intermediate_outputs') or []
+        source_refs = evidence.get("source_refs") or []
+        query_constraints = first_query.get('query_constraints') if isinstance(first_query, dict) else {}
+        implementation = first_query.get('implementation') if isinstance(first_query, dict) else {}
+        execution = first_query.get('execution') if isinstance(first_query, dict) else {}
+        metric_fields = calculation.get('metric_fields') if isinstance(calculation.get('metric_fields'), list) else []
+        quality_notes = evidence.get('quality_notes') or []
+        relevant_source_refs = InsightNsConversationService._relevant_source_refs(source_refs, query_refs, queries)
+        code_transformations = InsightNsConversationService._code_transformations(transformations)
+
+        steps = [
+            {
+                "type": "read_data",
+                "title": "读取数据",
+                "summary": InsightNsConversationService._describe_sources(relevant_source_refs, query_refs),
+                "items": InsightNsConversationService._source_items(relevant_source_refs, metric_fields),
+                "output": InsightNsConversationService._query_output_text(execution, intermediate_outputs),
+                "details": {
+                    "query_refs": query_refs,
+                    "source_refs": relevant_source_refs,
+                },
+            },
+            {
+                "type": "filter_scope",
+                "title": "筛选范围",
+                "summary": InsightNsConversationService._describe_scope(query_constraints),
+                "items": InsightNsConversationService._scope_items(query_constraints, implementation),
+                "output": InsightNsConversationService._execution_status_text(execution),
+                "details": {
+                    "query_constraints": query_constraints,
+                    "implementation": implementation,
+                    "execution": execution,
+                },
+            },
+            {
+                "type": "data_filter",
+                "title": "数据过滤",
+                "summary": InsightNsConversationService._describe_transformations(code_transformations),
+                "items": InsightNsConversationService._transformation_items(code_transformations, intermediate_outputs),
+                "output": InsightNsConversationService._data_filter_output_text(execution, code_transformations),
+                "details": {"transformations": code_transformations},
+            },
+        ]
+        steps.extend([
+            {
+                "type": "calculation",
+                "title": "数据计算",
+                "summary": InsightNsConversationService._describe_data_calculation(
+                    selected_context,
+                    evidence,
+                    derivation,
+                    calculation,
+                    code_transformations,
+                ),
+                "method": InsightNsConversationService._describe_calculation_method(calculation, derivation),
+                "formula": calculation.get('formula') or '',
+                "result_value": selected_context.get('display_value') or selected_context.get('raw_value'),
+                "items": InsightNsConversationService._data_calculation_items(
+                    selected_context,
+                    evidence,
+                    derivation,
+                    calculation,
+                    intermediate_outputs,
+                    code_transformations,
+                ),
+                "details": {
+                    "derivation": derivation,
+                    "calculation": calculation,
+                    "intermediate_outputs": intermediate_outputs,
+                    "selected_context": selected_context,
+                },
+            },
+            {
+                "type": "reliability",
+                "title": "结果校验与可信说明",
+                "summary": InsightNsConversationService._describe_reliability(execution, quality_notes),
+                "items": InsightNsConversationService._reliability_items(execution, quality_notes, intermediate_outputs),
+                "badges": InsightNsConversationService._reliability_badges(execution, quality_notes),
+                "warnings": [str(item) for item in quality_notes[:4]],
+                "details": {"execution": execution, "quality_notes": quality_notes},
+            },
+        ])
+        return steps
+
+    @staticmethod
+    def _describe_calculation(calculation: dict[str, Any], derivation: dict[str, Any] | None = None, transformations: Any = None) -> str:
+        if not calculation:
+            return "该步骤未提供额外说明。"
+        parts = []
+        derivation = derivation if isinstance(derivation, dict) else {}
+        description = str(derivation.get('description') or '').strip()
+        if description:
+            parts.append(description)
+        aggregation = calculation.get('aggregation')
+        if aggregation:
+            parts.append(f"按“{InsightNsConversationService._friendly_aggregation(aggregation)}”方式计算")
+        group_by = calculation.get('group_by')
+        if group_by:
+            parts.append(f"分组维度：{InsightNsConversationService._stringify_list(group_by)}")
+        formula = calculation.get('formula')
+        if formula:
+            parts.append(f"公式：{formula}")
+        if not description and isinstance(transformations, list) and transformations:
+            parts.append(str(transformations[0]))
+        normalized_parts = [str(part).strip().rstrip('。；;') for part in parts if str(part).strip()]
+        return "；".join(normalized_parts) + "。" if normalized_parts else "根据查询结果计算基础指标。"
+
+    @staticmethod
+    def _friendly_datasource_type(value: Any) -> str:
+        mapping = {
+            'local_file': '本地文件',
+            'table': '数据表',
+            'timeseries': '时序数据',
+            'time_series': '时序数据',
+            'api': '接口数据',
+            'minio': '远程文件',
+        }
+        key = str(value or '').strip()
+        return mapping.get(key, key or '数据源')
+
+    @staticmethod
+    def _friendly_aggregation(value: Any) -> str:
+        if isinstance(value, str) and '/' in value:
+            return "、".join(
+                InsightNsConversationService._friendly_aggregation(part.strip())
+                for part in value.split('/')
+                if part.strip()
+            )
+        mapping = {
+            'count': '计数',
+            'record_count': '记录数量',
+            'sum': '求和',
+            'avg': '平均值',
+            'average': '平均值',
+            'mean': '平均值',
+            'min': '最小值',
+            'max': '最大值',
+            'ratio': '比例',
+            'percentage': '占比',
+        }
+        key = str(value or '').strip().lower()
+        return mapping.get(key, str(value or '聚合'))
+
+    @staticmethod
+    def _friendly_metric(value: Any) -> str:
+        mapping = {
+            'count': '命中记录数',
+            'record_count': '命中记录数',
+            'sum': '合计值',
+            'avg': '平均值',
+            'average': '平均值',
+            'mean': '平均值',
+            'min': '最小值',
+            'max': '最大值',
+        }
+        if isinstance(value, list):
+            return InsightNsConversationService._stringify_list([
+                InsightNsConversationService._friendly_metric(item) for item in value
+            ])
+        key = str(value or '').strip()
+        return mapping.get(key.lower(), key)
+
+    @staticmethod
+    def _friendly_grain(value: Any) -> str:
+        mapping = {
+            'full': '全量汇总',
+            'overall': '整体汇总',
+            'detail': '明细记录',
+            'raw': '原始明细',
+            'day': '按天统计',
+            'date': '按日期统计',
+            'week': '按周统计',
+            'month': '按月统计',
+            'quarter': '按季度统计',
+            'year': '按年统计',
+            'hour': '按小时统计',
+            'minute': '按分钟统计',
+        }
+        key = str(value or '').strip().lower()
+        return mapping.get(key, str(value or '未指定'))
+
+    @staticmethod
+    def _friendly_field_hint(value: Any) -> str:
+        mapping = {
+            'name': '名称',
+            'username': '用户名',
+            'created_at': '创建时间',
+            'updated_at': '更新时间',
+            'status': '状态',
+            'type': '类型',
+            'id': 'ID',
+            'is_deleted': '删除状态',
+        }
+        if isinstance(value, list):
+            fields = value
+        else:
+            fields = [item.strip() for item in str(value or '').replace('，', ',').split(',') if item.strip()]
+        labels = [mapping.get(str(field), str(field)) for field in fields]
+        return "或".join(labels) if labels else '目标字段'
+
+    @staticmethod
+    def _friendly_match_mode(value: Any) -> str:
+        mapping = {
+            'fuzzy': '模糊匹配',
+            'contains': '包含',
+            'exact': '精确匹配',
+            'eq': '等于',
+            'in': '属于',
+            'range': '范围匹配',
+            'gte': '大于等于',
+            'lte': '小于等于',
+            'gt': '大于',
+            'lt': '小于',
+        }
+        key = str(value or '').strip().lower()
+        return mapping.get(key, key or '匹配')
+
+    @staticmethod
+    def _describe_target_filter(filter_item: Any) -> str:
+        if not isinstance(filter_item, dict):
+            return str(filter_item)
+        field = InsightNsConversationService._friendly_field_hint(
+            filter_item.get('field_label') or filter_item.get('field_hint') or filter_item.get('field') or filter_item.get('fields')
+        )
+        value = filter_item.get('value')
+        if value is None:
+            value = filter_item.get('values')
+        mode = InsightNsConversationService._friendly_match_mode(filter_item.get('match_mode') or filter_item.get('operator'))
+        if isinstance(value, list):
+            value_text = "、".join(str(item) for item in value)
+        else:
+            value_text = str(value) if value is not None else ''
+        role = str(filter_item.get('semantic_role') or '').strip()
+        if role == 'keyword_search':
+            return f"在{field}中{mode}“{value_text}”"
+        if value_text:
+            return f"{field}{mode}“{value_text}”"
+        return f"{field}使用{mode}条件"
+
+    @staticmethod
+    def _format_filter_rule(filter_item: Any) -> str:
+        if not isinstance(filter_item, dict):
+            return str(filter_item)
+        field = InsightNsConversationService._friendly_field_hint(
+            filter_item.get('field_label') or filter_item.get('field_hint') or filter_item.get('field') or filter_item.get('fields')
+        )
+        raw_field = filter_item.get('field') or filter_item.get('fields') or filter_item.get('field_hint')
+        mode = InsightNsConversationService._friendly_match_mode(filter_item.get('match_mode') or filter_item.get('operator'))
+        value = filter_item.get('value')
+        if value is None:
+            value = filter_item.get('values')
+        if isinstance(value, list):
+            value_text = "、".join(str(item) for item in value)
+        else:
+            value_text = str(value) if value is not None else '未指定'
+        field_text = field
+        if raw_field and str(raw_field).strip() and str(raw_field).strip() != field:
+            field_text = f"{field}（{raw_field}）"
+        parts = [f"字段：{field_text}", f"操作：{mode}", f"值：{value_text}"]
+        return "；".join(parts)
+
+    @staticmethod
+    def _friendly_derivation_mode(value: Any) -> str:
+        mapping = {
+            'query_output': '查询聚合结果',
+            'formula': '公式计算',
+            'algorithm': '算法计算',
+        }
+        key = str(value or '').strip()
+        return mapping.get(key, key or '直接计算')
+
+    @staticmethod
+    def _stringify_list(values: Any, *, limit: int = 6) -> str:
+        if not isinstance(values, list):
+            return str(values) if values not in (None, '') else ''
+        visible = [str(item) for item in values[:limit] if item not in (None, '')]
+        suffix = f" 等 {len(values)} 项" if len(values) > limit else ''
+        return " / ".join(visible) + suffix
+
+    @staticmethod
+    def _relevant_source_refs(source_refs: Any, query_refs: list[str], queries: list[Any]) -> list[dict[str, Any]]:
+        if not isinstance(source_refs, list):
+            return []
+        refs = [source for source in source_refs if isinstance(source, dict)]
+        if len(refs) <= 1:
+            return refs
+
+        query_ref_set = set(query_refs)
+        matched = [
+            source for source in refs
+            if query_ref_set.intersection({str(item) for item in source.get('query_keys') or []})
+        ]
+        if matched:
+            return matched
+
+        query_text = " ".join(
+            str(((query or {}).get('implementation') or {}).get('sql') or '')
+            for query in queries
+            if isinstance(query, dict)
+        ).lower()
+        if query_text:
+            matched = []
+            for source in refs:
+                identifier = str(source.get('datasource_identifier') or '').strip().lower()
+                name = str(source.get('datasource_name') or '').strip().lower()
+                if (identifier and identifier in query_text) or (name and name in query_text):
+                    matched.append(source)
+            if matched:
+                return matched
+
+        refs_with_fields = [source for source in refs if source.get('field_names') or source.get('fields')]
+        return refs_with_fields or refs[:1]
+
+    @staticmethod
+    def _code_transformations(transformations: Any) -> list[str]:
+        if not isinstance(transformations, list):
+            return []
+        query_prefixes = (
+            'where ',
+            'and ',
+            'or ',
+            'having ',
+            'order by ',
+            'group by ',
+            'select ',
+            'from ',
+        )
+        code_items: list[str] = []
+        for item in transformations:
+            text = str(item or '').strip()
+            if not text:
+                continue
+            normalized = text.lower().lstrip('(')
+            if normalized.startswith(query_prefixes):
+                continue
+            if ' ilike ' in normalized or ' like ' in normalized:
+                continue
+            code_items.append(text)
+        return code_items
+
+    @staticmethod
+    def _looks_like_query_scope_text(value: Any) -> bool:
+        text = str(value or '').strip().lower()
+        if not text:
+            return False
+        return any(keyword in text for keyword in (
+            'where',
+            ' ilike ',
+            ' like ',
+            '筛选',
+            '过滤',
+            '包含',
+            '匹配',
+            '时间范围',
+        ))
+
+    @staticmethod
+    def _describe_sources(source_refs: Any, query_refs: list[str]) -> str:
+        if isinstance(source_refs, list) and source_refs:
+            names = [str(item.get('datasource_name') or item.get('datasource_identifier') or '数据源') for item in source_refs[:2] if isinstance(item, dict)]
+            if names:
+                return f"从 {'、'.join(names)} 读取计算所需数据。"
+        return f"使用 {len(query_refs)} 个查询快照作为计算输入。" if query_refs else "该指标未提供查询快照引用。"
+
+    @staticmethod
+    def _source_items(source_refs: Any, metric_fields: list[Any]) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        if isinstance(source_refs, list):
+            for source in source_refs[:2]:
+                if not isinstance(source, dict):
+                    continue
+                items.append({"label": "来源", "value": source.get('datasource_name') or source.get('datasource_identifier') or '数据源'})
+                if source.get('datasource_type'):
+                    items.append({"label": "类型", "value": InsightNsConversationService._friendly_datasource_type(source.get('datasource_type'))})
+                break
+        if metric_fields:
+            items.append({"label": "关键字段", "value": InsightNsConversationService._stringify_list(metric_fields)})
+        return items
+
+    @staticmethod
+    def _describe_scope(query_constraints: Any) -> str:
+        if not isinstance(query_constraints, dict) or not query_constraints:
+            return "按照已校验的查询口径确定统计范围。"
+        notes = str(query_constraints.get('notes') or '').strip()
+        filters = query_constraints.get('target_filters')
+        filter_texts = [
+            InsightNsConversationService._describe_target_filter(item)
+            for item in filters
+        ] if isinstance(filters, list) else []
+        aggregation = query_constraints.get('aggregation')
+        aggregation = aggregation if isinstance(aggregation, dict) else {}
+        metrics = aggregation.get('metrics') or aggregation.get('metric')
+        group_by = aggregation.get('group_by') or query_constraints.get('group_by')
+        metric_text = InsightNsConversationService._friendly_metric(metrics) if metrics else ''
+
+        if notes:
+            return notes if notes.endswith(('。', '！', '？')) else f"{notes}。"
+        if filter_texts:
+            count = len(filter_texts)
+            return f"按 {count} 条过滤规则限定本次查询范围。"
+        if group_by and metric_text:
+            return f"按{InsightNsConversationService._stringify_list(group_by if isinstance(group_by, list) else [group_by])}划定统计分组。"
+        if notes:
+            return notes if '筛选' in notes or '过滤' in notes or '范围' in notes else f"{notes}。"
+
+        parts = []
+        time_range = query_constraints.get('time_range')
+        if isinstance(time_range, dict) and (time_range.get('start') or time_range.get('end')):
+            parts.append(f"时间：{time_range.get('start') or '不限'} 至 {time_range.get('end') or '不限'}")
+        grain = aggregation.get('grain')
+        if grain and not metric_text:
+            parts.append(f"统计口径：{InsightNsConversationService._friendly_grain(grain)}")
+        return "；".join(parts) if parts else "未设置额外筛选范围。"
+
+    @staticmethod
+    def _scope_items(query_constraints: Any, implementation: Any) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        if isinstance(query_constraints, dict):
+            time_range = query_constraints.get('time_range')
+            if isinstance(time_range, dict) and (time_range.get('start') or time_range.get('end')):
+                items.append({"label": "时间", "value": f"{time_range.get('start') or '不限'} 至 {time_range.get('end') or '不限'}"})
+            aggregation = query_constraints.get('aggregation')
+            if isinstance(aggregation, dict):
+                group_by = aggregation.get('group_by') or query_constraints.get('group_by')
+                if group_by:
+                    items.append({"label": "分组方式", "value": InsightNsConversationService._stringify_list(group_by if isinstance(group_by, list) else [group_by])})
+                elif aggregation.get('grain') and not (isinstance(target_filters := query_constraints.get('target_filters'), list) and target_filters):
+                    items.append({"label": "统计口径", "value": InsightNsConversationService._friendly_grain(aggregation.get('grain'))})
+            target_filters = query_constraints.get('target_filters')
+            if isinstance(target_filters, list) and target_filters:
+                items.append({
+                    "label": "过滤规则",
+                    "value": InsightNsConversationService._stringify_list([
+                        InsightNsConversationService._format_filter_rule(item)
+                        for item in target_filters
+                    ], limit=3)
+                })
+            else:
+                notes = str(query_constraints.get('notes') or '').strip()
+                items.append({"label": "过滤规则", "value": "未设置额外筛选范围"})
+                if notes and notes != items[-1]["value"]:
+                    items[-1]["value"] = notes
+        return items
+
+    @staticmethod
+    def _execution_status_text(execution: Any) -> str:
+        if isinstance(execution, dict) and execution.get('status'):
+            row_count = execution.get('row_count')
+            if row_count is not None:
+                return f"查询命中 {row_count} 条记录"
+            return "查询口径已通过校验" if execution.get('status') == 'validated' else f"执行状态：{execution.get('status')}"
+        return ''
+
+    @staticmethod
+    def _query_output_text(execution: Any, intermediate_outputs: Any) -> str:
+        if isinstance(execution, dict):
+            for key in ('row_count', 'rows', 'result_count'):
+                if execution.get(key) is not None:
+                    return f"获得 {execution.get(key)} 条记录"
+        if isinstance(intermediate_outputs, list) and intermediate_outputs:
+            first = intermediate_outputs[0]
+            if isinstance(first, dict) and first.get('name') and first.get('value') is not None:
+                return f"{first.get('name')}：{first.get('value')}"
+        return ''
+
+    @staticmethod
+    def _describe_transformations(transformations: Any) -> str:
+        if isinstance(transformations, list) and transformations:
+            return "；".join(str(item) for item in transformations[:3])
+        return "查询结果未再经过额外代码层清洗、转换或过滤，直接进入计算。"
+
+    @staticmethod
+    def _transformation_items(transformations: Any, intermediate_outputs: Any) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        if not isinstance(transformations, list) or not transformations:
+            return items
+        items.extend({"label": "处理动作", "value": str(item)} for item in transformations[:5] if item)
+        if isinstance(intermediate_outputs, list):
+            for output in intermediate_outputs[:3]:
+                if not isinstance(output, dict) or not output.get('name'):
+                    continue
+                name = str(output.get('name'))
+                if any(keyword in name for keyword in ('行数', '记录', '样本', '有效', '排除', '聚合')):
+                    items.append({"label": name, "value": output.get('value')})
+        return items
+
+    @staticmethod
+    def _data_filter_output_text(execution: Any, transformations: Any) -> str:
+        if isinstance(transformations, list) and transformations:
+            return "已完成代码层数据整理"
+        if isinstance(execution, dict) and execution.get('row_count') is not None:
+            return f"{execution.get('row_count')} 条查询命中记录直接进入计算"
+        return ''
+
+    @staticmethod
+    def _describe_calculation_method(calculation: dict[str, Any], derivation: dict[str, Any]) -> str:
+        metric_fields = calculation.get('metric_fields')
+        metric_text = InsightNsConversationService._stringify_list(metric_fields) if metric_fields else '指标字段'
+        aggregation = str(calculation.get('aggregation') or '').strip()
+        friendly_aggregation = InsightNsConversationService._friendly_aggregation(aggregation) if aggregation else ''
+        mode = str((derivation or {}).get('mode') or '').strip()
+        description = str((derivation or {}).get('description') or '').strip()
+        if mode == 'algorithm':
+            return f"使用算法计算：{description or calculation.get('formula') or metric_text}"
+        if friendly_aggregation:
+            return f"对 {metric_text} 执行{friendly_aggregation}计算。"
+        if description:
+            return description
+        if calculation.get('formula'):
+            return f"按公式 {calculation.get('formula')} 计算。"
+        return "根据查询结果计算基础指标。"
+
+    @staticmethod
+    def _describe_data_calculation(
+        selected_context: dict[str, Any],
+        evidence: dict[str, Any],
+        derivation: dict[str, Any],
+        calculation: dict[str, Any],
+        transformations: Any,
+    ) -> str:
+        method = InsightNsConversationService._describe_calculation_method(calculation, derivation).rstrip('。')
+        detail = InsightNsConversationService._describe_calculation(calculation, derivation, transformations).rstrip('。')
+        value = selected_context.get('display_value') or selected_context.get('raw_value')
+        metric_name = evidence.get('metric_name') or '当前指标'
+        parts = []
+        if detail and detail not in method and not InsightNsConversationService._looks_like_query_scope_text(derivation.get('description')):
+            parts.append(detail)
+        if method:
+            parts.append(method)
+        if value is not None:
+            parts.append(f"当前点击的 {metric_name} 为 {value}")
+        return "；".join(parts) + "。" if parts else f"当前点击位置已关联到 {metric_name} 的计算逻辑。"
+
+    @staticmethod
+    def _calculation_items(
+        calculation: dict[str, Any],
+        intermediate_outputs: Any,
+        derivation: dict[str, Any] | None = None,
+        transformations: Any = None,
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        derivation = derivation if isinstance(derivation, dict) else {}
+        if derivation.get('description') and not InsightNsConversationService._looks_like_query_scope_text(derivation.get('description')):
+            items.append({"label": "计算逻辑", "value": derivation.get('description')})
+        if derivation.get('mode'):
+            items.append({"label": "生成方式", "value": InsightNsConversationService._friendly_derivation_mode(derivation.get('mode'))})
+        metric_fields = calculation.get('metric_fields')
+        if metric_fields:
+            items.append({"label": "指标字段", "value": InsightNsConversationService._stringify_list(metric_fields)})
+        if calculation.get('aggregation'):
+            items.append({"label": "计算方式", "value": InsightNsConversationService._friendly_aggregation(calculation.get('aggregation'))})
+        if calculation.get('group_by'):
+            items.append({"label": "分组维度", "value": InsightNsConversationService._stringify_list(calculation.get('group_by'))})
+        if isinstance(transformations, list) and transformations:
+            items.append({"label": "处理步骤", "value": "；".join(str(item) for item in transformations[:3])})
+        items.extend(InsightNsConversationService._calculation_intermediate_items(
+            intermediate_outputs,
+            calculation,
+        ))
+        return items
+
+    @staticmethod
+    def _calculation_intermediate_items(
+        intermediate_outputs: Any,
+        calculation: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if not isinstance(intermediate_outputs, list):
+            return []
+        metric_fields = {
+            str(item).strip().lower()
+            for item in calculation.get('metric_fields') or []
+            if str(item).strip()
+        }
+        formula = str(calculation.get('formula') or '').lower()
+        include_keywords = (
+            '分子',
+            '分母',
+            '比例',
+            '占比',
+            '平均',
+            '均值',
+            '最大',
+            '最小',
+            '合计',
+            '总额',
+            '结果',
+            '当前',
+            '基础指标',
+        )
+        exclude_names = {
+            '总记录数',
+            '活跃记录数',
+            '已删除记录数',
+            '用户数',
+        }
+        items: list[dict[str, Any]] = []
+        for output in intermediate_outputs:
+            if not isinstance(output, dict) or not output.get('name'):
+                continue
+            name = str(output.get('name')).strip()
+            normalized_name = name.lower()
+            if name in exclude_names or normalized_name.startswith('top'):
+                continue
+            is_relevant = any(keyword in name for keyword in include_keywords)
+            is_relevant = is_relevant or any(field and field in normalized_name for field in metric_fields)
+            is_relevant = is_relevant or (formula and normalized_name in formula)
+            if is_relevant:
+                items.append({"label": name, "value": output.get('value')})
+            if len(items) >= 4:
+                break
+        return items
+
+    @staticmethod
+    def _data_calculation_items(
+        selected_context: dict[str, Any],
+        evidence: dict[str, Any],
+        derivation: dict[str, Any],
+        calculation: dict[str, Any],
+        intermediate_outputs: Any,
+        transformations: Any,
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        value = selected_context.get('display_value') or selected_context.get('raw_value')
+        if value is not None:
+            items.append({"label": "当前值", "value": value})
+        items.extend(InsightNsConversationService._calculation_items(
+            calculation,
+            intermediate_outputs,
+            derivation,
+            transformations,
+        ))
+        for item in InsightNsConversationService._current_value_items(selected_context, evidence, derivation, calculation):
+            if item.get('label') in {'原始值'} and value is not None:
+                continue
+            if not any(existing.get('label') == item.get('label') and existing.get('value') == item.get('value') for existing in items):
+                items.append(item)
+        return items
+
+    @staticmethod
+    def _derivation_items(derivation: dict[str, Any], calculation: dict[str, Any]) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        if derivation.get('mode'):
+            items.append({"label": "生成方式", "value": derivation.get('mode')})
+        if calculation.get('format'):
+            items.append({"label": "展示格式", "value": calculation.get('format')})
+        return items
+
+    @staticmethod
+    def _describe_current_value(
+        selected_context: dict[str, Any],
+        evidence: dict[str, Any],
+        derivation: dict[str, Any],
+        calculation: dict[str, Any],
+    ) -> str:
+        value = selected_context.get('display_value') or selected_context.get('raw_value')
+        metric_name = evidence.get('metric_name') or '当前指标'
+        description = derivation.get('description') or calculation.get('formula') or ''
+        if value is not None and description:
+            return f"当前点击的 {metric_name} 数值为 {value}，它由上述计算逻辑得到：{description}"
+        if value is not None:
+            return f"当前点击的 {metric_name} 数值为 {value}，它复用上述计算逻辑得到。"
+        return f"当前点击位置已关联到 {metric_name} 的证据链。"
+
+    @staticmethod
+    def _current_value_items(
+        selected_context: dict[str, Any],
+        evidence: dict[str, Any],
+        derivation: dict[str, Any],
+        calculation: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        if evidence.get('metric_name'):
+            items.append({"label": "对应指标", "value": evidence.get('metric_name')})
+        if selected_context.get('raw_value') is not None:
+            items.append({"label": "原始值", "value": selected_context.get('raw_value')})
+        if evidence.get('unit'):
+            items.append({"label": "单位", "value": evidence.get('unit')})
+        if derivation.get('mode'):
+            items.append({"label": "生成方式", "value": InsightNsConversationService._friendly_derivation_mode(derivation.get('mode'))})
+        if calculation.get('format'):
+            items.append({"label": "展示格式", "value": calculation.get('format')})
+        dimensions = selected_context.get('dimensions')
+        if isinstance(dimensions, dict):
+            for key, value in list(dimensions.items())[:4]:
+                items.append({"label": str(key), "value": value})
+        return items
+
+    @staticmethod
+    def _describe_reliability(execution: Any, quality_notes: Any) -> str:
+        validated = isinstance(execution, dict) and execution.get('status') in {'validated', 'success'}
+        if isinstance(quality_notes, list) and quality_notes:
+            prefix = "查询口径已通过校验。" if validated else "已记录本次计算的质量说明。"
+            return f"{prefix}{str(quality_notes[0])}"
+        if validated:
+            return "查询口径已通过校验，当前证据链记录了数据来源、统计范围和计算逻辑。"
+        return "当前证据链记录了数据来源、统计范围和计算逻辑，可展开查看查询口径与执行信息。"
+
+    @staticmethod
+    def _reliability_items(execution: Any, quality_notes: Any, intermediate_outputs: Any) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        if isinstance(execution, dict) and execution.get('status'):
+            items.append({"label": "口径校验", "value": "已通过" if execution.get('status') in {'validated', 'success'} else execution.get('status')})
+            if execution.get('row_count') is not None:
+                items.append({"label": "查询命中", "value": f"{execution.get('row_count')} 条记录"})
+        if isinstance(quality_notes, list) and quality_notes:
+            items.append({"label": "质量说明", "value": str(quality_notes[0])})
+        return items
+
+    @staticmethod
+    def _reliability_badges(execution: Any, quality_notes: Any) -> list[str]:
+        badges: list[str] = []
+        if isinstance(execution, dict) and execution.get('status') in {'validated', 'success'}:
+            badges.append("查询口径已校验")
+        if isinstance(quality_notes, list) and quality_notes:
+            risky_keywords = ('LIMIT', 'TopN', '抽样', '采样', 'head', 'tail', 'sample', '截取', '缺失', '排除')
+            if any(any(keyword in str(note) for keyword in risky_keywords) for note in quality_notes):
+                badges.append("存在口径说明")
+            else:
+                badges.append("无明显截断说明")
+        return badges or ["证据链已生成"]
+
+    @staticmethod
+    def _filter_chain_steps(chain_steps: list[dict[str, Any]], *, detail_level: str) -> list[dict[str, Any]]:
+        if detail_level == 'full':
+            return chain_steps
+        filtered: list[dict[str, Any]] = []
+        for step in chain_steps:
+            item = dict(step)
+            details = item.get('details')
+            if isinstance(details, dict):
+                safe_details = {
+                    key: value for key, value in details.items()
+                    if key not in {'implementation'}
+                }
+                if safe_details:
+                    item['details'] = safe_details
+                else:
+                    item.pop('details', None)
+            filtered.append(item)
+        return filtered
 
     def list_turn_versions(self, username: str, conversation_id: Any, turn_id: Any) -> dict[str, Any] | None:
         """返回某个轮次可回溯的分析任务版本列表。"""
@@ -596,6 +1514,7 @@ class InsightNsConversationService:
     def _empty_turn_artifacts(self) -> dict[str, Any]:
         return {
             'analysis_report': '',
+            'report_evidence_refs': {},
             'charts': [],
             'tables': [],
         }
@@ -614,12 +1533,14 @@ class InsightNsConversationService:
                     'summary_text': artifact_view['summary_text'],
                     'chart_type': artifact_view['content_json'].get('chart_type', ''),
                     'chart_spec': artifact_view['content_json'].get('chart_spec', {}),
+                    'evidence_refs': artifact_view.get('metadata_json', {}).get('evidence_refs', {}),
                     'sort_no': artifact_view.get('sort_no', 0),
                 })
             elif artifact_view['artifact_type'] == 'report':
                 report_markdown = artifact_view['content_json'].get('report_markdown') or artifact_view['summary_text']
                 if report_markdown:
                     turn_artifacts['analysis_report'] = report_markdown
+                    turn_artifacts['report_evidence_refs'] = artifact_view.get('metadata_json', {}).get('evidence_refs', {})
             elif artifact_view['artifact_type'] == 'table':
                 turn_artifacts['tables'].append({
                     'id': artifact_view['id'],
@@ -627,6 +1548,7 @@ class InsightNsConversationService:
                     'summary_text': artifact_view['summary_text'],
                     'columns': artifact_view['content_json'].get('columns', []),
                     'rows': artifact_view['content_json'].get('rows', []),
+                    'evidence_refs': artifact_view.get('metadata_json', {}).get('evidence_refs', {}),
                     'sort_no': artifact_view.get('sort_no', 0),
                 })
 

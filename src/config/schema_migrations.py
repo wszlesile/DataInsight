@@ -66,12 +66,19 @@ def _iter_migration_files(current_version: str, target_version: str) -> list[Pat
     return sorted(files, key=lambda path: _version_value(path.stem))
 
 
-def _split_sql_statements(sql: str) -> list[tuple[str | None, str]]:
-    blocks: list[tuple[str | None, str]] = []
+def _split_sql_statements(sql: str) -> list[tuple[str | None, str | None]]:
+    blocks: list[tuple[str | None, str | None]] = []
     current_directive: str | None = None
     current_lines: list[str] = []
     for line in sql.splitlines():
         stripped = line.strip()
+        if stripped.startswith("-- create_table_from_model:"):
+            if current_lines:
+                blocks.extend((current_directive, statement) for statement in _statements_from_lines(current_lines))
+                current_lines = []
+            blocks.append((stripped.removeprefix("-- create_table_from_model:").strip(), None))
+            current_directive = None
+            continue
         if stripped.startswith("-- add_column:"):
             if current_lines:
                 blocks.extend((current_directive, statement) for statement in _statements_from_lines(current_lines))
@@ -107,6 +114,20 @@ def _should_skip_statement(connection, directive: str | None) -> bool:
     return bool(table_name and column_name and _has_column(connection, table_name, column_name))
 
 
+def _create_table_from_model(connection, model_name: str) -> bool:
+    normalized_model_name = str(model_name or "").strip()
+    if not normalized_model_name:
+        return False
+    from model import __dict__ as model_namespace
+
+    model_class = model_namespace.get(normalized_model_name)
+    table = getattr(model_class, "__table__", None)
+    if table is None:
+        raise ValueError(f"Unknown migration model: {normalized_model_name}")
+    table.create(bind=connection, checkfirst=True)
+    return True
+
+
 def _is_duplicate_column_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return "duplicate column" in message or "already exists" in message
@@ -115,6 +136,9 @@ def _is_duplicate_column_error(exc: Exception) -> bool:
 def _apply_migration_file(connection, path: Path) -> None:
     sql = path.read_text(encoding="utf-8")
     for directive, statement in _split_sql_statements(sql):
+        if statement is None:
+            if _create_table_from_model(connection, directive or ""):
+                continue
         if _should_skip_statement(connection, directive):
             continue
         try:

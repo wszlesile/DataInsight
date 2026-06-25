@@ -10,7 +10,7 @@
 
 <script setup>
 import * as echarts from 'echarts'
-import { computed, defineExpose, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, defineExpose, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 
 const props = defineProps({
   chartSpec: {
@@ -18,9 +18,10 @@ const props = defineProps({
     default: () => null
   }
 })
+const emit = defineEmits(['point-click'])
 
 const specContainer = ref(null)
-const chartInstance = ref(null)
+const chartInstance = shallowRef(null)
 const isSpecMode = computed(() => props.chartSpec && typeof props.chartSpec === 'object' && Object.keys(props.chartSpec).length > 0)
 const normalizedChartSpec = computed(() => sanitizeChartSpec(props.chartSpec))
 const chartHeight = computed(() => estimateChartHeight(normalizedChartSpec.value))
@@ -36,6 +37,15 @@ function formatChartNumber(value) {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2
   })
+}
+
+function escapeTooltipText(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
 }
 
 function parseTemporalValue(value) {
@@ -372,15 +382,15 @@ function applyTooltipDisplayRules(normalized) {
       const axisHeader = isTemporalValue(axisValue)
         ? `<div style="margin-bottom:4px;font-weight:600;">${formatTemporalValue(axisValue, 'tooltip')}</div>`
         : (axisValue !== undefined && axisValue !== null && axisValue !== ''
-          ? `<div style="margin-bottom:4px;font-weight:600;">${axisValue}</div>`
+          ? `<div style="margin-bottom:4px;font-weight:600;">${escapeTooltipText(axisValue)}</div>`
           : '')
       const body = rows
         .filter(Boolean)
         .map((item) => {
           const marker = item.marker || ''
-          const seriesName = item.seriesName || ''
+          const seriesName = escapeTooltipText(item.seriesName || item.name || '')
           const rawValue = Array.isArray(item.value) ? item.value[item.value.length - 1] : item.value
-          return `${marker}${seriesName}: ${formatChartNumber(rawValue)}`
+          return `${marker}${seriesName}: ${escapeTooltipText(formatChartNumber(rawValue))}`
         })
         .join('<br/>')
       return `${axisHeader}${body}`
@@ -427,6 +437,10 @@ const renderSpecChart = async () => {
     chartInstance.value = echarts.init(specContainer.value, null, { renderer: 'canvas' })
   }
   chartInstance.value.setOption(normalizedChartSpec.value, true)
+  chartInstance.value.off('click')
+  chartInstance.value.on('click', (params) => {
+    emit('point-click', params)
+  })
   chartInstance.value.resize()
 }
 
@@ -443,7 +457,7 @@ watch(
       chartInstance.value = null
     }
   },
-  { immediate: true, deep: true }
+  { deep: true }
 )
 
 onMounted(async () => {

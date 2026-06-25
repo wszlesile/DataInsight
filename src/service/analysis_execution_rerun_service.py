@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from agent.tools import run_generated_code_locally
 from model import InsightNsArtifact, InsightNsConversation, InsightNsExecution, InsightNsTurn
 from service.analysis_task_service import AnalysisTaskService
+from service.evidence_assembly_service import EvidenceAssemblyService
 from utils.datasource_utils import dump_json, safe_json_loads, to_int
 
 
@@ -200,8 +201,9 @@ class AnalysisExecutionRerunService:
         tables: list[dict[str, Any]],
         analysis_task_id: int,
     ) -> None:
+        artifacts: list[dict[str, Any]] = []
         for index, chart in enumerate(charts or [], start=1):
-            self._create_disabled_artifact(
+            artifacts.append(self._create_disabled_artifact(
                 conversation_id=conversation.id,
                 turn_id=turn.id,
                 execution_id=execution_id,
@@ -215,10 +217,10 @@ class AnalysisExecutionRerunService:
                 },
                 analysis_task_id=analysis_task_id,
                 sort_no=index,
-            )
+            ))
 
         if analysis_report:
-            self._create_disabled_artifact(
+            artifacts.append(self._create_disabled_artifact(
                 conversation_id=conversation.id,
                 turn_id=turn.id,
                 execution_id=execution_id,
@@ -229,10 +231,10 @@ class AnalysisExecutionRerunService:
                 metadata={"turn_no": turn.turn_no},
                 analysis_task_id=analysis_task_id,
                 sort_no=0,
-            )
+            ))
 
         for index, table in enumerate(tables or [], start=1):
-            self._create_disabled_artifact(
+            artifacts.append(self._create_disabled_artifact(
                 conversation_id=conversation.id,
                 turn_id=turn.id,
                 execution_id=execution_id,
@@ -243,7 +245,18 @@ class AnalysisExecutionRerunService:
                 metadata={"turn_no": turn.turn_no},
                 analysis_task_id=analysis_task_id,
                 sort_no=100 + index,
-            )
+            ))
+
+        execution = self.session.query(InsightNsExecution).filter(
+            InsightNsExecution.id == execution_id,
+            InsightNsExecution.is_deleted == 0,
+        ).first()
+        EvidenceAssemblyService(self.session).assemble_for_execution(
+            conversation_id=conversation.id,
+            turn_id=turn.id,
+            execution=execution,
+            artifacts=artifacts,
+        )
 
     def _create_disabled_artifact(
         self,
@@ -258,7 +271,7 @@ class AnalysisExecutionRerunService:
         metadata: dict[str, Any],
         analysis_task_id: int,
         sort_no: int,
-    ) -> None:
+    ) -> dict[str, Any]:
         artifact = InsightNsArtifact(
             conversation_id=conversation_id,
             turn_id=turn_id,
@@ -273,6 +286,8 @@ class AnalysisExecutionRerunService:
             analysis_task_id=analysis_task_id,
         )
         self.session.add(artifact)
+        self.session.flush()
+        return artifact.to_dict()
 
     def _validate_parameters(self, schema: dict[str, Any], values: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(values, dict):

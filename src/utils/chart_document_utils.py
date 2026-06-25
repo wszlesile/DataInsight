@@ -33,6 +33,7 @@ def build_chart_document(
     stack: bool = False,
     merge_tail: bool | None = None,
     top_n: int | None = None,
+    value_precision: int = 2,
 ) -> dict[str, Any]:
     chart_kind_value = _normalize_chart_kind(chart_kind)
     dataset = _normalize_dataset(data)
@@ -74,6 +75,7 @@ def build_chart_document(
         "presentation": {
             "orientation": _normalize_orientation(orientation),
             "label_mode": _normalize_label_mode(label_mode),
+            "value_precision": _normalize_value_precision(value_precision),
             "stack": bool(stack),
             "merge_tail": bool(merge_tail) if merge_tail is not None else chart_kind_value == "pie",
         },
@@ -100,6 +102,7 @@ def build_chart_result(
     stack: bool = False,
     merge_tail: bool | None = None,
     top_n: int | None = None,
+    value_precision: int = 2,
 ) -> dict[str, Any]:
     document = build_chart_document(
         chart_kind=chart_kind,
@@ -119,6 +122,7 @@ def build_chart_result(
         stack=stack,
         merge_tail=merge_tail,
         top_n=top_n,
+        value_precision=value_precision,
     )
     return {
         "title": str(title or "").strip(),
@@ -143,6 +147,7 @@ def build_multi_metric_chart_result(
     orientation: str = "auto",
     label_mode: str = "hidden",
     stack: bool = False,
+    value_precision: int = 2,
 ) -> dict[str, Any]:
     chart_kind_value = _normalize_chart_kind(chart_kind)
     if chart_kind_value != "bar":
@@ -185,6 +190,7 @@ def build_multi_metric_chart_result(
         "presentation": {
             "orientation": _normalize_orientation(orientation),
             "label_mode": _normalize_label_mode(label_mode),
+            "value_precision": _normalize_value_precision(value_precision),
             "stack": bool(stack),
             "merge_tail": False,
         },
@@ -215,6 +221,7 @@ def build_chart_suite(
     include_pie: bool | None = None,
     stack: bool = False,
     max_charts: int = 3,
+    value_precision: int = 2,
 ) -> list[dict[str, Any]]:
     dataset = _normalize_dataset(data)
     rows = dataset["rows"]
@@ -247,6 +254,7 @@ def build_chart_suite(
             limit=resolved_limit,
             label_mode="hidden",
             stack=stack,
+            value_precision=value_precision,
         ))
 
     if want_bar:
@@ -265,6 +273,7 @@ def build_chart_suite(
             limit=resolved_limit,
             label_mode="hidden",
             stack=stack,
+            value_precision=value_precision,
         ))
 
     if want_pie:
@@ -280,6 +289,7 @@ def build_chart_suite(
             top_n=resolved_top_n,
             label_mode="hidden",
             merge_tail=True,
+            value_precision=value_precision,
         ))
 
     if not suite:
@@ -296,6 +306,7 @@ def build_chart_suite(
             limit=resolved_limit,
             label_mode="hidden",
             stack=stack,
+            value_precision=value_precision,
         ))
 
     deduped_suite: list[dict[str, Any]] = []
@@ -376,6 +387,11 @@ def _validate_chart_semantic_encoding(document: dict[str, Any]) -> None:
         "分布",
         "数量",
         "个数",
+        " 个",
+        "条",
+        "记录",
+        "明细",
+        "列表",
         "总数",
         "统计",
         "汇总",
@@ -504,6 +520,9 @@ def normalize_chart_document(
         "presentation": {
             "orientation": _normalize_orientation(presentation.get("orientation") or document.get("orientation") or "auto"),
             "label_mode": _normalize_label_mode(presentation.get("label_mode") or document.get("label_mode") or "auto"),
+            "value_precision": _normalize_value_precision(
+                presentation.get("value_precision", document.get("value_precision", 2))
+            ),
             "stack": bool(presentation.get("stack") or document.get("stack")),
             "merge_tail": bool(
                 presentation.get("merge_tail")
@@ -524,12 +543,18 @@ def compile_chart_document(chart_document: Any) -> dict[str, Any]:
     chart_kind = document["chart_kind"]
 
     if chart_kind in {"bar", "line", "scatter"}:
-        return _compile_cartesian_chart(document)
-    if chart_kind == "boxplot":
-        return _compile_boxplot_chart(document)
-    if chart_kind == "pie":
-        return _compile_pie_chart(document)
-    raise ValueError(f"Unsupported chart_kind: {chart_kind}")
+        chart_spec = _compile_cartesian_chart(document)
+    elif chart_kind == "boxplot":
+        chart_spec = _compile_boxplot_chart(document)
+    elif chart_kind == "pie":
+        chart_spec = _compile_pie_chart(document)
+    else:
+        raise ValueError(f"Unsupported chart_kind: {chart_kind}")
+
+    return _round_chart_spec_series_data(
+        chart_spec,
+        document["presentation"]["value_precision"],
+    )
 
 
 def infer_chart_document_from_chart_spec(
@@ -884,6 +909,46 @@ def _validate_chart_document(document: dict[str, Any]) -> None:
         if field_name and field_name not in columns:
             raise ValueError(f"chart_document field '{field_name}' is not present in dataset columns.")
 
+    if chart_kind in {"bar", "line"}:
+        _validate_cartesian_key_uniqueness(document)
+
+
+def _validate_cartesian_key_uniqueness(document: dict[str, Any]) -> None:
+    encoding = document["encoding"]
+    category_field = encoding["category_field"]
+    series_field = encoding.get("series_field")
+    seen: set[tuple[str, ...]] = set()
+    duplicates: list[tuple[str, ...]] = []
+
+    for row in document["dataset"]["rows"]:
+        category_value = "" if row.get(category_field) is None else str(row.get(category_field))
+        if series_field:
+            series_value = "" if row.get(series_field) is None else str(row.get(series_field))
+            key = (category_value, series_value)
+        else:
+            key = (category_value,)
+
+        if key in seen and key not in duplicates:
+            duplicates.append(key)
+        seen.add(key)
+
+    if not duplicates:
+        return
+
+    sample_text = ", ".join(repr(key) for key in duplicates[:3])
+    key_description = (
+        f"(category_field='{category_field}', series_field='{series_field}')"
+        if series_field
+        else f"category_field='{category_field}'"
+    )
+    raise ValueError(
+        "chart_semantic_error: bar/line chart dataset contains duplicate plotting keys for "
+        f"{key_description}; duplicate samples: {sample_text}. "
+        "The chart compiler cannot infer the intended business aggregation and would overwrite values. "
+        "Aggregate the data to one row per plotting key, add a series_field that makes each "
+        "(category_field, series_field) pair unique, or build a unique composite category before retrying."
+    )
+
 
 def _normalize_dataset(data: Any) -> dict[str, Any]:
     if hasattr(data, "to_dict") and hasattr(data, "columns"):
@@ -1041,6 +1106,46 @@ def _normalize_label_mode(value: Any) -> str:
     if label_mode in {"none", "hide", "hidden", "false", "no"}:
         return "hidden"
     return "auto"
+
+
+def _normalize_value_precision(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("value_precision must be an integer between 0 and 10.")
+    try:
+        precision = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("value_precision must be an integer between 0 and 10.") from exc
+    if precision < 0 or precision > 10:
+        raise ValueError("value_precision must be an integer between 0 and 10.")
+    return precision
+
+
+def _round_chart_spec_series_data(chart_spec: dict[str, Any], value_precision: int) -> dict[str, Any]:
+    for series in chart_spec.get("series") or []:
+        if not isinstance(series, dict) or not isinstance(series.get("data"), list):
+            continue
+        series["data"] = [
+            _round_chart_data_value(item, value_precision)
+            for item in series["data"]
+        ]
+    return chart_spec
+
+
+def _round_chart_data_value(value: Any, value_precision: int) -> Any:
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return round(value, value_precision)
+    if isinstance(value, list):
+        return [_round_chart_data_value(item, value_precision) for item in value]
+    if isinstance(value, tuple):
+        return [_round_chart_data_value(item, value_precision) for item in value]
+    if isinstance(value, dict):
+        rounded = dict(value)
+        if "value" in rounded:
+            rounded["value"] = _round_chart_data_value(rounded["value"], value_precision)
+        return rounded
+    return value
 
 
 def _ordered_unique(values: list[Any]) -> list[Any]:

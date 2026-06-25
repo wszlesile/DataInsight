@@ -615,6 +615,43 @@ class InsightNsArtifact(Base):
         }
 
 
+class InsightNsExecutionEvidence(Base):
+    """一次分析执行对应的证据链包。"""
+
+    __tablename__ = 'insight_ns_execution_evidence'
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment='执行证据包主键')
+    conversation_id = Column(Integer, nullable=False, comment='所属会话 ID')
+    turn_id = Column(Integer, nullable=False, comment='所属轮次 ID')
+    execution_id = Column(Integer, nullable=False, comment='所属代码执行 ID')
+    schema_version = Column(String(32), nullable=False, default='v1', comment='证据链结构版本')
+    query_snapshots_json = Column(Text, nullable=False, default='{}', comment='查询快照 JSON')
+    evidence_map_json = Column(Text, nullable=False, default='{}', comment='正式 EvidenceMap JSON')
+    is_deleted = Column(Integer, nullable=False, default=0, comment='软删除标记')
+    created_at = Column(DateTime, default=_now, comment='创建时间')
+    updated_at = Column(DateTime, default=_now, onupdate=_now, comment='更新时间')
+
+    __table_args__ = (
+        Index('uk_execution_evidence', 'execution_id', unique=True),
+        Index('idx_execution_evidence_turn', 'conversation_id', 'turn_id'),
+        {'comment': '执行证据链包表'},
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "conversation_id": self.conversation_id,
+            "turn_id": self.turn_id,
+            "execution_id": self.execution_id,
+            "schema_version": self.schema_version,
+            "query_snapshots_json": self.query_snapshots_json,
+            "evidence_map_json": self.evidence_map_json,
+            "is_deleted": self.is_deleted,
+            "created_at": _format(self.created_at),
+            "updated_at": _format(self.updated_at),
+        }
+
+
 class InsightUserCollect(Base):
     __tablename__ = 'insight_user_collect'
 

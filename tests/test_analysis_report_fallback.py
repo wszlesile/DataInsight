@@ -13,6 +13,7 @@ from agent.invoker import (  # noqa: E402
     MAX_ANALYSIS_AGENT_ROUNDS,
     _build_failure_reason_reply,
     _ensure_analysis_result_ready,
+    _is_chart_contract_error_text,
     _promote_assistant_message_to_report,
     _should_use_failure_reason_fallback,
     _should_use_report_only_fallback,
@@ -31,6 +32,13 @@ class _FakeService:
 
 
 class AnalysisReportFallbackTestCase(unittest.TestCase):
+    def test_chart_semantic_error_is_classified_as_chart_contract_error(self) -> None:
+        self.assertTrue(
+            _is_chart_contract_error_text(
+                "chart_semantic_error: bar/line chart dataset contains duplicate plotting keys"
+            )
+        )
+
     def test_last_round_visible_reply_can_be_promoted_to_report(self) -> None:
         self.assertTrue(
             _should_use_report_only_fallback(

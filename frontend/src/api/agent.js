@@ -148,6 +148,10 @@ export function getTurnVersionDetail(conversationId, turnId, analysisTaskId) {
   return api.get(`/insight/conversations/${conversationId}/turns/${turnId}/versions/${analysisTaskId}`)
 }
 
+export function resolveEvidence(conversationId, turnId, payload) {
+  return api.post(`/insight/conversations/${conversationId}/turns/${turnId}/evidence/resolve`, payload || {})
+}
+
 export function bindConversationDatasource(conversationId, datasourceId) {
   return api.post('/insight/conversation/datasource/', {
     insight_conversation_id: conversationId,

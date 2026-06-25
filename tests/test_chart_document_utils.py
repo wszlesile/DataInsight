@@ -42,6 +42,60 @@ class ChartDocumentUtilsTestCase(unittest.TestCase):
         self.assertEqual(len(normalized_item["chart_spec"]["series"]), 2)
         self.assertEqual({item["name"] for item in normalized_item["chart_spec"]["series"]}, {"East", "West"})
 
+    def test_bar_chart_rejects_duplicate_category_without_series(self) -> None:
+        chart_item = build_chart_result(
+            chart_kind="bar",
+            data=[
+                {"workshop": "WS1", "line": "L01", "ratio": 17.23},
+                {"workshop": "WS2", "line": "L01", "ratio": 3.23},
+            ],
+            title="Labor Cost Ratio",
+            category_field="line",
+            value_field="ratio",
+        )
+
+        with self.assertRaisesRegex(ValueError, "chart_semantic_error.*duplicate plotting keys"):
+            normalize_chart_result_item(chart_item)
+
+    def test_bar_chart_accepts_duplicate_category_with_unique_series(self) -> None:
+        chart_item = build_chart_result(
+            chart_kind="bar",
+            data=[
+                {"workshop": "WS1", "line": "L01", "ratio": 17.23},
+                {"workshop": "WS1", "line": "L02", "ratio": 3.53},
+                {"workshop": "WS2", "line": "L01", "ratio": 3.23},
+                {"workshop": "WS2", "line": "L02", "ratio": 2.19},
+            ],
+            title="Labor Cost Ratio",
+            category_field="line",
+            value_field="ratio",
+            series_field="workshop",
+        )
+
+        normalized_item = normalize_chart_result_item(chart_item)
+        chart_spec = normalized_item["chart_spec"]
+        self.assertEqual(chart_spec["xAxis"]["data"], ["L01", "L02"])
+        self.assertEqual(
+            {item["name"]: item["data"] for item in chart_spec["series"]},
+            {"WS1": [17.23, 3.53], "WS2": [3.23, 2.19]},
+        )
+
+    def test_line_chart_rejects_duplicate_category_and_series_pair(self) -> None:
+        chart_item = build_chart_result(
+            chart_kind="line",
+            data=[
+                {"day": "2026-06-01", "region": "East", "sales": 120},
+                {"day": "2026-06-01", "region": "East", "sales": 131},
+            ],
+            title="Daily Sales",
+            category_field="day",
+            value_field="sales",
+            series_field="region",
+        )
+
+        with self.assertRaisesRegex(ValueError, "chart_semantic_error.*series_field='region'"):
+            normalize_chart_result_item(chart_item)
+
     def test_compile_chart_document_auto_uses_horizontal_bar_for_long_categories(self) -> None:
         chart_document = {
             "chart_kind": "bar",
@@ -87,6 +141,23 @@ class ChartDocumentUtilsTestCase(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "chart_semantic_error"):
             normalize_chart_result_item(chart_item)
 
+    def test_detail_record_chart_rejects_id_as_value_axis(self) -> None:
+        chart_item = build_chart_result(
+            chart_kind="bar",
+            data=[
+                {"name": "wsztest", "id": 5},
+                {"name": "wsz", "id": 3},
+            ],
+            title="名称包含「wsz」的洞察空间",
+            description="展示名称中包含「wsz」的 2 个洞察空间",
+            category_field="name",
+            value_field="id",
+            value_precision=0,
+        )
+
+        with self.assertRaisesRegex(ValueError, "chart_semantic_error"):
+            normalize_chart_result_item(chart_item)
+
     def test_distribution_chart_accepts_grouped_count_value_field(self) -> None:
         chart_item = build_chart_result(
             chart_kind="bar",
@@ -123,6 +194,48 @@ class ChartDocumentUtilsTestCase(unittest.TestCase):
 
         normalized_item = normalize_chart_result_item(chart_item)
         self.assertTrue(normalized_item["chart_spec"]["series"][0]["label"]["show"])
+
+    def test_chart_values_default_to_two_decimal_places(self) -> None:
+        chart_item = build_chart_result(
+            chart_kind="bar",
+            data=[{"company": "A", "ratio": 19.23808878416981}],
+            title="Ratio",
+            category_field="company",
+            value_field="ratio",
+        )
+
+        normalized_item = normalize_chart_result_item(chart_item)
+        self.assertEqual(normalized_item["chart_spec"]["series"][0]["data"], [19.24])
+        self.assertNotIn("value_precision", normalized_item["chart_spec"])
+
+    def test_chart_values_honor_custom_value_precision(self) -> None:
+        chart_item = build_chart_result(
+            chart_kind="bar",
+            data=[
+                {"company": "A", "ratio": 19.23808878416981},
+                {"company": "B", "ratio": 16.65710218501819},
+                {"company": "C", "ratio": 11.386771794382815},
+            ],
+            title="Ratio",
+            category_field="company",
+            value_field="ratio",
+            value_precision=1,
+        )
+
+        normalized_item = normalize_chart_result_item(chart_item)
+        self.assertEqual(normalized_item["chart_spec"]["series"][0]["data"], [19.2, 16.7, 11.4])
+        self.assertNotIn("value_precision", normalized_item["chart_spec"])
+
+    def test_chart_rejects_invalid_value_precision(self) -> None:
+        with self.assertRaisesRegex(ValueError, "value_precision must be an integer between 0 and 10"):
+            build_chart_result(
+                chart_kind="bar",
+                data=[{"company": "A", "ratio": 19.2}],
+                title="Ratio",
+                category_field="company",
+                value_field="ratio",
+                value_precision=11,
+            )
 
     def test_normalize_chart_result_item_keeps_legacy_chart_spec_path(self) -> None:
         chart_item = {

@@ -204,7 +204,10 @@
                         :key="`${item.turnId}-chart-${chart.id || chartIndex}`"
                         class="answer-chart"
                       >
-                        <ChartDisplay :chart-spec="chart.chartSpec" />
+                        <ChartDisplay
+                          :chart-spec="chart.chartSpec"
+                          @point-click="onChartEvidenceClick(item, chart, chartIndex, $event)"
+                        />
                       </div>
                     </div>
 
@@ -229,7 +232,12 @@
                             </thead>
                             <tbody>
                               <tr v-for="(row, rowIndex) in getTableRows(table)" :key="rowIndex">
-                                <td v-for="column in getTableColumns(table)" :key="`${rowIndex}-${column.field}`">
+                                <td
+                                  v-for="column in getTableColumns(table)"
+                                  :key="`${rowIndex}-${column.field}`"
+                                  :class="{ 'traceable-cell': hasTableEvidenceRef(table, column) }"
+                                  @click="onTableEvidenceClick(item, table, tableIndex, row, rowIndex, column)"
+                                >
                                   {{ formatTableCell(row[column.field]) }}
                                 </td>
                               </tr>
@@ -242,7 +250,8 @@
                     <div
                       v-if="item.report"
                       class="message-bubble ai report-text answer-report"
-                      v-html="renderMarkdown(item.report)"
+                      v-html="renderTraceableReport(item.report, getReportEvidenceRefs(item))"
+                      @click="onReportEvidenceClick(item, $event)"
                     />
                   </div>
                 </div>
@@ -339,7 +348,10 @@
                         :key="`${currentTurnId}-chart-${chart.id || chartIndex}`"
                         class="answer-chart"
                       >
-                        <ChartDisplay :chart-spec="chart.chartSpec" />
+                        <ChartDisplay
+                          :chart-spec="chart.chartSpec"
+                          @point-click="onChartEvidenceClick({ turnId: currentTurnId }, chart, chartIndex, $event)"
+                        />
                       </div>
                     </div>
                     <div v-if="currentTables.length" class="answer-table-list">
@@ -363,7 +375,12 @@
                             </thead>
                             <tbody>
                               <tr v-for="(row, rowIndex) in getTableRows(table)" :key="rowIndex">
-                                <td v-for="column in getTableColumns(table)" :key="`${rowIndex}-${column.field}`">
+                                <td
+                                  v-for="column in getTableColumns(table)"
+                                  :key="`${rowIndex}-${column.field}`"
+                                  :class="{ 'traceable-cell': hasTableEvidenceRef(table, column) }"
+                                  @click="onTableEvidenceClick({ turnId: currentTurnId }, table, tableIndex, row, rowIndex, column)"
+                                >
                                   {{ formatTableCell(row[column.field]) }}
                                 </td>
                               </tr>
@@ -375,7 +392,8 @@
                     <div
                       v-if="currentReport"
                       class="message-bubble ai report-text answer-report"
-                      v-html="renderMarkdown(currentReport)"
+                      v-html="renderTraceableReport(currentReport, currentReportEvidenceRefs)"
+                      @click="onReportEvidenceClick({ turnId: currentTurnId, reportEvidenceRefs: currentReportEvidenceRefs }, $event)"
                     />
                   </div>
                 </div>
@@ -535,7 +553,11 @@
 
             <div v-if="turnDetail.turn.final_answer" class="detail-section">
               <div class="section-title">最终结论</div>
-              <div class="detail-card" v-html="renderMarkdown(turnDetail.turn.final_answer)" />
+              <div
+                class="detail-card answer-report"
+                v-html="renderTraceableReport(turnDetail.turn.final_answer, getTurnDetailReportEvidenceRefs(turnDetail))"
+                @click="onReportEvidenceClick({ turnId: turnDetail.turn.id, reportEvidenceRefs: getTurnDetailReportEvidenceRefs(turnDetail) }, $event)"
+              />
             </div>
 
             <div class="detail-section">
@@ -592,7 +614,10 @@
               <div class="section-title">产物预览</div>
               <div class="detail-card">
                 <div class="artifact-title">{{ previewArtifact.title || '图表预览' }}</div>
-                <ChartDisplay :chart-spec="artifactChartSpec(previewArtifact)" />
+                <ChartDisplay
+                  :chart-spec="artifactChartSpec(previewArtifact)"
+                  @point-click="onArtifactChartEvidenceClick(previewArtifact, $event)"
+                />
               </div>
             </div>
           </el-tab-pane>
@@ -649,7 +674,10 @@
                       >
                         <div class="answer-chart-title">{{ chart.title || `图表 ${chartIndex + 1}` }}</div>
                         <div v-if="chart.summaryText" class="answer-chart-desc">{{ chart.summaryText }}</div>
-                        <ChartDisplay :chart-spec="chart.chartSpec" />
+                        <ChartDisplay
+                          :chart-spec="chart.chartSpec"
+                          @point-click="onChartEvidenceClick({ turnId: selectedVersionDetail?.turn?.id || turnDetail?.turn?.id }, chart, chartIndex, $event)"
+                        />
                       </div>
                     </div>
                   </div>
@@ -677,7 +705,12 @@
                             </thead>
                             <tbody>
                               <tr v-for="(row, rowIndex) in getTableRows(table)" :key="rowIndex">
-                                <td v-for="column in getTableColumns(table)" :key="`${rowIndex}-${column.field}`">
+                                <td
+                                  v-for="column in getTableColumns(table)"
+                                  :key="`${rowIndex}-${column.field}`"
+                                  :class="{ 'traceable-cell': hasTableEvidenceRef(table, column) }"
+                                  @click="onTableEvidenceClick({ turnId: selectedVersionDetail?.turn?.id || turnDetail?.turn?.id }, table, tableIndex, row, rowIndex, column)"
+                                >
                                   {{ formatTableCell(row[column.field]) }}
                                 </td>
                               </tr>
@@ -690,7 +723,11 @@
 
                   <div v-if="getVersionReport(selectedVersionDetail)" class="detail-section">
                     <div class="section-title">报告</div>
-                    <div class="detail-card answer-report" v-html="renderMarkdown(getVersionReport(selectedVersionDetail))" />
+                    <div
+                      class="detail-card answer-report"
+                      v-html="renderTraceableReport(getVersionReport(selectedVersionDetail), getVersionReportEvidenceRefs(selectedVersionDetail))"
+                      @click="onReportEvidenceClick({ turnId: selectedVersionDetail?.turn?.id || turnDetail?.turn?.id, reportEvidenceRefs: getVersionReportEvidenceRefs(selectedVersionDetail) }, $event)"
+                    />
                   </div>
 
                   <div
@@ -707,6 +744,67 @@
         </el-tabs>
       </div>
       <div v-else class="detail-empty">没有可展示的轮次详情。</div>
+    </el-drawer>
+
+    <el-drawer v-model="evidenceDrawerVisible" title="" size="42%" destroy-on-close custom-class="evidence-drawer">
+      <div v-if="evidenceLoading" class="detail-empty">正在加载证据链...</div>
+      <div v-else-if="evidenceDetail" class="evidence-panel">
+        <div class="evidence-hero">
+          <div class="evidence-hero-title">{{ getEvidenceDisplayValue(evidenceDetail) }} 是怎么计算出来的？</div>
+          <div class="evidence-hero-subtitle">{{ evidenceDetail.metric_name || '可追溯指标' }}</div>
+        </div>
+        <div class="evidence-chain">
+          <div
+            v-for="(step, stepIndex) in evidenceDetail.chain_steps || []"
+            :key="`${step.type || 'step'}-${stepIndex}`"
+            :class="['evidence-step', { 'evidence-step-final': stepIndex === (evidenceDetail.chain_steps || []).length - 1 }]"
+          >
+            <div class="evidence-step-rail">
+              <div class="evidence-step-index">{{ stepIndex + 1 }}</div>
+            </div>
+            <div class="evidence-step-body">
+              <div class="evidence-step-title">{{ step.title || step.type }}</div>
+              <div class="evidence-step-summary">{{ step.summary || '该步骤未提供额外说明。' }}</div>
+              <div v-if="stepItems(step).length" class="evidence-step-items">
+                <div v-for="(item, itemIndex) in stepItems(step)" :key="`${step.type}-item-${itemIndex}`" class="evidence-step-item">
+                  <span class="evidence-item-label">{{ item.label }}</span>
+                  <span class="evidence-item-value">{{ formatEvidenceValue(item.value) }}</span>
+                </div>
+              </div>
+              <div v-if="step.method" class="evidence-method">
+                <div class="evidence-method-label">计算方法</div>
+                <div class="evidence-method-value">{{ step.method }}</div>
+              </div>
+              <div v-if="step.formula" class="evidence-formula">{{ step.formula }}</div>
+              <div v-if="step.output" class="evidence-output">{{ step.output }}</div>
+              <div v-if="step.type !== 'result' && stepBadges(step).length" class="evidence-step-badges">
+                <span v-for="badge in stepBadges(step)" :key="badge" class="evidence-badge">{{ badge }}</span>
+              </div>
+              <div v-if="stepWarnings(step).length" class="evidence-warnings">
+                <div v-for="(warning, warningIndex) in stepWarnings(step)" :key="`${step.type}-warning-${warningIndex}`" class="evidence-warning">
+                  {{ warning }}
+                </div>
+              </div>
+              <div v-if="step.type === 'result' || step.type === 'calculation'" class="evidence-result-card">
+                <div class="evidence-result-value">{{ formatEvidenceValue(step.result_value || getEvidenceDisplayValue(evidenceDetail)) }}</div>
+                <div class="evidence-result-label">{{ evidenceDetail.metric_name || '最终结果' }}</div>
+                <div v-if="stepBadges(step).length" class="evidence-result-badges">
+                  <span v-for="badge in stepBadges(step)" :key="badge" class="evidence-badge">{{ badge }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <el-collapse v-if="hasEvidenceDebugInfo(evidenceDetail)" class="evidence-debug-collapse">
+          <el-collapse-item title="查看 SQL" name="sql">
+            <pre class="evidence-debug-pre">{{ getEvidenceSqlText(evidenceDetail) }}</pre>
+          </el-collapse-item>
+          <el-collapse-item title="查看执行代码" name="code">
+            <pre class="evidence-debug-pre">{{ getEvidenceCodeText(evidenceDetail) }}</pre>
+          </el-collapse-item>
+        </el-collapse>
+      </div>
+      <div v-else class="detail-empty">没有可展示的证据链。</div>
     </el-drawer>
   </div>
 </template>
@@ -742,6 +840,7 @@ import {
   renameConversation,
   renameNamespace,
   rerunExecutionLocally,
+  resolveEvidence,
   selectLlmModel,
   submitAgentTask,
   submitRerunTurnTask,
@@ -764,6 +863,7 @@ const currentChartArtifactId = ref(0)
 const currentCharts = ref([])
 const currentTables = ref([])
 const currentReport = ref('')
+const currentReportRefs = ref({})
 const currentAssistantMessage = ref('')
 const currentDataSource = ref(null)
 const currentProgressItems = ref([])
@@ -785,6 +885,9 @@ const selectedVersionKey = ref('')
 const selectedVersionDetail = ref(null)
 const turnVersionDetailLoading = ref(false)
 const previewArtifact = ref(null)
+const evidenceDrawerVisible = ref(false)
+const evidenceLoading = ref(false)
+const evidenceDetail = ref(null)
 const favoritesPanelVisible = ref(false)
 const llmModels = ref([])
 const llmModelsLoading = ref(false)
@@ -811,6 +914,35 @@ const selectedLlmModel = computed(() =>
 )
 
 const renderMarkdown = (content) => (content ? marked.parse(content) : '')
+const escapeHtml = (value) => String(value ?? '')
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&#39;')
+
+const renderTraceableReport = (content, refs = []) => {
+  const text = String(content || '')
+  const normalizedRefs = (Array.isArray(refs) ? refs : [])
+    .filter((ref) => ref && Number.isFinite(Number(ref.start)) && Number.isFinite(Number(ref.end)) && ref.evidence_id)
+    .map((ref) => ({ ...ref, start: Number(ref.start), end: Number(ref.end) }))
+    .filter((ref) => ref.start >= 0 && ref.end > ref.start && ref.end <= text.length)
+    .sort((left, right) => left.start - right.start)
+
+  if (!normalizedRefs.length) return renderMarkdown(text)
+
+  let cursor = 0
+  let markdown = ''
+  normalizedRefs.forEach((ref) => {
+    if (ref.start < cursor) return
+    markdown += text.slice(cursor, ref.start)
+    const targetText = text.slice(ref.start, ref.end)
+    markdown += `<span class="traceable-value" data-evidence-id="${escapeHtml(ref.evidence_id)}" data-start="${ref.start}" data-end="${ref.end}">${escapeHtml(targetText)}</span>`
+    cursor = ref.end
+  })
+  markdown += text.slice(cursor)
+  return marked.parse(markdown)
+}
 const collectKey = (collectType, targetId) => `${collectType}:${targetId}`
 const parseCollectMetadata = (collect) => {
   if (!collect?.metadata_json) return {}
@@ -1074,6 +1206,7 @@ const normalizeChartItem = (chart) => {
     title: chart.title || '',
     chartType: chart.chart_type || '',
     chartSpec: sanitizeChartSpec(chart.chart_spec || null),
+    evidenceRefs: chart.evidence_refs || chart.metadata_json?.evidence_refs || {},
     summaryText: chart.summary_text || chart.description || '',
     sortNo: chart.sort_no || 0
   }
@@ -1092,6 +1225,7 @@ const getDisplayCharts = (item) => item?.charts || []
 const getDisplayTables = (item) => Array.isArray(item?.tables) ? item.tables : []
 const getPrimaryChart = (item) => getDisplayCharts(item)[0] || null
 const artifactChartSpec = (artifact) => sanitizeChartSpec(artifact?.content_json?.chart_spec || null)
+const getArtifactEvidenceRefs = (artifact) => artifact?.metadata_json?.evidence_refs || artifact?.evidence_refs || {}
 
 const getTableColumns = (table) => {
   if (Array.isArray(table?.columns) && table.columns.length > 0) {
@@ -1117,6 +1251,32 @@ const getTableColumns = (table) => {
 }
 
 const getTableRows = (table) => Array.isArray(table?.rows) ? table.rows : []
+const getTableEvidenceRefs = (table) => table?.evidence_refs?.table_trace_refs || table?.metadata_json?.evidence_refs?.table_trace_refs || []
+const normalizeReportRefs = (value) => {
+  if (Array.isArray(value)) return value
+  return value?.report_trace_refs || []
+}
+const getReportEvidenceRefs = (item) => normalizeReportRefs(item?.reportEvidenceRefs || item?.report_evidence_refs)
+const currentReportEvidenceRefs = computed(() => normalizeReportRefs(currentReportRefs.value))
+
+const getVersionReportEvidenceRefs = (detail) => {
+  const reportArtifact = getVersionArtifactsByType(detail, 'report')[0]
+  return getArtifactEvidenceRefs(reportArtifact)?.report_trace_refs || []
+}
+
+const getTurnDetailReportEvidenceRefs = (detail) => {
+  const reportArtifact = Array.isArray(detail?.artifacts)
+    ? detail.artifacts.find((artifact) => artifact?.artifact_type === 'report')
+    : null
+  return getArtifactEvidenceRefs(reportArtifact)?.report_trace_refs || []
+}
+
+const normalizeTables = (tables = []) => (
+  (Array.isArray(tables) ? tables : []).map((table) => ({
+    ...table,
+    evidence_refs: table.evidence_refs || table.metadata_json?.evidence_refs || {}
+  }))
+)
 
 const formatTableCell = (value) => {
   if (value === null || value === undefined) return ''
@@ -1124,6 +1284,121 @@ const formatTableCell = (value) => {
   if (typeof value === 'boolean') return value ? 'true' : 'false'
   if (typeof value === 'object') return JSON.stringify(value)
   return String(value)
+}
+
+const getRefValueField = (ref) => String(ref?.value_field || ref?.field || ref?.x_field || ref?.y_field || '').trim()
+const getRefTableColumn = (ref) => String(ref?.column_key || ref?.value_column || ref?.column || '').trim()
+const hasTableEvidenceRef = (table, column) => (
+  getTableEvidenceRefs(table).some((ref) => getRefTableColumn(ref) === column.field || getRefTableColumn(ref) === column.title)
+)
+
+const findChartEvidenceRef = (chart, chartIndex, params = {}) => {
+  const refs = chart?.evidenceRefs?.chart_trace_refs || []
+  const encode = params.encode || {}
+  const valueFields = [
+    ...(Array.isArray(encode.y) ? encode.y : []),
+    ...(Array.isArray(encode.x) ? encode.x : []),
+    params.seriesName
+  ].map((item) => String(item || '').trim()).filter(Boolean)
+  return refs.find((ref) => {
+    const refIndex = Number(ref.chart_index || 0)
+    const refField = getRefValueField(ref)
+    return refIndex === Number(chartIndex || 0) && (!refField || valueFields.includes(refField))
+  }) || refs.find((ref) => Number(ref.chart_index || 0) === Number(chartIndex || 0))
+}
+
+const findTableEvidenceRef = (table, column) => {
+  const refs = getTableEvidenceRefs(table)
+  return refs.find((ref) => getRefTableColumn(ref) === column.field || getRefTableColumn(ref) === column.title)
+}
+
+const resolveEvidenceDetail = async ({ turnId, artifactId, evidenceId, selection }) => {
+  if (!activeConversationId.value || !turnId || !artifactId || !evidenceId) return
+  evidenceLoading.value = true
+  evidenceDetail.value = null
+  evidenceDrawerVisible.value = true
+  try {
+    const response = await resolveEvidence(activeConversationId.value, turnId, {
+      artifact_id: artifactId,
+      evidence_id: evidenceId,
+      selection: selection || {},
+      detail_level: 'full'
+    })
+    evidenceDetail.value = response.data?.data || null
+  } catch (error) {
+    console.error('Resolve evidence error:', error)
+    ElMessage.error(error?.response?.data?.message || '证据链加载失败')
+    evidenceDrawerVisible.value = false
+  } finally {
+    evidenceLoading.value = false
+  }
+}
+
+const onChartEvidenceClick = (item, chart, chartIndex, params) => {
+  const ref = findChartEvidenceRef(chart, chartIndex, params)
+  if (!ref?.evidence_id) return
+  resolveEvidenceDetail({
+    turnId: item?.turnId,
+    artifactId: ref.artifact_id || chart.id,
+    evidenceId: ref.evidence_id,
+    selection: {
+      type: 'chart',
+      chart_index: chartIndex,
+      data_index: Number(params?.dataIndex ?? -1),
+      series_index: Number(params?.seriesIndex ?? -1),
+      value_field: getRefValueField(ref),
+      raw_value: params?.value
+    }
+  })
+}
+
+const onArtifactChartEvidenceClick = (artifact, params) => {
+  const refs = getArtifactEvidenceRefs(artifact)
+  const chart = {
+    id: artifact?.id,
+    evidenceRefs: refs,
+    chartSpec: artifactChartSpec(artifact)
+  }
+  onChartEvidenceClick({ turnId: artifact?.turn_id || turnDetail.value?.turn?.id }, chart, 0, params)
+}
+
+const onTableEvidenceClick = (item, table, tableIndex, row, rowIndex, column) => {
+  const ref = findTableEvidenceRef(table, column)
+  if (!ref?.evidence_id) return
+  resolveEvidenceDetail({
+    turnId: item?.turnId,
+    artifactId: ref.artifact_id || table.id,
+    evidenceId: ref.evidence_id,
+    selection: {
+      type: 'table',
+      table_index: tableIndex,
+      row_index: rowIndex,
+      column_key: column.field,
+      raw_value: row?.[column.field]
+    }
+  })
+}
+
+const onReportEvidenceClick = (item, event) => {
+  const target = event.target?.closest?.('.traceable-value')
+  if (!target) return
+  const evidenceId = target.dataset.evidenceId
+  const start = Number(target.dataset.start)
+  const end = Number(target.dataset.end)
+  const refs = normalizeReportRefs(item?.reportEvidenceRefs || item?.report_evidence_refs)
+  const ref = refs.find((candidate) => candidate.evidence_id === evidenceId && Number(candidate.start) === start && Number(candidate.end) === end)
+  if (!ref?.evidence_id) return
+  resolveEvidenceDetail({
+    turnId: item?.turnId,
+    artifactId: ref.artifact_id,
+    evidenceId: ref.evidence_id,
+    selection: {
+      type: 'report',
+      start,
+      end,
+      raw_value: target.textContent || ''
+    }
+  })
 }
 
 const favoriteTypeLabel = (collect) => {
@@ -1270,6 +1545,7 @@ const resetCurrentConversationState = () => {
   currentCharts.value = []
   currentTables.value = []
   currentReport.value = ''
+  currentReportRefs.value = {}
   currentAssistantMessage.value = ''
   currentProgressItems.value = []
   currentTaskId.value = ''
@@ -1293,6 +1569,7 @@ const finalizeCurrentConversation = () => {
     charts: [...currentCharts.value],
     tables: [...currentTables.value],
     report: finalReply,
+    reportEvidenceRefs: currentReportRefs.value,
     progressItems: [...currentProgressItems.value]
   })
   resetCurrentConversationState()
@@ -1360,8 +1637,9 @@ const mapHistoryItem = (item) => ({
   latestExecution: item.latest_execution || null,
   chartArtifactId: item.chart_artifact_id || 0,
   charts: normalizeCharts(item.charts || []),
-  tables: item.tables || [],
+  tables: normalizeTables(item.tables || []),
   report: item.report,
+  reportEvidenceRefs: item.report_evidence_refs || {},
   progressItems: []
 })
 
@@ -1797,6 +2075,53 @@ const hasObjectEntries = (value) => (
   value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0
 )
 
+const getEvidenceDisplayValue = (detail) => {
+  const context = detail?.selected_context || {}
+  return context.display_value ?? context.raw_value ?? '当前数值'
+}
+
+const formatEvidenceValue = (value) => {
+  if (Array.isArray(value)) return value.filter((item) => item !== null && item !== undefined && item !== '').join(' / ')
+  if (value && typeof value === 'object') return JSON.stringify(value)
+  return value ?? '-'
+}
+
+const stepItems = (step) => Array.isArray(step?.items)
+  ? step.items.filter((item) => item && item.value !== undefined && item.value !== null && item.value !== '')
+  : []
+
+const stepWarnings = (step) => Array.isArray(step?.warnings)
+  ? step.warnings.filter(Boolean)
+  : []
+
+const stepBadges = (step) => Array.isArray(step?.badges)
+  ? step.badges.filter(Boolean)
+  : []
+
+const getEvidenceSteps = (detail) => Array.isArray(detail?.chain_steps) ? detail.chain_steps : []
+
+const collectEvidenceDetails = (detail, keys) => {
+  const result = {}
+  getEvidenceSteps(detail).forEach((step) => {
+    const details = step?.details
+    if (!details || typeof details !== 'object') return
+    keys.forEach((key) => {
+      if (details[key] !== undefined && details[key] !== null && details[key] !== '') {
+        result[`${step.title || step.type}.${key}`] = details[key]
+      }
+    })
+  })
+  return result
+}
+
+const getEvidenceSqlText = (detail) => String(detail?.debug_sql || '').trim() || '本次证据链没有记录 SQL。'
+
+const getEvidenceCodeText = (detail) => String(detail?.generated_code || '').trim() || '本次证据链没有记录执行代码。'
+
+const hasEvidenceDebugInfo = (detail) => Boolean(
+  String(detail?.debug_sql || '').trim() || String(detail?.generated_code || '').trim()
+)
+
 const getArtifactContent = (artifact) => parseJsonObject(artifact?.content_json)
 
 const getVersionArtifactsByType = (detail, artifactType) => (
@@ -1827,6 +2152,7 @@ const getVersionCharts = (detail) => normalizeCharts(
       summary_text: artifact.summary_text,
       chart_type: content.chart_type || '',
       chart_spec: content.chart_spec || {},
+      evidence_refs: getArtifactEvidenceRefs(artifact),
       sort_no: artifact.sort_no || 0
     }
   })
@@ -1843,6 +2169,7 @@ const getVersionTables = (detail) => (
         description: artifact.summary_text,
         columns: Array.isArray(content.columns) ? content.columns : [],
         rows: Array.isArray(content.rows) ? content.rows : [],
+        evidence_refs: getArtifactEvidenceRefs(artifact),
         sort_no: artifact.sort_no || 0
       }
     })
@@ -2252,11 +2579,12 @@ const handleStreamEvent = async (event) => {
     await Promise.all([fetchConversations(), fetchCollects()])
     return
   }
-    if (event.type === 'result') {
+  if (event.type === 'result') {
       currentCharts.value = normalizeCharts(event.charts || [])
-      if (Array.isArray(event.tables)) currentTables.value = event.tables
+      if (Array.isArray(event.tables)) currentTables.value = normalizeTables(event.tables)
       if (event.chart_artifact_id) currentChartArtifactId.value = Number(event.chart_artifact_id)
       if (event.analysis_report) currentReport.value = event.analysis_report
+      if (event.report_evidence_refs) currentReportRefs.value = event.report_evidence_refs
       scrollToBottom()
       return
   }
@@ -2494,6 +2822,114 @@ onMounted(async () => {
 .answer-report :deep(h4) {
   margin: 0 0 12px;
   color: #0f172a;
+}
+.answer-report :deep(.traceable-value) {
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 3px;
+}
+.answer-report :deep(.traceable-value:hover) {
+  color: #1d4ed8;
+}
+.traceable-cell {
+  cursor: pointer;
+}
+.traceable-cell:hover {
+  background: #eff6ff;
+}
+.evidence-panel { display: flex; flex-direction: column; gap: 18px; padding-bottom: 18px; }
+.evidence-hero { padding: 0 0 14px; border-bottom: 1px solid #e5e7eb; }
+.evidence-hero-title { font-size: 20px; line-height: 1.35; font-weight: 800; color: #0f172a; word-break: break-word; }
+.evidence-hero-subtitle { margin-top: 6px; font-size: 13px; color: #475569; }
+.evidence-chain { display: flex; flex-direction: column; }
+.evidence-step { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 12px; position: relative; }
+.evidence-step:not(:last-child) { padding-bottom: 16px; }
+.evidence-step-rail { position: relative; display: flex; justify-content: center; }
+.evidence-step:not(:last-child) .evidence-step-rail::after {
+  content: '';
+  position: absolute;
+  top: 30px;
+  bottom: -16px;
+  width: 2px;
+  background: #0f8b8d;
+}
+.evidence-step-index {
+  position: relative;
+  z-index: 1;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: #0f8b8d;
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 800;
+}
+.evidence-step-body { border-bottom: 1px solid #e5e7eb; padding: 0 0 14px; min-width: 0; }
+.evidence-step-final .evidence-step-body { border-bottom: none; }
+.evidence-step-title { font-size: 15px; font-weight: 800; color: #0f172a; margin-bottom: 8px; }
+.evidence-step-summary { font-size: 13px; line-height: 1.7; color: #334155; }
+.evidence-step-items { display: flex; flex-direction: column; gap: 7px; margin-top: 10px; }
+.evidence-step-item { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 12px; font-size: 13px; line-height: 1.55; }
+.evidence-item-label { color: #64748b; }
+.evidence-item-value { color: #0f172a; font-weight: 600; word-break: break-word; }
+.evidence-formula {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f0fdfa;
+  border: 1px solid #99f6e4;
+  color: #0f766e;
+  font-size: 18px;
+  font-weight: 800;
+  text-align: center;
+  word-break: break-word;
+}
+.evidence-method {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid #bae6fd;
+  background: #f0f9ff;
+  border-radius: 8px;
+}
+.evidence-method-label { color: #0369a1; font-size: 12px; font-weight: 800; margin-bottom: 4px; }
+.evidence-method-value { color: #0f172a; font-size: 13px; line-height: 1.6; font-weight: 600; }
+.evidence-output {
+  display: inline-flex;
+  margin-top: 10px;
+  color: #0f8b8d;
+  font-weight: 800;
+  font-size: 13px;
+}
+.evidence-warnings { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.evidence-warning { color: #d97706; font-size: 13px; line-height: 1.6; }
+.evidence-step-badges { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; }
+.evidence-result-card {
+  margin-top: 14px;
+  border: 1px solid #99f6e4;
+  background: linear-gradient(180deg, #f0fdfa 0%, #ffffff 100%);
+  border-radius: 8px;
+  padding: 18px 14px;
+  text-align: center;
+}
+.evidence-result-value { color: #0f8b8d; font-size: 42px; line-height: 1.1; font-weight: 800; word-break: break-word; }
+.evidence-result-label { margin-top: 6px; color: #334155; font-size: 14px; font-weight: 700; }
+.evidence-result-badges { margin-top: 10px; display: flex; justify-content: center; flex-wrap: wrap; gap: 8px; }
+.evidence-badge { border: 1px solid #86efac; color: #15803d; background: #f0fdf4; border-radius: 999px; padding: 3px 9px; font-size: 12px; font-weight: 700; }
+.evidence-debug-collapse { border-top: 1px solid #e5e7eb; border-bottom: 1px solid #e5e7eb; }
+.evidence-debug-pre {
+  margin: 0;
+  padding: 10px;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #334155;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-x: auto;
+  white-space: pre-wrap;
 }
 .result-header, .favorites-header, .detail-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }
 .favorites-mask { position: fixed; inset: 56px 0 0 0; background: rgba(15, 23, 42, 0.28); z-index: 34; }

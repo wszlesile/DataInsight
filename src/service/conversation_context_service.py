@@ -35,6 +35,7 @@ from utils.datasource_utils import (
     to_int,
 )
 from utils.analysis_task_cancel import AnalysisTaskCancelled, CANCELLED_MESSAGE, is_analysis_task_cancelled
+from service.evidence_assembly_service import EvidenceAssemblyService
 
 ROLE_TO_TYPE = {
     'system': 0,
@@ -367,6 +368,13 @@ class ConversationContextService:
                 analysis_task_id=analysis_task_id,
                 sort_no=100 + index,
             ))
+
+        EvidenceAssemblyService(self.session).assemble_for_execution(
+            conversation_id=conversation.id,
+            turn_id=turn.id,
+            execution=latest_execution,
+            artifacts=artifacts,
+        )
 
         if analysis_task_id and is_analysis_task_cancelled(task_pk=int(analysis_task_id or 0)):
             raise AnalysisTaskCancelled(CANCELLED_MESSAGE)
