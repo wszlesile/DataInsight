@@ -358,7 +358,7 @@ execution_intent = "probe"     # 数据探测
 - `execution_intent = "probe"`：探测代码只负责轻量探测，并将 `request_retry(retry_type="probe_feedback", ...)` 的返回值赋给 `result`；探测代码不要生成 `query_constraints`，也不要调用 `validate_query_constraints(...)`。probe 的目标是验证已选分析对象所需的字段、时间、候选值、JOIN key 或错误原因，不是发现所有可用数据源；只围绕当前问题相关的数据源访问数据，不要把 probe 当成对所有候选数据源的全量巡检。
 - `query_constraints` 只属于正式 `analysis` 代码，是当前分析所采用的时间范围、目标筛选和聚合粒度的显式契约；它必须从 `analysis_parameters` 派生，不能和 `analysis_parameters` 写成两套互相独立的口径。
 - `query_constraints` 必须是真实 Python `dict`，不能只是注释或自然语言说明。
-- `query_constraints.target_filters` 应沉淀可结构化展示的过滤规则：每条过滤项尽量写清 `field` 或 `field_hint`、`match_mode/operator`、`value/values`；`notes` 只写整体口径总结，不要用 notes 替代具体过滤规则。
+- `query_constraints.target_filters` 应沉淀可结构化展示的过滤规则：每条过滤项必须使用稳定 schema（`semantic_role`、`field_hint`、`value`、`match_mode`）；`notes` 只写整体口径总结，不要用 notes 替代具体过滤规则。
 - 正式分析代码在声明 `query_constraints` 后，不能跳过 `validate_query_constraints(...)`，且应传入稳定 `query_key`，供 EvidenceDefinition.query_refs 引用。
 - 如果文件 / 表 / API 本身不可访问，应返回 `request_retry(retry_type="data_source_unavailable", ...)`，不要伪装成 `no_data_found`。
 - 探测代码不能调用 `save_analysis_result(...)`，也不能把探测结果包装成最终分析报告。
@@ -377,7 +377,10 @@ analysis_parameters_schema = {
 analysis_parameters = get_analysis_parameters(analysis_parameters_schema["defaults"])
 
 query_constraints = {
-    # 必须从 analysis_parameters 派生
+    "time_range": None,
+    "target_filters": [],
+    "aggregation": {"grain": "detail", "metric": "count"},
+    "notes": "一句话说明本轮正式分析查询口径",
 }
 
 # 先基于 analysis_parameters 构造 sql / filter_expressions / sql_context.fragments
@@ -397,10 +400,9 @@ else:
         raise_no_data_error(...)
 
     # 构造 charts / tables / analysis_report
-    # 同步构造 evidence_definitions 和 trace refs
-    evidence_definitions = [...]  # 按计算逻辑边界补齐；有图表/表格/报告核心数值时不能为空
-    chart_trace_refs = [...]      # 有图表指标字段时补齐
-    table_trace_refs = [...]      # 有结构化表格 metric 列时补齐
+    # 同步构造 evidence_definitions 和指标字段绑定
+    evidence_definitions = [...]       # 优先用 define_evidence(...) 按计算逻辑边界生成；有图表/表格/报告核心数值时不能为空
+    metric_evidence_bindings = {...}   # 图表 value_field / 表格 metric 列 到 evidence_key 的字段级绑定，save_analysis_result 会自动生成 chart/table trace refs
     table_trace_metadata = {...}  # 使用 build_table_result(...) 时从 helper 返回值读取
     report_trace_refs = [...]     # 有报告核心计算数值时通过 build_report_result(...) 生成
     result = save_analysis_result(
@@ -410,8 +412,7 @@ else:
         analysis_parameters_schema=analysis_parameters_schema,
         analysis_parameters=analysis_parameters,
         evidence_definitions=evidence_definitions,
-        chart_trace_refs=chart_trace_refs,
-        table_trace_refs=table_trace_refs,
+        metric_evidence_bindings=metric_evidence_bindings,
         table_trace_metadata=table_trace_metadata,
         report_trace_refs=report_trace_refs,
     )
@@ -476,13 +477,112 @@ else:
 
 Evidence 的生成目标是让用户能看懂“这个数值来自哪些查询、经过哪些筛选/清洗/聚合/公式、最终怎么得到”。因此按**计算逻辑边界**生成 Evidence：同一套查询、筛选、聚合或公式得到的一组数值共用一条 EvidenceDefinition；不要按每个图表点、每行表格或每个相同数值各写一条。
 
+EvidenceDefinition 不是“指标集合”，而是“一个用户点击某个数值后，这个数值如何计算出来”的解释单元。生成时先逐个列出图表 `value_field`、表格 metric 列、报告中的计算数值，再按它们回答的问题拆分 Evidence。禁止用“利润指标”“成本指标”“综合指标”“核心指标”“总体情况”这类大而全的 Evidence 承载多个不相关数值。
+
+常见计算逻辑边界：
+
+- 计数类：产品数量、公司数量、记录数、空间数等，单独生成 count Evidence，例如 `product_count = COUNT(DISTINCT 产品编码)`。
+- 金额汇总类：销售收入、结转成本、毛利分别是不同指标；即使来自同一查询，也应分别生成 Evidence，例如 `total_sales_amount`、`total_settled_cost`、`total_gross_profit`。
+- 比率/占比类：毛利率、利润率、完成率、占比等是复合指标，Evidence 只解释最终比率字段；分子、分母写入 `formula`，不要混入 `metric_fields`。
+- Top/Min/Max 类：最高毛利产品、最低单位成本产品、最大值、最小值等，单独生成 Evidence，说明“先按维度聚合，再排序/取最大/取最小”。
+- 构成/分解类：物料成本、人工成本、制造费用这类共同组成“单位成本构成”的字段可以共享一条 Evidence；但它只能解释成本构成，不要同时解释销量、销售收入、毛利、毛利率。
+
+错误示例：下面这种 Evidence 太宽泛，会导致 ref 乱绑，禁止生成：
+
+```python
+{
+    "evidence_key": "profit_metrics",
+    "metric_name": "利润指标",
+    "calculation": {
+        "metric_fields": ["销量_件", "销售收入_元", "毛利_元", "毛利率_百分比"],
+        "formula": "SUM(销量_件), SUM(销售收入_元), SUM(毛利_元), AVG(毛利率_百分比)"
+    }
+}
+```
+
+正确拆分示例：
+
+```python
+evidence_definitions = [
+    {
+        "evidence_key": "product_count",
+        "metric_name": "参与分析产品数量",
+        "value_type": "count",
+        "unit": "个",
+        "query_refs": ["q_march_cost_profit"],
+        "derivation": {"mode": "query_output", "description": "筛选目标月份后统计不同产品编码数量。"},
+        "calculation": {"metric_fields": ["产品数量"], "aggregation": "count_distinct", "group_by": [], "formula": "COUNT(DISTINCT 产品编码)"}
+    },
+    {
+        "evidence_key": "total_sales_amount",
+        "metric_name": "销售收入合计",
+        "value_type": "currency",
+        "unit": "元",
+        "query_refs": ["q_march_cost_profit"],
+        "derivation": {"mode": "query_output", "description": "筛选目标月份后按产品或全局汇总销售收入。"},
+        "calculation": {"metric_fields": ["销售收入_元"], "aggregation": "sum", "group_by": ["产品编码"], "formula": "SUM(销售收入_元)"}
+    },
+    {
+        "evidence_key": "gross_margin_rate",
+        "metric_name": "毛利率",
+        "value_type": "percentage",
+        "unit": "%",
+        "query_refs": ["q_march_cost_profit"],
+        "derivation": {"mode": "query_output", "description": "基于毛利和销售收入计算毛利率。"},
+        "calculation": {"metric_fields": ["毛利率_百分比"], "aggregation": "formula", "group_by": ["产品编码"], "formula": "毛利率 = 毛利_元 / 销售收入_元 * 100"}
+    },
+    {
+        "evidence_key": "unit_cost_components",
+        "metric_name": "单位成本构成",
+        "value_type": "currency",
+        "unit": "元/件",
+        "query_refs": ["q_march_cost_profit"],
+        "derivation": {"mode": "query_output", "description": "筛选目标月份后按产品统计单位成本的组成项。"},
+        "calculation": {"metric_fields": ["物料成本_元每件", "人工成本_元每件", "制造费用_元每件"], "aggregation": "mean", "group_by": ["产品编码"], "formula": "单位成本构成 = 物料成本 + 人工成本 + 制造费用"}
+    }
+]
+```
+
+报告 trace 绑定也必须按语义选择 Evidence：`3 个产品` 绑定 `product_count`，不要绑定成本构成或毛利；`总销售收入` 绑定 `total_sales_amount`；`毛利率` 绑定 `gross_margin_rate`；`最高毛利产品的金额` 绑定 Top/Max 毛利 Evidence。不要为了让报告数值可点击而随便复用一个看起来相关的大 Evidence。
+
 `save_analysis_result(...)` 支持以下 Evidence 参数：
 
 - `evidence_definitions`：计算逻辑说明列表。
-- `chart_trace_refs`：图表指标字段到 `evidence_key` 的绑定。
-- `table_trace_refs`：表格指标列到 `evidence_key` 的绑定。
+- `metric_evidence_bindings`：图表指标字段、表格指标列到 `evidence_key` 的轻量绑定。优先使用它，不要手写图表/表格 trace refs；后端会根据图表/表格结构自动生成 `chart_trace_refs` 和 `table_trace_refs`。
+- `chart_trace_refs` / `table_trace_refs`：兼容旧写法；只有在 `metric_evidence_bindings` 无法表达时才手写。
 - `table_trace_metadata`：表格列角色等辅助信息，优先来自 `build_table_result(...)`。
 - `report_trace_refs`：报告文本中核心数值到 `evidence_key` 的绑定，优先来自 `build_report_result(...)`。
+
+优先使用 `define_evidence(...)` 生成单条 EvidenceDefinition。LLM 只需要声明“这个指标的业务名称、最终字段、查询来源、聚合/公式/分组和必要说明”，不要手写系统字段，也不要把多个不相关指标塞进同一个 Evidence。
+
+```python
+evidence_definitions = [
+    define_evidence(
+        evidence_key="total_sales_amount",
+        metric_name="销售收入合计",
+        value_type="currency",
+        unit="元",
+        query_refs=["q_march_profit"],
+        metric_fields=["销售收入_元"],
+        aggregation="sum",
+        group_by=["产品编码"],
+        formula="SUM(销售收入_元)",
+        derivation_description="筛选目标月份后，按产品汇总销售收入。",
+    ),
+    define_evidence(
+        evidence_key="gross_margin_rate",
+        metric_name="毛利率",
+        value_type="percentage",
+        unit="%",
+        query_refs=["q_march_profit"],
+        metric_fields=["毛利率_百分比"],
+        aggregation="formula",
+        group_by=["产品编码"],
+        formula="毛利率 = 毛利_元 / 销售收入_元 * 100",
+        derivation_description="先得到毛利和销售收入，再计算毛利率。",
+    ),
+]
+```
 
 ### EvidenceDefinition 结构
 
@@ -520,6 +620,7 @@ evidence_definitions = [
 - `evidence_key` 当前执行内唯一，只能使用稳定英文、数字、下划线或短横线。
 - `query_refs` 必须引用本轮 `validate_query_constraints(query_key=...)` 使用过的真实 `query_key`；多查询计算可以引用多个 query key。
 - `calculation.metric_fields` 必须覆盖绑定的图表 `value_field/value_fields` 或表格指标列。
+- `calculation.metric_fields` 只放这条 Evidence 要解释的最终可点击结果字段。复合指标的输入字段、分子、分母、排序依据、辅助字段写在 `formula`、`intermediate_outputs` 或 `derivation.description` 中，不要混入 `metric_fields`。
 - `derivation.description` 写给用户看，说明这个指标为什么这样算，例如“从筛选后的记录中取额定功率字段，分别计算平均值、最小值和最大值”，不要只写底层变量名。
 - `calculation` 记录算法和公式：聚合类写清 `aggregation`、`group_by`、`formula`；比例、毛利率、利润率、完成率、占比、差值、同比环比等复合指标必须在 `formula` 中说明分子、分母或前后项，例如 `毛利率 = 毛利_元 / 销售收入_元 * 100`，不能只写 `AVG(毛利率_百分比)` 这类无法解释业务算法的字段聚合。
 - `transformations` 只记录查询之后、计算之前在 Python 中做的数据清洗、类型转换、排除、补齐、去重、二次过滤等动作；不要把 SQL `WHERE`、`ILIKE/LIKE`、时间范围、target_filters 这类查询口径过滤写到这里，也不要把最终聚合公式重复写到这里。如果查询结果直接进入计算，使用空列表。
@@ -544,11 +645,39 @@ validation = validate_query_constraints(
 
 然后 EvidenceDefinition 使用 `"query_refs": ["q_monthly_sales"]`。如果是本地文件分析，没有 SQL，也必须把 pandas 筛选表达式和聚合提示传给 `validate_query_constraints(...)`，并用这个 `query_key` 作为 Evidence 的输入事实来源。
 
-### TraceRef 结构
+### 指标绑定与 TraceRef 结构
 
-TraceRef 只负责把产物位置绑定到 EvidenceDefinition，不重复保存计算逻辑。
+图表和结构化表格优先不要手写 TraceRef。只写字段级 `metric_evidence_bindings`，让 `save_analysis_result(...)` 根据图表/表格结构自动生成 refs。TraceRef 只负责把产物位置绑定到 EvidenceDefinition，不重复保存计算逻辑。
 
-图表 trace ref：
+```python
+metric_evidence_bindings = {
+    "charts": {
+        0: {
+            "销售收入_元": "total_sales_amount",
+            "毛利率_百分比": "gross_margin_rate",
+        }
+    },
+    "tables": {
+        0: {
+            "销售收入_元": "total_sales_amount",
+            "毛利率_百分比": "gross_margin_rate",
+        }
+    },
+}
+```
+
+也可以使用列表形式：
+
+```python
+metric_evidence_bindings = [
+    {"artifact_type": "chart", "artifact_index": 0, "field": "销售收入_元", "evidence_key": "total_sales_amount"},
+    {"artifact_type": "table", "artifact_index": 0, "field": "毛利率_百分比", "evidence_key": "gross_margin_rate"},
+]
+```
+
+TraceRef 的 `evidence_key` 必须回答当前位置数值本身的问题，不能只因为同属一个业务主题就复用。例如表格列 `毛利率(%)` 不能绑定到“利润指标”大包，也不能绑定到“毛利金额”Evidence；报告文本 `3 个产品` 不能绑定到“单位成本构成”Evidence。若找不到准确 Evidence，应先补充对应 EvidenceDefinition，再写 trace ref。
+
+兼容旧写法的图表 trace ref：
 
 ```python
 chart_trace_refs = [
@@ -560,7 +689,7 @@ chart_trace_refs = [
 - `value_field` 必须等于 `chart_document.encoding.value_field`，多指标图则为 `value_fields` 中的字段。
 - 同一个图表字段下的多个数据点共享同一条 EvidenceDefinition。
 
-表格 trace ref：
+兼容旧写法的表格 trace ref：
 
 ```python
 table_trace_refs = [
@@ -570,7 +699,7 @@ table_trace_refs = [
 
 - `table_index` 是 `tables` 列表中的 0 基下标。
 - `column_key` 或 `value_column` 必须命中表格 columns 中的 key/field。
-- 表格优先使用 `build_table_result(...)` 同步声明列角色，metric 列必须有对应 `table_trace_refs`。
+- 表格优先使用 `build_table_result(...)` 同步声明列角色，metric 列必须有对应 `metric_evidence_bindings["tables"]`；后端会自动生成 `table_trace_refs`。
 
 报告 trace ref 不要手写 `start/end`。应先在报告草稿中用临时标签包住由代码计算、聚合、统计或格式化得到的数值，再交给 `build_report_result(...)`：
 
@@ -585,7 +714,7 @@ report_trace_refs = report_result["report_trace_refs"]
 
 报告正文中由代码计算出来的数值必须尽量完整 trace，不只标核心结论中的一两个值。概览数值、分布数量/占比、平均值、最大值、最小值、总数、TopN 数值、单位换算后的展示值都应包裹 trace 标签；同一计算逻辑下的多个报告数值可以复用同一个 `evidence_key`。章节编号、普通序号、非计算性的日期参数不需要 trace。
 
-如果报告里使用 Markdown 表格承载大量可追溯指标，优先改用结构化 `tables + table_trace_refs`；报告 Markdown 表格更适合摘要说明。报告正文中的计算数值仍可用 `[[trace:evidence_key=...]]...[[/trace]]` 标记后交给 `build_report_result(...)`。
+如果报告里使用 Markdown 表格承载大量可追溯指标，优先改用结构化 `tables + metric_evidence_bindings`；报告 Markdown 表格更适合摘要说明。报告正文中的计算数值仍可用 `[[trace:evidence_key=...]]...[[/trace]]` 标记后交给 `build_report_result(...)`。
 
 该保存函数会通过上下文消息传入，包含：
 - 函数名称
@@ -602,7 +731,7 @@ report_trace_refs = report_result["report_trace_refs"]
 - `charts` 中每一项都表示一个结构化图表结果
 - 生成分析代码时，应把 `build_chart_result(...)`、`build_multi_metric_chart_result(...)` 或 `build_chart_suite(...)` 的返回值放入 `charts`；helper 返回包含 `title`、`chart_type`、`description` 和 `chart_document` 的语义结构
 - `save_analysis_result(...)` 会在后端校验并把 `chart_document` 编译为前端可直接渲染的 `chart_spec`；不要在生成代码中手写或修改 `chart_spec`
-- 每个图表的核心数值字段都必须有 `chart_trace_refs`。单指标图绑定 `chart_document.encoding.value_field`；多指标图分别绑定 `value_fields` 中每个指标字段；散点图可按核心解释目标绑定 `x_field` 或 `y_field`。
+- 每个图表的核心数值字段都必须在 `metric_evidence_bindings["charts"]` 中绑定到对应 `evidence_key`。单指标图绑定 `chart_document.encoding.value_field`；多指标图分别绑定 `value_fields` 中每个指标字段；散点图可按核心解释目标绑定 `x_field` 或 `y_field`。
 - 明细记录列表不要强行画柱状图或折线图；应优先使用结构化表格。严禁把 `id`、主键、序号、编号这类标识字段作为柱状图/折线图/饼图的 `value_field`。如果要展示数量，必须先按业务维度聚合出 `count/数量/洞察空间数量` 等明确数量列，再把该数量列作为 `value_field`。
 - 图表标题和描述必须与实际数据范围一致。若图表只展示目标时间窗中的前 N 条、后 N 条、抽样点或聚合点，应在 `description` 中写清楚实际展示范围、点数和限制/采样口径。
 - helper 会规范化 DataFrame、pandas/numpy 标量、日期时间、`NaN` 和 `Inf`；传入的数据仍应保持字段类型合理，不要预先拼成 pyecharts option 或 JSON 字符串
@@ -612,7 +741,7 @@ report_trace_refs = report_result["report_trace_refs"]
 - `tables` 中每一项都表示一个结构化表格结果
 - 需要可追溯的结构化表格优先使用 `build_table_result(...)` 构造，不要只手写 `columns/rows` 后遗漏列角色。
 - `build_table_result(...)` 的 `columns` 可以包含 `role`、`value_type`、`unit` 等辅助字段；helper 会把展示表格和 `trace_metadata` 拆开，列角色不会污染最终表格展示。
-- role 为 `metric` 的列必须在 `table_trace_refs` 中绑定 `table_index + column_key + evidence_key`。
+- role 为 `metric` 的列必须在 `metric_evidence_bindings["tables"]` 中绑定 `table_index + column_key + evidence_key`，不要手写到展示 rows 中。
 - 每个表格项至少应包含：
   - `title`
   - `description`
@@ -634,9 +763,9 @@ table_result = build_table_result(
 )
 tables = [table_result["table"]]
 table_trace_metadata = table_result["trace_metadata"]
-table_trace_refs = [
-    {"table_index": 0, "column_key": "completion_rate", "evidence_key": "completion_rate"}
-]
+metric_evidence_bindings = {
+    "tables": {0: {"completion_rate": "completion_rate"}}
+}
 
 # 报告：先用临时 trace 标签包裹核心计算值，再生成干净 Markdown 和 report_trace_refs
 report_result = build_report_result(
@@ -693,9 +822,9 @@ analysis_parameters = get_analysis_parameters(analysis_parameters_schema["defaul
 6. **数据处理** - 使用 pandas 进行数据清洗、转换、聚合等；所有可变筛选、分组、排序、TopN、采样和展示上限都应来自 `analysis_parameters`
 7. **可视化** - 已支持的图表类型必须使用后端 chart helper 生成图表；图表标题、描述中的时间范围、筛选对象、指标、粒度应与 `analysis_parameters` 一致
 8. **构造结构化结果** - 默认生成一个或多个结构化图表，必要时附带结构化表格；报告正文必须说明本次实际采用的关键查询口径
-9. **构造证据链草稿** - 为核心计算逻辑生成 `evidence_definitions`，并为图表、表格、报告分别生成 `chart_trace_refs`、`table_trace_refs`、`report_trace_refs`
-10. **保存分析结果或返回探测反馈** - `analysis` 代码调用 `save_analysis_result(..., analysis_parameters_schema=analysis_parameters_schema, analysis_parameters=analysis_parameters, evidence_definitions=evidence_definitions, chart_trace_refs=chart_trace_refs, table_trace_refs=table_trace_refs, table_trace_metadata=table_trace_metadata, report_trace_refs=report_trace_refs)`；`probe` 代码调用 `request_retry()`
-11. **按需复用通用辅助函数** - 当问题涉及相对日期、跨时区时间过滤、可复跑查询口径、明细表输出、无数据重试、本地大文件加载、图表产物构造、结构化表格或报告 trace 标签时，可以优先考虑复用 `get_day_range()`、`get_analysis_parameters()`、`load_local_file_low_memory()`、`probe_distinct_values()`、`probe_text_candidates()`、`describe_time_coverage()`、`build_markdown_table()`、`build_table_result()`、`build_report_result()`、`build_chart_result()`、`build_multi_metric_chart_result()`、`build_chart_suite()`、`raise_no_data_error()`、`request_retry()` 等辅助函数；如果当前分析不需要这些能力，则不必使用
+9. **构造证据链草稿** - 为核心计算逻辑生成 `evidence_definitions`；图表、表格生成字段级 `metric_evidence_bindings`，报告生成 `report_trace_refs`
+10. **保存分析结果或返回探测反馈** - `analysis` 代码调用 `save_analysis_result(..., analysis_parameters_schema=analysis_parameters_schema, analysis_parameters=analysis_parameters, evidence_definitions=evidence_definitions, metric_evidence_bindings=metric_evidence_bindings, table_trace_metadata=table_trace_metadata, report_trace_refs=report_trace_refs)`；`probe` 代码调用 `request_retry()`
+11. **按需复用通用辅助函数** - 当问题涉及相对日期、跨时区时间过滤、可复跑查询口径、证据链定义、明细表输出、无数据重试、本地大文件加载、图表产物构造、结构化表格或报告 trace 标签时，可以优先考虑复用 `get_day_range()`、`get_analysis_parameters()`、`define_evidence()`、`load_local_file_low_memory()`、`probe_distinct_values()`、`probe_text_candidates()`、`describe_time_coverage()`、`build_markdown_table()`、`build_table_result()`、`build_report_result()`、`build_chart_result()`、`build_multi_metric_chart_result()`、`build_chart_suite()`、`raise_no_data_error()`、`request_retry()` 等辅助函数；如果当前分析不需要这些能力，则不必使用
 
 ### 必须遵守
 1. **只生成数据分析相关的代码**，不生成无关代码
@@ -708,7 +837,7 @@ analysis_parameters = get_analysis_parameters(analysis_parameters_schema["defaul
 8. **一轮分析允许多个图表和多个表格，但最终只能调用一次 `save_analysis_result()` 完成统一结果保存**
 9. **不要描述工具调用过程本身**：面向用户的最终输出只应基于工具执行结果，不要把工具名称、工具参数、调用标记或中间执行代码当成最终回答的一部分
 10. **`analysis_report` 必须先求值再保存**：`analysis_report` 必须是已经求值后的最终 Markdown 文本。如果报告中包含动态统计值、DataFrame 单元格、最大/最小值、同比环比、格式化数值等内容，必须先在 Python 中通过 f-string、提前计算变量、格式化变量或字符串拼接得到最终文本，再把最终结果传给 `save_analysis_result()`。禁止在 `analysis_report` 中残留 `{data...}`、`{df...}`、`{row...}`、`{result...}`、`{xxx:,.2f}`、`{xxx:.2%}` 等未求值模板表达式。
-11. **正式分析必须生成证据链**：只要结果包含图表、表格或报告核心计算数值，就必须生成 `evidence_definitions` 和对应 `chart_trace_refs` / `table_trace_refs` / `report_trace_refs`，并传给 `save_analysis_result(...)`；不要依赖后端或前端按 raw_value 反查。
+11. **正式分析必须生成证据链**：只要结果包含图表、表格或报告核心计算数值，就必须生成 `evidence_definitions` 和对应绑定；图表/表格优先传 `metric_evidence_bindings`，报告传 `report_trace_refs`，并统一交给 `save_analysis_result(...)`；不要依赖后端或前端按 raw_value 反查。
 12. **正式分析必须可本地复跑**：`analysis_parameters_schema` 必须描述用户可理解、前端可渲染的查询口径，字段名使用稳定英文 key，`label` / `description` 使用业务可读文本；`query_constraints`、SQL、DataFrame 过滤、图表标题、表格标题和报告正文必须使用 `analysis_parameters`，不要把同一口径硬编码成另一份值。
 13. **必须优先使用数据源真实字段名**：字段选择要以 `metadata_schema.properties` 中给出的真实字段名为准，不要凭空假设并不存在的字段
 14. **相对日期问题必须考虑业务时区**：遇到“今天 / 昨天 / 前天 / 近 N 天”时，必须保证时间过滤和业务时区一致；可以使用 `get_day_range()`，也可以采用其他同样正确且可读的实现方式。时序 SQL 中的时间字面量必须带 `+08:00` 这类业务时区偏移，不要用 `Z` 结尾的 UTC 字面量
@@ -727,7 +856,7 @@ analysis_parameters = get_analysis_parameters(analysis_parameters_schema["defaul
 27. **图表契约或语义错误只修图表构造**：如果执行反馈提示 `chart_contract_error`、`chart_semantic_error`、`chart_spec`、`chart_document`、`chart_kind`、`series`、`xAxis` 或 `yAxis` 问题，说明数据查询通常已经走到图表阶段；下一版应保留正确的数据查询与业务口径，只修正聚合粒度、字段映射或 helper 参数，不要误判成无数据，也不要只输出自然语言报告。遇到重复绘图键时，不允许用去重或覆盖静默丢行；应按当前业务口径先聚合、补充正确的 `series_field`，或构造唯一的组合分类字段
 28. **本地大文件失败后必须切换低内存策略**：如果外部文件已经触发内存耗尽、`MemoryError` 或子进程被 OOM 终止，下一版代码必须改用 `load_local_file_low_memory()` 或等价的批处理方案，在批次内完成过滤和累计统计，不能继续整表读入 pandas
 29. **数值精度必须覆盖报告和图表**：如果用户问题或会话补充提示词要求结果保留 N 位小数，报告中的数值格式和所有 chart helper 必须使用同一精度；调用 `build_chart_result(...)`、`build_multi_metric_chart_result(...)` 或 `build_chart_suite(...)` 时显式传入 `value_precision=N`。未指定精度时图表默认保留 2 位小数
-30. **证据链校验错误只修 evidence/ref**：如果执行反馈包含 `missing_evidence_contract`、`invalid_chart_trace_ref`、`invalid_table_trace_ref`、`invalid_report_trace_ref` 或 `invalid_evidence_contract`，通常说明数据查询和业务计算已走到结果保存阶段；下一版代码应保留正确的数据查询、筛选、聚合和图表/表格构造逻辑，重点补齐或修正 `evidence_definitions`、`chart_trace_refs`、`table_trace_refs`、`report_trace_refs`、报告 trace 标签和 `build_table_result(...)` 列角色，不要误判为无数据或改写业务口径。若反馈指出报告存在 `uncovered_numeric_values`，需要把这些报告数值补上 trace 标签，而不是删掉数值或只保留原有少量 refs。
+30. **证据链校验错误只修 evidence/ref**：如果执行反馈包含 `missing_evidence_contract`、`invalid_chart_trace_ref`、`invalid_table_trace_ref`、`invalid_report_trace_ref` 或 `invalid_evidence_contract`，通常说明数据查询和业务计算已走到结果保存阶段；下一版代码应保留正确的数据查询、筛选、聚合和图表/表格构造逻辑，重点补齐或修正 `evidence_definitions`、`metric_evidence_bindings`、`report_trace_refs`、报告 trace 标签和 `build_table_result(...)` 列角色，不要误判为无数据或改写业务口径。若反馈指出报告存在 `uncovered_numeric_values`，需要把这些报告数值补上 trace 标签，而不是删掉数值或只保留原有少量 refs。
 
 ### 禁止行为
 1. 禁止生成涉及系统安全的代码
@@ -941,9 +1070,9 @@ else:
             "quality_notes": ["未使用抽样、head/tail、sample 或 LIMIT 截断。"]
         }
     ]
-    chart_trace_refs = [
-        {"chart_index": 0, "value_field": "total_dosage", "evidence_key": evidence_key}
-    ]
+    metric_evidence_bindings = {
+        "charts": {0: {"total_dosage": evidence_key}}
+    }
     total_dosage = data["total_dosage"].sum()
     report_result = build_report_result(
         f"## 分析报告\n\n### 核心结论\n\n- 本次分析已基于通过校验的 query_constraints 完成执行，汇总用量为 [[trace:evidence_key={evidence_key}]]{total_dosage:,.2f}[[/trace]]。"
@@ -955,7 +1084,7 @@ else:
         analysis_parameters_schema=analysis_parameters_schema,
         analysis_parameters=analysis_parameters,
         evidence_definitions=evidence_definitions,
-        chart_trace_refs=chart_trace_refs,
+        metric_evidence_bindings=metric_evidence_bindings,
         report_trace_refs=report_result["report_trace_refs"],
     )
 ```
@@ -1110,9 +1239,9 @@ else:
             "quality_notes": []
         }
     ]
-    chart_trace_refs = [
-        {"chart_index": 0, "value_field": metric, "evidence_key": evidence_key}
-    ]
+    metric_evidence_bindings = {
+        "charts": {0: {metric: evidence_key}}
+    }
 
     total_metric_value = monthly_sales[metric].sum()
     peak_row = monthly_sales.loc[monthly_sales[metric].idxmax()]
@@ -1138,7 +1267,7 @@ else:
         analysis_parameters_schema=analysis_parameters_schema,
         analysis_parameters=analysis_parameters,
         evidence_definitions=evidence_definitions,
-        chart_trace_refs=chart_trace_refs,
+        metric_evidence_bindings=metric_evidence_bindings,
         report_trace_refs=report_result["report_trace_refs"],
     )
 ```
@@ -1269,9 +1398,9 @@ else:
             ]
         }
     ]
-    chart_trace_refs = [
-        {"chart_index": 0, "value_field": "报警数量", "evidence_key": evidence_key}
-    ]
+    metric_evidence_bindings = {
+        "charts": {0: {"报警数量": evidence_key}}
+    }
 
     report_sections = [
         "## 报警分析报告",
@@ -1294,7 +1423,7 @@ else:
         analysis_parameters_schema=analysis_parameters_schema,
         analysis_parameters=analysis_parameters,
         evidence_definitions=evidence_definitions,
-        chart_trace_refs=chart_trace_refs,
+        metric_evidence_bindings=metric_evidence_bindings,
         report_trace_refs=report_result["report_trace_refs"],
     )
 ```
@@ -1443,19 +1572,53 @@ LLM 需要理解数据源元数据 `metadata_schema` 的结构：
 3. SQL、本地文件筛选、pandas/DataFrame 过滤都只是实现方式；正式分析时都必须遵守同一份 `query_constraints`。
 4. `query_constraints` 是当前正式分析的显式执行契约，不是注释，也不是自然语言说明。
 
-**`query_constraints` 结构要求**：
+**`query_constraints` schema 要求**：
 
-- 必须使用真实 Python `dict`
-- 第一版至少包含：
-  - `time_range`
-  - `target_filters`
-  - `aggregation`
-  - `notes`
-- `target_filters` 中每个过滤项建议包含：
-  - `semantic_role`
-  - `field_hint`
-  - `value`
-  - `match_mode`
+`query_constraints` 必须是真实 Python `dict`，且必须从 `analysis_parameters` 派生。请优先使用下面的稳定结构，不要发明新的核心字段名来表达同一件事：
+
+```python
+query_constraints = {
+    # 没有明确时间范围时写 None；不要写 {"start": None, "end": None}
+    "time_range": None,
+    # 有明确时间范围时写 dict；start/end 必须是字符串，end_exclusive 必须是 bool
+    # "time_range": {"start": "2026-03-01", "end": "2026-04-01", "end_exclusive": True},
+
+    # 没有目标筛选时写 []；每个筛选项的 value 必须是非空字符串
+    "target_filters": [
+        {
+            "semantic_role": "keyword_search",
+            "field_hint": "name",
+            "value": "wsz",
+            "match_mode": "fuzzy",
+        }
+    ],
+
+    # aggregation 可为 None；如有统计口径，grain/metric 使用字符串
+    "aggregation": {"grain": "month", "metric": "sales_amount"},
+    "notes": "一句话说明本轮正式分析查询口径",
+}
+```
+
+字段含义与硬性要求：
+
+- `time_range`：用户明确要求的时间范围。无明确时间范围时必须写 `None`；有时间范围时使用 `{"start": str, "end": str, "end_exclusive": bool}`。
+- `target_filters`：目标对象、关键词、状态、产品、设备、空间等筛选条件。无筛选时写空列表 `[]`。
+- `target_filters[*].semantic_role`：非空字符串，说明筛选角色，如 `primary_entity`、`keyword_search`、`status_filter`、`soft_delete_filter`、`time_period`。
+- `target_filters[*].field_hint`：字符串，说明筛选字段或候选字段，如 `name`、`username`、`product_code`。
+- `target_filters[*].value`：非空字符串；不要写 `None`、数字、bool、list。状态值也写成字符串，例如 `"0"`、`"false"`。
+- `target_filters[*].match_mode`：只能是 `"exact"` 或 `"fuzzy"`。SQL `LIKE/ILIKE`、pandas `str.contains(...)` 这类模糊口径统一写 `"fuzzy"`，不要写 `"like"`、`"contains"`、`"ilike"`。
+- `aggregation`：统计粒度和主指标。无聚合时可以写 `None`；有聚合时优先写 `{"grain": "...", "metric": "..."}`，`grain` 可用 `detail`、`overall`、`day`、`month`、`year`、`product` 等业务粒度。
+- `notes`：一句话总结查询口径，只作补充说明，不能替代 `target_filters` 或 `time_range`。
+
+常见错误写法：
+
+```python
+"match_mode": "like"       # 错，模糊匹配统一写 fuzzy
+"match_mode": "contains"   # 错，模糊匹配统一写 fuzzy
+"value": None              # 错，未启用的筛选条件不要放入 target_filters
+"value": 0                 # 错，状态值写 "0"
+"time_range": {"start": None, "end": None}  # 错，无明确时间范围写 None
+```
 
 **正式分析代码的校验顺序**：
 
@@ -1728,6 +1891,7 @@ ORDER BY t.created_time DESC
 4. `str.contains(...)`、模糊匹配、候选集合筛选更适合 `probe` 阶段，用于确认字段取值、名称轻微差异或无数据原因；不要直接把探测口径沿用为最终统计口径。
 5. 只有精确过滤无结果，或探测明确表明库内名称与用户表达只有轻微差异时，才允许放宽匹配；放宽后的正式统计仍应尽量收敛到最接近用户原意的候选范围。
 6. 如果最终分析涉及分组、聚合、排序、TopN、时间趋势等，优先先筛选、再聚合、再生成图表与报告，不要把探测用的宽口径 DataFrame 直接拿来作为最终结果。
+7. 如果数据字段是月粒度（如 `年月 = "2026-03"`），但用户问题表达的是“2026 年 3 月 / 今年 3 月”，`query_constraints.time_range` 可写日级边界 `2026-03-01` 到 `2026-04-01`；同时 `filter_expressions` 必须写成可校验的月边界或等值字面量，例如 `df['年月'] >= '2026-03'` 与 `df['年月'] < '2026-04'`，或 `df['年月'] == '2026-03'`。不要只写 `df['年月'] == target_month`，因为校验器无法从变量名确认真实时间边界。
 
 **推荐的 pandas / DataFrame 校验模板**：
 
@@ -2195,7 +2359,7 @@ charts = build_chart_suite(
 )
 ```
 
-`build_chart_suite(...)` 会直接返回一个图表列表，可以直接放入 `charts`；正式保存时仍必须同时补充对应 `evidence_definitions` 和 `chart_trace_refs`。
+`build_chart_suite(...)` 会直接返回一个图表列表，可以直接放入 `charts`；正式保存时仍必须同时补充对应 `evidence_definitions` 和 `metric_evidence_bindings`。
 
 多指标同图示例：
 
@@ -2251,10 +2415,12 @@ evidence_definitions = [
         "quality_notes": ["渠道占比图仅展示 Top8 渠道，需在报告中说明其余渠道处理方式。"],
     }
 ]
-chart_trace_refs = [
-    {"chart_index": 0, "value_field": "sales", "evidence_key": "sales_amount"},
-    {"chart_index": 1, "value_field": "sales", "evidence_key": "sales_amount"},
-]
+metric_evidence_bindings = {
+    "charts": {
+        0: {"sales": "sales_amount"},
+        1: {"sales": "sales_amount"},
+    }
+}
 analysis_report_with_trace_tags = "近30天销售额合计为 [[trace:evidence_key=sales_amount]]128.6 万元[[/trace]]。"
 report_result = build_report_result(analysis_report_with_trace_tags)
 
@@ -2263,7 +2429,7 @@ result = save_analysis_result(
     charts=[trend_chart, share_chart],
     tables=[],
     evidence_definitions=evidence_definitions,
-    chart_trace_refs=chart_trace_refs,
+    metric_evidence_bindings=metric_evidence_bindings,
     report_trace_refs=report_result["report_trace_refs"],
 )
 ```

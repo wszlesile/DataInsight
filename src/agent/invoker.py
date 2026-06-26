@@ -373,6 +373,43 @@ def _format_relative_short_time_range(amount: int, unit: str, label: str) -> dic
     }
 
 
+def _format_anchor_month_time_range(text: str, today: Any) -> dict[str, Any]:
+    match = re.search(r'(?P<anchor>今年|去年)\s*(?P<month>\d{1,2})月(?:(?P<day>\d{1,2})日)?', text)
+    if not match:
+        return {}
+    year = today.year if match.group('anchor') == '今年' else today.year - 1
+    month = int(match.group('month'))
+    if not 1 <= month <= 12:
+        return {}
+    day_text = match.group('day')
+    if day_text:
+        day = int(day_text)
+        if not 1 <= day <= monthrange(year, month)[1]:
+            return {}
+        start = datetime(year, month, day).date()
+        return _format_expected_time_range(start, start + timedelta(days=1), match.group(0))
+    start, end = _month_window(year, month)
+    return _format_expected_time_range(start, end, match.group(0))
+
+
+def _format_absolute_date_time_range(text: str) -> dict[str, Any]:
+    date_match = re.search(r'(?P<year>\d{4})[-/年](?P<month>\d{1,2})(?:[-/月](?P<day>\d{1,2}))?', text)
+    if not date_match:
+        return {}
+    year = int(date_match.group('year'))
+    month = int(date_match.group('month'))
+    day_text = date_match.group('day')
+    if 1 <= month <= 12 and day_text:
+        day = int(day_text)
+        if 1 <= day <= monthrange(year, month)[1]:
+            start = datetime(year, month, day).date()
+            return _format_expected_time_range(start, start + timedelta(days=1), date_match.group(0))
+    if 1 <= month <= 12:
+        start, end = _month_window(year, month)
+        return _format_expected_time_range(start, end, date_match.group(0))
+    return {}
+
+
 def _build_expected_time_range_from_user_query(user_query: str) -> dict[str, Any]:
     """Parse a small trusted time-range anchor from explicit user wording."""
     text = str(user_query or '').strip()
@@ -401,6 +438,14 @@ def _build_expected_time_range_from_user_query(user_query: str) -> dict[str, Any
 
     today = datetime.now(ZoneInfo('Asia/Shanghai')).date()
     current_week_start = today - timedelta(days=today.weekday())
+
+    explicit_absolute_range = _format_absolute_date_time_range(text)
+    if explicit_absolute_range:
+        return explicit_absolute_range
+
+    anchored_month_range = _format_anchor_month_time_range(text, today)
+    if anchored_month_range:
+        return anchored_month_range
 
     if '本周' in text:
         return _format_expected_time_range(current_week_start, current_week_start + timedelta(days=7), '本周')
@@ -431,20 +476,6 @@ def _build_expected_time_range_from_user_query(user_query: str) -> dict[str, Any
         start = datetime(today.year - 1, 1, 1).date()
         end = datetime(today.year, 1, 1).date()
         return _format_expected_time_range(start, end, '去年')
-
-    date_match = re.search(r'(?P<year>\d{4})[-/年](?P<month>\d{1,2})(?:[-/月](?P<day>\d{1,2}))?', text)
-    if date_match:
-        year = int(date_match.group('year'))
-        month = int(date_match.group('month'))
-        day_text = date_match.group('day')
-        if 1 <= month <= 12 and day_text:
-            day = int(day_text)
-            if 1 <= day <= monthrange(year, month)[1]:
-                start = datetime(year, month, day).date()
-                return _format_expected_time_range(start, start + timedelta(days=1), date_match.group(0))
-        if 1 <= month <= 12:
-            start, end = _month_window(year, month)
-            return _format_expected_time_range(start, end, date_match.group(0))
 
     return {}
 
@@ -1678,7 +1709,7 @@ def _extract_execution_error_type(execution: Any) -> str:
         payload_text = json.dumps(payload, ensure_ascii=False).lower()
         if any(marker in payload_text for marker in TIME_SERIES_EMPTY_SOURCE_ERROR_MARKERS):
             return 'no_data_found'
-        error_type = str(payload.get('error_type') or '').strip()
+        error_type = str(payload.get('error_type') or payload.get('retry_type') or '').strip()
         if error_type:
             return error_type
         error_signature = payload.get('error_signature')

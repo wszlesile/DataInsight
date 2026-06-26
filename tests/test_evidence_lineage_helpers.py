@@ -10,12 +10,15 @@ from sqlalchemy.orm import sessionmaker  # noqa: E402
 from agent.tools import (  # noqa: E402
     CURRENT_QUERY_SNAPSHOTS,
     StructuredResult,
+    _check_time_range_constraint,
     _validate_evidence_contract,
+    define_evidence,
     build_report_result,
     build_table_result,
     save_analysis_result,
     validate_query_constraints,
 )
+from agent.invoker import _build_expected_time_range_from_user_query  # noqa: E402
 from model import InsightNsArtifact, InsightNsExecution, InsightNsExecutionEvidence, InsightNsTurn  # noqa: E402
 from config.database import Base  # noqa: E402
 from service.evidence_assembly_service import EvidenceAssemblyService  # noqa: E402
@@ -88,6 +91,80 @@ def test_save_analysis_result_injects_query_snapshots():
     )
 
     assert "q_completion" in result.query_snapshots
+
+
+def test_define_evidence_builds_standard_definition():
+    evidence = define_evidence(
+        evidence_key="total_sales_amount",
+        metric_name="销售收入合计",
+        value_type="currency",
+        unit="元",
+        query_refs=["q_sales"],
+        metric_fields=["销售收入_元"],
+        aggregation="sum",
+        group_by=["产品编码"],
+        formula="SUM(销售收入_元)",
+        derivation_description="按产品汇总销售收入。",
+    )
+
+    assert evidence["evidence_key"] == "total_sales_amount"
+    assert evidence["query_refs"] == ["q_sales"]
+    assert evidence["calculation"]["metric_fields"] == ["销售收入_元"]
+    assert evidence["calculation"]["group_by"] == ["产品编码"]
+
+
+def test_save_analysis_result_generates_trace_refs_from_metric_bindings():
+    table_result = build_table_result(
+        title="销售汇总",
+        columns=[
+            {"key": "product_code", "label": "产品", "role": "dimension"},
+            {"key": "sales_amount", "label": "销售收入", "role": "metric", "value_type": "currency", "unit": "元"},
+        ],
+        rows=[{"product_code": "P-001", "sales_amount": 100.0}],
+    )
+    result = save_analysis_result(
+        analysis_report="## 销售汇总\n\n销售收入为 100 元。",
+        charts=[
+            {
+                "title": "销售收入",
+                "description": "按产品汇总",
+                "chart_document": {
+                    "chart_kind": "bar",
+                    "dataset": {
+                        "columns": ["product_code", "sales_amount"],
+                        "rows": [{"product_code": "P-001", "sales_amount": 100.0}],
+                    },
+                    "encoding": {"category_field": "product_code", "value_field": "sales_amount"},
+                },
+            }
+        ],
+        tables=[table_result["table"]],
+        table_trace_metadata=table_result["trace_metadata"],
+        evidence_definitions=[
+            define_evidence(
+                evidence_key="total_sales_amount",
+                metric_name="销售收入",
+                value_type="currency",
+                unit="元",
+                query_refs=["q_sales"],
+                metric_fields=["sales_amount"],
+                aggregation="sum",
+                formula="SUM(sales_amount)",
+                derivation_description="按产品汇总销售收入。",
+            )
+        ],
+        metric_evidence_bindings={
+            "charts": {0: {"sales_amount": "total_sales_amount"}},
+            "tables": {0: {"sales_amount": "total_sales_amount"}},
+        },
+    )
+
+    assert result.chart_trace_refs == [
+        {"chart_index": 0, "value_field": "sales_amount", "evidence_key": "total_sales_amount"}
+    ]
+    assert result.table_trace_refs == [
+        {"table_index": 0, "column_key": "sales_amount", "evidence_key": "total_sales_amount", "row_scope": "all"}
+    ]
 
 
 def _base_evidence_result(**overrides):
@@ -176,6 +253,29 @@ def test_numeric_report_requires_report_trace_refs():
 
     assert retry is not None
     assert retry.retry_type == "invalid_report_trace_ref"
+
+
+def test_expected_time_range_prefers_anchor_month_over_year():
+    result = _build_expected_time_range_from_user_query("今年3月各产品成本和利润分析")
+
+    assert result["start"].endswith("-03-01")
+    assert result["end"].endswith("-04-01")
+    assert result["source"] == "今年3月"
+
+
+def test_month_grain_year_filter_satisfies_daily_time_range():
+    query_constraints = {
+        "time_range": {"start": "2026-01-01", "end": "2027-01-01", "end_exclusive": True}
+    }
+
+    assert _check_time_range_constraint(
+        query_constraints,
+        "cost_data['年月'] >= '2026-01'\ncost_data['年月'] < '2027-01'",
+    ) is None
+    assert _check_time_range_constraint(
+        query_constraints,
+        "cost_data['年月'].str.startswith('2026')",
+    ) is None
 
 
 def test_table_metric_columns_require_trace_ref():

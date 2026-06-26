@@ -512,25 +512,37 @@ def _month_grain_filter_satisfies_time_range(
     except ValueError:
         return False
 
-    if start_date.day != 1:
+    if start_date.day != 1 or end_date.day != 1:
         return False
+    start_month = start_date.strftime('%Y-%m')
+    end_month = end_date.strftime('%Y-%m')
+
+    if (
+        start_date.month == 1
+        and end_date.year == start_date.year + 1
+        and end_date.month == 1
+        and re.search(rf"\.str\.startswith\(\s*['\"]{start_date.year}['\"]\s*\)", code)
+    ):
+        return True
+
+    if (
+        re.search(rf">=\s*['\"]{re.escape(start_month)}['\"]", code) is not None
+        and re.search(rf"<\s*['\"]{re.escape(end_month)}['\"]", code) is not None
+    ):
+        return True
+
     next_month_year = start_date.year + (1 if start_date.month == 12 else 0)
     next_month = 1 if start_date.month == 12 else start_date.month + 1
     if end_date.year != next_month_year or end_date.month != next_month or end_date.day != 1:
         return False
 
-    start_month = start_date.strftime('%Y-%m')
-    end_month = end_date.strftime('%Y-%m')
     if re.search(rf"['\"]{re.escape(start_month)}['\"]", code):
         if re.search(rf"==\s*['\"]{re.escape(start_month)}['\"]", code) or re.search(
             rf"=\s*['\"]{re.escape(start_month)}['\"]",
             code,
         ):
             return True
-    return (
-        re.search(rf">=\s*['\"]{re.escape(start_month)}['\"]", code) is not None
-        and re.search(rf"<\s*['\"]{re.escape(end_month)}['\"]", code) is not None
-    )
+    return False
 
 
 def _check_aggregation_constraint(query_constraints: dict[str, Any], code: str) -> dict[str, Any] | None:
@@ -2711,6 +2723,179 @@ def get_analysis_parameters(defaults: Optional[dict[str, Any]] = None) -> dict[s
     return base
 
 
+def define_evidence(
+    *,
+    evidence_key: str,
+    metric_name: str,
+    query_refs: list[str],
+    metric_fields: list[str],
+    value_type: str = '',
+    unit: str = '',
+    aggregation: str = '',
+    group_by: Optional[list[str]] = None,
+    formula: str = '',
+    derivation_description: str = '',
+    derivation_mode: str = 'query_output',
+    transformations: Optional[list[str]] = None,
+    intermediate_outputs: Optional[list[dict[str, Any]]] = None,
+    quality_notes: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Build a normalized EvidenceDefinition for one calculation-logic boundary."""
+    key = str(evidence_key or '').strip()
+    if not key:
+        raise ValueError('define_evidence.evidence_key 不能为空。')
+    normalized_query_refs = [str(item).strip() for item in (query_refs or []) if str(item).strip()]
+    normalized_metric_fields = [str(item).strip() for item in (metric_fields or []) if str(item).strip()]
+    if not normalized_query_refs:
+        raise ValueError('define_evidence.query_refs 至少需要包含一个 validate_query_constraints(...) 的 query_key。')
+    if not normalized_metric_fields:
+        raise ValueError('define_evidence.metric_fields 至少需要包含一个最终可点击结果字段。')
+
+    calculation: dict[str, Any] = {"metric_fields": normalized_metric_fields}
+    aggregation_text = str(aggregation or '').strip()
+    if aggregation_text:
+        calculation["aggregation"] = aggregation_text
+    normalized_group_by = [str(item).strip() for item in (group_by or []) if str(item).strip()]
+    if normalized_group_by:
+        calculation["group_by"] = normalized_group_by
+    formula_text = str(formula or '').strip()
+    if formula_text:
+        calculation["formula"] = formula_text
+
+    return {
+        "evidence_key": key,
+        "metric_name": str(metric_name or key).strip() or key,
+        "value_type": str(value_type or '').strip(),
+        "unit": str(unit or '').strip(),
+        "query_refs": normalized_query_refs,
+        "derivation": {
+            "mode": str(derivation_mode or 'query_output').strip() or 'query_output',
+            "description": str(derivation_description or '').strip(),
+        },
+        "calculation": calculation,
+        "transformations": _copy_jsonable(transformations or [], []),
+        "intermediate_outputs": _copy_jsonable(intermediate_outputs or [], []),
+        "quality_notes": _copy_jsonable(quality_notes or [], []),
+    }
+
+
+def _normalize_metric_evidence_bindings(metric_evidence_bindings: Any) -> list[dict[str, Any]]:
+    """Normalize lightweight metric-to-evidence bindings from generated code."""
+    bindings: list[dict[str, Any]] = []
+
+    def _append(artifact_type: str, artifact_index: Any, field_name: Any, evidence_key: Any) -> None:
+        field = str(field_name or '').strip()
+        key = str(evidence_key or '').strip()
+        if not field or not key:
+            return
+        try:
+            index = int(artifact_index or 0)
+        except Exception:
+            index = 0
+        bindings.append({
+            "artifact_type": str(artifact_type or '').strip().lower(),
+            "artifact_index": index,
+            "field": field,
+            "evidence_key": key,
+        })
+
+    if isinstance(metric_evidence_bindings, list):
+        for item in metric_evidence_bindings:
+            if not isinstance(item, dict):
+                continue
+            artifact_type = item.get('artifact_type') or item.get('type') or item.get('artifact')
+            field_name = item.get('field') or item.get('value_field') or item.get('column_key') or item.get('value_column')
+            artifact_index = item.get('artifact_index')
+            if artifact_index is None:
+                artifact_index = item.get('chart_index') if str(artifact_type or '').lower() == 'chart' else item.get('table_index')
+            _append(artifact_type, artifact_index, field_name, item.get('evidence_key'))
+        return bindings
+
+    if not isinstance(metric_evidence_bindings, dict):
+        return bindings
+
+    for group_name, artifact_type in (('charts', 'chart'), ('chart', 'chart'), ('tables', 'table'), ('table', 'table')):
+        group = metric_evidence_bindings.get(group_name)
+        if not isinstance(group, (dict, list)):
+            continue
+        if isinstance(group, list):
+            iterable = enumerate(group)
+        else:
+            iterable = group.items()
+        for artifact_index, field_map in iterable:
+            if not isinstance(field_map, dict):
+                continue
+            for field_name, evidence_key in field_map.items():
+                _append(artifact_type, artifact_index, field_name, evidence_key)
+    return bindings
+
+
+def _auto_trace_refs_from_metric_bindings(
+    *,
+    charts: list[dict[str, Any]],
+    tables: list[dict[str, Any]],
+    table_trace_metadata: dict[str, Any],
+    metric_evidence_bindings: Any,
+    chart_trace_refs: Optional[list[dict[str, Any]]] = None,
+    table_trace_refs: Optional[list[dict[str, Any]]] = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Generate chart/table trace refs from field-level metric evidence bindings."""
+    normalized_bindings = _normalize_metric_evidence_bindings(metric_evidence_bindings)
+    chart_bindings = {
+        (int(item["artifact_index"]), str(item["field"])): str(item["evidence_key"])
+        for item in normalized_bindings
+        if item.get("artifact_type") == "chart"
+    }
+    table_bindings = {
+        (int(item["artifact_index"]), str(item["field"])): str(item["evidence_key"])
+        for item in normalized_bindings
+        if item.get("artifact_type") == "table"
+    }
+
+    resolved_chart_refs = _copy_jsonable(chart_trace_refs or [], [])
+    existing_chart_keys = {
+        (_normalize_ref_chart_index(ref), _ref_value_field(ref))
+        for ref in resolved_chart_refs
+        if isinstance(ref, dict)
+    }
+    for expected in _expected_chart_trace_refs(charts):
+        ref_key = (int(expected.get("chart_index") or 0), str(expected.get("value_field") or ''))
+        if ref_key in existing_chart_keys:
+            continue
+        evidence_key = chart_bindings.get(ref_key)
+        if not evidence_key:
+            continue
+        resolved_chart_refs.append({
+            "chart_index": ref_key[0],
+            "value_field": ref_key[1],
+            "evidence_key": evidence_key,
+        })
+        existing_chart_keys.add(ref_key)
+
+    resolved_table_refs = _copy_jsonable(table_trace_refs or [], [])
+    existing_table_keys = {
+        (_normalize_ref_table_index(ref), _ref_table_column(ref))
+        for ref in resolved_table_refs
+        if isinstance(ref, dict)
+    }
+    for expected in _expected_table_trace_refs(tables, table_trace_metadata):
+        ref_key = (int(expected.get("table_index") or 0), str(expected.get("column_key") or ''))
+        if ref_key in existing_table_keys:
+            continue
+        evidence_key = table_bindings.get(ref_key)
+        if not evidence_key:
+            continue
+        resolved_table_refs.append({
+            "table_index": ref_key[0],
+            "column_key": ref_key[1],
+            "evidence_key": evidence_key,
+            "row_scope": "all",
+        })
+        existing_table_keys.add(ref_key)
+
+    return resolved_chart_refs, resolved_table_refs
+
+
 def save_analysis_result(
     analysis_report: str = '',
     charts: Optional[list[dict[str, Any]]] = None,
@@ -2722,6 +2907,7 @@ def save_analysis_result(
     table_trace_refs: Optional[list[dict[str, Any]]] = None,
     report_trace_refs: Optional[list[dict[str, Any]]] = None,
     table_trace_metadata: Optional[dict[str, Any]] = None,
+    metric_evidence_bindings: Any = None,
 ) -> StructuredResult:
     """
     结束一次由生成代码驱动的分析任务，并返回标准结构化结果。
@@ -2736,8 +2922,18 @@ def save_analysis_result(
     if not report_text:
         raise ValueError('analysis_report 不能为空，必须传入完整的 Markdown 分析报告。')
 
-    normalized_charts = _normalize_chart_items(charts=charts)
+    source_charts = charts or []
+    normalized_charts = _normalize_chart_items(charts=source_charts)
     normalized_tables = _normalize_table_items(tables=tables)
+    normalized_table_trace_metadata = _copy_jsonable(table_trace_metadata or {}, {})
+    resolved_chart_trace_refs, resolved_table_trace_refs = _auto_trace_refs_from_metric_bindings(
+        charts=source_charts,
+        tables=normalized_tables,
+        table_trace_metadata=normalized_table_trace_metadata,
+        metric_evidence_bindings=metric_evidence_bindings,
+        chart_trace_refs=chart_trace_refs,
+        table_trace_refs=table_trace_refs,
+    )
     return StructuredResult(
         analysis_report=report_text,
         charts=normalized_charts,
@@ -2745,10 +2941,10 @@ def save_analysis_result(
         analysis_parameters_schema=analysis_parameters_schema or {},
         analysis_parameters=analysis_parameters or {},
         evidence_definitions=_copy_jsonable(evidence_definitions or [], []),
-        chart_trace_refs=_copy_jsonable(chart_trace_refs or [], []),
-        table_trace_refs=_copy_jsonable(table_trace_refs or [], []),
+        chart_trace_refs=resolved_chart_trace_refs,
+        table_trace_refs=resolved_table_trace_refs,
         report_trace_refs=_copy_jsonable(report_trace_refs or [], []),
-        table_trace_metadata=_copy_jsonable(table_trace_metadata or {}, {}),
+        table_trace_metadata=normalized_table_trace_metadata,
         query_snapshots=_copy_jsonable(CURRENT_QUERY_SNAPSHOTS.get() or {}, {}),
     )
 
@@ -4136,6 +4332,7 @@ def _build_execution_namespace() -> dict[str, Any]:
         'probe_text_candidates': probe_text_candidates,
         'get_analysis_parameters': get_analysis_parameters,
         'validate_query_constraints': validate_query_constraints,
+        'define_evidence': define_evidence,
         'build_markdown_table': build_markdown_table,
         'build_table_result': build_table_result,
         'build_report_result': build_report_result,
