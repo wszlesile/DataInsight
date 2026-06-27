@@ -37,6 +37,10 @@ export function getAnalysisTask(taskId) {
   return api.get(`/agent/tasks/${taskId}`)
 }
 
+export function cancelAnalysisTask(taskId) {
+  return api.post(`/agent/tasks/${taskId}/cancel`)
+}
+
 export function getRunningTurn(conversationId) {
   return api.get(`/insight/conversations/${conversationId}/running-turn`)
 }
@@ -56,6 +60,13 @@ export function submitRerunTurnTask(conversationId, turnId) {
 ```
 
 旧方法 `streamAgent`、`streamRerunTurn` 可以暂时保留兼容，但主流程不再使用。
+
+停止分析：
+
+- 输入框处于分析中时，前端可把发送按钮切换为停止按钮。
+- 点击停止时调用 `POST /api/agent/tasks/{task_id}/cancel`。
+- 后端会把任务置为 `cancelled`，并向轮次 SSE 推送 `stage=cancelled` 事件。
+- 如果任务已经结束，接口仍返回成功，前端按最终任务状态收尾即可。
 
 ## 3. 页面状态建议
 

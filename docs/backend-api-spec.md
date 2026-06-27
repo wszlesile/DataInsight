@@ -1604,7 +1604,7 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 
 说明：
 
-- 同一用户默认最多同时存在 2 个未完成分析任务。
+- 同一用户默认最多同时存在 20 个未完成分析任务，可通过 `DATAINSIGHT_ANALYSIS_TASK_MAX_ACTIVE_PER_USER` 调整。
 - 同一会话同一时间只允许一个 `queued` 或 `running` 任务。
 - 如果 Redis 流式队列不可用，提交任务会失败，避免创建无法订阅输出的任务。
 
@@ -1636,8 +1636,80 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
   - 分析完成
 - `failed`
   - 分析失败
+- `cancelled`
+  - 用户主动停止
 
-### 5.5 查询当前会话运行中轮次
+### 5.5 停止分析任务
+
+`POST /api/agent/tasks/{task_id}/cancel`
+
+用途：
+
+- 用户主动终止一个仍在排队或执行中的分析任务。
+- 适用于新分析任务和刷新分析任务。
+- 后端会把任务状态更新为 `cancelled`，并向对应轮次 SSE 队列推送 `stage=cancelled` 事件。
+- 对刷新分析任务，停止时会保留原有分析结果，避免污染历史产物。
+
+路径参数：
+
+- `task_id`
+  - 后台分析任务 ID，即 `POST /api/agent/tasks` 或刷新任务接口返回的 `task_id`
+
+请求体：
+
+无。
+
+成功响应示例：
+
+```json
+{
+  "success": true,
+  "data": {
+    "task_id": "5d7e8dc66a1642dc98d7f114f7f92a2a",
+    "username": "admin",
+    "namespace_id": 7,
+    "conversation_id": 19,
+    "turn_id": 39,
+    "task_type": "new_analysis",
+    "status": "cancelled",
+    "request": {
+      "namespace_id": 7,
+      "conversation_id": 19,
+      "turn_id": 39,
+      "user_message": "分析2024年Q4季度的销售趋势"
+    },
+    "error_message": "用户已停止本轮分析。",
+    "created_at": "2026-05-11T14:04:35.465959",
+    "started_at": "2026-05-11T14:04:36.102211",
+    "finished_at": "2026-05-11T14:05:10.331872"
+  },
+  "message": "分析任务已停止",
+  "code": 200
+}
+```
+
+如果任务已经结束，接口仍返回成功，`message` 为 `分析任务已结束`，`data` 为当前任务状态。
+
+常见失败：
+
+- `404`
+  - 分析任务不存在，或当前用户无权操作该任务
+
+停止事件示例：
+
+```json
+{
+  "type": "error",
+  "task_id": "5d7e8dc66a1642dc98d7f114f7f92a2a",
+  "turn_id": 39,
+  "conversation_id": 19,
+  "stage": "cancelled",
+  "level": "warning",
+  "message": "用户已停止本轮分析。"
+}
+```
+
+### 5.6 查询当前会话运行中轮次
 
 `GET /api/insight/conversations/{conversation_id}/running-turn`
 
@@ -1682,7 +1754,7 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 }
 ```
 
-### 5.6 订阅轮次流式输出
+### 5.7 订阅轮次流式输出
 
 `GET /api/insight/conversations/{conversation_id}/turns/{turn_id}/stream`
 
@@ -1715,7 +1787,7 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 - 任务结束后，前端收到 `done` 或 `error` 应关闭当前 SSE 连接，并重新拉取会话历史。
 - 如果队列暂时没有事件，后端会保持 SSE 连接并输出 heartbeat。
 
-### 5.7 提交原轮次异步刷新分析任务
+### 5.8 提交原轮次异步刷新分析任务
 
 `POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/rerun/task`
 
@@ -1745,7 +1817,7 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 - 成功后结果回写到同一个 `turn_id`。
 - 同样受用户任务并发上限和会话运行中任务限制。
 
-### 5.8 原轮次同步流式刷新分析
+### 5.9 原轮次同步流式刷新分析
 
 `POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/rerun/stream`
 
