@@ -222,7 +222,7 @@ export function getNamespaceDatasourceContent(namespaceId, datasourceId, params 
   })
 }
 
-export const UNS_TREE_DATA_TYPE_FILTER = [1, 2, 9]
+export const UNS_TREE_DATA_TYPE_FILTER = [1, 2, 3, 7, 9]
 
 export function fetchUnsTreeNodes(namespaceId, parentId = '0', options = {}) {
   const dataType = options.dataType ?? options.dataTypes ?? UNS_TREE_DATA_TYPE_FILTER

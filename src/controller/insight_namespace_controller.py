@@ -124,6 +124,7 @@ class InsightNamespaceController(BaseController):
 
     def upload_datasource_file(self, namespace_id: int):
         """上传文件到空间，并转换成一条空间级数据源。"""
+        user_context = get_current_user_context()
         upload_file = request.files.get('file')
         if upload_file is None:
             return self.error_response('请选择要上传的文件')
@@ -135,6 +136,7 @@ class InsightNamespaceController(BaseController):
                 insight_namespace_id=namespace_id,
                 upload_file=upload_file,
                 upload_dir=Config.UPLOAD_DIR,
+                selected_llm_model_id=getattr(user_context, 'selected_llm_model_id', '') or '',
             )
             if result['success']:
                 return jsonify(Result.success(data=result['data'], message=result['message'], code=201).to_dict()), 201

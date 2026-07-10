@@ -162,6 +162,10 @@ def extract_datasource_identifier(datasource: Any, config_json: dict[str, Any]) 
             )
         database_name = normalize_fedquery_database_name(config_json.get('database_name'))
         table_name = str(config_json.get('table_name') or '').strip()
+        if str(config_json.get('uns_data_type') or '').strip() == '7':
+            refer_alias = str(config_json.get('refer_alias') or '').strip()
+            if refer_alias:
+                return f"public.{refer_alias}"
         if str(config_json.get('uns_data_type') or '').strip() == '9' and database_name and table_name:
             return f"{database_name}.{table_name}"
         return (

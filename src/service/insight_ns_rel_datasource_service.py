@@ -39,10 +39,15 @@ BIND_SOURCE_IMPORT_SELECTED = 'import_selected'
 BIND_SOURCE_SYSTEM_DEFAULT = 'system_default'
 UNS_TIME_SERIES_DATA_TYPE = 1
 UNS_RELATIONAL_TABLE_DATA_TYPE = 2
+UNS_CALCULATED_TABLE_DATA_TYPE = 3
+UNS_REFERENCE_TABLE_DATA_TYPE = 7
 UNS_PROTOCOL_TABLE_DATA_TYPE = 9
+UPLOADED_DATASOURCE_DESCRIPTION_PENDING = '见解自动生成中，请稍后查看'
 UNS_TABLE_DATA_TYPES = {
     UNS_TIME_SERIES_DATA_TYPE,
     UNS_RELATIONAL_TABLE_DATA_TYPE,
+    UNS_CALCULATED_TABLE_DATA_TYPE,
+    UNS_REFERENCE_TABLE_DATA_TYPE,
     UNS_PROTOCOL_TABLE_DATA_TYPE,
 }
 UNS_MAX_EXPANDED_FILES = Config.UNS_MAX_EXPANDED_FILES
@@ -318,10 +323,9 @@ class InsightNsRelDatasourceService:
                         for node in expanded_file_nodes
                         if str(node.get("id") or "").strip()
                     }
-                    if any(
-                        data_type in {UNS_TIME_SERIES_DATA_TYPE, UNS_RELATIONAL_TABLE_DATA_TYPE}
-                        for data_type in node_type_by_id.values()
-                    ) and not lake_rds_database_name:
+                    lake_rds_required_types = UNS_TABLE_DATA_TYPES - {UNS_PROTOCOL_TABLE_DATA_TYPE}
+                    if any(data_type in lake_rds_required_types for data_type in node_type_by_id.values()) \
+                            and not lake_rds_database_name:
                         return {
                             "success": False,
                             "message": "当前用户上下文未初始化 LakeRDS 数据库名",
@@ -837,16 +841,54 @@ class InsightNsRelDatasourceService:
             )
         else:
             datasource.datasource_schema = self._build_uns_datasource_schema(detail, datasource.datasource_name)
-            datasource.datasource_config_json = dump_json({
-                "database_name": lake_rds_database_name,
-                "table_name": f"public.{alias}",
-                "uns_alias": alias,
-                "uns_data_type": UNS_RELATIONAL_TABLE_DATA_TYPE,
-                "table_engine": TABLE_ENGINE_RELATIONAL,
-                "uns_path": detail.get('path') or '',
-                "uns_path_name": detail.get('pathName') or detail.get('name') or '',
-            })
+            datasource.datasource_config_json = dump_json(
+                self._build_relational_table_config(
+                    detail=detail,
+                    alias=alias,
+                    data_type=data_type,
+                    lake_rds_database_name=lake_rds_database_name,
+                )
+            )
         return datasource
+
+    def _build_relational_table_config(
+        self,
+        *,
+        detail: dict[str, Any],
+        alias: str,
+        data_type: int | None,
+        lake_rds_database_name: str,
+    ) -> dict[str, Any]:
+        table_alias = alias
+        payload: dict[str, Any] = {}
+        if data_type == UNS_REFERENCE_TABLE_DATA_TYPE:
+            table_alias = self._extract_reference_uns_alias(detail)
+            payload["refer_alias"] = table_alias
+
+        payload.update({
+            "database_name": lake_rds_database_name,
+            "table_name": f"public.{table_alias}",
+            "uns_alias": alias,
+            "uns_data_type": data_type or UNS_RELATIONAL_TABLE_DATA_TYPE,
+            "table_engine": TABLE_ENGINE_RELATIONAL,
+            "uns_path": detail.get('path') or '',
+            "uns_path_name": detail.get('pathName') or detail.get('name') or '',
+        })
+        return payload
+
+    def _extract_reference_uns_alias(self, detail: dict[str, Any]) -> str:
+        refers = detail.get('refers') or []
+        if isinstance(refers, str):
+            refers = safe_json_loads(refers, [])
+        if not isinstance(refers, list) or not refers:
+            raise ValueError('dataType=7 的 UNS 节点 refers 缺失或为空')
+        first_ref = refers[0]
+        if not isinstance(first_ref, dict):
+            raise ValueError('dataType=7 的 UNS 节点 refers[0] 无效')
+        ref_alias = str(first_ref.get('alias') or '').strip()
+        if not ref_alias:
+            raise ValueError('dataType=7 的 UNS 节点 refers[0].alias 缺失或无效')
+        return ref_alias
 
     def _build_protocol_table_config(self, *, detail: dict[str, Any], alias: str) -> dict[str, Any]:
         protocol = safe_json_loads(detail.get('protocol'), {})
@@ -1444,6 +1486,7 @@ class InsightNsRelDatasourceService:
         insight_namespace_id: int,
         upload_file: FileStorage,
         upload_dir: str,
+        selected_llm_model_id: str = '',
     ) -> dict[str, Any]:
         """上传文件并在空间下创建数据源；Excel 会按 sheet 拆成多个逻辑数据源。"""
         if insight_namespace_id <= 0:
@@ -1499,7 +1542,10 @@ class InsightNsRelDatasourceService:
             })
 
         self.session.commit()
-        self._submit_uploaded_datasource_description_job(description_items)
+        self._submit_uploaded_datasource_description_job(
+            description_items,
+            selected_llm_model_id=selected_llm_model_id,
+        )
         created_datasources = self._load_datasource_dicts(created_datasource_ids)
         message = "文件上传成功"
         if len(created_datasources) > 1:
@@ -1510,12 +1556,19 @@ class InsightNsRelDatasourceService:
             "data": self._build_upload_response_data(created_datasources),
         }
 
-    def _submit_uploaded_datasource_description_job(self, description_items: list[dict[str, Any]]) -> None:
+    def _submit_uploaded_datasource_description_job(
+        self,
+        description_items: list[dict[str, Any]],
+        selected_llm_model_id: str = '',
+    ) -> None:
         valid_items = [item for item in description_items if int(item.get("datasource_id") or 0) > 0]
         if not valid_items:
             return
         try:
-            future = get_datasource_description_runner().submit(valid_items)
+            future = get_datasource_description_runner().submit(
+                valid_items,
+                selected_model_id=selected_llm_model_id,
+            )
             wait_seconds = max(float(getattr(Config, 'DATASOURCE_DESCRIPTION_SYNC_WAIT_SECONDS', 2) or 0), 0)
             if wait_seconds > 0:
                 future.result(timeout=wait_seconds)
@@ -1573,9 +1626,7 @@ class InsightNsRelDatasourceService:
                 example=self._extract_example_value(series),
             )
 
-        description = f"用户上传的 {file_path.suffix.lstrip('.').upper()} 文件"
-        if sheet_name:
-            description = f"{description}（工作表：{sheet_name}）"
+        description = UPLOADED_DATASOURCE_DESCRIPTION_PENDING
 
         schema = DataSourceSchema(
             name=datasource_name,

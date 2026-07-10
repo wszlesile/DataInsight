@@ -12,7 +12,7 @@ from config.database import SessionLocal
 from model import InsightDatasource
 from utils import dump_json, logger, safe_json_loads
 from utils.context_compression import clip_text
-from utils.llm_model_factory import create_data_insight_model
+from utils.llm_model_factory import create_data_insight_model, create_runtime_config
 
 
 DESCRIPTION_SOURCE_DEFAULT = 'system_default'
@@ -28,14 +28,18 @@ class DatasourceDescriptionRunner:
             max_workers=max(1, int(getattr(Config, 'DATASOURCE_DESCRIPTION_MAX_WORKERS', 1) or 1))
         )
 
-    def submit(self, items: list[dict[str, Any]]) -> Future:
-        return self._executor.submit(self._run, [dict(item) for item in items if item])
+    def submit(self, items: list[dict[str, Any]], selected_model_id: str = '') -> Future:
+        return self._executor.submit(
+            self._run,
+            [dict(item) for item in items if item],
+            (selected_model_id or '').strip(),
+        )
 
-    def _run(self, items: list[dict[str, Any]]) -> dict[int, str]:
+    def _run(self, items: list[dict[str, Any]], selected_model_id: str = '') -> dict[int, str]:
         if not items:
             return {}
         try:
-            descriptions = _generate_descriptions(items)
+            descriptions = _generate_descriptions(items, selected_model_id=selected_model_id)
         except Exception:
             logger.warning("LLM 生成上传数据源描述失败，保留默认描述", exc_info=True)
             return {}
@@ -71,9 +75,10 @@ def schema_guard_hash(schema_payload: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()
 
 
-def _generate_descriptions(items: list[dict[str, Any]]) -> dict[int, str]:
+def _generate_descriptions(items: list[dict[str, Any]], selected_model_id: str = '') -> dict[int, str]:
     prompt = _build_prompt(items)
-    model = create_data_insight_model()
+    runtime_config = create_runtime_config(selected_model_id=selected_model_id)
+    model = create_data_insight_model(runtime_config)
     response = _invoke_model_with_timeout(model, prompt)
     content = _extract_content(response)
     payload = _parse_json_object(content)

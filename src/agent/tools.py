@@ -3301,11 +3301,13 @@ def _datasource_mention_tokens(item: dict[str, Any]) -> list[str]:
         item.get('datasource_identifier'),
         item.get('table_name'),
         item.get('uns_alias'),
+        item.get('refer_alias'),
     ]
     config = item.get('config') if isinstance(item.get('config'), dict) else {}
     raw_values.extend([
         config.get('table_name'),
         config.get('uns_alias'),
+        config.get('refer_alias'),
     ])
 
     tokens: list[str] = []
