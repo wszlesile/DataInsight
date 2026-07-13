@@ -51,6 +51,9 @@ class AnalysisStreamQueue:
                 "message": str(raw),
             }
 
+    def clear_turn(self, turn_id: int) -> None:
+        self._redis.delete(self.events_key(turn_id))
+
     def expire_turn(self, turn_id: int, ttl_seconds: int) -> None:
         self._redis.expire(self.events_key(turn_id), max(1, int(ttl_seconds or 1)))
 

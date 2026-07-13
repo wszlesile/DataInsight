@@ -339,6 +339,7 @@ class InsightNsConversationController(BaseController):
         username = self._get_username()
         session = SessionLocal()
         task_status = ''
+        expected_task_id = ''
         try:
             task = AnalysisTaskService(session).get_latest_task_for_turn(
                 username=username,
@@ -348,6 +349,7 @@ class InsightNsConversationController(BaseController):
             if task is None:
                 return self.error_response('当前轮次没有可订阅的分析任务', 404)
             task_status = task.status or ''
+            expected_task_id = task.task_id or ''
         finally:
             session.close()
 
@@ -372,11 +374,12 @@ class InsightNsConversationController(BaseController):
                 })
                 return
 
-            if task_status == 'queued':
+            if task_status in ACTIVE_TASK_STATUSES:
                 yield encode_sse({
                     'type': 'status',
-                    'stage': 'queued',
+                    'stage': task_status,
                     'level': 'info',
+                    'task_id': expected_task_id,
                     'conversation_id': conversation_id,
                     'turn_id': turn_id,
                     'message': '问题已进入分析队列，等待执行...',
@@ -391,6 +394,10 @@ class InsightNsConversationController(BaseController):
                             yield encode_sse(terminal_event)
                         return
                     yield ': heartbeat\n\n'
+                    continue
+
+                event_task_id = str(event.get('task_id') or '')
+                if expected_task_id and event_task_id and event_task_id != expected_task_id:
                     continue
 
                 event.setdefault('conversation_id', conversation_id)
@@ -493,6 +500,16 @@ class InsightNsConversationController(BaseController):
                 },
             )
             session.commit()
+            try:
+                queue = AnalysisStreamQueue(
+                    get_redis_client(),
+                    max_len=Config.STREAM_QUEUE_MAX_LEN,
+                    event_max_bytes=Config.STREAM_EVENT_MAX_BYTES,
+                    ttl_seconds=Config.STREAM_QUEUE_TTL_SECONDS,
+                )
+                queue.clear_turn(runtime.turn.id)
+            except Exception:
+                pass
             get_analysis_task_runner().submit(
                 task_id=task.task_id,
                 analysis_task_id=task.id,

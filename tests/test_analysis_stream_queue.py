@@ -28,6 +28,10 @@ class FakeRedisListClient:
         value = values.pop(0)
         return key.encode("utf-8"), value
 
+    def delete(self, key: str):
+        self.values.pop(key, None)
+        self.expirations.pop(key, None)
+
 
 class FakeRedisTimeoutClient(FakeRedisListClient):
     def blpop(self, key: str, timeout: int = 0):
@@ -103,6 +107,16 @@ class AnalysisStreamQueueTestCase(unittest.TestCase):
         queue = AnalysisStreamQueue(client, max_len=10, event_max_bytes=1024, ttl_seconds=60)
 
         self.assertIsNone(queue.pop_event(9, timeout_seconds=30))
+
+    def test_clear_turn_removes_pending_events_and_expiration(self):
+        client = FakeRedisListClient()
+        queue = AnalysisStreamQueue(client, max_len=10, event_max_bytes=1024, ttl_seconds=60)
+
+        queue.push_event(9, {"type": "error", "task_id": "old", "message": "cancelled"})
+        queue.clear_turn(9)
+
+        self.assertNotIn("data-insight:{9}:events", client.values)
+        self.assertNotIn("data-insight:{9}:events", client.expirations)
 
 
 if __name__ == "__main__":
