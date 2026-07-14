@@ -330,7 +330,8 @@ class InsightNsRelDatasourceService:
                             "success": False,
                             "message": "当前用户上下文未初始化 LakeRDS 数据库名",
                         }
-                    if any(data_type == UNS_TIME_SERIES_DATA_TYPE for data_type in node_type_by_id.values()) \
+                    time_series_required_types = {UNS_TIME_SERIES_DATA_TYPE, UNS_CALCULATED_TABLE_DATA_TYPE}
+                    if any(data_type in time_series_required_types for data_type in node_type_by_id.values()) \
                             and not normalized_ts_query_source:
                         return {
                             "success": False,
@@ -343,7 +344,7 @@ class InsightNsRelDatasourceService:
                                         "message": "缺少平台时序数据库类型",
                                     }
                                     for node_id, data_type in node_type_by_id.items()
-                                    if data_type == UNS_TIME_SERIES_DATA_TYPE
+                                    if data_type in time_series_required_types
                                 ],
                                 "selections": self.list_uns_selections(insight_conversation_id),
                             },
@@ -412,14 +413,41 @@ class InsightNsRelDatasourceService:
                                 },
                             }
 
+                        reference_detail_by_id, reference_failed_rows = self._fetch_reference_uns_details_for_import(
+                            [result["detail"] for result in detail_results if result.get("success")],
+                            authorization,
+                        )
+                        failed_rows.extend(reference_failed_rows)
+                        if failed_rows:
+                            return {
+                                "success": False,
+                                "message": self._build_uns_failure_message(
+                                    failed_rows,
+                                    "UNS 引用节点同步失败，请稍后重试",
+                                ),
+                                "data": {
+                                    "imported": [],
+                                    "failed": failed_rows,
+                                    "selections": self.list_uns_selections(insight_conversation_id),
+                                },
+                            }
+
                         for result in detail_results:
                             node_id = str(result.get("id") or (result.get("detail") or {}).get("id") or "").strip()
-                            datasource = self._upsert_uns_table_datasource(
-                                detail=result["detail"],
-                                lake_rds_database_name=lake_rds_database_name,
-                                uns_data_type=node_type_by_id.get(node_id),
-                                ts_query_source=normalized_ts_query_source,
-                            )
+                            try:
+                                datasource = self._upsert_uns_table_datasource(
+                                    detail=result["detail"],
+                                    lake_rds_database_name=lake_rds_database_name,
+                                    uns_data_type=node_type_by_id.get(node_id),
+                                    ts_query_source=normalized_ts_query_source,
+                                    reference_detail_by_id=reference_detail_by_id,
+                                )
+                            except ValueError as exc:
+                                failed_rows.append({
+                                    "id": node_id,
+                                    "message": str(exc),
+                                })
+                                continue
                             self._bind_datasource(
                                 insight_namespace_id=SHARED_UNS_NAMESPACE_ID,
                                 insight_conversation_id=DEFAULT_CONVERSATION_ID,
@@ -428,6 +456,20 @@ class InsightNsRelDatasourceService:
                             )
                             if node_id not in existing_datasources:
                                 imported_rows.append(self._datasource_to_dict(datasource))
+
+                    if failed_rows:
+                        return {
+                            "success": False,
+                            "message": self._build_uns_failure_message(
+                                failed_rows,
+                                "UNS 节点同步失败，请稍后重试",
+                            ),
+                            "data": {
+                                "imported": imported_rows,
+                                "failed": failed_rows,
+                                "selections": self.list_uns_selections(insight_conversation_id),
+                            },
+                        }
 
                     desired_datasource_ids = self._find_datasource_ids_by_uns_node_ids(desired_file_node_ids)
 
@@ -787,6 +829,7 @@ class InsightNsRelDatasourceService:
         lake_rds_database_name: str,
         uns_data_type: int | None = None,
         ts_query_source: str = '',
+        reference_detail_by_id: dict[str, dict[str, Any]] | None = None,
     ) -> InsightDatasource:
         uns_node_id = str(detail.get('id') or '').strip()
         if not uns_node_id:
@@ -820,7 +863,7 @@ class InsightNsRelDatasourceService:
             if uns_data_type is not None
             else self._normalize_uns_data_type(detail)
         )
-        if data_type == UNS_TIME_SERIES_DATA_TYPE:
+        if data_type in {UNS_TIME_SERIES_DATA_TYPE, UNS_CALCULATED_TABLE_DATA_TYPE}:
             datasource.datasource_schema = self._build_uns_time_series_datasource_schema(
                 detail,
                 datasource.datasource_name,
@@ -832,6 +875,7 @@ class InsightNsRelDatasourceService:
                     alias=alias,
                     lake_rds_database_name=lake_rds_database_name,
                     ts_query_source=ts_query_source,
+                    uns_data_type=data_type,
                 )
             )
         elif data_type == UNS_PROTOCOL_TABLE_DATA_TYPE:
@@ -839,6 +883,43 @@ class InsightNsRelDatasourceService:
             datasource.datasource_config_json = dump_json(
                 self._build_protocol_table_config(detail=detail, alias=alias)
             )
+        elif data_type == UNS_REFERENCE_TABLE_DATA_TYPE:
+            ref_info = self._extract_reference_uns_ref(detail)
+            ref_id = str(ref_info.get('id') or '').strip()
+            ref_alias = str(ref_info.get('alias') or '').strip()
+            ref_detail = (reference_detail_by_id or {}).get(ref_id) if ref_id else None
+            if not isinstance(ref_detail, dict) or not ref_detail:
+                ref_detail = dict(ref_info)
+            ref_data_type = self._normalize_uns_data_type(ref_detail) or self._normalize_uns_data_type(ref_info)
+
+            if ref_data_type == UNS_TIME_SERIES_DATA_TYPE:
+                if not normalize_ts_query_source(ts_query_source):
+                    raise ValueError('引用节点类型暂不支持')
+                datasource.datasource_schema = self._build_uns_time_series_datasource_schema(
+                    ref_detail,
+                    datasource.datasource_name,
+                    ts_query_source=ts_query_source,
+                )
+                config = self._build_time_series_table_config(
+                    detail=ref_detail,
+                    alias=ref_alias,
+                    lake_rds_database_name=lake_rds_database_name,
+                    ts_query_source=ts_query_source,
+                )
+                config.update(self._build_reference_config_overlay(detail, alias, ref_info, ref_data_type))
+                datasource.datasource_config_json = dump_json(config)
+            elif ref_data_type == UNS_RELATIONAL_TABLE_DATA_TYPE:
+                datasource.datasource_schema = self._build_uns_datasource_schema(ref_detail, datasource.datasource_name)
+                datasource.datasource_config_json = dump_json(
+                    self._build_reference_relational_table_config(
+                        detail=detail,
+                        alias=alias,
+                        ref_info=ref_info,
+                        lake_rds_database_name=lake_rds_database_name,
+                    )
+                )
+            else:
+                raise ValueError('引用节点类型暂不支持')
         else:
             datasource.datasource_schema = self._build_uns_datasource_schema(detail, datasource.datasource_name)
             datasource.datasource_config_json = dump_json(
@@ -850,6 +931,72 @@ class InsightNsRelDatasourceService:
                 )
             )
         return datasource
+
+    def _fetch_reference_uns_details_for_import(
+        self,
+        details: list[dict[str, Any]],
+        authorization: str,
+    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+        reference_ids: list[str] = []
+        available_detail_by_id: dict[str, dict[str, Any]] = {
+            str(detail.get('id') or '').strip(): detail
+            for detail in details
+            if str(detail.get('id') or '').strip()
+        }
+        reference_detail_by_id: dict[str, dict[str, Any]] = {}
+        owner_by_ref_id: dict[str, str] = {}
+        failed_rows: list[dict[str, Any]] = []
+
+        for detail in details:
+            if self._normalize_uns_data_type(detail) != UNS_REFERENCE_TABLE_DATA_TYPE:
+                continue
+            owner_id = str(detail.get('id') or '').strip()
+            try:
+                ref_info = self._extract_reference_uns_ref(detail)
+            except ValueError as exc:
+                failed_rows.append({"id": owner_id, "message": str(exc)})
+                continue
+
+            ref_id = str(ref_info.get('id') or '').strip()
+            if not ref_id:
+                if self._normalize_uns_data_type(ref_info) not in {
+                    UNS_RELATIONAL_TABLE_DATA_TYPE,
+                    UNS_TIME_SERIES_DATA_TYPE,
+                }:
+                    failed_rows.append({"id": owner_id, "message": "引用节点类型暂不支持"})
+                continue
+            if ref_id in available_detail_by_id:
+                ref_data_type = self._normalize_uns_data_type(available_detail_by_id[ref_id])
+                if ref_data_type not in {UNS_RELATIONAL_TABLE_DATA_TYPE, UNS_TIME_SERIES_DATA_TYPE}:
+                    failed_rows.append({"id": owner_id, "message": "引用节点类型暂不支持"})
+                else:
+                    reference_detail_by_id[ref_id] = available_detail_by_id[ref_id]
+                continue
+            if ref_id not in owner_by_ref_id:
+                owner_by_ref_id[ref_id] = owner_id
+                reference_ids.append(ref_id)
+
+        if not reference_ids or failed_rows:
+            return {}, failed_rows
+
+        for result in self._fetch_uns_details_in_parallel(reference_ids, authorization):
+            ref_id = str(result.get("id") or (result.get("detail") or {}).get("id") or "").strip()
+            owner_id = owner_by_ref_id.get(ref_id, ref_id)
+            if not result.get("success"):
+                failed_rows.append({
+                    "id": owner_id,
+                    "message": result.get("message", "引用节点详情同步失败"),
+                })
+                continue
+
+            ref_detail = result.get("detail") if isinstance(result.get("detail"), dict) else {}
+            ref_data_type = self._normalize_uns_data_type(ref_detail)
+            if ref_data_type not in {UNS_RELATIONAL_TABLE_DATA_TYPE, UNS_TIME_SERIES_DATA_TYPE}:
+                failed_rows.append({"id": owner_id, "message": "引用节点类型暂不支持"})
+                continue
+            reference_detail_by_id[ref_id] = ref_detail
+
+        return reference_detail_by_id, failed_rows
 
     def _build_relational_table_config(
         self,
@@ -876,10 +1023,56 @@ class InsightNsRelDatasourceService:
         })
         return payload
 
+    def _build_reference_relational_table_config(
+        self,
+        *,
+        detail: dict[str, Any],
+        alias: str,
+        ref_info: dict[str, Any],
+        lake_rds_database_name: str,
+    ) -> dict[str, Any]:
+        ref_alias = str(ref_info.get('alias') or '').strip()
+        payload = {
+            "database_name": lake_rds_database_name,
+            "table_name": f"public.{ref_alias}",
+            "table_engine": TABLE_ENGINE_RELATIONAL,
+        }
+        payload.update(self._build_reference_config_overlay(
+            detail,
+            alias,
+            ref_info,
+            UNS_RELATIONAL_TABLE_DATA_TYPE,
+        ))
+        return payload
+
+    def _build_reference_config_overlay(
+        self,
+        detail: dict[str, Any],
+        alias: str,
+        ref_info: dict[str, Any],
+        ref_data_type: int | None,
+    ) -> dict[str, Any]:
+        return {
+            "uns_data_type": UNS_REFERENCE_TABLE_DATA_TYPE,
+            "source_uns_alias": alias,
+            "refer_node_id": str(ref_info.get('id') or '').strip(),
+            "refer_alias": str(ref_info.get('alias') or '').strip(),
+            "refer_data_type": ref_data_type,
+            "uns_path": detail.get('path') or '',
+            "uns_path_name": detail.get('pathName') or detail.get('name') or '',
+        }
+
     def _extract_reference_uns_alias(self, detail: dict[str, Any]) -> str:
+        return str(self._extract_reference_uns_ref(detail).get('alias') or '').strip()
+
+    def _extract_reference_uns_ref(self, detail: dict[str, Any]) -> dict[str, Any]:
         refers = detail.get('refers') or []
+        if not refers:
+            refers = detail.get('refer') or []
         if isinstance(refers, str):
             refers = safe_json_loads(refers, [])
+        if isinstance(refers, dict):
+            refers = [refers]
         if not isinstance(refers, list) or not refers:
             raise ValueError('dataType=7 的 UNS 节点 refers 缺失或为空')
         first_ref = refers[0]
@@ -888,7 +1081,7 @@ class InsightNsRelDatasourceService:
         ref_alias = str(first_ref.get('alias') or '').strip()
         if not ref_alias:
             raise ValueError('dataType=7 的 UNS 节点 refers[0].alias 缺失或无效')
-        return ref_alias
+        return dict(first_ref)
 
     def _build_protocol_table_config(self, *, detail: dict[str, Any], alias: str) -> dict[str, Any]:
         protocol = safe_json_loads(detail.get('protocol'), {})
@@ -921,6 +1114,7 @@ class InsightNsRelDatasourceService:
         alias: str,
         lake_rds_database_name: str,
         ts_query_source: str,
+        uns_data_type: int = UNS_TIME_SERIES_DATA_TYPE,
     ) -> dict[str, Any]:
         normalized_ts_query_source = normalize_ts_query_source(ts_query_source)
         time_field = 'timeStamp'
@@ -932,7 +1126,7 @@ class InsightNsRelDatasourceService:
             "database_name": lake_rds_database_name,
             "table_name": alias,
             "uns_alias": alias,
-            "uns_data_type": UNS_TIME_SERIES_DATA_TYPE,
+            "uns_data_type": uns_data_type,
             "table_engine": TABLE_ENGINE_TIME_SERIES,
             "ts_query_source": normalized_ts_query_source,
             "time_field": time_field,
