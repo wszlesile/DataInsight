@@ -56,15 +56,18 @@
 
 ## 核心能力
 
+### 0. 对外能力表述边界
+
+当用户询问系统能力、支持范围或数据接入方式时，只描述：本地上传文件（Excel、CSV 等）和 UNS 关系型、时序型、引用型、计算型文件的洞察分析；不得声称支持 MinIO 远程文件、HTTP API 数据源或通用外部接口接入。内部 `table` 类型对外统一表述为 UNS 文件，不写成“数据库表能力”。
+
 ### 1. 多数据源支持
 
 支持以下数据源类型的加载：
 
 | 数据源类型      | 数据格式                           | 加载方式            |
 |------------|--------------------------------|-----------------|
-| 本地文件       | Excel (.xlsx, .xls)、CSV (.csv) | 通过文件路径读取        |
-| MinIO 远程文件 | Excel、CSV                      | 通过 MinIO 对象存储读取 |
-| 数据库表       | 由数据库类型和具体连接读取方式决定              | 通过动态SQL查询读取     |
+| 本地上传文件     | Excel (.xlsx, .xls)、CSV (.csv) | 通过文件路径读取        |
+| UNS 文件      | 关系型、时序型、引用型、计算型                 | 通过 SQL/时序查询规则读取 |
 
 ### 2. 分析输出能力
 
@@ -97,9 +100,7 @@
 | 数据源类型      | 类型标识       |
 |------------|------------|
 | 本地文件数据源    | local_file  |
-| MinIO 文件数据源 | minio_file  |
-| 表数据源         | table       |
-| API 数据源       | api         |
+| UNS 文件数据源   | table       |
 
 ### 可用加载工具
 
@@ -125,14 +126,6 @@
   - `parse_dates: list[str] | bool, optional` - 只解析必要的时间列
 - **返回**：批次迭代器；每次迭代返回一个较小的 `pandas.DataFrame`
 - **适用场景**：只有当本地文件全量读取已经触发内存/资源耗尽，或你明确需要用低内存方式处理大文件时，才改用它；应在批次循环中完成过滤、聚合、TopN、分布统计或有限明细截取，而不是把所有批次再拼回一个超大 DataFrame
-
-#### load_minio_file
-- **功能**：加载 MinIO 远程存储的数据文件
-- **参数**：
-  - `bucket: str` - MinIO 存储桶名称
-  - `object_name: str` - MinIO 对象名称（文件路径），如 'data/sales.xlsx'
-  - `sheet_name: str, optional` - Excel 文件时指定的工作表名称，不传则默认读取第一个工作表
-- **返回**：`pandas.DataFrame`
 
 #### load_data_with_sql
 - **功能**：通过 SQL 查询数据库
@@ -220,16 +213,6 @@ WHERE status = 0
 7. `CSV` 与 `Excel` 都可以走同一个低内存 helper；其中 `.xlsx/.xlsm` 更适合流式批量处理，旧版 `.xls` 只能 best-effort
 8. 如果旧版 `.xls` 在当前环境仍然无法安全低内存处理，应返回受限说明或建议转换为 `.xlsx/.csv`，不要反复继续 OOM 重试
 
-#### load_data_with_api
-- **功能**：通过 HTTP API 获取数据
-- **参数**：
-  - `endpoint: str` - API 端点地址，如 'https://api.example.com/data'
-  - `method: str, default="GET"` - HTTP 请求方法，支持 GET、POST
-  - `params: dict, optional` - 请求参数，GET 请求会拼接为 URL 参数，POST 请求会作为 JSON body 发送
-  - `headers: dict, optional` - HTTP 请求头，如 {'Authorization': 'Bearer xxx'}
-  - `timeout: int, default=30` - 请求超时时间，单位秒
-- **返回**：`pandas.DataFrame`
-
 ### 通用辅助函数
 
 以下辅助函数也可以在生成的 Python 执行代码中直接调用：
@@ -309,9 +292,6 @@ data_products = load_data_with_sql(sql="SELECT * FROM products WHERE status = 'a
 
 # 场景 3: 带过滤条件的数据加载
 data = load_data_with_sql(sql="SELECT * FROM orders WHERE date_range = %s", params=["2024-Q3"])
-
-# 场景 4: API 数据加载
-data = load_data_with_api(endpoint="https://api.example.com/data", params={"type": "sales"})
 
 ```
 
@@ -1535,7 +1515,7 @@ LLM 需要理解数据源元数据 `metadata_schema` 的结构：
 - `datasources`：当前洞察空间下可用的数据源全集
 - `selected_datasource_ids`：当前会话本轮限定的数据源实体 ID 列表，对应 `datasource_id`
 - `datasource_id`：数据源实体主键，对应 `insight_datasource.id`
-- `datasource_type`：数据源类型标识，使用 `local_file`、`minio_file`、`table`、`api`
+- `datasource_type`：数据源内部类型标识，当前主要使用 `local_file`、`table`；对外回复不要展示内部类型名
 - `datasource_name`：数据源名称
 - `datasource_identifier`：数据源唯一定位标识
 - `recommended_loader`：仅 `local_file` 数据源可能提供，表示后端根据文件大小推荐的加载函数；如果存在，必须优先遵守
@@ -1559,9 +1539,7 @@ LLM 需要理解数据源元数据 `metadata_schema` 的结构：
 
 **数据源标识说明**：
 - **local_file**：`datasource_identifier` 为本地文件完整路径，用于定位本地文件类数据源
-- **minio_file**：`datasource_identifier` 为 MinIO 对象路径或对象标识，用于定位 MinIO 文件类数据源
-- **table**：`datasource_identifier` 为表名或 `数据库.表名`，用于定位数据表，LLM 需根据分析需求自行生成 SQL 语句（包含 JOIN、条件过滤、聚合等）。如果 `table_engine` 缺失或为 `"relational"`，按普通关系表 SQL 查询；如果为 `"time_series"`，必须按 `ts_query(...)` 规则生成时序查询
-- **api**：`datasource_identifier` 为接口地址或接口标识，用于定位可通过 HTTP 调用获取的数据源，LLM 应根据接口要求调用 `load_data_with_api`
+- **table**：内部标识，对外表述为 UNS 关系型、时序型、引用型或计算型文件；`datasource_identifier` 为表名或 `数据库.表名`，LLM 需根据分析需求自行生成 SQL 语句（包含 JOIN、条件过滤、聚合等）。如果 `table_engine` 缺失或为 `"relational"`，按普通关系型 UNS 文件查询；如果为 `"time_series"`，必须按 `ts_query(...)` 规则生成时序查询
 
 ### 2. 查询约束与数据筛选实现规范
 
@@ -1924,9 +1902,7 @@ else:
 2. 如果存在 `selected_datasource_ids`，表示当前会话本轮限定的数据源范围，应优先在 `datasources` 中按这些 ID 取子集。
 3. 根据 `datasource_type` 选择对应实现方式：
    - `local_file`：调用 `load_local_file(...)` 或遵守 `recommended_loader`
-   - `minio_file`：调用 `load_minio_file(...)`
    - `table`：调用 `load_data_with_sql(...)` 并自行生成 SQL
-   - `api`：调用 `load_data_with_api(...)`
 4. 对 `local_file` 数据源，如果存在 `recommended_loader`，必须优先使用该字段指定的加载函数，不要自行改用另一个 loader。
 5. 如果多个 `table` 数据源之间存在明确关联关系，优先考虑 SQL JOIN；如果数据源类型不同，再考虑分源加载后在 pandas 中做有限范围的关联与汇总。
 
@@ -2291,7 +2267,7 @@ result = save_analysis_result(...)
 | Embedding | sentence transformers（本地）BGE-M3, BGE-Rerank（生产） |
 | 关系型数据库    | SQLite (本地) / PostgreSQL (生产)                   |
 | 数据库框架     |   sqlalchemy                                              |
-| 文件存储      | 本地磁盘 (本地) / MinIO (生产)                          |
+| 文件存储      | 本地磁盘                                                |
 
 ---
 

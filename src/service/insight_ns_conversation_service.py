@@ -683,11 +683,12 @@ class InsightNsConversationService:
     def _friendly_datasource_type(value: Any) -> str:
         mapping = {
             'local_file': '本地文件',
-            'table': '数据表',
-            'timeseries': '时序数据',
-            'time_series': '时序数据',
-            'api': '接口数据',
-            'minio': '远程文件',
+            'table': 'UNS 文件',
+            'timeseries': 'UNS 时序型文件',
+            'time_series': 'UNS 时序型文件',
+            'api': '数据源',
+            'minio': '数据源',
+            'minio_file': '数据源',
         }
         key = str(value or '').strip()
         return mapping.get(key, key or '数据源')
