@@ -180,7 +180,7 @@ class ConversationContextService:
         conversation_id: Any,
         turn_id: Any,
     ) -> ConversationRunContext | None:
-        """在同一轮次内重新执行分析，并复用该轮原始问题与数据源快照。"""
+        """在同一轮次内重新执行分析，复用原始问题并刷新当前数据源选择。"""
         conversation = self._get_conversation_for_run(conversation_id)
         if conversation is None:
             return None
@@ -197,15 +197,9 @@ class ConversationContextService:
         if turn is None:
             return None
 
-        selected_ids = safe_json_loads(turn.selected_datasource_ids_json, [])
-        selected_snapshot = safe_json_loads(turn.selected_datasource_snapshot_json, [])
-        active_snapshot = {
-            "namespace_id": conversation.insight_namespace_id,
-            "conversation_id": conversation.id,
-            "selected_datasource_ids": selected_ids,
-            "selected_datasource_snapshot": selected_snapshot,
-            "updated_at": _now().isoformat(),
-        }
+        active_snapshot = self._merge_datasource_snapshot(conversation=conversation)
+        selected_ids = list(active_snapshot.get('selected_datasource_ids', []))
+        selected_snapshot = list(active_snapshot.get('selected_datasource_snapshot') or [])
 
         self._reset_turn_runtime_state(conversation, turn)
         conversation.active_datasource_snapshot = dump_json(active_snapshot)
@@ -213,6 +207,8 @@ class ConversationContextService:
         conversation.updated_at = _now()
         conversation.user_message = turn.user_query
         conversation.status = 'active'
+        turn.selected_datasource_ids_json = dump_json(selected_ids)
+        turn.selected_datasource_snapshot_json = dump_json(selected_snapshot)
 
         self.session.commit()
         return ConversationRunContext(

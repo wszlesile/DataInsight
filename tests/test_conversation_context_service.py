@@ -12,7 +12,15 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from config.database import Base
-from model import InsightNsConversation, InsightNsExecution, InsightNsMessage, InsightNsTurn
+from model import (
+    InsightDatasource,
+    InsightNamespace,
+    InsightNsConversation,
+    InsightNsExecution,
+    InsightNsMessage,
+    InsightNsRelDatasource,
+    InsightNsTurn,
+)
 from service.conversation_context_service import ConversationContextService, _attach_chart_artifact_refs
 
 
@@ -271,6 +279,73 @@ class ConversationContextServiceTestCase(unittest.TestCase):
         self.assertEqual('success', turn.status)
         self.assertEqual('legacy report', turn.final_answer)
         self.assertEqual('', turn.error_message)
+
+    def test_start_rerun_refreshes_current_datasource_bindings(self) -> None:
+        self.session.add(InsightNamespace(
+            id=5,
+            username='admin',
+            name='默认空间',
+            is_deleted=0,
+        ))
+        self.session.add(InsightNsConversation(
+            id=109,
+            insight_namespace_id=5,
+            title='analysis',
+            status='active',
+            summary_text='',
+            active_datasource_snapshot='{}',
+            last_turn_no=1,
+            user_message='统计一下',
+            insight_result='当前会话还没有关联数据源',
+            is_deleted=0,
+        ))
+        self.session.add(InsightNsTurn(
+            id=901,
+            conversation_id=109,
+            turn_no=1,
+            user_query='统计一下',
+            selected_datasource_ids_json='[]',
+            selected_datasource_snapshot_json='[]',
+            final_answer='当前会话还没有关联数据源',
+            status='success',
+            error_message='',
+            is_deleted=0,
+        ))
+        self.session.add(InsightDatasource(
+            id=301,
+            insight_namespace_id=5,
+            datasource_type='table',
+            datasource_name='产量表',
+            knowledge_tag='',
+            datasource_schema='{"properties":{"产量":{"type":"number"}}}',
+            datasource_config_json='{"table_name":"public.output"}',
+            is_deleted=0,
+        ))
+        self.session.add(InsightNsRelDatasource(
+            insight_namespace_id=5,
+            insight_conversation_id=109,
+            datasource_id=301,
+            sort_no=1,
+            bind_source='user_selected',
+            is_deleted=0,
+        ))
+        self.session.commit()
+
+        runtime = ConversationContextService(self.session).start_rerun(
+            username='admin',
+            conversation_id=109,
+            turn_id=901,
+        )
+
+        self.assertIsNotNone(runtime)
+        self.assertEqual(runtime.active_datasource_snapshot['selected_datasource_ids'], [301])
+        self.assertEqual(
+            runtime.active_datasource_snapshot['selected_datasource_snapshot'][0]['datasource_name'],
+            '产量表',
+        )
+        turn = self.session.query(InsightNsTurn).filter_by(id=901).one()
+        self.assertEqual(turn.selected_datasource_ids_json, '[301]')
+        self.assertIn('产量表', turn.selected_datasource_snapshot_json)
 
 
 if __name__ == "__main__":
