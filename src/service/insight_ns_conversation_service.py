@@ -54,7 +54,6 @@ TWEMOJI_BASE_URL = 'https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/sv
 class InsightNsConversationService:
     """会话历史、轮次详情与导出相关的查询服务。"""
 
-    DEFAULT_CONVERSATION_NAME = '默认会话'
     NEW_CONVERSATION_NAME = '新建会话'
 
     def __init__(self, session: Session):
@@ -78,12 +77,6 @@ class InsightNsConversationService:
             InsightNsConversation.last_message_at.desc(),
             InsightNsConversation.id.desc(),
         ).all()
-        if not conversations:
-            conversation = self._build_conversation(namespace_id_int, self.DEFAULT_CONVERSATION_NAME)
-            self.session.add(conversation)
-            self.session.commit()
-            self.session.refresh(conversation)
-            conversations = [conversation]
         return [conversation.to_dict() for conversation in conversations]
 
     def create_conversation(
@@ -125,23 +118,6 @@ class InsightNsConversationService:
         self.session.commit()
         self.session.refresh(conversation)
         return conversation.to_dict()
-
-    def _build_conversation(self, namespace_id: int, title: str) -> InsightNsConversation:
-        now = datetime.now()
-        return InsightNsConversation(
-            insight_namespace_id=namespace_id,
-            title=title,
-            status='active',
-            summary_text='',
-            active_datasource_snapshot='{}',
-            last_turn_no=0,
-            last_message_at=now,
-            user_message='',
-            insight_result='',
-            is_deleted=0,
-            created_at=now,
-            updated_at=now,
-        )
 
     def rename_conversation(self, username: str, conversation_id: Any, title: str) -> dict[str, Any] | None:
         """更新会话标题；空标题时回退到默认标题生成逻辑。"""
