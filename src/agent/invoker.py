@@ -10,6 +10,14 @@ from zoneinfo import ZoneInfo
 from sqlalchemy.exc import SQLAlchemyError
 
 from agent import CustomContext, get_data_insight_agent, get_input
+from agent.analysis_preparation import (
+    BusinessContextContract,
+    DatasourceSelectionContract,
+    IntentContract,
+    PreparationResult,
+    infer_query_capabilities,
+    prepare_analysis,
+)
 from agent.context_engineering_runtime import classify_analysis_context_mode, is_analysis_like_request
 from agent.intent_classifier import resolve_context_mode_with_llm
 from config import Config
@@ -586,7 +594,11 @@ def _build_expected_time_no_data_report(
     return '\n\n'.join(item for item in lines if item).strip()
 
 
-def _build_agent_context(agent_request: AgentRequest, runtime: ConversationRunContext) -> CustomContext:
+def _build_agent_context(
+    agent_request: AgentRequest,
+    runtime: ConversationRunContext,
+    preparation: PreparationResult | None = None,
+) -> CustomContext:
     """构造 Agent 与工具层使用的运行上下文。"""
     user_query = getattr(runtime.turn, 'user_query', '') or agent_request.user_message or ''
     return CustomContext(
@@ -598,7 +610,11 @@ def _build_agent_context(agent_request: AgentRequest, runtime: ConversationRunCo
         expected_time_range=_build_expected_time_range_from_user_query(user_query),
         auth_token=agent_request.auth_token or '',
         database_conn_info=dict(agent_request.database_conn_info or {}),
-        active_datasource_snapshot=dict(runtime.active_datasource_snapshot or {}),
+        active_datasource_snapshot=dict(
+            preparation.prompt_snapshot()
+            if preparation is not None
+            else runtime.active_datasource_snapshot or {}
+        ),
         analysis_task_id=runtime.analysis_task_id,
     )
 
@@ -613,22 +629,129 @@ def _build_agent_input_with_runtime_instruction(
     agent_request: AgentRequest,
     runtime: ConversationRunContext,
     runtime_instruction: str = '',
+    preparation: PreparationResult | None = None,
 ):
     """在必要时追加一条很短的运行时修复指令。"""
-    extra_system_messages = [runtime_instruction] if runtime_instruction else None
+    extra_system_messages = [runtime_instruction] if runtime_instruction else []
+    if preparation is not None:
+        extra_system_messages.append(
+            "本轮选源使用的业务意图：\n"
+            + json.dumps(
+                {
+                    "business_goal": preparation.intent.business_goal,
+                    "business_subjects": preparation.intent.business_subjects,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n该摘要只帮助理解用户问题，不限制查询、指标、图表、表格或报告表达。"
+        )
     return get_input(
         agent_request.user_message,
         namespace_id=runtime.conversation.insight_namespace_id,
         conversation_id=runtime.conversation.id,
-        extra_system_messages=extra_system_messages,
+        extra_system_messages=extra_system_messages or None,
         history_turn_limit=runtime.history_turn_limit,
-        datasource_snapshot_override=runtime.active_datasource_snapshot,
+        datasource_snapshot_override=(
+            preparation.prompt_snapshot()
+            if preparation is not None
+            else runtime.active_datasource_snapshot
+        ),
         context_mode=getattr(runtime, 'context_mode', None),
     )
 
 
 def _resolve_agent_runtime_config(agent_request: AgentRequest):
     return create_runtime_config(selected_model_id=agent_request.selected_llm_model_id)
+
+
+def _prepare_analysis_context(
+    *,
+    runtime: ConversationRunContext,
+    agent_request: AgentRequest,
+    runtime_config,
+) -> PreparationResult:
+    """Select and enrich datasource Schema without owning insight semantics."""
+    cached = runtime.short_term_memory.get("preparation_result")
+    if isinstance(cached, PreparationResult):
+        return cached
+
+    user_query = getattr(runtime.turn, "user_query", "") or agent_request.user_message
+    conversation_context: dict[str, Any] = {}
+    previous_turn_no = max(int(getattr(runtime.turn, "turn_no", 0) or 0) - 1, 0)
+    if previous_turn_no > 0 and getattr(runtime, "context_mode", "") == "followup":
+        with session_scope(expire_on_commit=False) as session:
+            recent_messages = ConversationContextService(session).get_recent_prompt_messages(
+                runtime.conversation.id,
+                limit_messages=6,
+                max_turn_no=previous_turn_no,
+            )
+        conversation_context["recent_messages"] = [
+            {
+                "role": getattr(item, "role", ""),
+                "content": str(getattr(item, "content", "") or "")[:800],
+            }
+            for item in recent_messages
+        ]
+
+    source_snapshot = dict(runtime.active_datasource_snapshot or {})
+    try:
+        result = prepare_analysis(
+            user_query=user_query,
+            context_mode=getattr(runtime, "context_mode", "") or "fresh_analysis",
+            expected_time_range=_build_expected_time_range_from_user_query(user_query),
+            datasource_snapshot=source_snapshot,
+            conversation_context=conversation_context,
+            runtime_config=runtime_config,
+            cancelled=lambda: _raise_if_analysis_task_cancelled(runtime),
+            stage_callback=lambda stage: logger.info(
+                "analysis preparation stage started: conversation_id=%s turn_id=%s stage=%s",
+                runtime.conversation.id,
+                runtime.turn.id,
+                stage,
+            ),
+        )
+    except AnalysisTaskCancelled:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "analysis preparation unavailable; preserving original datasource context: "
+            "conversation_id=%s turn_id=%s error=%s",
+            runtime.conversation.id,
+            runtime.turn.id,
+            exc,
+        )
+        selected_ids = [
+            int(item)
+            for item in source_snapshot.get("selected_datasource_ids") or []
+            if int(item or 0) > 0
+        ]
+        if not selected_ids:
+            selected_ids = [
+                int(item.get("datasource_id") or item.get("id") or 0)
+                for item in source_snapshot.get("selected_datasource_snapshot") or []
+                if isinstance(item, dict)
+                and int(item.get("datasource_id") or item.get("id") or 0) > 0
+            ]
+        result = PreparationResult(
+            intent=IntentContract(
+                business_goal=user_query or "完成本轮数据洞察分析",
+                business_questions=[user_query or "完成本轮数据洞察分析"],
+            ),
+            selection=DatasourceSelectionContract(
+                selected_datasource_ids=selected_ids,
+                selection_reason="Preparation 不可用，保留原版数据源范围",
+            ),
+            business_context=BusinessContextContract(
+                unresolved_relationships=["数据源关系尚未在 Preparation 中确认"]
+                if len(selected_ids) > 1
+                else [],
+            ),
+            selected_snapshot=source_snapshot,
+            query_capabilities=infer_query_capabilities(source_snapshot),
+        )
+    runtime.short_term_memory["preparation_result"] = result
+    return result
 
 
 def _resolve_runtime_context_mode(runtime: ConversationRunContext, user_message: str) -> str:
@@ -658,6 +781,8 @@ def _resolve_runtime_context_mode(runtime: ConversationRunContext, user_message:
 
 
 def _is_analysis_request_expected(runtime: ConversationRunContext, user_message: str) -> bool:
+    if runtime.is_rerun:
+        return True
     if _is_regenerate_request(user_message):
         return True
     context_mode = getattr(runtime, 'context_mode', '') or classify_analysis_context_mode(user_message)
@@ -2121,7 +2246,25 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 allow_report_only=allow_report_only,
             )
 
-        if _should_finish_with_too_many_datasources(runtime, agent_request.user_message):
+        runtime_config = _resolve_agent_runtime_config(agent_request)
+        preparation = (
+            _prepare_analysis_context(
+                runtime=runtime,
+                agent_request=agent_request,
+                runtime_config=runtime_config,
+            )
+            if analysis_request_expected
+            else None
+        )
+
+        if (
+            _should_finish_with_too_many_datasources(runtime, agent_request.user_message)
+            and (
+                preparation is None
+                or len(preparation.selection.selected_datasource_ids)
+                > Config.DATASOURCE_CONTEXT_MAX_COUNT
+            )
+        ):
             assistant_message = _build_too_many_datasources_reply(runtime)
             allow_report_only = True
             return _finalize_run_with_fresh_session(
@@ -2136,7 +2279,6 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 allow_report_only=allow_report_only,
             )
 
-        runtime_config = _resolve_agent_runtime_config(agent_request)
         agent = get_data_insight_agent(runtime_config)
 
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
@@ -2176,8 +2318,13 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                     agent_request=agent_request,
                     runtime=runtime,
                     runtime_instruction=runtime_instruction,
+                    preparation=preparation,
                 ),
-                context=_build_agent_context(agent_request, runtime),
+                context=_build_agent_context(
+                    agent_request,
+                    runtime,
+                    preparation,
+                ),
             )
             _raise_if_analysis_task_cancelled(runtime)
             _update_short_term_memory_from_messages(runtime, agent_response.get('messages', []))
@@ -2371,7 +2518,25 @@ def _stream_with_runtime(
             )
             return
 
-        if _should_finish_with_too_many_datasources(runtime, agent_request.user_message):
+        runtime_config = _resolve_agent_runtime_config(agent_request)
+        preparation = (
+            _prepare_analysis_context(
+                runtime=runtime,
+                agent_request=agent_request,
+                runtime_config=runtime_config,
+            )
+            if analysis_request_expected
+            else None
+        )
+
+        if (
+            _should_finish_with_too_many_datasources(runtime, agent_request.user_message)
+            and (
+                preparation is None
+                or len(preparation.selection.selected_datasource_ids)
+                > Config.DATASOURCE_CONTEXT_MAX_COUNT
+            )
+        ):
             assistant_message = _build_too_many_datasources_reply(runtime)
             allow_report_only = True
             yield _build_progress_event(
@@ -2399,7 +2564,6 @@ def _stream_with_runtime(
             )
             return
 
-        runtime_config = _resolve_agent_runtime_config(agent_request)
         agent = get_data_insight_agent(runtime_config)
 
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
@@ -2457,8 +2621,13 @@ def _stream_with_runtime(
                     agent_request=agent_request,
                     runtime=runtime,
                     runtime_instruction=runtime_instruction,
+                    preparation=preparation,
                 ),
-                context=_build_agent_context(agent_request, runtime),
+                context=_build_agent_context(
+                    agent_request,
+                    runtime,
+                    preparation,
+                ),
                 stream_mode=["updates", "custom"],
             ):
                 _raise_if_analysis_task_cancelled(runtime)

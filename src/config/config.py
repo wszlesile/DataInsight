@@ -140,6 +140,15 @@ class Config:
         os.environ.get('CONTEXT_COMPRESSION_ARTIFACT_SUMMARY_CHARS', 500)
     )
     DATASOURCE_CONTEXT_MAX_COUNT = int(os.environ.get('DATASOURCE_CONTEXT_MAX_COUNT', 30))
+    ANALYSIS_PREPARATION_TEMPERATURE = float(
+        os.environ.get('ANALYSIS_PREPARATION_TEMPERATURE', 0.1)
+    )
+    DATASOURCE_SELECTION_SHORTLIST_TRIGGER_COUNT = int(
+        os.environ.get('DATASOURCE_SELECTION_SHORTLIST_TRIGGER_COUNT', 8)
+    )
+    DATASOURCE_SELECTION_SHORTLIST_TRIGGER_CHARS = int(
+        os.environ.get('DATASOURCE_SELECTION_SHORTLIST_TRIGGER_CHARS', 24000)
+    )
 
     @classmethod
     def get(cls, key: str, default: Any = None) -> Any:
