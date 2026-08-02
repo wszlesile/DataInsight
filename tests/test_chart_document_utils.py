@@ -11,6 +11,7 @@ if str(SRC_ROOT) not in sys.path:
 from utils.chart_document_utils import (
     BACKEND_LAYOUT_LOCK_KEY,
     build_chart_result,
+    build_multi_metric_chart_result,
     build_chart_suite,
     compile_chart_document,
     normalize_chart_result_item,
@@ -18,6 +19,48 @@ from utils.chart_document_utils import (
 
 
 class ChartDocumentUtilsTestCase(unittest.TestCase):
+    def test_multi_metric_line_supports_a_business_series_dimension(self) -> None:
+        chart_item = build_multi_metric_chart_result(
+            chart_kind="line",
+            data=[
+                {"month": "2026-01", "department": "Sales", "amount": 120, "sets": 8},
+                {"month": "2026-01", "department": "Service", "amount": 98, "sets": 6},
+                {"month": "2026-02", "department": "Sales", "amount": 131, "sets": 9},
+                {"month": "2026-02", "department": "Service", "amount": 103, "sets": 7},
+            ],
+            title="Monthly performance",
+            category_field="month",
+            value_fields=["amount", "sets"],
+            value_labels=["Amount", "Sets"],
+            series_field="department",
+        )
+
+        normalized_item = normalize_chart_result_item(chart_item)
+        chart_spec = normalized_item["chart_spec"]
+        self.assertEqual(chart_spec["xAxis"]["data"], ["2026-01", "2026-02"])
+        self.assertEqual(
+            {item["name"] for item in chart_spec["series"]},
+            {"Sales · Amount", "Sales · Sets", "Service · Amount", "Service · Sets"},
+        )
+        self.assertEqual(chart_spec["series"][0]["data"], [120.0, 131.0])
+
+    def test_multi_metric_helper_degrades_to_single_metric_chart(self) -> None:
+        chart_item = build_multi_metric_chart_result(
+            chart_kind="line",
+            data=[
+                {"month": "2026-01", "department": "Sales", "amount": 120},
+                {"month": "2026-02", "department": "Sales", "amount": 131},
+            ],
+            title="Monthly performance",
+            category_field="month",
+            value_fields=["amount"],
+            series_field="department",
+        )
+
+        normalized_item = normalize_chart_result_item(chart_item)
+        self.assertEqual(normalized_item["chart_spec"]["xAxis"]["data"], ["2026-01", "2026-02"])
+        self.assertEqual(normalized_item["chart_spec"]["series"][0]["data"], [120.0, 131.0])
+
     def test_build_chart_result_compiles_multi_series_line(self) -> None:
         chart_item = build_chart_result(
             chart_kind="line",
@@ -41,6 +84,42 @@ class ChartDocumentUtilsTestCase(unittest.TestCase):
         self.assertEqual(normalized_item["chart_spec"]["xAxis"]["data"], ["2026-04-01", "2026-04-02"])
         self.assertEqual(len(normalized_item["chart_spec"]["series"]), 2)
         self.assertEqual({item["name"] for item in normalized_item["chart_spec"]["series"]}, {"East", "West"})
+
+    def test_build_chart_result_accepts_unambiguous_wide_series_data(self) -> None:
+        chart_item = build_chart_result(
+            chart_kind="line",
+            data=[
+                {"month": "2026-01", "Sales": 120, "Service": 98},
+                {"month": "2026-02", "Sales": 131, "Service": None},
+            ],
+            title="Monthly performance",
+            category_field="month",
+            value_field="amount",
+            series_field="department",
+            sort_field="month",
+            sort_order="asc",
+        )
+
+        normalized_item = normalize_chart_result_item(chart_item)
+        chart_spec = normalized_item["chart_spec"]
+        self.assertEqual(chart_spec["xAxis"]["data"], ["2026-01", "2026-02"])
+        self.assertEqual(
+            {item["name"]: item["data"] for item in chart_spec["series"]},
+            {"Sales": [120.0, 131.0], "Service": [98.0, None]},
+        )
+
+    def test_build_chart_result_does_not_guess_mixed_wide_series_data(self) -> None:
+        chart_item = build_chart_result(
+            chart_kind="line",
+            data=[{"month": "2026-01", "Sales": 120, "note": "estimated"}],
+            title="Monthly performance",
+            category_field="month",
+            value_field="amount",
+            series_field="department",
+        )
+
+        with self.assertRaisesRegex(ValueError, "field 'amount' is not present"):
+            normalize_chart_result_item(chart_item)
 
     def test_bar_chart_rejects_duplicate_category_without_series(self) -> None:
         chart_item = build_chart_result(

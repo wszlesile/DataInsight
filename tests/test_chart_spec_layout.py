@@ -83,6 +83,14 @@ class ChartSpecLayoutTestCase(unittest.TestCase):
         pie_series = final_spec["series"][0]
         self.assertLessEqual(len(pie_series["data"]), 8)
         self.assertFalse(pie_series["label"].get("show", True))
+        self.assertEqual(final_spec["legend"]["orient"], "horizontal")
+        self.assertEqual(final_spec["legend"]["bottom"], 8)
+        self.assertNotIn("right", final_spec["legend"])
+        self.assertEqual(
+            final_spec["legend"]["data"],
+            [item["name"] for item in pie_series["data"]],
+        )
+        self.assertEqual(pie_series["center"], ["50%", "48%"])
 
     def test_browser_validation_smoke_prefers_finalized_spec(self) -> None:
         raw_spec = {

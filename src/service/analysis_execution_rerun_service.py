@@ -7,6 +7,7 @@ from agent.tools import run_generated_code_locally
 from model import InsightNsArtifact, InsightNsConversation, InsightNsExecution, InsightNsTurn
 from service.analysis_task_service import AnalysisTaskService
 from service.evidence_assembly_service import EvidenceAssemblyService
+from utils import logger
 from utils.datasource_utils import dump_json, safe_json_loads, to_int
 
 
@@ -106,7 +107,7 @@ class AnalysisExecutionRerunService:
             }
 
         self._disable_execution_content(run_result.get('execution_id'))
-        self._create_disabled_artifacts(
+        artifacts = self._create_disabled_artifacts(
             conversation=conversation,
             turn=turn,
             execution_id=to_int(run_result.get('execution_id'), 0),
@@ -118,6 +119,26 @@ class AnalysisExecutionRerunService:
         self._restore_turn_state(turn, old_turn_state)
         task_service.mark_finished(task.task_id, status='success')
         self.session.commit()
+        try:
+            execution = self.session.query(InsightNsExecution).filter(
+                InsightNsExecution.id == to_int(run_result.get('execution_id'), 0),
+                InsightNsExecution.is_deleted == 0,
+            ).first()
+            EvidenceAssemblyService(self.session).assemble_for_execution(
+                conversation_id=conversation.id,
+                turn_id=turn.id,
+                execution=execution,
+                artifacts=artifacts,
+            )
+            self.session.commit()
+        except Exception as exc:
+            self.session.rollback()
+            logger.warning(
+                "post-rerun evidence persistence failed without affecting rerun: execution_id=%s error=%s",
+                to_int(run_result.get('execution_id'), 0),
+                exc,
+                exc_info=True,
+            )
         return {
             'task': task_service.serialize_task(task),
             'execution': self._load_execution_dict(run_result.get('execution_id')),
@@ -200,7 +221,7 @@ class AnalysisExecutionRerunService:
         charts: list[dict[str, Any]],
         tables: list[dict[str, Any]],
         analysis_task_id: int,
-    ) -> None:
+    ) -> list[dict[str, Any]]:
         artifacts: list[dict[str, Any]] = []
         for index, chart in enumerate(charts or [], start=1):
             artifacts.append(self._create_disabled_artifact(
@@ -247,16 +268,7 @@ class AnalysisExecutionRerunService:
                 sort_no=100 + index,
             ))
 
-        execution = self.session.query(InsightNsExecution).filter(
-            InsightNsExecution.id == execution_id,
-            InsightNsExecution.is_deleted == 0,
-        ).first()
-        EvidenceAssemblyService(self.session).assemble_for_execution(
-            conversation_id=conversation.id,
-            turn_id=turn.id,
-            execution=execution,
-            artifacts=artifacts,
-        )
+        return artifacts
 
     def _create_disabled_artifact(
         self,

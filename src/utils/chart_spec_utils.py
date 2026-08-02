@@ -26,10 +26,11 @@ def normalize_chart_spec(chart_spec: Any) -> dict[str, Any]:
 
     option = json.loads(json.dumps(chart_spec, ensure_ascii=False))
     _disable_animation(option)
+    _normalize_series(option)
+    _sync_pie_legend_data(option)
     _normalize_title_legend_grid(option)
     _normalize_axes(option)
     _normalize_tooltip(option)
-    _normalize_series(option)
     _normalize_data_zoom(option)
     return option
 
@@ -169,9 +170,10 @@ def repair_chart_spec(chart_spec: Any, issues: list[dict[str, Any]]) -> dict[str
     if {"crowded_pie", "browser_text_overlap"} & codes:
         _tighten_pies(option)
 
+    _normalize_series(option)
+    _sync_pie_legend_data(option)
     _normalize_title_legend_grid(option)
     _normalize_axes(option)
-    _normalize_series(option)
     _normalize_data_zoom(option)
     return option
 
@@ -277,7 +279,19 @@ def _normalize_title_legend_grid(option: dict[str, Any]) -> None:
     title_present = bool(title.get("text"))
     legend_items = _extract_legend_items(option)
     legend_present = bool(legend_items or legend)
-    legend_vertical = len(legend_items) > 10 or max((len(str(item or "")) for item in legend_items), default=0) > 14
+    pie_series = [
+        item for item in option.get("series", [])
+        if isinstance(item, dict)
+        and str(item.get("type") or "").strip().lower() == "pie"
+    ] if isinstance(option.get("series"), list) else []
+    legend_vertical = (
+        not pie_series
+        and (
+            str(legend.get("orient") or "").lower() == "vertical"
+            or len(legend_items) > 10
+            or max((len(str(item or "")) for item in legend_items), default=0) > 14
+        )
+    )
 
     if title_present:
         title.setdefault("top", 8)
@@ -303,11 +317,23 @@ def _normalize_title_legend_grid(option: dict[str, Any]) -> None:
         legend.setdefault("pageIconSize", 10)
         legend.setdefault("pageTextStyle", {"fontSize": 10})
 
-        if legend_vertical:
+        if pie_series:
+            legend["orient"] = "horizontal"
+            legend["left"] = "center"
+            legend["bottom"] = 8
+            legend.pop("right", None)
+            legend.pop("top", None)
+            legend.pop("height", None)
+            for series in pie_series:
+                series["center"] = ["50%", "48%"]
+                series["radius"] = ["28%", "60%"]
+        elif legend_vertical:
             legend["orient"] = "vertical"
-            legend.setdefault("right", 8)
-            legend.setdefault("top", "middle")
-            legend.setdefault("height", "70%")
+            legend["right"] = 8
+            legend["top"] = "middle"
+            legend["height"] = "70%"
+            legend.pop("left", None)
+            legend.pop("bottom", None)
         else:
             legend.setdefault("orient", "horizontal")
             legend.setdefault("left", "center")
@@ -352,6 +378,33 @@ def _normalize_title_legend_grid(option: dict[str, Any]) -> None:
     _assign_option_mapping(option, "title", title)
     _assign_option_mapping(option, "legend", legend)
     _assign_option_mapping(option, "grid", grid)
+
+
+def _sync_pie_legend_data(option: dict[str, Any]) -> None:
+    """Keep pie legends aligned with slices after deterministic tail merging."""
+    series_list = option.get("series")
+    if not isinstance(series_list, list):
+        return
+    names: list[str] = []
+    has_pie = False
+    for series in series_list:
+        if not isinstance(series, dict) or str(series.get("type") or "").lower() != "pie":
+            continue
+        has_pie = True
+        for item in series.get("data") or []:
+            name = str(item.get("name") or "") if isinstance(item, dict) else ""
+            if name and name not in names:
+                names.append(name)
+    if not has_pie:
+        return
+    legend = _extract_first_mapping(option.get("legend"))
+    if len(names) > 1:
+        legend["data"] = names
+        legend.pop("show", None)
+    else:
+        legend["show"] = False
+        legend["data"] = names
+    _assign_option_mapping(option, "legend", legend)
 
 
 def _normalize_axes(option: dict[str, Any]) -> None:

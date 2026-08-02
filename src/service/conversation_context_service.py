@@ -35,6 +35,7 @@ from utils.datasource_utils import (
     to_int,
 )
 from utils.analysis_task_cancel import AnalysisTaskCancelled, CANCELLED_MESSAGE, is_analysis_task_cancelled
+from utils import logger
 from service.evidence_assembly_service import EvidenceAssemblyService
 
 ROLE_TO_TYPE = {
@@ -365,18 +366,29 @@ class ConversationContextService:
                 sort_no=100 + index,
             ))
 
-        EvidenceAssemblyService(self.session).assemble_for_execution(
-            conversation_id=conversation.id,
-            turn_id=turn.id,
-            execution=latest_execution,
-            artifacts=artifacts,
-        )
-
         if analysis_task_id and is_analysis_task_cancelled(task_pk=int(analysis_task_id or 0)):
             raise AnalysisTaskCancelled(CANCELLED_MESSAGE)
 
         self._refresh_memories(conversation)
+        # Commit the successful analysis before optional Evidence post-processing.
+        # Evidence persistence uses the next transaction and cannot roll the result back.
         self.session.commit()
+        try:
+            EvidenceAssemblyService(self.session).assemble_for_execution(
+                conversation_id=conversation.id,
+                turn_id=turn.id,
+                execution=latest_execution,
+                artifacts=artifacts,
+            )
+            self.session.commit()
+        except Exception as exc:
+            self.session.rollback()
+            logger.warning(
+                "post-analysis evidence persistence failed without affecting analysis: execution_id=%s error=%s",
+                int(getattr(latest_execution, 'id', 0) or 0),
+                exc,
+                exc_info=True,
+            )
         chart_artifacts = [artifact for artifact in artifacts if artifact.get('artifact_type') == 'chart']
         return {
             "conversation": conversation,
@@ -933,16 +945,6 @@ class ConversationContextService:
         """
         snapshot = safe_json_loads(conversation.active_datasource_snapshot, {})
         selected_datasource_ids = self._load_bound_datasource_ids(conversation.id)
-        datasource_limit = max(int(getattr(Config, 'DATASOURCE_CONTEXT_MAX_COUNT', 10) or 0), 0)
-
-        if datasource_limit > 0 and len(selected_datasource_ids) > datasource_limit:
-            snapshot["namespace_id"] = conversation.insight_namespace_id
-            snapshot["conversation_id"] = conversation.id
-            snapshot["selected_datasource_ids"] = selected_datasource_ids
-            snapshot["selected_datasource_snapshot"] = []
-            snapshot["updated_at"] = _now().isoformat()
-            return snapshot
-
         selected_datasource_snapshot = self._build_turn_datasource_snapshot(
             conversation_id=conversation.id,
             datasource_ids=selected_datasource_ids,

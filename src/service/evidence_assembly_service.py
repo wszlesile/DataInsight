@@ -1,20 +1,26 @@
 import hashlib
+import re
 from datetime import datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from model import InsightNsArtifact, InsightNsExecution, InsightNsExecutionEvidence, InsightNsTurn
+from config import Config
+from service.post_analysis_evidence_service import (
+    PostAnalysisEvidenceCompiler,
+    build_execution_snapshot,
+)
 from utils.datasource_utils import dump_json, safe_json_loads
+from utils import logger
 
 
-EVIDENCE_PAYLOAD_FIELDS = {
+LEGACY_EVIDENCE_PAYLOAD_FIELDS = {
     "evidence_definitions",
     "chart_trace_refs",
     "table_trace_refs",
     "report_trace_refs",
     "table_trace_metadata",
-    "query_snapshots",
 }
 
 
@@ -39,14 +45,78 @@ class EvidenceAssemblyService:
         if not isinstance(payload, dict):
             return
 
-        evidence_definitions = payload.get("evidence_definitions") or []
-        chart_trace_refs = payload.get("chart_trace_refs") or []
-        table_trace_refs = payload.get("table_trace_refs") or []
-        report_trace_refs = payload.get("report_trace_refs") or []
-        query_snapshots = payload.get("query_snapshots") or {}
-        table_trace_metadata = payload.get("table_trace_metadata") or {}
+        turn = self.session.query(InsightNsTurn).filter(
+            InsightNsTurn.id == turn_id,
+            InsightNsTurn.is_deleted == 0,
+        ).first()
+        generated_code = str(getattr(execution, 'generated_code', '') or '').strip()
+        post_compilation_attempted = False
+        compilation_status = "complete"
+        compilation_diagnostics: dict[str, Any] = {}
+        compiled_bundle: dict[str, Any] = {}
+        if Config.POST_ANALYSIS_EVIDENCE_ENABLED and generated_code:
+            post_compilation_attempted = True
+            selected_snapshot = safe_json_loads(
+                getattr(turn, 'selected_datasource_snapshot_json', '') or '[]',
+                [],
+            ) if turn is not None else []
+            try:
+                snapshot = build_execution_snapshot(
+                    execution=execution,
+                    artifacts=artifacts,
+                    selected_datasource_snapshot=(
+                        selected_snapshot if isinstance(selected_snapshot, list) else []
+                    ),
+                    user_query=getattr(turn, 'user_query', '') if turn is not None else '',
+                )
+                compiled_bundle = PostAnalysisEvidenceCompiler().compile(snapshot)
+                compilation_status = str(compiled_bundle.get("status") or "partial")
+                compilation_diagnostics = (
+                    compiled_bundle.get("diagnostics")
+                    if isinstance(compiled_bundle.get("diagnostics"), dict)
+                    else {}
+                )
+                logger.info(
+                    "post-analysis evidence compiled: execution_id=%s status=%s definitions=%s chart_refs=%s table_refs=%s report_refs=%s",
+                    int(getattr(execution, 'id', 0) or 0),
+                    compiled_bundle.get('status'),
+                    len(compiled_bundle.get('evidence_definitions') or []),
+                    len(compiled_bundle.get('chart_trace_refs') or []),
+                    len(compiled_bundle.get('table_trace_refs') or []),
+                    len(compiled_bundle.get('report_trace_refs') or []),
+                )
+            except Exception as exc:
+                # Evidence is post-processing. It must never invalidate an already
+                # successful analysis execution or suppress its artifacts.
+                logger.warning(
+                    "post-analysis evidence unavailable: execution_id=%s error=%s",
+                    int(getattr(execution, 'id', 0) or 0),
+                    exc,
+                    exc_info=True,
+                )
+                compilation_status = "failed"
+                compilation_diagnostics = {"reason": "unexpected_compiler_failure", "error": str(exc)[:1200]}
 
+        evidence_definitions = compiled_bundle.get("evidence_definitions") or []
+        chart_trace_refs = compiled_bundle.get("chart_trace_refs") or []
+        table_trace_refs = compiled_bundle.get("table_trace_refs") or []
+        report_trace_refs = compiled_bundle.get("report_trace_refs") or []
+        query_snapshots = compiled_bundle.get("query_snapshots") or payload.get("query_snapshots") or {}
+
+        self._clear_artifact_evidence_metadata(artifacts)
         if not evidence_definitions and not chart_trace_refs and not table_trace_refs and not report_trace_refs:
+            if post_compilation_attempted:
+                self._upsert_execution_evidence(
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    execution_id=int(execution.id or 0),
+                    query_snapshots=query_snapshots if isinstance(query_snapshots, dict) else {},
+                    evidence_map={},
+                    compilation_status=compilation_status,
+                    diagnostics=compilation_diagnostics,
+                )
+            else:
+                self._delete_execution_evidence(int(execution.id or 0))
             self._cleanup_execution_payload(execution, payload)
             return
 
@@ -118,12 +188,42 @@ class EvidenceAssemblyService:
             execution_id=int(execution.id or 0),
             query_snapshots=query_snapshots if isinstance(query_snapshots, dict) else {},
             evidence_map=evidence_map,
+            compilation_status=compilation_status,
+            diagnostics=compilation_diagnostics,
         )
         self._write_artifact_metadata(
             artifact_refs=artifact_refs,
-            table_trace_metadata=table_trace_metadata if isinstance(table_trace_metadata, dict) else {},
         )
         self._cleanup_execution_payload(execution, payload)
+
+    def _delete_execution_evidence(self, execution_id: int) -> None:
+        if execution_id <= 0:
+            return
+        row = self.session.query(InsightNsExecutionEvidence).filter(
+            InsightNsExecutionEvidence.execution_id == execution_id,
+        ).first()
+        if row is not None:
+            self.session.delete(row)
+
+    def _clear_artifact_evidence_metadata(self, artifacts: list[dict[str, Any]]) -> None:
+        artifact_ids = [
+            int(artifact.get("id") or 0)
+            for artifact in artifacts
+            if int(artifact.get("id") or 0) > 0
+        ]
+        if not artifact_ids:
+            return
+        rows = self.session.query(InsightNsArtifact).filter(
+            InsightNsArtifact.id.in_(artifact_ids),
+            InsightNsArtifact.is_deleted == 0,
+        ).all()
+        for artifact in rows:
+            metadata = safe_json_loads(artifact.metadata_json, {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata.pop("evidence_refs", None)
+            metadata.pop("evidence_meta", None)
+            artifact.metadata_json = dump_json(metadata)
 
     @staticmethod
     def _build_evidence_id(execution_id: int, evidence_key: str) -> str:
@@ -139,10 +239,20 @@ class EvidenceAssemblyService:
     def _build_artifact_lookup(artifacts: list[dict[str, Any]]) -> dict[tuple[str, int], dict[str, Any]]:
         lookup: dict[tuple[str, int], dict[str, Any]] = {}
         counters: dict[str, int] = {}
-        for artifact in artifacts:
+        for artifact in sorted(
+            artifacts,
+            key=lambda item: (
+                str(item.get("artifact_type") or ""),
+                int(item.get("sort_no") or 0),
+                int(item.get("id") or 0),
+            ),
+        ):
             artifact_type = str(artifact.get("artifact_type") or '').strip()
             if not artifact_type:
                 continue
+            artifact_id = int(artifact.get("id") or 0)
+            if artifact_id > 0:
+                lookup[("id", artifact_id)] = artifact
             index = counters.get(artifact_type, 0)
             counters[artifact_type] = index + 1
             lookup[(artifact_type, index)] = artifact
@@ -169,7 +279,10 @@ class EvidenceAssemblyService:
             if not evidence_id:
                 continue
             artifact_index = int(ref.get(index_field) or 0)
-            artifact = artifact_lookup.get((artifact_type, artifact_index))
+            artifact_id = int(ref.get("artifact_id") or 0)
+            artifact = artifact_lookup.get(("id", artifact_id)) if artifact_id > 0 else None
+            if artifact is None:
+                artifact = artifact_lookup.get((artifact_type, artifact_index))
             if artifact is None and artifact_type == "report":
                 artifact = artifact_lookup.get((artifact_type, 0))
             if artifact is None:
@@ -200,6 +313,8 @@ class EvidenceAssemblyService:
         execution_id: int,
         query_snapshots: dict[str, Any],
         evidence_map: dict[str, Any],
+        compilation_status: str = "complete",
+        diagnostics: dict[str, Any] | None = None,
     ) -> None:
         if execution_id <= 0:
             return
@@ -212,7 +327,9 @@ class EvidenceAssemblyService:
                 conversation_id=conversation_id,
                 turn_id=turn_id,
                 execution_id=execution_id,
-                schema_version='v1',
+                schema_version='v2',
+                compilation_status=compilation_status,
+                diagnostics_json=dump_json(diagnostics or {}),
                 query_snapshots_json=dump_json(query_snapshots),
                 evidence_map_json=dump_json(evidence_map),
                 is_deleted=0,
@@ -223,6 +340,9 @@ class EvidenceAssemblyService:
             return
         row.conversation_id = conversation_id
         row.turn_id = turn_id
+        row.schema_version = 'v2'
+        row.compilation_status = compilation_status
+        row.diagnostics_json = dump_json(diagnostics or {})
         row.query_snapshots_json = dump_json(query_snapshots)
         row.evidence_map_json = dump_json(evidence_map)
         row.is_deleted = 0
@@ -232,7 +352,6 @@ class EvidenceAssemblyService:
         self,
         *,
         artifact_refs: dict[int, dict[str, list[dict[str, Any]]]],
-        table_trace_metadata: dict[str, Any],
     ) -> None:
         if not artifact_refs:
             return
@@ -245,8 +364,6 @@ class EvidenceAssemblyService:
             if not isinstance(metadata, dict):
                 metadata = {}
             metadata["evidence_refs"] = artifact_refs.get(int(artifact.id or 0), {})
-            if artifact.artifact_type == "table" and table_trace_metadata:
-                metadata["evidence_meta"] = self._metadata_for_table_artifact(artifact, table_trace_metadata)
             artifact.metadata_json = dump_json(metadata)
 
     def _build_source_refs(
@@ -271,14 +388,20 @@ class EvidenceAssemblyService:
         if not isinstance(snapshot_rows, list):
             snapshot_rows = []
 
+        evidence_query_keys = {
+            str(item).strip()
+            for item in (evidence_definition or {}).get("query_refs") or []
+            if str(item).strip()
+        }
         identifier_to_query_keys: dict[str, list[str]] = {}
         for query_key, snapshot in (query_snapshots or {}).items():
+            query_key_text = str(query_key)
+            if evidence_query_keys and query_key_text not in evidence_query_keys:
+                continue
             implementation = ((snapshot or {}).get("implementation") or {})
             sql_context = implementation.get("sql_context") or {}
             fragments = sql_context.get("fragments") or []
-            if not isinstance(fragments, list):
-                continue
-            for fragment in fragments:
+            for fragment in fragments if isinstance(fragments, list) else []:
                 if not isinstance(fragment, dict):
                     continue
                 identifier = str(
@@ -288,23 +411,32 @@ class EvidenceAssemblyService:
                     or ''
                 ).strip()
                 if identifier:
-                    identifier_to_query_keys.setdefault(identifier, []).append(str(query_key))
+                    identifier_to_query_keys.setdefault(identifier, []).append(query_key_text)
             sql_text = str(implementation.get("sql") or '')
             if sql_text:
                 for row in snapshot_rows:
                     if not isinstance(row, dict):
                         continue
                     identifier = str(row.get("datasource_identifier") or row.get("table_name") or '').strip()
-                    if identifier and identifier in sql_text:
-                        identifier_to_query_keys.setdefault(identifier, []).append(str(query_key))
+                    if identifier and re.search(
+                        rf"(?<![A-Za-z0-9_]){re.escape(identifier)}(?![A-Za-z0-9_])",
+                        sql_text,
+                        re.IGNORECASE,
+                    ):
+                        identifier_to_query_keys.setdefault(identifier, []).append(query_key_text)
 
         refs: list[dict[str, Any]] = []
+        has_precise_source = bool(identifier_to_query_keys)
         for row in snapshot_rows:
             if not isinstance(row, dict):
                 continue
             datasource_id = int(row.get("datasource_id") or row.get("id") or 0)
             identifier = str(row.get("datasource_identifier") or row.get("table_name") or '').strip()
-            if used_ids and datasource_id not in used_ids and identifier not in identifier_to_query_keys:
+            if has_precise_source and identifier not in identifier_to_query_keys:
+                continue
+            if not has_precise_source and len(used_ids) != 1:
+                continue
+            if used_ids and datasource_id not in used_ids:
                 continue
             ref = {
                 "datasource_id": datasource_id or None,
@@ -312,7 +444,7 @@ class EvidenceAssemblyService:
                 "datasource_type": row.get("datasource_type") or '',
                 "datasource_identifier": identifier,
                 "resolution": "query_scope" if identifier in identifier_to_query_keys else "execution_scope",
-                "query_keys": identifier_to_query_keys.get(identifier, []),
+                "query_keys": identifier_to_query_keys.get(identifier, sorted(evidence_query_keys)),
             }
             field_summary = self._build_source_field_summary(
                 row.get("metadata_schema") if isinstance(row.get("metadata_schema"), dict) else {},
@@ -322,7 +454,17 @@ class EvidenceAssemblyService:
             refs.append(ref)
         if refs:
             return refs
-        return [{"datasource_id": datasource_id, "resolution": "execution_scope"} for datasource_id in sorted(used_ids)]
+        if len(used_ids) == 1:
+            return [{
+                "datasource_id": next(iter(used_ids)),
+                "resolution": "execution_scope",
+                "query_keys": sorted(evidence_query_keys),
+            }]
+        return [{
+            "datasource_id": None,
+            "resolution": "query_scope",
+            "query_keys": sorted(evidence_query_keys),
+        }]
 
     @staticmethod
     def _build_source_field_summary(metadata_schema: dict[str, Any], evidence_definition: dict[str, Any]) -> dict[str, Any]:
@@ -366,26 +508,9 @@ class EvidenceAssemblyService:
         return field_names
 
     @staticmethod
-    def _metadata_for_table_artifact(artifact: InsightNsArtifact, table_trace_metadata: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(table_trace_metadata, dict):
-            return {}
-        if isinstance(table_trace_metadata.get("tables"), list):
-            # Table artifact sort_no starts at 101, so table_index is sort_no - 101.
-            table_index = max(int(artifact.sort_no or 100) - 101, 0)
-            rows = table_trace_metadata.get("tables") or []
-            if 0 <= table_index < len(rows) and isinstance(rows[table_index], dict):
-                return rows[table_index]
-        if isinstance(table_trace_metadata.get("by_table"), dict):
-            table_index = max(int(artifact.sort_no or 100) - 101, 0)
-            value = table_trace_metadata.get("by_table", {}).get(str(table_index))
-            if isinstance(value, dict):
-                return value
-        return table_trace_metadata
-
-    @staticmethod
     def _cleanup_execution_payload(execution: InsightNsExecution, payload: dict[str, Any]) -> None:
         cleaned = dict(payload)
-        for field in EVIDENCE_PAYLOAD_FIELDS:
+        for field in LEGACY_EVIDENCE_PAYLOAD_FIELDS:
             cleaned.pop(field, None)
         if cleaned != payload:
             execution.result_payload_json = dump_json(cleaned)

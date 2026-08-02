@@ -625,6 +625,8 @@ class InsightNsExecutionEvidence(Base):
     turn_id = Column(Integer, nullable=False, comment='所属轮次 ID')
     execution_id = Column(Integer, nullable=False, comment='所属代码执行 ID')
     schema_version = Column(String(32), nullable=False, default='v1', comment='证据链结构版本')
+    compilation_status = Column(String(32), nullable=False, default='complete', comment='后置证据编译状态')
+    diagnostics_json = Column(Text, nullable=False, default='{}', comment='后置证据编译诊断 JSON')
     query_snapshots_json = Column(Text, nullable=False, default='{}', comment='查询快照 JSON')
     evidence_map_json = Column(Text, nullable=False, default='{}', comment='正式 EvidenceMap JSON')
     is_deleted = Column(Integer, nullable=False, default=0, comment='软删除标记')
@@ -644,6 +646,9 @@ class InsightNsExecutionEvidence(Base):
             "turn_id": self.turn_id,
             "execution_id": self.execution_id,
             "schema_version": self.schema_version,
+            "compilation_status": self.compilation_status,
+            "diagnostics_json": self.diagnostics_json,
+            "diagnostics": _safe_json_loads(self.diagnostics_json, {}),
             "query_snapshots_json": self.query_snapshots_json,
             "evidence_map_json": self.evidence_map_json,
             "is_deleted": self.is_deleted,

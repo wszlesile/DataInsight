@@ -819,6 +819,7 @@ import Sidebar from './components/Sidebar.vue'
 import DataSourcePanel from './components/DataSourcePanel.vue'
 import ChatInput from './components/ChatInput.vue'
 import ChartDisplay from './components/ChartDisplay.vue'
+import { applyPieLegendSafety } from './utils/chartSpecSafety'
 import {
   createConversation,
   createNamespace,
@@ -1158,6 +1159,7 @@ const sanitizeChartSpec = (chartSpec) => {
   normalized.animationDurationUpdate = 0
   normalized.animationDelay = 0
   normalized.animationDelayUpdate = 0
+  applyPieLegendSafety(normalized)
 
   if (backendManaged) {
     applyTooltipDisplayRules(normalized)

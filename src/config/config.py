@@ -55,7 +55,7 @@ class Config:
     # 应用配置
     APP_NAME = "DataInsight App"
     VERSION = "1.0.0"
-    SCHEMA_VERSION = os.environ.get('DATA_INSIGHT_SCHEMA_VERSION', '1.4.0')
+    SCHEMA_VERSION = os.environ.get('DATA_INSIGHT_SCHEMA_VERSION', '1.6.0')
 
     # 用户系统配置
     USER_AUTH_ENDPOINT = '/os/inter-api/auth/v1/current-user/sessionInfo'
@@ -139,10 +139,15 @@ class Config:
     CONTEXT_COMPRESSION_ARTIFACT_SUMMARY_CHARS = int(
         os.environ.get('CONTEXT_COMPRESSION_ARTIFACT_SUMMARY_CHARS', 500)
     )
-    DATASOURCE_CONTEXT_MAX_COUNT = int(os.environ.get('DATASOURCE_CONTEXT_MAX_COUNT', 30))
     ANALYSIS_PREPARATION_TEMPERATURE = float(
         os.environ.get('ANALYSIS_PREPARATION_TEMPERATURE', 0.1)
     )
+    POST_ANALYSIS_EVIDENCE_ENABLED = os.environ.get(
+        'POST_ANALYSIS_EVIDENCE_ENABLED', 'true'
+    ).lower() == 'true'
+    POST_ANALYSIS_EVIDENCE_PLANNER_ENABLED = os.environ.get(
+        'POST_ANALYSIS_EVIDENCE_PLANNER_ENABLED', 'true'
+    ).lower() == 'true'
     DATASOURCE_SELECTION_SHORTLIST_TRIGGER_COUNT = int(
         os.environ.get('DATASOURCE_SELECTION_SHORTLIST_TRIGGER_COUNT', 8)
     )

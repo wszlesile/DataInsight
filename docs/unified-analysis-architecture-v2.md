@@ -52,14 +52,15 @@
 
 Preparation 不能规划或冻结这些内容。
 
-### 3.2 Preparation 是准备信息，不是执行合同
+### 3.2 Preparation 交付完整洞察语义空间，不交付执行计划
 
 Preparation 只负责：
 
-1. 理解用户要分析的大致业务问题，为数据源检索提供语义。
-2. 从授权候选范围中选择相关数据源。
+1. 将用户目标分解为共同构成完整回答的业务问题，并描述每个问题所需的业务事实概念。
+2. 围绕全部业务问题选择完整数据源集合，逐问题说明事实覆盖，保证用户明确提出的对象和口径不漏选。
 3. 补充选中数据源之间可确认的 ER 关系。
-4. 将关系信息内聚到选中数据源的完整 Schema 中。
+4. 建立问题到业务事实、Schema 字段和关系路径的洞察分析业务血缘。
+5. 将完整已选 Schema 与轻量业务语义上下文作为一个内聚输入交给正式分析。
 
 Preparation 不输出：
 
@@ -72,22 +73,35 @@ Preparation 不输出：
 - 强制分析维度
 - 推断出来的硬过滤条件
 
-Preparation 失败或信息不完整不能终止分析。它只能：
+业务问题覆盖和业务血缘是正式分析的语义入口，但不是查询、指标或报告模板。Preparation 失败或信息不完整不能终止分析。它只能：
 
 - 使用已确认的部分信息继续；
 - 将未确认关系标记为 unresolved；
 - 在无法完成选源时退回原版授权数据源上下文。
 
-### 3.3 Schema 是 Preparation 与正式分析的主载体
+### 3.3 完整 Schema 与业务语义上下文共同构成唯一交付物
 
-Preparation 的正式输出不是一个庞大的业务契约对象，而是：
+Preparation 的正式输出不是历史版本中包含角色、粒度、Probe、指标和报告规划的庞大业务契约，而是：
 
 ```text
 selected_datasource_ids
 selected_datasource_snapshot
   └─ 每个数据源的完整 Schema
        └─ relationship metadata
+analysis_semantic_context
+  ├─ business_goal / business_questions
+  ├─ question_coverage
+  └─ insight_lineage
 ```
+
+其中：
+
+- `business_questions` 表达完整业务意图；每项所需事实只在 Intent 中定义一次稳定 `fact_id`、业务名称和语义定义，明确业务对象、事件、度量与必要时间含义；
+- `question_coverage` 按每个 canonical `fact_id` 分别记录 `direct/partial/unresolved`、支撑来源和原因；问题级状态、问题来源和最终选源集合全部由事实覆盖在本地确定性推导，LLM 不重复填写这些派生字段；
+- `insight_lineage` 继续用同一 `fact_id` 将业务问题、真实字段和关系路径组织为连贯语义；每项事实必须落在已绑定或未解决集合中；
+- 不包含 SQL、计算公式、Metric、图表、表格、报告章节或预设结论。
+
+正式分析不再重新选源，也不能静默缩减用户明确提出的业务问题；它在该完整语义空间内自主决定查询、计算和表达。
 
 关系元数据至少表达：
 
@@ -115,27 +129,29 @@ selected_datasource_snapshot
 Preparation 在验证 ER 关系时可以复用同一组底层 Probe API，但不能把这条技术
 验证链变成正式分析的前置硬门槛。
 
-### 3.5 Metric、Evidence 和 Trace 按对象关系生成
+### 3.5 Evidence 在正式分析成功后编译
 
 目标关系为：
 
 ```text
-QueryResult
-  -> MetricDefinition (一个计算逻辑边界)
-       -> EvidenceDefinition (唯一 Evidence)
-            -> TraceRef (报告、图表或表格中的使用位置)
+成功的正式分析代码与 QuerySnapshot
+  -> LineageIndex (真实计算与产物位置)
+       -> calculation signature (一个计算逻辑边界)
+            -> EvidenceDefinition (唯一 Evidence)
+                 -> TraceRef (报告、图表或表格中的使用位置)
 ```
 
 规则：
 
-1. 一个 Metric 只对应一个 Evidence。
-2. 同一个 Metric 可以被报告、图表和表格共同引用。
+1. 正式 Agent 不手写 Metric、Evidence 或 TraceRef。
+2. 同一个计算签名可以被报告、图表和表格共同引用。
 3. 不同计算签名不能共享 Evidence。
-4. 派生比率、差额、增长率和组合值必须建立独立 Metric/Evidence。
-5. grouped Metric 按一个计算列形成 Evidence，各成员通过 selector 定位；不能按单元格生成 Evidence。
-6. TraceRef 由 Metric 对象绑定关系生成，不由模型手写 ID。
+4. 派生比率、差额、增长率和组合值必须形成独立计算签名和 Evidence。
+5. grouped 计算按一个计算列形成 Evidence，各成员通过 selector 定位；不能按单元格生成 Evidence。
+6. TraceRef 由 LineageIndex 与产物位置编译，不由模型手写 ID。
 7. 不扫描 Markdown 数字来反推 Metric 或 Evidence。
-8. Runtime 校验对象身份和计算谱系，不替代模型判断业务算法。
+8. Evidence 错误不能推翻正式分析成功，也不能触发业务代码重写。
+9. 详细设计以 `post-analysis-evidence-architecture.md` 为准。
 
 ### 3.6 报告仍由统一洞察 Agent 自由表达
 
@@ -150,12 +166,13 @@ QueryResult
 - 风险与限制
 - 基于事实的建议
 
-Runtime 只负责：
+后置 Evidence 编译链只负责：
 
-- 安全渲染 MetricTrace
 - 生成可点击位置
 - 保证单位与展示值一致
-- 保存 Markdown
+- 保存 Evidence 与 Trace 元数据
+
+Markdown 由统一洞察 Agent 的正式 Python 代码直接生成和保存，后置编译链不得改写。
 
 不得使用固定章节数量、最低段落数量或文本数值扫描作为报告质量的主要保证。
 
@@ -163,10 +180,11 @@ Runtime 只负责：
 
 ```mermaid
 flowchart TD
-    A["用户问题与会话上下文"] --> B["Intent Analysis：生成选源用业务意图"]
-    B --> C["Preparation：渐进选源与 ER 关系补充"]
-    C --> D["完整的已选数据源 Schema（关系内聚）"]
-    D --> E["统一洞察 Agent"]
+    A["用户问题与会话上下文"] --> B["Intent Analysis：规划完整业务问题与事实需求"]
+    B --> C["Selection：按业务问题完成数据源覆盖"]
+    C --> D["Business Context：ER + 洞察分析业务血缘"]
+    D --> E0["完整已选 Schema + analysis_semantic_context"]
+    E0 --> E["统一洞察 Agent"]
     E --> F{"是否需要 Probe"}
     F -- "需要" --> G["execute_python：Probe"]
     G --> H["结构化 Probe 反馈"]
@@ -175,7 +193,8 @@ flowchart TD
     I --> J{"执行与契约是否通过"}
     J -- "可修复" --> K["结构化局部错误反馈"]
     K --> E
-    J -- "通过" --> L["报告、图表、表格、Metric/Evidence/Trace"]
+    J -- "通过" --> L["报告、图表和表格"]
+    L --> N["后置 Evidence 编译与 Trace 入库"]
     J -- "确认无数据" --> M["无数据洞察报告"]
 ```
 
@@ -196,14 +215,16 @@ Preparation 可以使用本地 Schema 关系或受限 Probe 验证 ER，但它�
 3. **数据源上下文**
    - Preparation 选中的完整 Schema
    - 内聚后的 ER 关系
+   - 完整业务问题、逐问题选源覆盖和洞察分析业务血缘
 4. **数据访问协议**
    - 仅加载当前数据源类型需要的查询能力模块
 5. **分析代码协议**
    - Probe/Analysis 生命周期
    - Python 代码结构
    - No Data 处理
-6. **Metric、Evidence 与产物 API**
-   - 由 Runtime API reference 生成或集中维护
+6. **分析产物 API**
+   - 正式 Agent 只负责报告、图表和表格产物
+   - Evidence 由成功执行后的独立编译链生成，不进入正式 Agent 主 Prompt
 7. **对话历史和短期记忆**
    - 按当前问题相关性压缩
 8. **执行反馈**
@@ -266,7 +287,7 @@ Preparation 可以使用本地 Schema 关系或受限 Probe 验证 ER，但它�
 - 指标算法与业务名称一致。
 - 不同计算边界不共享 Evidence。
 - 每个可点击数值关联正确 Evidence 和当前值。
-- 图表按指标列、表格按业务数值列、报告按 MetricTrace 绑定。
+- 图表按指标列、表格按业务数值列、报告按代码表达式锚点绑定。
 - 单位只影响展示，不改变底层计算值。
 - Evidence 说明使用业务语言，同时保留可审计查询与转换谱系。
 

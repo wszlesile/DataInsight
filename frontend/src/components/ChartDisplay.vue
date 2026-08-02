@@ -11,6 +11,7 @@
 <script setup>
 import * as echarts from 'echarts'
 import { computed, defineExpose, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
+import { applyPieLegendSafety } from '../utils/chartSpecSafety'
 
 const props = defineProps({
   chartSpec: {
@@ -119,6 +120,7 @@ function sanitizeChartSpec(chartSpec) {
   normalized.animationDurationUpdate = 0
   normalized.animationDelay = 0
   normalized.animationDelayUpdate = 0
+  applyPieLegendSafety(normalized)
 
   if (backendManaged) {
     applyAxisDisplayRules(normalized)

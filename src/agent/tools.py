@@ -43,6 +43,7 @@ CURRENT_TIME_RANGE_GUARD_ACTIVE = ContextVar('current_time_range_guard_active', 
 CURRENT_ANALYSIS_PARAMETERS_OVERRIDE = ContextVar('current_analysis_parameters_override', default={})
 CURRENT_QUERY_SNAPSHOTS = ContextVar('current_query_snapshots', default={})
 CURRENT_LAST_QUERY_KEY = ContextVar('current_last_query_key', default='')
+CURRENT_DATASOURCE_NUMERIC_FIELDS = ContextVar('current_datasource_numeric_fields', default=[])
 
 TOOL_ERROR_CURRENT_CODE_MAX_CHARS = int(os.environ.get('TOOL_ERROR_CURRENT_CODE_MAX_CHARS', '3500'))
 TOOL_ERROR_TEXT_MAX_CHARS = int(os.environ.get('TOOL_ERROR_TEXT_MAX_CHARS', '1800'))
@@ -400,8 +401,23 @@ def _validate_query_constraints_schema(query_constraints: Any) -> list[str]:
                     continue
                 if not isinstance(item.get('semantic_role'), str) or not str(item.get('semantic_role') or '').strip():
                     errors.append(f'target_filters[{index}].semantic_role 必须是非空字符串。')
-                if not isinstance(item.get('value'), str) or not str(item.get('value') or '').strip():
-                    errors.append(f'target_filters[{index}].value 必须是非空字符串。')
+                filter_value = item.get('value')
+                valid_scalar_value = (
+                    isinstance(filter_value, str)
+                    and bool(filter_value.strip())
+                )
+                valid_multi_value = (
+                    isinstance(filter_value, list)
+                    and bool(filter_value)
+                    and all(
+                        isinstance(value, str) and bool(value.strip())
+                        for value in filter_value
+                    )
+                )
+                if not (valid_scalar_value or valid_multi_value):
+                    errors.append(
+                        f'target_filters[{index}].value 必须是非空字符串或非空字符串列表。'
+                    )
                 if str(item.get('match_mode') or '').strip().lower() not in QUERY_CONSTRAINT_MATCH_MODES:
                     errors.append(f'target_filters[{index}].match_mode 必须是 exact 或 fuzzy。')
                 if item.get('field_hint') is not None and not isinstance(item.get('field_hint'), str):
@@ -442,30 +458,34 @@ def _check_target_filter_constraints(query_constraints: dict[str, Any], code: st
         if str(item.get('match_mode') or '').strip().lower() != 'exact':
             continue
 
-        expected_value = _normalize_filter_text(item.get('value', ''))
-        if len(expected_value) < 2:
-            continue
+        raw_values = item.get('value', '')
+        expected_values = raw_values if isinstance(raw_values, list) else [raw_values]
+        for raw_value in expected_values:
+            expected_value = _normalize_filter_text(raw_value)
+            if len(expected_value) < 2:
+                continue
 
-        exact_matches = [
-            filter_item for filter_item in filters
-            if filter_item.get('kind') in {'sql_exact', 'pandas_exact'}
-            and _normalize_filter_text(filter_item.get('literal', '')) == expected_value
-        ]
-        fuzzy_matches = [
-            filter_item for filter_item in filters
-            if filter_item.get('kind') in {'sql_fuzzy', 'pandas_fuzzy'}
-            and _normalize_filter_text(filter_item.get('literal', '')) == expected_value
-        ]
-        if fuzzy_matches and not exact_matches:
-            return _build_query_constraint_error(
-                'query_constraint_violation',
-                f'query_constraints 要求 `{item.get("semantic_role", "target_filter")}` 使用精确匹配，但当前代码把 `{item.get("value", "")}` 实现成了模糊匹配。',
-                diagnostics={
-                    'violated_constraint': 'target_filters',
-                    'constraint_item': item,
-                    'matched_fuzzy_filters': fuzzy_matches[:5],
-                },
-            )
+            exact_matches = [
+                filter_item for filter_item in filters
+                if filter_item.get('kind') in {'sql_exact', 'pandas_exact'}
+                and _normalize_filter_text(filter_item.get('literal', '')) == expected_value
+            ]
+            fuzzy_matches = [
+                filter_item for filter_item in filters
+                if filter_item.get('kind') in {'sql_fuzzy', 'pandas_fuzzy'}
+                and _normalize_filter_text(filter_item.get('literal', '')) == expected_value
+            ]
+            if fuzzy_matches and not exact_matches:
+                return _build_query_constraint_error(
+                    'query_constraint_violation',
+                    f'query_constraints 要求 `{item.get("semantic_role", "target_filter")}` 使用精确匹配，但当前代码把 `{raw_value}` 实现成了模糊匹配。',
+                    diagnostics={
+                        'violated_constraint': 'target_filters',
+                        'constraint_item': item,
+                        'violated_value': raw_value,
+                        'matched_fuzzy_filters': fuzzy_matches[:5],
+                    },
+                )
     return None
 
 
@@ -477,6 +497,10 @@ def _check_time_range_constraint(query_constraints: dict[str, Any], code: str) -
     start = str(time_range.get('start') or '').strip()
     end = str(time_range.get('end') or '').strip()
     if _month_grain_filter_satisfies_time_range(start, end, time_range, code):
+        return None
+    if _year_grain_filter_satisfies_time_range(start, end, time_range, code):
+        return None
+    if _named_time_parameters_satisfy_time_range(code):
         return None
 
     missing_parts = []
@@ -494,8 +518,127 @@ def _check_time_range_constraint(query_constraints: dict[str, Any], code: str) -
             'violated_constraint': 'time_range',
             'time_range': time_range,
             'missing_parts': missing_parts,
+            'repair_strategy': (
+                'filter_the_original_time_field_with_the_declared_start_and_end; '
+                'derived year/month predicates are only equivalent when they preserve the exact boundary'
+            ),
         },
     )
+
+
+def _check_portable_time_bucket_expression(
+    query_constraints: dict[str, Any],
+    sql: str,
+) -> dict[str, Any] | None:
+    """Reject SQL operators that can silently turn a temporal bucket into a boolean."""
+    aggregation = query_constraints.get('aggregation')
+    if not isinstance(aggregation, dict):
+        return None
+    grain = str(aggregation.get('grain') or '').strip().lower()
+    if grain not in {'hour', 'day', 'week', 'month', 'quarter', 'year'}:
+        return None
+    if '||' not in str(sql or ''):
+        return None
+    return _build_query_constraint_error(
+        'query_constraint_violation',
+        '当前时间分桶使用了 `||` 拼接；该运算符在联邦关系查询中可能被解释为布尔运算，导致所有周期塌缩为同一个值。',
+        diagnostics={
+            'violated_constraint': 'nonportable_time_bucket_concat',
+            'aggregation_grain': grain,
+        },
+    )
+
+
+def _named_time_parameters_satisfy_time_range(code: str) -> bool:
+    """Recognize bound SQL ranges whose parameter names carry start/end roles."""
+    text = str(code or "")
+    parameter_names = {
+        item.lower()
+        for item in re.findall(
+            r":([A-Za-z_][A-Za-z0-9_]*)|%\(([A-Za-z_][A-Za-z0-9_]*)\)s",
+            text,
+        )
+        for item in item
+        if item
+    }
+    if not parameter_names:
+        return False
+    start_names = {
+        item for item in parameter_names
+        if "start" in item or item in {"from", "begin", "since"}
+    }
+    end_names = {
+        item for item in parameter_names
+        if "end" in item or item in {"to", "until"}
+    }
+    return bool(start_names and end_names)
+
+
+def _year_grain_filter_satisfies_time_range(
+    start: str,
+    end: str,
+    time_range: dict[str, Any],
+    code: str,
+) -> bool:
+    """Recognize an exact year-column predicate as a full-year date range."""
+    if not start or not end or not bool(time_range.get('end_exclusive')):
+        return False
+    try:
+        start_date = datetime.strptime(start, '%Y-%m-%d').date()
+        end_date = datetime.strptime(end, '%Y-%m-%d').date()
+    except ValueError:
+        return False
+    if not (
+        start_date.month == 1
+        and start_date.day == 1
+        and end_date.year == start_date.year + 1
+        and end_date.month == 1
+        and end_date.day == 1
+    ):
+        return False
+
+    def _is_year_field(value: str) -> bool:
+        normalized = re.sub(r'[^a-z0-9]+', '_', str(value or '').lower()).strip('_')
+        return normalized == 'year' or normalized.endswith('_year')
+
+    try:
+        from sqlglot import exp, parse
+
+        for statement in parse(code):
+            for comparison in statement.find_all(exp.EQ):
+                sides = ((comparison.left, comparison.right), (comparison.right, comparison.left))
+                for field_node, value_node in sides:
+                    if not isinstance(field_node, exp.Column) or not isinstance(value_node, exp.Literal):
+                        continue
+                    if _is_year_field(field_node.name) and str(value_node.this) == str(start_date.year):
+                        return True
+    except Exception:
+        pass
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    for comparison in (node for node in ast.walk(tree) if isinstance(node, ast.Compare)):
+        if len(comparison.ops) != 1 or not isinstance(comparison.ops[0], ast.Eq):
+            continue
+        if len(comparison.comparators) != 1:
+            continue
+        sides = ((comparison.left, comparison.comparators[0]), (comparison.comparators[0], comparison.left))
+        for field_node, value_node in sides:
+            field_name = ''
+            if isinstance(field_node, ast.Subscript):
+                try:
+                    field_name = str(ast.literal_eval(field_node.slice))
+                except Exception:
+                    field_name = ''
+            elif isinstance(field_node, ast.Attribute):
+                field_name = field_node.attr
+            if not _is_year_field(field_name):
+                continue
+            if isinstance(value_node, ast.Constant) and value_node.value == start_date.year:
+                return True
+    return False
 
 
 def _month_grain_filter_satisfies_time_range(
@@ -516,6 +659,15 @@ def _month_grain_filter_satisfies_time_range(
         return False
     start_month = start_date.strftime('%Y-%m')
     end_month = end_date.strftime('%Y-%m')
+
+    if start_date.year == end_date.year and end_date.month > start_date.month:
+        year_month_pattern = re.compile(
+            rf"(?P<prefix>[A-Za-z_][A-Za-z0-9_]*)_YEAR\s*=\s*{start_date.year}"
+            rf"[\s\S]*?(?P=prefix)_MONTH\s+BETWEEN\s+{start_date.month}\s+AND\s+{end_date.month - 1}",
+            re.IGNORECASE,
+        )
+        if year_month_pattern.search(code):
+            return True
 
     if (
         start_date.month == 1
@@ -945,11 +1097,36 @@ def load_local_file(file_path: str, sheet_name: Optional[str] = None):
     lower_file_path = file_path.lower()
 
     if lower_file_path.endswith('.csv'):
-        return pd.read_csv(file_path)
-    if lower_file_path.endswith(('.xlsx', '.xls', '.xlsm')):
-        return pd.read_excel(file_path, sheet_name=sheet_name if sheet_name else 0)
+        loader_name = 'read_csv'
+    elif lower_file_path.endswith(('.xlsx', '.xls', '.xlsm')):
+        loader_name = 'read_excel'
+    else:
+        raise ValueError(f"不支持的文件格式: {file_path}")
 
-    raise ValueError(f"不支持的文件格式: {file_path}")
+    _begin_loader_snapshot_execution(
+        loader='load_local_file',
+        datasource_identifier=file_path,
+        options={'sheet_name': sheet_name},
+    )
+    start_time = time.time()
+    try:
+        data = (
+            pd.read_csv(file_path)
+            if loader_name == 'read_csv'
+            else pd.read_excel(file_path, sheet_name=sheet_name if sheet_name else 0)
+        )
+    except Exception:
+        _mark_latest_query_snapshot_execution(status='failed', duration_ms=int((time.time() - start_time) * 1000))
+        raise
+    _mark_latest_query_snapshot_execution(
+        status='success',
+        duration_ms=int((time.time() - start_time) * 1000),
+        data=data,
+    )
+    attrs = getattr(data, 'attrs', None)
+    if isinstance(attrs, dict):
+        attrs['data_insight_query_key'] = str(CURRENT_LAST_QUERY_KEY.get() or '').strip()
+    return data
 
 
 def _parse_excel_usecols(
@@ -1148,7 +1325,7 @@ def load_local_file_low_memory(
     normalized_chunk_size = max(int(chunk_size or 50000), 1)
 
     if lower_file_path.endswith('.csv'):
-        return pd.read_csv(
+        iterator = pd.read_csv(
             file_path,
             chunksize=normalized_chunk_size,
             usecols=usecols,
@@ -1156,9 +1333,8 @@ def load_local_file_low_memory(
             parse_dates=parse_dates,
             low_memory=low_memory,
         )
-
-    if lower_file_path.endswith(('.xlsx', '.xls', '.xlsm')):
-        return _iter_excel_rows_in_batches(
+    elif lower_file_path.endswith(('.xlsx', '.xls', '.xlsm')):
+        iterator = _iter_excel_rows_in_batches(
             file_path=file_path,
             sheet_name=sheet_name,
             chunk_size=normalized_chunk_size,
@@ -1166,8 +1342,49 @@ def load_local_file_low_memory(
             dtype=dtype,
             parse_dates=parse_dates,
         )
+    else:
+        raise ValueError(f"不支持的文件格式: {file_path}")
 
-    raise ValueError(f"不支持的文件格式: {file_path}")
+    _begin_loader_snapshot_execution(
+        loader='load_local_file_low_memory',
+        datasource_identifier=file_path,
+        options={
+            'sheet_name': sheet_name,
+            'chunk_size': normalized_chunk_size,
+            'usecols': usecols,
+            'parse_dates': parse_dates,
+        },
+    )
+    query_key = str(CURRENT_LAST_QUERY_KEY.get() or '').strip()
+    start_time = time.time()
+
+    def _tracked_iterator():
+        row_count = 0
+        columns: list[str] = []
+        try:
+            for chunk in iterator:
+                row_count += int(len(chunk))
+                columns = [str(column) for column in getattr(chunk, 'columns', [])]
+                attrs = getattr(chunk, 'attrs', None)
+                if isinstance(attrs, dict):
+                    attrs['data_insight_query_key'] = query_key
+                yield chunk
+        except Exception:
+            _mark_latest_query_snapshot_execution(
+                status='failed',
+                duration_ms=int((time.time() - start_time) * 1000),
+                query_key=query_key,
+            )
+            raise
+        _mark_latest_query_snapshot_execution(
+            status='success',
+            duration_ms=int((time.time() - start_time) * 1000),
+            query_key=query_key,
+            row_count=row_count,
+            columns=columns,
+        )
+
+    return _tracked_iterator()
 
 
 def load_minio_file(bucket: str, object_name: str, sheet_name: Optional[str] = None):
@@ -1175,10 +1392,35 @@ def load_minio_file(bucket: str, object_name: str, sheet_name: Optional[str] = N
     pass
 
 
-def load_data_with_sql(sql: str, params: Optional[list[Any]] = None):
+def load_data_with_sql(
+    sql: str,
+    params: Optional[list[Any]] = None,
+    numeric_columns: Optional[list[str]] = None,
+):
+    _begin_query_snapshot_execution(sql=sql, params=params)
     start_time = time.time()
     try:
         data = _load_data_with_fed_query(sql=sql, params=params)
+        effective_numeric_columns = list(dict.fromkeys([
+            *[str(item) for item in (numeric_columns or [])],
+            *_infer_sql_aggregate_numeric_columns(sql),
+            *_infer_schema_numeric_result_columns(sql, list(data.columns)),
+        ]))
+        if effective_numeric_columns:
+            import pandas as pd
+
+            missing_columns = [
+                str(column)
+                for column in effective_numeric_columns
+                if str(column) not in data.columns
+            ]
+            if missing_columns:
+                raise ValueError(
+                    "numeric_columns references unavailable query result columns: "
+                    + ", ".join(missing_columns)
+                )
+            for column in effective_numeric_columns:
+                data[column] = pd.to_numeric(data[column], errors="raise")
     except Exception:
         _mark_latest_query_snapshot_execution(status='failed', duration_ms=int((time.time() - start_time) * 1000))
         raise
@@ -1187,7 +1429,90 @@ def load_data_with_sql(sql: str, params: Optional[list[Any]] = None):
         duration_ms=int((time.time() - start_time) * 1000),
         data=data,
     )
+    attrs = getattr(data, 'attrs', None)
+    if isinstance(attrs, dict):
+        attrs['data_insight_query_key'] = str(CURRENT_LAST_QUERY_KEY.get() or '').strip()
     return data
+
+
+def _infer_schema_numeric_result_columns(sql: str, result_columns: list[Any]) -> list[str]:
+    """Map direct SQL projections back to numeric fields in the selected datasource schemas."""
+    profiles = CURRENT_DATASOURCE_NUMERIC_FIELDS.get() or []
+    sql_text = str(sql or "")
+    matched_fields: set[str] = set()
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        identifiers = [str(item or "").strip() for item in profile.get("identifiers") or []]
+        if identifiers and not any(identifier in sql_text for identifier in identifiers):
+            continue
+        matched_fields.update(str(item) for item in profile.get("fields") or [] if str(item))
+    if not matched_fields:
+        return []
+
+    output_names = {str(item) for item in result_columns}
+    inferred = [field for field in matched_fields if field in output_names]
+    try:
+        from sqlglot import exp, parse_one
+
+        statement = parse_one(sql_text)
+        select = statement.find(exp.Select)
+        for projection in select.expressions if select is not None else []:
+            source = projection.this if isinstance(projection, exp.Alias) else projection
+            if not isinstance(source, exp.Column) or source.name not in matched_fields:
+                continue
+            output_name = str(projection.alias_or_name or source.name)
+            if output_name in output_names:
+                inferred.append(output_name)
+    except Exception:
+        pass
+    return list(dict.fromkeys(inferred))
+
+
+def _infer_sql_aggregate_numeric_columns(sql: str) -> list[str]:
+    """Infer unambiguously numeric aggregate and date-part projection aliases."""
+    try:
+        from sqlglot import exp, parse
+    except Exception:
+        return []
+
+    result: list[str] = []
+    try:
+        statements = parse(str(sql or ""))
+    except Exception:
+        return []
+    for statement in statements:
+        select = statement.find(exp.Select)
+        if select is None:
+            continue
+        for projection in select.expressions:
+            aggregate_nodes = list(projection.find_all(exp.AggFunc))
+            numeric_aggregate = bool(aggregate_nodes) and not all(
+                isinstance(node, (exp.Min, exp.Max)) for node in aggregate_nodes
+            )
+            date_part_projection = bool(list(projection.find_all(exp.Extract)))
+            if not date_part_projection:
+                date_part_projection = any(
+                    isinstance(node, exp.Anonymous)
+                    and str(node.name or "").strip().upper()
+                    in {"YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"}
+                    for node in projection.walk()
+                )
+            if not date_part_projection:
+                direct_expression = projection.this if isinstance(projection, exp.Alias) else projection
+                date_part_projection = (
+                    isinstance(direct_expression, exp.Column)
+                    and bool(re.search(
+                        r"(?i)^WM_EXTRA_TS_.+_(?:YEAR|MONTH|DAY|HOUR|MINUTE|SECOND)$",
+                        str(direct_expression.name or ""),
+                    ))
+                )
+            if not numeric_aggregate and not date_part_projection:
+                continue
+            alias = str(projection.alias_or_name or "").strip()
+            if alias and alias not in result:
+                result.append(alias)
+    return result
 
 def load_local_data_with_sql(sql: str, params: Optional[list[Any]] = None):
     """通过 SQL 从当前配置的数据源中加载表格数据。"""
@@ -1234,6 +1559,7 @@ def _register_query_snapshot(
     query_key: str,
     query_constraints: Any,
     sql: str = '',
+    query_params: Any = None,
     filter_expressions: Optional[list[str]] = None,
     aggregation_hints: Optional[list[str]] = None,
     sql_context: Optional[dict[str, Any]] = None,
@@ -1248,6 +1574,7 @@ def _register_query_snapshot(
             "sql": sql_text,
             "sql_hash": hashlib.sha256(str(sql or '').encode('utf-8')).hexdigest() if str(sql or '').strip() else '',
             "sql_truncated": sql_truncated,
+            "query_params": _copy_jsonable(query_params, None),
             "filter_expressions": _copy_jsonable(filter_expressions or [], []),
             "aggregation_hints": _copy_jsonable(aggregation_hints or [], []),
             "sql_context": sql_context_json,
@@ -1284,13 +1611,140 @@ def _register_query_snapshot(
     return None
 
 
+def _begin_query_snapshot_execution(*, sql: str, params: Any = None) -> None:
+    """Bind one physical SQL execution to its own immutable query snapshot."""
+    sql_text = str(sql or '')
+    if not sql_text.strip():
+        return
+    snapshots = dict(CURRENT_QUERY_SNAPSHOTS.get() or {})
+    sql_hash = hashlib.sha256(sql_text.encode('utf-8')).hexdigest()
+    matching_key = next(
+        (
+            str(key)
+            for key, value in snapshots.items()
+            if isinstance(value, dict)
+            and isinstance(value.get('implementation'), dict)
+            and value['implementation'].get('sql_hash') == sql_hash
+        ),
+        '',
+    )
+    if matching_key:
+        matching_snapshot = dict(snapshots[matching_key])
+        matching_implementation = dict(matching_snapshot.get('implementation') or {})
+        matching_implementation['physical_execution'] = True
+        matching_snapshot['implementation'] = matching_implementation
+        snapshots[matching_key] = matching_snapshot
+        CURRENT_QUERY_SNAPSHOTS.set(snapshots)
+        CURRENT_LAST_QUERY_KEY.set(matching_key)
+        return
+
+    parent_key = str(CURRENT_LAST_QUERY_KEY.get() or '').strip()
+    parent = snapshots.get(parent_key) if parent_key else None
+    parent = parent if isinstance(parent, dict) else {}
+    parent_implementation = (
+        parent.get('implementation')
+        if isinstance(parent.get('implementation'), dict)
+        else {}
+    )
+    scope_source_key = str(parent_implementation.get('scope_source_query_key') or '').strip()
+    if scope_source_key and isinstance(snapshots.get(scope_source_key), dict):
+        parent_key = scope_source_key
+        parent = snapshots[scope_source_key]
+        parent_implementation = (
+            parent.get('implementation')
+            if isinstance(parent.get('implementation'), dict)
+            else {}
+        )
+    query_key = _normalize_query_key(f'{parent_key or "query"}__exec_{sql_hash[:10]}')
+    sql_snapshot, sql_truncated = _clip_snapshot_text(sql_text, QUERY_SNAPSHOT_SQL_MAX_CHARS)
+    snapshots[query_key] = {
+        'query_key': query_key,
+        'query_constraints': _copy_jsonable(parent.get('query_constraints') or {}, {}),
+        'implementation': {
+            'sql': sql_snapshot,
+            'sql_hash': sql_hash,
+            'sql_truncated': sql_truncated,
+            'query_params': _copy_jsonable(params, None),
+            'filter_expressions': [],
+            'aggregation_hints': _copy_jsonable(parent_implementation.get('aggregation_hints') or [], []),
+            'sql_context': {},
+            'sql_context_truncated': False,
+            'scope_source_query_key': parent_key,
+            'physical_execution': True,
+        },
+        'execution': {'status': 'running'},
+    }
+    CURRENT_QUERY_SNAPSHOTS.set(snapshots)
+    CURRENT_LAST_QUERY_KEY.set(query_key)
+
+
+def _begin_loader_snapshot_execution(
+    *,
+    loader: str,
+    datasource_identifier: str,
+    options: dict[str, Any] | None = None,
+) -> None:
+    identifier = str(datasource_identifier or '').strip()
+    if not identifier:
+        return
+    snapshots = dict(CURRENT_QUERY_SNAPSHOTS.get() or {})
+    identity = json.dumps(
+        {"loader": loader, "datasource_identifier": identifier, "options": options or {}},
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    access_hash = hashlib.sha256(identity.encode('utf-8')).hexdigest()
+    matching_key = next(
+        (
+            str(key)
+            for key, value in snapshots.items()
+            if isinstance(value, dict)
+            and isinstance(value.get('implementation'), dict)
+            and value['implementation'].get('access_hash') == access_hash
+        ),
+        '',
+    )
+    if matching_key:
+        CURRENT_LAST_QUERY_KEY.set(matching_key)
+        return
+
+    parent_key = str(CURRENT_LAST_QUERY_KEY.get() or '').strip()
+    parent = snapshots.get(parent_key) if parent_key else None
+    parent = parent if isinstance(parent, dict) else {}
+    parent_implementation = parent.get('implementation') if isinstance(parent.get('implementation'), dict) else {}
+    scope_source_key = str(parent_implementation.get('scope_source_query_key') or '').strip()
+    if scope_source_key and isinstance(snapshots.get(scope_source_key), dict):
+        parent_key = scope_source_key
+        parent = snapshots[scope_source_key]
+    query_key = _normalize_query_key(f'{parent_key or "query"}__load_{access_hash[:10]}')
+    snapshots[query_key] = {
+        'query_key': query_key,
+        'query_constraints': _copy_jsonable(parent.get('query_constraints') or {}, {}),
+        'implementation': {
+            'loader': loader,
+            'datasource_identifier': identifier,
+            'loader_options': _copy_jsonable(options or {}, {}),
+            'access_hash': access_hash,
+            'scope_source_query_key': parent_key,
+            'physical_execution': True,
+        },
+        'execution': {'status': 'running'},
+    }
+    CURRENT_QUERY_SNAPSHOTS.set(snapshots)
+    CURRENT_LAST_QUERY_KEY.set(query_key)
+
+
 def _mark_latest_query_snapshot_execution(
     *,
     status: str,
     duration_ms: int = 0,
     data: Any = None,
+    query_key: str = '',
+    row_count: int | None = None,
+    columns: list[str] | None = None,
 ) -> None:
-    query_key = str(CURRENT_LAST_QUERY_KEY.get() or '').strip()
+    query_key = str(query_key or CURRENT_LAST_QUERY_KEY.get() or '').strip()
     if not query_key:
         return
     snapshots = dict(CURRENT_QUERY_SNAPSHOTS.get() or {})
@@ -1312,6 +1766,10 @@ def _mark_latest_query_snapshot_execution(
                 execution["columns"] = [str(column) for column in list(columns)]
             except Exception:
                 pass
+    if row_count is not None:
+        execution["row_count"] = max(int(row_count), 0)
+    if columns is not None:
+        execution["columns"] = [str(column) for column in columns]
     execution["executed_at"] = datetime.now().isoformat()
     snapshot["execution"] = execution
     snapshots[query_key] = snapshot
@@ -1549,7 +2007,7 @@ def _serialize_probe_value(value: Any) -> Any:
     return value.item() if hasattr(value, 'item') else value
 
 
-def build_markdown_table(dataframe, columns: Optional[list[str]] = None, max_rows: int = 10) -> str:
+def build_markdown_table(dataframe, columns: Optional[list[Any]] = None, max_rows: int = 10) -> str:
     """
     把 DataFrame 转成 Markdown 表格文本。
 
@@ -1565,8 +2023,19 @@ def build_markdown_table(dataframe, columns: Optional[list[str]] = None, max_row
     if not isinstance(dataframe, pd.DataFrame):
         dataframe = pd.DataFrame(dataframe)
 
+    header_labels: dict[str, str] = {}
     if columns:
-        available_columns = [column for column in columns if column in dataframe.columns]
+        available_columns = []
+        for column in columns:
+            if isinstance(column, dict):
+                key = str(column.get('key') or column.get('field') or '').strip()
+                label = str(column.get('label') or column.get('title') or key).strip()
+            else:
+                key = str(column).strip()
+                label = key
+            if key and key in dataframe.columns:
+                available_columns.append(key)
+                header_labels[key] = label
         table_df = dataframe[available_columns].copy()
     else:
         table_df = dataframe.copy()
@@ -1584,7 +2053,7 @@ def build_markdown_table(dataframe, columns: Optional[list[str]] = None, max_row
             return f"{value:,.2f}".rstrip('0').rstrip('.')
         return re.sub(r'\s+', ' ', str(value)).strip()
 
-    headers = [str(column) for column in table_df.columns]
+    headers = [header_labels.get(str(column), str(column)) for column in table_df.columns]
     header_line = "| " + " | ".join(headers) + " |"
     separator_line = "| " + " | ".join(['---'] * len(headers)) + " |"
 
@@ -1604,11 +2073,6 @@ class StructuredResult(BaseModel):
     tables: list[dict[str, Any]] = Field(default_factory=list, description="表格产物列表")
     analysis_parameters_schema: dict[str, Any] = Field(default_factory=dict, description="Reusable parameter schema")
     analysis_parameters: dict[str, Any] = Field(default_factory=dict, description="Actual parameter values")
-    evidence_definitions: list[dict[str, Any]] = Field(default_factory=list, description="Evidence definitions keyed by calculation logic")
-    chart_trace_refs: list[dict[str, Any]] = Field(default_factory=list, description="Chart position refs to evidence definitions")
-    table_trace_refs: list[dict[str, Any]] = Field(default_factory=list, description="Table position refs to evidence definitions")
-    report_trace_refs: list[dict[str, Any]] = Field(default_factory=list, description="Report text refs to evidence definitions")
-    table_trace_metadata: dict[str, Any] = Field(default_factory=dict, description="Sidecar metadata for table trace validation")
     query_snapshots: dict[str, Any] = Field(default_factory=dict, description="Runtime query snapshots collected by backend")
 
 
@@ -1624,13 +2088,6 @@ class RetryResult(BaseModel):
         "contract_error",
         "result_contract_error",
         "chart_contract_error",
-        "missing_evidence_contract",
-        "invalid_evidence_definition",
-        "invalid_evidence_query_ref",
-        "invalid_chart_trace_ref",
-        "invalid_table_trace_ref",
-        "invalid_report_trace_ref",
-        "evidence_over_expansion",
         "missing_query_constraints",
         "invalid_query_constraints",
         "query_constraint_violation",
@@ -1720,13 +2177,6 @@ def request_retry(
         "contract_error",
         "result_contract_error",
         "chart_contract_error",
-        "missing_evidence_contract",
-        "invalid_evidence_definition",
-        "invalid_evidence_query_ref",
-        "invalid_chart_trace_ref",
-        "invalid_table_trace_ref",
-        "invalid_report_trace_ref",
-        "evidence_over_expansion",
         "missing_query_constraints",
         "invalid_query_constraints",
         "query_constraint_violation",
@@ -1877,6 +2327,349 @@ def _validate_analysis_sql_validation_order(tree: ast.AST) -> RetryResult | None
             "不要先执行 SQL 再补做 validate_query_constraints(...)；这样会让错误 SQL 先进入执行链路。",
         ],
     )
+
+
+def _validate_query_mapping_default_contract(tree: ast.AST) -> RetryResult | None:
+    """Reject silent zero defaults for keys missing from query-derived mappings."""
+    mapping_names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if not (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "to_dict"
+        ):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        mapping_names.update(
+            target.id for target in targets if isinstance(target, ast.Name)
+        )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or len(node.args) < 2:
+            continue
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and func.attr == "get"
+            and isinstance(func.value, ast.Name)
+            and func.value.id in mapping_names
+        ):
+            continue
+        default = node.args[1]
+        if not (
+            isinstance(default, ast.Constant)
+            and isinstance(default.value, (int, float))
+            and not isinstance(default.value, bool)
+            and default.value == 0
+        ):
+            continue
+        return request_retry(
+            retry_type="contract_error",
+            message=(
+                "查询结果按维度转成字典后，不能用 mapping.get(key, 0) "
+                "把键缺失静默解释为真实数值 0。"
+            ),
+            diagnostics={
+                "violated_contract": "query_dimension_missing_is_not_zero",
+                "mapping_name": func.value.id,
+                "line_no": getattr(node, "lineno", None),
+            },
+            repair_instructions=[
+                "先统一查询维度和分析参数的类型，例如把年份两侧都规范为字符串，再显式判断 key 是否存在。",
+                "键不存在表示口径、类型或数据覆盖缺失，不等于测量值为 0；应区分无记录与真实零值。",
+                "修复完整代码中的同类查找，并让报告、图表和同比计算消费同一份已对齐结果。",
+            ],
+        )
+    return None
+
+
+def _validate_analysis_relationship_contract(
+    context: CustomContext,
+    code: str,
+) -> RetryResult | None:
+    """Keep the finalized Preparation relationship graph authoritative at runtime."""
+    snapshot = getattr(context, "active_datasource_snapshot", {}) or {}
+    semantic_context = snapshot.get("analysis_semantic_context") or {}
+    relationships = semantic_context.get("relationships") or []
+    governed_relationships = [
+        item
+        for item in relationships
+        if isinstance(item, dict)
+        and item.get("relationship_type") in {
+            "same_entity",
+            "parent_child",
+            "event_of_entity",
+            "dimension_enrichment",
+            "bridge",
+        }
+    ]
+    unresolved_pairs = [
+        item
+        for item in governed_relationships
+        if item.get("joinability") != "joinable"
+    ]
+    fanout_pairs = [
+        item
+        for item in governed_relationships
+        if item.get("joinability") == "joinable"
+        and any(
+            isinstance(policy, dict)
+            and policy.get("status") == "unsafe_repeated_by_join"
+            for policy in (item.get("aggregation_safety") or {}).values()
+        )
+    ]
+    if not unresolved_pairs and not fanout_pairs:
+        return None
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return None
+    identifiers = {
+        int(item.get("datasource_id") or 0): str(
+            item.get("datasource_identifier") or ""
+        ).strip()
+        for item in snapshot.get("selected_datasource_snapshot") or []
+        if isinstance(item, dict) and int(item.get("datasource_id") or 0) > 0
+    }
+
+    def _relationship_retry(relationship: dict[str, Any]) -> RetryResult:
+        left_id = int(relationship.get("left_datasource_id") or 0)
+        right_id = int(relationship.get("right_datasource_id") or 0)
+        return request_retry(
+            retry_type="query_constraint_violation",
+            message=(
+                "当前代码使用了 Business Context 未确认可直接关联的跨数据源路径；"
+                "unknown/alignable/not_joinable 关系不能直接作为 JOIN 或 DataFrame merge。"
+            ),
+            diagnostics={
+                "violated_contract": "unresolved_business_lineage_join",
+                "relationship_id": relationship.get("relationship_id"),
+                "left_datasource_id": left_id,
+                "right_datasource_id": right_id,
+                "joinability": relationship.get("joinability"),
+            },
+            repair_instructions=[
+                "业务血缘已经由 Business Context 定稿；不要在正式运行阶段再次探测或改写关系结论。",
+                "若关系为 alignable，可先分别聚合到共同且不会放大量值的业务粒度后再比较；否则分别分析并如实说明事实边界。",
+                "不要因字段同名、描述相近或能够执行就把关系视为已确认。",
+            ],
+        )
+
+    def _normalize_identifier(value: str) -> str:
+        return re.sub(r'["`\[\]\s]+', "", value or "").lower()
+
+    def _source_ids_in_text(value: str) -> set[int]:
+        normalized = _normalize_identifier(value)
+        return {
+            datasource_id
+            for datasource_id, identifier in identifiers.items()
+            if identifier and _normalize_identifier(identifier) in normalized
+        }
+
+    sql_sources_by_name: dict[str, set[int]] = {}
+    dataframe_sources_by_name: dict[str, set[int]] = {}
+    assignments = [node for node in ast.walk(tree) if isinstance(node, ast.Assign)]
+    for assignment in assignments:
+        if len(assignment.targets) != 1 or not isinstance(assignment.targets[0], ast.Name):
+            continue
+        target_name = assignment.targets[0].id
+        source_text = ast.get_source_segment(code, assignment.value) or ""
+        source_ids = _source_ids_in_text(source_text)
+        if source_ids:
+            sql_sources_by_name[target_name] = source_ids
+        if not isinstance(assignment.value, ast.Call):
+            continue
+        call = assignment.value
+        function_name = (
+            call.func.id
+            if isinstance(call.func, ast.Name)
+            else call.func.attr
+            if isinstance(call.func, ast.Attribute)
+            else ""
+        )
+        if function_name != "load_data_with_sql":
+            continue
+        sql_node = call.args[0] if call.args else next(
+            (item.value for item in call.keywords if item.arg == "sql"),
+            None,
+        )
+        if isinstance(sql_node, ast.Name):
+            dataframe_sources_by_name[target_name] = set(
+                sql_sources_by_name.get(sql_node.id, set())
+            )
+        elif sql_node is not None:
+            dataframe_sources_by_name[target_name] = _source_ids_in_text(
+                ast.get_source_segment(code, sql_node) or ""
+            )
+
+    for _ in range(3):
+        for assignment in assignments:
+            if len(assignment.targets) != 1 or not isinstance(assignment.targets[0], ast.Name):
+                continue
+            target_name = assignment.targets[0].id
+            if target_name in dataframe_sources_by_name:
+                continue
+            inherited = {
+                datasource_id
+                for node in ast.walk(assignment.value)
+                if isinstance(node, ast.Name)
+                for datasource_id in dataframe_sources_by_name.get(node.id, set())
+            }
+            if inherited:
+                dataframe_sources_by_name[target_name] = inherited
+
+    def _sources_for_expression(node: ast.AST | None) -> set[int]:
+        if node is None:
+            return set()
+        return {
+            datasource_id
+            for child in ast.walk(node)
+            if isinstance(child, ast.Name)
+            for datasource_id in dataframe_sources_by_name.get(child.id, set())
+        }
+
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if not isinstance(call.func, ast.Attribute) or call.func.attr not in {"merge", "join"}:
+            continue
+        if isinstance(call.func.value, ast.Name) and call.func.value.id == "pd":
+            left_node = call.args[0] if call.args else None
+            right_node = call.args[1] if len(call.args) > 1 else None
+        else:
+            left_node = call.func.value
+            right_node = call.args[0] if call.args else next(
+                (item.value for item in call.keywords if item.arg == "right"),
+                None,
+            )
+        merged_source_ids = (
+            _sources_for_expression(left_node) | _sources_for_expression(right_node)
+        )
+        for relationship in unresolved_pairs:
+            pair = {
+                int(relationship.get("left_datasource_id") or 0),
+                int(relationship.get("right_datasource_id") or 0),
+            }
+            if pair.issubset(merged_source_ids):
+                return _relationship_retry(relationship)
+
+    sql_literals = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and re.search(r"\bselect\b", node.value, re.IGNORECASE)
+        and re.search(r"\bjoin\b", node.value, re.IGNORECASE)
+    ]
+    if not sql_literals:
+        return None
+
+    try:
+        from sqlglot import exp, parse
+    except Exception:
+        return None
+
+    def _sql_for_contract_parsing(sql: str) -> str:
+        """Replace driver placeholders without changing the query structure."""
+        return re.sub(
+            r"%\([A-Za-z_][A-Za-z0-9_]*\)s|%s",
+            "'__query_parameter__'",
+            sql,
+        )
+
+    for sql in sql_literals:
+        try:
+            statements = parse(_sql_for_contract_parsing(sql))
+        except Exception:
+            continue
+        table_names: set[str] = set()
+        for statement in statements:
+            for table in statement.find_all(exp.Table):
+                qualified_name = ".".join(
+                    part
+                    for part in (table.catalog, table.db, table.name)
+                    if part
+                )
+                table_names.add(_normalize_identifier(qualified_name))
+        for relationship in unresolved_pairs:
+            left_id = int(relationship.get("left_datasource_id") or 0)
+            right_id = int(relationship.get("right_datasource_id") or 0)
+            left_identifier = _normalize_identifier(identifiers.get(left_id, ""))
+            right_identifier = _normalize_identifier(identifiers.get(right_id, ""))
+            if not left_identifier or not right_identifier:
+                continue
+            if left_identifier not in table_names or right_identifier not in table_names:
+                continue
+            return _relationship_retry(relationship)
+
+        if not fanout_pairs:
+            continue
+        try:
+            from sqlglot.optimizer.scope import traverse_scope
+        except Exception:
+            continue
+        for statement in statements:
+            for scope in traverse_scope(statement):
+                alias_source_ids: dict[str, int] = {}
+                for alias, source in scope.sources.items():
+                    if not isinstance(source, exp.Table):
+                        continue
+                    qualified_name = ".".join(
+                        part
+                        for part in (source.catalog, source.db, source.name)
+                        if part
+                    )
+                    normalized_name = _normalize_identifier(qualified_name)
+                    for datasource_id, identifier in identifiers.items():
+                        if normalized_name == _normalize_identifier(identifier):
+                            alias_source_ids[str(alias)] = datasource_id
+                            break
+
+                scope_source_ids = set(alias_source_ids.values())
+                for relationship in fanout_pairs:
+                    left_id = int(relationship.get("left_datasource_id") or 0)
+                    right_id = int(relationship.get("right_datasource_id") or 0)
+                    if not {left_id, right_id}.issubset(scope_source_ids):
+                        continue
+                    safety = relationship.get("aggregation_safety") or {}
+                    unsafe_source_ids: set[int] = set()
+                    if (safety.get("left_measure_after_join") or {}).get("status") == "unsafe_repeated_by_join":
+                        unsafe_source_ids.add(left_id)
+                    if (safety.get("right_measure_after_join") or {}).get("status") == "unsafe_repeated_by_join":
+                        unsafe_source_ids.add(right_id)
+                    for aggregate in scope.expression.find_all(exp.AggFunc):
+                        if isinstance(aggregate, (exp.Min, exp.Max)):
+                            continue
+                        if isinstance(aggregate, exp.Count) and isinstance(aggregate.this, exp.Distinct):
+                            continue
+                        unsafe_columns = [
+                            column
+                            for column in aggregate.find_all(exp.Column)
+                            if alias_source_ids.get(str(column.table)) in unsafe_source_ids
+                        ]
+                        if not unsafe_columns:
+                            continue
+                        return request_retry(
+                            retry_type="query_constraint_violation",
+                            message=(
+                                "当前查询在一对多或多对一连接后直接聚合了会被重复展开的一侧度量，"
+                                "会造成指标放大或加权失真。"
+                            ),
+                            diagnostics={
+                                "violated_contract": "relationship_fanout_aggregation",
+                                "relationship_id": relationship.get("relationship_id"),
+                                "cardinality": relationship.get("cardinality"),
+                                "unsafe_datasource_ids": sorted(unsafe_source_ids),
+                                "aggregate_expression": aggregate.sql(),
+                            },
+                            repair_instructions=[
+                                "整体度量在其原始事实粒度独立聚合，不要经一对多明细连接后再求和、计数或平均。",
+                                "若要按另一侧维度拆分，改用该维度侧自身可加度量；只有存在明确分摊规则或已确认函数依赖时，才可分配父侧度量。",
+                                "图表、表格和报告应消费修正后的同一计算结果，并如实说明不同事实口径不能直接相加。",
+                            ],
+                        )
+    return None
 
 
 def _node_calls_function(node: ast.AST, function_name: str) -> bool:
@@ -2370,6 +3163,10 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
         if validation_order_retry is not None:
             return validation_order_retry
 
+        mapping_default_retry = _validate_query_mapping_default_contract(tree)
+        if mapping_default_retry is not None:
+            return mapping_default_retry
+
         helper_chart_retry = _validate_helper_chart_usage_contract(tree, calls)
         if helper_chart_retry is not None:
             return helper_chart_retry
@@ -2407,11 +3204,23 @@ def validate_query_constraints(
     query_constraints: Any,
     query_key: str = '',
     sql: str = '',
+    query_params: Any = None,
+    sql_params: Any = None,
     filter_expressions: Optional[list[str]] = None,
     aggregation_hints: Optional[list[str]] = None,
     sql_context: Optional[dict[str, Any]] = None,
 ) -> RetryResult | None:
     """Validate analysis-stage query constraints against SQL / pandas filtering implementations."""
+    if query_params is not None and sql_params is not None and query_params != sql_params:
+        return request_retry(
+            retry_type="invalid_query_constraints",
+            message="validate_query_constraints(...) 同时收到不一致的 query_params 与 sql_params。",
+            diagnostics={"violated_constraint": "conflicting_query_parameter_aliases"},
+            repair_instructions=[
+                "query_params 与 sql_params 是同一参数语义的别名；只传一个，且与 load_data_with_sql(..., params=...) 使用同一组值。",
+            ],
+        )
+    effective_query_params = query_params if query_params is not None else sql_params
     schema_errors = _validate_query_constraints_schema(query_constraints)
     if schema_errors:
         return request_retry(
@@ -2452,6 +3261,21 @@ def validate_query_constraints(
             ],
         )
 
+    portable_bucket_issue = _check_portable_time_bucket_expression(
+        query_constraints,
+        sql,
+    )
+    if portable_bucket_issue is not None:
+        return request_retry(
+            retry_type=str(portable_bucket_issue.get('error_type') or 'query_constraint_violation'),
+            message=str(portable_bucket_issue.get('error_message') or '当前时间分桶表达式不具备可移植语义。'),
+            diagnostics=portable_bucket_issue.get('diagnostics') or {},
+            repair_instructions=[
+                '优先分别返回数值 year/month/day 字段，再在 pandas 中构造展示标签。',
+                '如必须在 SQL 中拼接，使用当前关系查询引擎明确支持的 CONCAT(...)，不要使用 `||`。',
+            ],
+        )
+
     fragment_issues, context_filter_code, context_aggregation_code = _validate_sql_context_fragments(
         query_constraints=query_constraints,
         sql=sql,
@@ -2470,8 +3294,11 @@ def validate_query_constraints(
             ],
         )
 
+    parameter_code = json.dumps(effective_query_params, ensure_ascii=False, default=str) \
+        if effective_query_params is not None else ""
     filter_fragments = [
         str(sql or '').strip(),
+        parameter_code,
         context_filter_code,
         *[str(item or '').strip() for item in (filter_expressions or [])],
     ]
@@ -2527,6 +3354,7 @@ def validate_query_constraints(
                 diagnostics=issue.get('diagnostics') if isinstance(issue.get('diagnostics'), dict) else {},
                 repair_instructions=[
                     '先保持 query_constraints 不变，再重写 SQL / pandas / 文件过滤实现，使其符合时间范围、目标筛选和聚合粒度约束。',
+                    '时间范围优先直接作用于原始时间字段：field >= start 且 field < end；除非完整保持日期边界，不要用 YEAR/MONTH 派生条件替代原始范围。',
                     '如果 target_filters 里的 match_mode = "exact"，正式 analysis 代码不要把同一个值实现成 LIKE、ILIKE、contains 或 str.contains(...)。',
                     '如果需要先探测候选值，请改成 execution_intent = "probe"，不要在 analysis 阶段继续放宽口径。',
                 ],
@@ -2536,6 +3364,7 @@ def validate_query_constraints(
         query_key=normalized_query_key,
         query_constraints=query_constraints,
         sql=sql,
+        query_params=effective_query_params,
         filter_expressions=filter_expressions,
         aggregation_hints=aggregation_hints,
         sql_context=sql_context,
@@ -2581,12 +3410,21 @@ def save_empty_analysis_result(
 
 
 def _normalize_chart_items(
-    charts: Optional[list[dict[str, Any]]] = None,
+    charts: Optional[list[Any]] = None,
 ) -> list[dict[str, Any]]:
     """统一图表结果结构。"""
     normalized_items: list[dict[str, Any]] = []
 
-    for index, chart in enumerate(charts or [], start=1):
+    flattened: list[Any] = []
+    pending = list(charts or [])
+    while pending:
+        chart = pending.pop(0)
+        if isinstance(chart, (list, tuple)):
+            pending[0:0] = list(chart)
+            continue
+        flattened.append(chart)
+
+    for index, chart in enumerate(flattened, start=1):
         normalized_items.append(normalize_chart_result_item(chart, index=index))
 
     return normalized_items
@@ -2598,6 +3436,9 @@ def _normalize_table_items(tables: Optional[list[dict[str, Any]]] = None) -> lis
     for index, table in enumerate(tables or [], start=1):
         if not isinstance(table, dict):
             raise ValueError('tables 中的每一项都必须是 dict。')
+        wrapped_table = table.get('table')
+        if isinstance(wrapped_table, dict):
+            table = wrapped_table
 
         title = str(table.get('title') or f'表格 {index}').strip()
         description = str(table.get('description') or '').strip()
@@ -2620,27 +3461,46 @@ def build_table_result(
     description: str = '',
     columns: Optional[list[dict[str, Any]]] = None,
     rows: Optional[list[dict[str, Any]]] = None,
+    data: Any = None,
 ) -> dict[str, Any]:
-    """Build a clean table artifact plus sidecar trace metadata."""
+    """Build a normalized table artifact."""
+    if data is not None and rows is not None:
+        raise ValueError('build_table_result 的 data 与 rows 不能同时传入。')
+    if data is not None:
+        if hasattr(data, 'to_dict') and hasattr(data, 'columns'):
+            rows = data.to_dict(orient='records')
+            if columns is None:
+                columns = [
+                    {'key': str(column), 'label': str(column)}
+                    for column in list(data.columns)
+                ]
+        elif isinstance(data, dict) and isinstance(data.get('rows'), list):
+            rows = data.get('rows') or []
+            if columns is None:
+                columns = data.get('columns')
+        elif isinstance(data, list):
+            rows = data
+            if columns is None and rows and isinstance(rows[0], dict):
+                columns = [
+                    {'key': str(key), 'label': str(key)}
+                    for key in rows[0].keys()
+                ]
+        else:
+            raise ValueError('build_table_result.data 必须是 DataFrame、records 列表或包含 rows 的 dict。')
+
     clean_columns: list[dict[str, Any]] = []
-    column_roles: dict[str, str] = {}
-    column_value_types: dict[str, str] = {}
-    column_units: dict[str, str] = {}
     for index, column in enumerate(columns or [], start=1):
         if not isinstance(column, dict):
             raise ValueError('build_table_result.columns 中的每一项都必须是 dict。')
-        key = str(column.get('key') or column.get('dataIndex') or column.get('label') or f'col_{index}').strip()
+        key = str(
+            column.get('key')
+            or column.get('field')
+            or column.get('dataIndex')
+            or column.get('label')
+            or f'col_{index}'
+        ).strip()
         label = str(column.get('label') or column.get('title') or key).strip()
         clean_columns.append({"key": key, "label": label})
-        role = str(column.get('role') or '').strip()
-        if role:
-            column_roles[key] = role
-        value_type = str(column.get('value_type') or '').strip()
-        if value_type:
-            column_value_types[key] = value_type
-        unit = str(column.get('unit') or '').strip()
-        if unit:
-            column_units[key] = unit
 
     clean_rows = []
     for row in rows or []:
@@ -2648,70 +3508,47 @@ def build_table_result(
             raise ValueError('build_table_result.rows 中的每一项都必须是 dict。')
         clean_rows.append(dict(row))
 
-    return {
-        "table": {
-            "title": str(title or '表格').strip() or '表格',
-            "description": str(description or '').strip(),
-            "columns": clean_columns,
-            "rows": clean_rows,
-        },
-        "trace_metadata": {
-            "column_roles": column_roles,
-            "column_value_types": column_value_types,
-            "column_units": column_units,
-        },
+    metric_discriminator_keys = {
+        column["key"]
+        for column in clean_columns
+        if re.search(r"(?:^|_)(?:metric|measure)(?:$|_)|指标|度量", column["key"], re.IGNORECASE)
+        or re.search(r"指标|度量|metric|measure", column["label"], re.IGNORECASE)
     }
+    for discriminator_key in metric_discriminator_keys:
+        metric_labels = {
+            str(row.get(discriminator_key) or '').strip()
+            for row in clean_rows
+            if str(row.get(discriminator_key) or '').strip()
+        }
+        if len(metric_labels) < 2:
+            continue
+        mixed_value_columns = []
+        for column in clean_columns:
+            key = column["key"]
+            if key == discriminator_key:
+                continue
+            labels_with_numeric_values = {
+                str(row.get(discriminator_key) or '').strip()
+                for row in clean_rows
+                if isinstance(row.get(key), (int, float))
+                and not isinstance(row.get(key), bool)
+                and math.isfinite(float(row.get(key)))
+            }
+            if len(labels_with_numeric_values) > 1:
+                mixed_value_columns.append(key)
+        if mixed_value_columns:
+            raise ValueError(
+                'table_semantic_error: 同一数值列包含多个由指标行区分的计算口径，'
+                f'无法形成稳定的列级指标语义：{mixed_value_columns[:8]}。'
+                '请使用长表结构，将部门、月份等作为维度列，并把每个业务指标分别放在独立数值列中。'
+            )
 
-
-REPORT_TRACE_PATTERN = re.compile(
-    r"\[\[trace:evidence_key=(?P<key>[A-Za-z0-9_-]+)\]\](?P<text>.*?)\[\[/trace\]\]",
-    re.DOTALL,
-)
-
-
-def build_report_result(report_markdown_with_trace_tags: str) -> dict[str, Any]:
-    """Strip report trace tags and return clean Markdown plus report trace refs."""
-    source = str(report_markdown_with_trace_tags or '')
-    if not source.strip():
-        raise ValueError('报告内容不能为空。')
-    if '[[trace:' in source and '[[/trace]]' not in source:
-        raise ValueError('报告 trace 标签未闭合。')
-
-    output_parts: list[str] = []
-    refs: list[dict[str, Any]] = []
-    cursor = 0
-    clean_length = 0
-    for match in REPORT_TRACE_PATTERN.finditer(source):
-        prefix = source[cursor:match.start()]
-        output_parts.append(prefix)
-        clean_length += len(prefix)
-        evidence_key = str(match.group('key') or '').strip()
-        text = str(match.group('text') or '')
-        if not evidence_key or not text:
-            raise ValueError('报告 trace 标签必须包含 evidence_key 和非空文本。')
-        if '[[trace:' in text or '[[/trace]]' in text:
-            raise ValueError('报告 trace 标签不允许嵌套。')
-        start = clean_length
-        output_parts.append(text)
-        clean_length += len(text)
-        refs.append({
-            "evidence_key": evidence_key,
-            "start": start,
-            "end": clean_length,
-            "text": text,
-        })
-        cursor = match.end()
-    output_parts.append(source[cursor:])
-    clean_report = ''.join(output_parts)
-    if '[[trace:' in clean_report or '[[/trace]]' in clean_report:
-        raise ValueError('报告 trace 标签格式不合法或未被完整清洗。')
-    for ref in refs:
-        if clean_report[int(ref["start"]):int(ref["end"])] != ref["text"]:
-            raise ValueError('报告 trace ref 字符区间校验失败。')
-    return {
-        "analysis_report": clean_report.strip(),
-        "report_trace_refs": refs,
-    }
+    return {"table": {
+        "title": str(title or '表格').strip() or '表格',
+        "description": str(description or '').strip(),
+        "columns": clean_columns,
+        "rows": clean_rows,
+    }}
 
 
 def get_analysis_parameters(defaults: Optional[dict[str, Any]] = None) -> dict[str, Any]:
@@ -2723,191 +3560,12 @@ def get_analysis_parameters(defaults: Optional[dict[str, Any]] = None) -> dict[s
     return base
 
 
-def define_evidence(
-    *,
-    evidence_key: str,
-    metric_name: str,
-    query_refs: list[str],
-    metric_fields: list[str],
-    value_type: str = '',
-    unit: str = '',
-    aggregation: str = '',
-    group_by: Optional[list[str]] = None,
-    formula: str = '',
-    derivation_description: str = '',
-    derivation_mode: str = 'query_output',
-    transformations: Optional[list[str]] = None,
-    intermediate_outputs: Optional[list[dict[str, Any]]] = None,
-    quality_notes: Optional[list[str]] = None,
-) -> dict[str, Any]:
-    """Build a normalized EvidenceDefinition for one calculation-logic boundary."""
-    key = str(evidence_key or '').strip()
-    if not key:
-        raise ValueError('define_evidence.evidence_key 不能为空。')
-    normalized_query_refs = [str(item).strip() for item in (query_refs or []) if str(item).strip()]
-    normalized_metric_fields = [str(item).strip() for item in (metric_fields or []) if str(item).strip()]
-    if not normalized_query_refs:
-        raise ValueError('define_evidence.query_refs 至少需要包含一个 validate_query_constraints(...) 的 query_key。')
-    if not normalized_metric_fields:
-        raise ValueError('define_evidence.metric_fields 至少需要包含一个最终可点击结果字段。')
-
-    calculation: dict[str, Any] = {"metric_fields": normalized_metric_fields}
-    aggregation_text = str(aggregation or '').strip()
-    if aggregation_text:
-        calculation["aggregation"] = aggregation_text
-    normalized_group_by = [str(item).strip() for item in (group_by or []) if str(item).strip()]
-    if normalized_group_by:
-        calculation["group_by"] = normalized_group_by
-    formula_text = str(formula or '').strip()
-    if formula_text:
-        calculation["formula"] = formula_text
-
-    return {
-        "evidence_key": key,
-        "metric_name": str(metric_name or key).strip() or key,
-        "value_type": str(value_type or '').strip(),
-        "unit": str(unit or '').strip(),
-        "query_refs": normalized_query_refs,
-        "derivation": {
-            "mode": str(derivation_mode or 'query_output').strip() or 'query_output',
-            "description": str(derivation_description or '').strip(),
-        },
-        "calculation": calculation,
-        "transformations": _copy_jsonable(transformations or [], []),
-        "intermediate_outputs": _copy_jsonable(intermediate_outputs or [], []),
-        "quality_notes": _copy_jsonable(quality_notes or [], []),
-    }
-
-
-def _normalize_metric_evidence_bindings(metric_evidence_bindings: Any) -> list[dict[str, Any]]:
-    """Normalize lightweight metric-to-evidence bindings from generated code."""
-    bindings: list[dict[str, Any]] = []
-
-    def _append(artifact_type: str, artifact_index: Any, field_name: Any, evidence_key: Any) -> None:
-        field = str(field_name or '').strip()
-        key = str(evidence_key or '').strip()
-        if not field or not key:
-            return
-        try:
-            index = int(artifact_index or 0)
-        except Exception:
-            index = 0
-        bindings.append({
-            "artifact_type": str(artifact_type or '').strip().lower(),
-            "artifact_index": index,
-            "field": field,
-            "evidence_key": key,
-        })
-
-    if isinstance(metric_evidence_bindings, list):
-        for item in metric_evidence_bindings:
-            if not isinstance(item, dict):
-                continue
-            artifact_type = item.get('artifact_type') or item.get('type') or item.get('artifact')
-            field_name = item.get('field') or item.get('value_field') or item.get('column_key') or item.get('value_column')
-            artifact_index = item.get('artifact_index')
-            if artifact_index is None:
-                artifact_index = item.get('chart_index') if str(artifact_type or '').lower() == 'chart' else item.get('table_index')
-            _append(artifact_type, artifact_index, field_name, item.get('evidence_key'))
-        return bindings
-
-    if not isinstance(metric_evidence_bindings, dict):
-        return bindings
-
-    for group_name, artifact_type in (('charts', 'chart'), ('chart', 'chart'), ('tables', 'table'), ('table', 'table')):
-        group = metric_evidence_bindings.get(group_name)
-        if not isinstance(group, (dict, list)):
-            continue
-        if isinstance(group, list):
-            iterable = enumerate(group)
-        else:
-            iterable = group.items()
-        for artifact_index, field_map in iterable:
-            if not isinstance(field_map, dict):
-                continue
-            for field_name, evidence_key in field_map.items():
-                _append(artifact_type, artifact_index, field_name, evidence_key)
-    return bindings
-
-
-def _auto_trace_refs_from_metric_bindings(
-    *,
-    charts: list[dict[str, Any]],
-    tables: list[dict[str, Any]],
-    table_trace_metadata: dict[str, Any],
-    metric_evidence_bindings: Any,
-    chart_trace_refs: Optional[list[dict[str, Any]]] = None,
-    table_trace_refs: Optional[list[dict[str, Any]]] = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Generate chart/table trace refs from field-level metric evidence bindings."""
-    normalized_bindings = _normalize_metric_evidence_bindings(metric_evidence_bindings)
-    chart_bindings = {
-        (int(item["artifact_index"]), str(item["field"])): str(item["evidence_key"])
-        for item in normalized_bindings
-        if item.get("artifact_type") == "chart"
-    }
-    table_bindings = {
-        (int(item["artifact_index"]), str(item["field"])): str(item["evidence_key"])
-        for item in normalized_bindings
-        if item.get("artifact_type") == "table"
-    }
-
-    resolved_chart_refs = _copy_jsonable(chart_trace_refs or [], [])
-    existing_chart_keys = {
-        (_normalize_ref_chart_index(ref), _ref_value_field(ref))
-        for ref in resolved_chart_refs
-        if isinstance(ref, dict)
-    }
-    for expected in _expected_chart_trace_refs(charts):
-        ref_key = (int(expected.get("chart_index") or 0), str(expected.get("value_field") or ''))
-        if ref_key in existing_chart_keys:
-            continue
-        evidence_key = chart_bindings.get(ref_key)
-        if not evidence_key:
-            continue
-        resolved_chart_refs.append({
-            "chart_index": ref_key[0],
-            "value_field": ref_key[1],
-            "evidence_key": evidence_key,
-        })
-        existing_chart_keys.add(ref_key)
-
-    resolved_table_refs = _copy_jsonable(table_trace_refs or [], [])
-    existing_table_keys = {
-        (_normalize_ref_table_index(ref), _ref_table_column(ref))
-        for ref in resolved_table_refs
-        if isinstance(ref, dict)
-    }
-    for expected in _expected_table_trace_refs(tables, table_trace_metadata):
-        ref_key = (int(expected.get("table_index") or 0), str(expected.get("column_key") or ''))
-        if ref_key in existing_table_keys:
-            continue
-        evidence_key = table_bindings.get(ref_key)
-        if not evidence_key:
-            continue
-        resolved_table_refs.append({
-            "table_index": ref_key[0],
-            "column_key": ref_key[1],
-            "evidence_key": evidence_key,
-            "row_scope": "all",
-        })
-        existing_table_keys.add(ref_key)
-
-    return resolved_chart_refs, resolved_table_refs
-
-
 def save_analysis_result(
     analysis_report: str = '',
     charts: Optional[list[dict[str, Any]]] = None,
     tables: Optional[list[dict[str, Any]]] = None,
     analysis_parameters_schema: Optional[dict[str, Any]] = None,
     analysis_parameters: Optional[dict[str, Any]] = None,
-    evidence_definitions: Optional[list[dict[str, Any]]] = None,
-    chart_trace_refs: Optional[list[dict[str, Any]]] = None,
-    table_trace_refs: Optional[list[dict[str, Any]]] = None,
-    report_trace_refs: Optional[list[dict[str, Any]]] = None,
-    table_trace_metadata: Optional[dict[str, Any]] = None,
-    metric_evidence_bindings: Any = None,
 ) -> StructuredResult:
     """
     结束一次由生成代码驱动的分析任务，并返回标准结构化结果。
@@ -2922,29 +3580,14 @@ def save_analysis_result(
     if not report_text:
         raise ValueError('analysis_report 不能为空，必须传入完整的 Markdown 分析报告。')
 
-    source_charts = charts or []
-    normalized_charts = _normalize_chart_items(charts=source_charts)
+    normalized_charts = _normalize_chart_items(charts=charts or [])
     normalized_tables = _normalize_table_items(tables=tables)
-    normalized_table_trace_metadata = _copy_jsonable(table_trace_metadata or {}, {})
-    resolved_chart_trace_refs, resolved_table_trace_refs = _auto_trace_refs_from_metric_bindings(
-        charts=source_charts,
-        tables=normalized_tables,
-        table_trace_metadata=normalized_table_trace_metadata,
-        metric_evidence_bindings=metric_evidence_bindings,
-        chart_trace_refs=chart_trace_refs,
-        table_trace_refs=table_trace_refs,
-    )
     return StructuredResult(
         analysis_report=report_text,
         charts=normalized_charts,
         tables=normalized_tables,
         analysis_parameters_schema=analysis_parameters_schema or {},
         analysis_parameters=analysis_parameters or {},
-        evidence_definitions=_copy_jsonable(evidence_definitions or [], []),
-        chart_trace_refs=resolved_chart_trace_refs,
-        table_trace_refs=resolved_table_trace_refs,
-        report_trace_refs=_copy_jsonable(report_trace_refs or [], []),
-        table_trace_metadata=normalized_table_trace_metadata,
         query_snapshots=_copy_jsonable(CURRENT_QUERY_SNAPSHOTS.get() or {}, {}),
     )
 
@@ -3056,7 +3699,14 @@ def _find_invalid_chart_data_points(charts: list[dict[str, Any]] | None) -> list
             data_items = series.get("data") or []
             if not isinstance(data_items, list):
                 continue
+            series_type = str(series.get("type") or "").strip().lower()
+            sparse_series_has_renderable_point = series_type in {"line", "bar"} and any(
+                value is not None and not _is_invalid_chart_data_value(value)
+                for value in data_items
+            )
             for data_index, value in enumerate(data_items):
+                if sparse_series_has_renderable_point and value is None:
+                    continue
                 if _is_invalid_chart_data_value(value):
                     invalid_points.append({
                         "chart_index": chart_index,
@@ -3173,23 +3823,76 @@ def _extract_sql_limit_clauses(code: str) -> list[str]:
 
 
 def _extract_dataframe_reduction_clauses(code: str) -> list[str]:
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return []
+
+    parent_by_id: dict[int, ast.AST] = {}
+    loaded_names: dict[str, int] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parent_by_id[id(child)] = parent
+        if isinstance(parent, ast.Name) and isinstance(parent.ctx, ast.Load):
+            loaded_names[parent.id] = loaded_names.get(parent.id, 0) + 1
+
+    def assigned_names(node: ast.AST) -> list[str]:
+        current = node
+        while id(current) in parent_by_id:
+            current = parent_by_id[id(current)]
+            if isinstance(current, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    current.targets
+                    if isinstance(current, ast.Assign)
+                    else [current.target]
+                )
+                return [
+                    target.id
+                    for target in targets
+                    if isinstance(target, ast.Name)
+                ]
+            if isinstance(current, (ast.Expr, ast.Return, ast.Call)):
+                return []
+        return []
+
+    reduction_nodes: list[ast.AST] = []
+    for node in ast.walk(tree):
+        is_reducer_call = (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"head", "tail", "sample"}
+        )
+        is_iloc_slice = (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "iloc"
+            and any(
+                isinstance(slice_node, ast.Slice)
+                for slice_node in ast.walk(node.slice)
+            )
+        )
+        if not (is_reducer_call or is_iloc_slice):
+            continue
+        targets = assigned_names(node)
+        if targets and not any(loaded_names.get(name, 0) > 0 for name in targets):
+            continue
+        reduction_nodes.append(node)
+
     clauses: list[str] = []
-    patterns = (
-        r'\.\s*(?:head|tail|sample)\s*\(\s*(?:n\s*=\s*)?\d+',
-        r'\.\s*iloc\s*\[\s*(?::\s*\d+|\-\d+\s*:|\d+\s*:\s*\d+)',
-    )
-    for pattern in patterns:
-        for match in re.finditer(pattern, code or '', re.IGNORECASE):
-            clause = re.sub(r'\s+', ' ', match.group(0)).strip()
-            if clause and clause.lower() not in {item.lower() for item in clauses}:
-                clauses.append(clause)
-            if len(clauses) >= 10:
-                return clauses
+    for node in reduction_nodes:
+        clause = ast.get_source_segment(code, node) or ""
+        clause = re.sub(r"\s+", " ", clause).strip()
+        if clause and clause.lower() not in {item.lower() for item in clauses}:
+            clauses.append(clause)
+        if len(clauses) >= 10:
+            break
     return clauses
 
 
 def _text_discloses_limit_usage(text: str) -> bool:
     scan_text = str(text or '').lower()
+    if re.search(r'\btop\s*\d+\b', scan_text, re.IGNORECASE):
+        return True
     disclosure_markers = (
         'limit',
         '限制',
@@ -3211,8 +3914,35 @@ def _text_discloses_limit_usage(text: str) -> bool:
     return any(marker in scan_text for marker in disclosure_markers)
 
 
+def _text_discloses_relative_window(text: str) -> bool:
+    scan_text = str(text or "")
+    return bool(
+        re.search(
+            r"(?:近|最近)\s*\d+\s*(?:个)?(?:小时|天|周|月|季度|年|条|项|个)",
+            scan_text,
+        )
+        or re.search(
+            r"\b(?:latest|recent)\s+\d+\s+(?:hours?|days?|weeks?|months?|quarters?|years?|rows?|items?)\b",
+            scan_text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _result_visible_text(exec_result: StructuredResult) -> str:
+    visible_parts = [str(exec_result.analysis_report or "")]
+    for artifact in [*(exec_result.charts or []), *(exec_result.tables or [])]:
+        if not isinstance(artifact, dict):
+            continue
+        visible_parts.extend([
+            str(artifact.get("title") or ""),
+            str(artifact.get("description") or ""),
+        ])
+    return "\n".join(part for part in visible_parts if part)
+
+
 def _result_discloses_limit_usage(exec_result: StructuredResult) -> bool:
-    return _text_discloses_limit_usage(_result_to_scan_text(exec_result))
+    return _text_discloses_limit_usage(_result_visible_text(exec_result))
 
 
 def _report_discloses_limit_usage(exec_result: StructuredResult) -> bool:
@@ -3221,7 +3951,9 @@ def _report_discloses_limit_usage(exec_result: StructuredResult) -> bool:
 
 def _is_no_data_like_report(report_text: str) -> bool:
     normalized = str(report_text or '').lower()
-    return any(marker.lower() in normalized for marker in NO_DATA_RESULT_MARKERS)
+    return any(marker.lower() in normalized for marker in NO_DATA_RESULT_MARKERS) or bool(
+        re.search(r"(?:无|没有|未)[^。；;\n]{0,16}(?:数据|记录|结果)", normalized)
+    )
 
 
 def _chart_point_count(chart: dict[str, Any]) -> int:
@@ -3295,46 +4027,63 @@ def _get_runtime_selected_datasource_snapshot(context: CustomContext) -> list[di
         session.close()
 
 
-def _datasource_mention_tokens(item: dict[str, Any]) -> list[str]:
+def _query_snapshot_table_names(query_snapshots: dict[str, Any]) -> set[str]:
+    table_names: set[str] = set()
+    for snapshot in (query_snapshots or {}).values():
+        if not isinstance(snapshot, dict):
+            continue
+        execution = snapshot.get('execution') if isinstance(snapshot.get('execution'), dict) else {}
+        if execution.get('status') not in {'success', 'validated', None}:
+            continue
+        implementation = (
+            snapshot.get('implementation')
+            if isinstance(snapshot.get('implementation'), dict)
+            else {}
+        )
+        sql = str(implementation.get('sql') or '').strip()
+        if not sql:
+            continue
+        try:
+            from sqlglot import exp, parse
+
+            for statement in parse(sql):
+                for table in statement.find_all(exp.Table):
+                    parts = [str(part).strip().lower() for part in (table.catalog, table.db, table.name) if str(part).strip()]
+                    if not parts:
+                        continue
+                    table_names.add('.'.join(parts))
+                    table_names.add(parts[-1])
+        except Exception:
+            # Query snapshots remain useful even for a dialect sqlglot cannot parse.
+            normalized_sql = sql.lower()
+            for match in re.finditer(r'(?i)\b(?:from|join)\s+([`"\[]?[\w.:-]+[`"\]]?)', normalized_sql):
+                token = match.group(1).strip('`"[]').lower()
+                if token:
+                    table_names.add(token)
+                    table_names.add(token.rsplit('.', 1)[-1])
+    return table_names
+
+
+def _datasource_relation_tokens(item: dict[str, Any]) -> set[str]:
+    config = item.get('config') if isinstance(item.get('config'), dict) else {}
+    metadata_schema = item.get('metadata_schema') if isinstance(item.get('metadata_schema'), dict) else {}
     raw_values = [
-        item.get('datasource_name'),
         item.get('datasource_identifier'),
         item.get('table_name'),
-        item.get('uns_alias'),
-        item.get('refer_alias'),
-    ]
-    config = item.get('config') if isinstance(item.get('config'), dict) else {}
-    raw_values.extend([
         config.get('table_name'),
-        config.get('uns_alias'),
-        config.get('refer_alias'),
-    ])
-
-    tokens: list[str] = []
-    for value in raw_values:
-        text = str(value or '').strip()
-        if not text:
+        metadata_schema.get('name'),
+    ]
+    tokens: set[str] = set()
+    for raw_value in raw_values:
+        value = str(raw_value or '').strip().strip('`"[]').lower()
+        if not value:
             continue
-        candidates = {text}
-        for sep in ('/', '\\', '.', ':'):
-            if sep in text:
-                tail = text.rstrip('/\\').split(sep)[-1].strip()
-                if tail:
-                    candidates.add(tail)
-        if '_' in text:
-            parts = [part for part in text.split('_') if part]
-            if len(parts) >= 2:
-                candidates.add('_'.join(parts[-2:]))
-            if len(parts) >= 3:
-                candidates.add('_'.join(parts[-3:]))
-        for candidate in candidates:
-            candidate = candidate.strip()
-            if len(candidate) >= 4 and candidate not in tokens:
-                tokens.append(candidate)
+        tokens.add(value)
+        tokens.add(value.rsplit('.', 1)[-1])
     return tokens
 
 
-def _find_untracked_datasource_mentions(
+def _find_untracked_datasource_accesses(
     exec_result: StructuredResult,
     *,
     used_datasource_ids: list[int] | None,
@@ -3343,8 +4092,10 @@ def _find_untracked_datasource_mentions(
     if not used_datasource_ids or not selected_datasource_snapshot:
         return []
     used_id_set = {int(item) for item in used_datasource_ids}
-    result_text = _result_to_scan_text(exec_result)
-    mentions: list[dict[str, Any]] = []
+    accessed_table_names = _query_snapshot_table_names(exec_result.query_snapshots)
+    if not accessed_table_names:
+        return []
+    accesses: list[dict[str, Any]] = []
     for item in selected_datasource_snapshot:
         try:
             datasource_id = int(item.get('datasource_id') or item.get('id') or 0)
@@ -3352,542 +4103,202 @@ def _find_untracked_datasource_mentions(
             continue
         if datasource_id <= 0 or datasource_id in used_id_set:
             continue
-        matched_tokens = [
-            token for token in _datasource_mention_tokens(item)
-            if token and token in result_text
-        ]
+        matched_tokens = sorted(_datasource_relation_tokens(item) & accessed_table_names)
         if not matched_tokens:
             continue
-        mentions.append({
+        accesses.append({
             'datasource_id': datasource_id,
             'datasource_name': item.get('datasource_name'),
             'datasource_identifier': item.get('datasource_identifier'),
             'matched_tokens': matched_tokens[:5],
         })
-        if len(mentions) >= 10:
+        if len(accesses) >= 10:
             break
-    return mentions
+    return accesses
 
 
-SYSTEM_EVIDENCE_FIELDS = {
-    'turn_id',
-    'execution_id',
-    'artifact_id',
-    'evidence_id',
-    'datasource_id',
-    'datasource_ids',
-    'analysis_parameters',
-    'query_constraints',
-    'sql',
-}
-
-
-def _report_has_traceable_numeric_value(analysis_report: str) -> bool:
-    text = str(analysis_report or '')
-    if not text.strip():
-        return False
-    return re.search(r'(?<![A-Za-z0-9_])\d+(?:\.\d+)?\s*(?:%|台|个|家|种|年|月|日|kW|KW|kw)?', text) is not None
-
-
-_REPORT_TRACEABLE_NUMBER_PATTERN = re.compile(
-    r'(?<![A-Za-z0-9_])\d+(?:\.\d+)?\s*(?:%|台|个|家|种|条|次|kW|KW|kw|元|万元|小时|分钟)'
-)
-
-
-def _uncovered_report_numeric_values(analysis_report: str, report_trace_refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    text = str(analysis_report or '')
-    if not text.strip():
+def _find_opaque_dimension_artifacts(
+    exec_result: StructuredResult,
+    selected_datasource_snapshot: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Find user-facing chart dimensions backed by fields known to contain opaque IDs."""
+    if not selected_datasource_snapshot:
         return []
-    ranges: list[tuple[int, int]] = []
-    for ref in report_trace_refs or []:
-        if not isinstance(ref, dict):
-            continue
+
+    opaque_fields_by_source: list[tuple[set[str], set[str]]] = []
+    for datasource in selected_datasource_snapshot:
+        metadata_schema = (
+            datasource.get("metadata_schema")
+            if isinstance(datasource.get("metadata_schema"), dict)
+            else {}
+        )
+        properties = (
+            metadata_schema.get("properties")
+            if isinstance(metadata_schema.get("properties"), dict)
+            else {}
+        )
+        opaque_fields = {
+            str(field_name).strip().lower()
+            for field_name, definition in properties.items()
+            if isinstance(definition, dict)
+            and isinstance(definition.get("observed_value_profile"), dict)
+            and definition["observed_value_profile"].get("readability")
+            == "opaque_identifier"
+        }
+        if opaque_fields:
+            opaque_fields_by_source.append(
+                (_datasource_relation_tokens(datasource), opaque_fields)
+            )
+    def looks_like_opaque_value(value: Any) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        return bool(
+            re.fullmatch(r"-?\d{10,}", text)
+            or re.fullmatch(
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                text,
+            )
+            or re.fullmatch(r"[0-9a-fA-F]{24,}", text)
+        )
+
+    def chart_category_values(chart: dict[str, Any], category_field: str) -> list[Any]:
+        document = chart.get("chart_document") if isinstance(chart.get("chart_document"), dict) else {}
+        dataset = document.get("dataset") if isinstance(document.get("dataset"), dict) else {}
+        rows = dataset.get("rows") if isinstance(dataset.get("rows"), list) else []
+        values = [row.get(category_field) for row in rows if isinstance(row, dict)]
+        if values:
+            return values
+        spec = chart.get("chart_spec") if isinstance(chart.get("chart_spec"), dict) else {}
+        x_axis = spec.get("xAxis")
+        if isinstance(x_axis, list):
+            x_axis = x_axis[0] if x_axis else {}
+        if isinstance(x_axis, dict) and isinstance(x_axis.get("data"), list):
+            return x_axis["data"]
+        for series in spec.get("series") or []:
+            if not isinstance(series, dict) or str(series.get("type") or "").lower() != "pie":
+                continue
+            pie_values = [
+                item.get("name")
+                for item in series.get("data") or []
+                if isinstance(item, dict)
+            ]
+            if pie_values:
+                return pie_values
+        return []
+
+    def query_details(query_key: str) -> tuple[set[str], dict[str, set[str]]]:
+        snapshot = (exec_result.query_snapshots or {}).get(query_key) or {}
+        implementation = (
+            snapshot.get("implementation")
+            if isinstance(snapshot, dict)
+            and isinstance(snapshot.get("implementation"), dict)
+            else {}
+        )
+        sql = str(implementation.get("sql") or "").strip()
+        if not sql:
+            return set(), {}
+        table_names: set[str] = set()
+        output_origins: dict[str, set[str]] = {}
         try:
-            start = int(ref.get('start'))
-            end = int(ref.get('end'))
+            from sqlglot import exp, parse
+
+            for statement in parse(re.sub(
+                r"%\([A-Za-z_][A-Za-z0-9_]*\)s|%s",
+                "'__query_parameter__'",
+                sql,
+            )):
+                for table in statement.find_all(exp.Table):
+                    parts = [
+                        str(part).strip().lower()
+                        for part in (table.catalog, table.db, table.name)
+                        if str(part).strip()
+                    ]
+                    if parts:
+                        table_names.update({".".join(parts), parts[-1]})
+                for select in statement.find_all(exp.Select):
+                    for projection in select.expressions:
+                        output_name = str(projection.alias_or_name or "").strip().lower()
+                        if not output_name:
+                            continue
+                        output_origins.setdefault(output_name, set()).update(
+                            str(column.name).strip().lower()
+                            for column in projection.find_all(exp.Column)
+                            if str(column.name).strip()
+                        )
         except Exception:
-            continue
-        ranges.append((start, end))
-    uncovered: list[dict[str, Any]] = []
-    for match in _REPORT_TRACEABLE_NUMBER_PATTERN.finditer(text):
-        start, end = match.span()
-        if any(start >= ref_start and end <= ref_end for ref_start, ref_end in ranges):
-            continue
-        context_start = max(0, start - 30)
-        context_end = min(len(text), end + 30)
-        uncovered.append({
-            "text": match.group(0),
-            "start": start,
-            "end": end,
-            "context": text[context_start:context_end],
-        })
-        if len(uncovered) >= 20:
-            break
-    return uncovered
+            normalized_sql = sql.lower()
+            for match in re.finditer(
+                r"(?i)\b(?:from|join)\s+([`\"\[]?[\w.:-]+[`\"\]]?)",
+                normalized_sql,
+            ):
+                token = match.group(1).strip('`"[]').lower()
+                if token:
+                    table_names.update({token, token.rsplit(".", 1)[-1]})
+        return table_names, output_origins
 
-
-def _chart_document_columns(chart: dict[str, Any]) -> set[str]:
-    document = chart.get('chart_document') if isinstance(chart, dict) else None
-    if not isinstance(document, dict):
-        return set()
-    dataset = document.get('dataset') if isinstance(document.get('dataset'), dict) else {}
-    columns = dataset.get('columns') or []
-    if not columns and isinstance(dataset.get('rows'), list) and dataset.get('rows') and isinstance(dataset['rows'][0], dict):
-        columns = list(dataset['rows'][0].keys())
-    return {str(column) for column in columns}
-
-
-def _expected_chart_trace_refs(charts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    expected: list[dict[str, Any]] = []
-    for chart_index, chart in enumerate(charts or []):
+    findings: list[dict[str, Any]] = []
+    for chart_index, chart in enumerate(exec_result.charts or []):
         if not isinstance(chart, dict):
             continue
-        document = chart.get('chart_document') or {}
-        if not isinstance(document, dict):
-            continue
-        encoding = document.get('encoding') or {}
-        if not isinstance(encoding, dict):
-            continue
-        chart_kind = str(document.get('chart_kind') or chart.get('chart_type') or '').strip().lower()
-        value_fields = [str(item) for item in (encoding.get('value_fields') or []) if str(item).strip()]
-        if value_fields:
-            for value_field in value_fields:
-                expected.append({"chart_index": chart_index, "value_field": value_field, "chart_kind": chart_kind})
-            continue
-        value_field = str(encoding.get('value_field') or '').strip()
-        if value_field:
-            expected.append({"chart_index": chart_index, "value_field": value_field, "chart_kind": chart_kind})
-            continue
-        if chart_kind == 'scatter':
-            for field_name in ('x_field', 'y_field'):
-                field_value = str(encoding.get(field_name) or '').strip()
-                if field_value:
-                    expected.append({"chart_index": chart_index, "value_field": field_value, "chart_kind": chart_kind})
-    return expected
-
-
-def _normalize_ref_chart_index(ref: dict[str, Any]) -> int:
-    try:
-        return int(ref.get('chart_index') or 0)
-    except Exception:
-        return 0
-
-
-def _normalize_ref_table_index(ref: dict[str, Any]) -> int:
-    try:
-        return int(ref.get('table_index') or 0)
-    except Exception:
-        return 0
-
-
-def _ref_value_field(ref: dict[str, Any]) -> str:
-    return str(ref.get('value_field') or ref.get('field') or ref.get('x_field') or ref.get('y_field') or '').strip()
-
-
-def _normalize_table_trace_metadata(table_trace_metadata: dict[str, Any]) -> dict[int, dict[str, Any]]:
-    if not isinstance(table_trace_metadata, dict) or not table_trace_metadata:
-        return {}
-    if isinstance(table_trace_metadata.get('tables'), list):
-        return {
-            index: item for index, item in enumerate(table_trace_metadata.get('tables') or [])
-            if isinstance(item, dict)
-        }
-    if isinstance(table_trace_metadata.get('by_table'), dict):
-        result: dict[int, dict[str, Any]] = {}
-        for key, value in table_trace_metadata.get('by_table', {}).items():
-            if isinstance(value, dict):
-                try:
-                    result[int(key)] = value
-                except Exception:
-                    continue
-        return result
-    return {0: table_trace_metadata}
-
-
-def _table_column_keys(table: dict[str, Any]) -> set[str]:
-    columns = table.get('columns') if isinstance(table, dict) else []
-    keys: set[str] = set()
-    for column in columns or []:
-        if isinstance(column, dict):
-            key = str(column.get('key') or column.get('dataIndex') or '').strip()
-            label = str(column.get('label') or column.get('title') or '').strip()
-            if key:
-                keys.add(key)
-            if label:
-                keys.add(label)
-        else:
-            text = str(column or '').strip()
-            if text:
-                keys.add(text)
-    return keys
-
-
-def _expected_table_trace_refs(tables: list[dict[str, Any]], table_trace_metadata: dict[str, Any]) -> list[dict[str, Any]]:
-    metadata_by_table = _normalize_table_trace_metadata(table_trace_metadata)
-    expected: list[dict[str, Any]] = []
-    for table_index, table in enumerate(tables or []):
-        metadata = metadata_by_table.get(table_index) or (metadata_by_table.get(0) if len(tables or []) == 1 else {})
-        column_roles = metadata.get('column_roles') if isinstance(metadata, dict) else {}
-        if not isinstance(column_roles, dict):
-            continue
-        for column_key, role in column_roles.items():
-            if str(role).strip().lower() == 'metric':
-                expected.append({"table_index": table_index, "column_key": str(column_key)})
-    return expected
-
-
-def _ref_table_column(ref: dict[str, Any]) -> str:
-    return str(ref.get('column_key') or ref.get('value_column') or ref.get('column') or '').strip()
-
-
-def _serialized_size(value: Any) -> int:
-    try:
-        return len(json.dumps(value, ensure_ascii=False, default=str))
-    except Exception:
-        return len(str(value))
-
-
-def _find_intermediate_output_issue(evidence_key: str, intermediate_outputs: Any) -> dict[str, Any] | None:
-    if intermediate_outputs in (None, []):
-        return None
-    if not isinstance(intermediate_outputs, list):
-        return {"evidence_key": evidence_key, "reason": "intermediate_outputs 必须是 list"}
-    if len(intermediate_outputs) > 20:
-        return {"evidence_key": evidence_key, "reason": "intermediate_outputs 数量过多", "count": len(intermediate_outputs)}
-    if _serialized_size(intermediate_outputs) > 8000:
-        return {"evidence_key": evidence_key, "reason": "intermediate_outputs 体积过大"}
-    for index, item in enumerate(intermediate_outputs):
-        if _serialized_size(item) > 1200:
-            return {"evidence_key": evidence_key, "index": index, "reason": "单个中间结果过大"}
-        if isinstance(item, list) and len(item) > 20:
-            return {"evidence_key": evidence_key, "index": index, "reason": "中间结果不能保存大数组"}
-        if isinstance(item, dict):
-            if len(item) > 12:
-                return {"evidence_key": evidence_key, "index": index, "reason": "中间结果字段过多"}
-            lowered_keys = {str(key).lower() for key in item.keys()}
-            if {'rows', 'dataframe', 'records', 'details'} & lowered_keys:
-                return {"evidence_key": evidence_key, "index": index, "reason": "中间结果疑似包含明细数据"}
-    return None
-
-
-def _validate_evidence_contract(exec_result: StructuredResult, *, generated_code: str = '') -> RetryResult | None:
-    evidence_definitions = exec_result.evidence_definitions or []
-    trace_ref_groups = {
-        'chart_trace_refs': exec_result.chart_trace_refs or [],
-        'table_trace_refs': exec_result.table_trace_refs or [],
-        'report_trace_refs': exec_result.report_trace_refs or [],
-    }
-    has_evidence_payload = bool(evidence_definitions or any(trace_ref_groups.values()))
-    if not has_evidence_payload:
-        if exec_result.charts or exec_result.tables or _report_has_traceable_numeric_value(exec_result.analysis_report):
-            return request_retry(
-                retry_type="missing_evidence_contract",
-                message="当前分析结果包含图表、表格或报告数值，但没有提供 evidence_definitions 和 trace refs。",
-                diagnostics={
-                    "chart_count": len(exec_result.charts or []),
-                    "table_count": len(exec_result.tables or []),
-                    "report_has_numeric_value": _report_has_traceable_numeric_value(exec_result.analysis_report),
-                },
-                repair_instructions=[
-                    "按计算逻辑边界补充 evidence_definitions，不要按每个数据点生成 Evidence。",
-                    "图表补充 chart_trace_refs，表格补充 table_trace_refs。",
-                    "报告中的核心计算数值使用 [[trace:evidence_key=xxx]]数值[[/trace]] 包裹，并通过 build_report_result(...) 生成 report_trace_refs。",
-                ],
-                analysis_report=exec_result.analysis_report,
-            )
-        return None
-    if not evidence_definitions:
-        return request_retry(
-            retry_type="missing_evidence_contract",
-            message="当前结果声明了 trace refs，但没有提供 evidence_definitions。",
-            diagnostics={name: len(items) for name, items in trace_ref_groups.items()},
-            repair_instructions=[
-                "补充 evidence_definitions，并让每个 trace ref 的 evidence_key 能命中对应 EvidenceDefinition。",
-                "EvidenceDefinition 按计算逻辑边界生成，不要按数据点或表格行逐个生成。",
-            ],
-            analysis_report=exec_result.analysis_report,
+        contract = (
+            chart.get("chart_data_contract")
+            if isinstance(chart.get("chart_data_contract"), dict)
+            else {}
         )
-
-    evidence_by_key: dict[str, dict[str, Any]] = {}
-    for index, item in enumerate(evidence_definitions):
-        if not isinstance(item, dict):
-            return request_retry(
-                retry_type="invalid_evidence_definition",
-                message="evidence_definitions 中的每一项都必须是 dict。",
-                diagnostics={"index": index},
-                repair_instructions=["按 EvidenceDefinition 结构重写 evidence_definitions。"],
-                analysis_report=exec_result.analysis_report,
-            )
-        evidence_key = str(item.get('evidence_key') or '').strip()
-        if not evidence_key:
-            return request_retry(
-                retry_type="invalid_evidence_definition",
-                message="EvidenceDefinition 缺少 evidence_key。",
-                diagnostics={"index": index},
-                repair_instructions=["为每条 EvidenceDefinition 提供 execution 内唯一的 evidence_key。"],
-                analysis_report=exec_result.analysis_report,
-            )
-        if evidence_key in evidence_by_key:
-            return request_retry(
-                retry_type="invalid_evidence_definition",
-                message=f"EvidenceDefinition.evidence_key={evidence_key} 重复。",
-                diagnostics={"evidence_key": evidence_key},
-                repair_instructions=["合并重复 Evidence，或为不同计算逻辑使用不同 evidence_key。"],
-                analysis_report=exec_result.analysis_report,
-            )
-        forbidden_fields = sorted(field for field in SYSTEM_EVIDENCE_FIELDS if field in item)
-        if forbidden_fields:
-            return request_retry(
-                retry_type="invalid_evidence_definition",
-                message="EvidenceDefinition 包含应由后端注入的系统事实字段。",
-                diagnostics={"evidence_key": evidence_key, "forbidden_fields": forbidden_fields},
-                repair_instructions=[
-                    "移除 turn_id、execution_id、artifact_id、evidence_id、datasource_id、sql、query_constraints 等系统字段。",
-                    "EvidenceDefinition 只保留指标名、单位、query_refs、计算说明、转换步骤和必要中间结果。",
-                ],
-                analysis_report=exec_result.analysis_report,
-            )
-        intermediate_issue = _find_intermediate_output_issue(evidence_key, item.get('intermediate_outputs'))
-        if intermediate_issue is not None:
-            return request_retry(
-                retry_type="invalid_evidence_definition",
-                message="EvidenceDefinition.intermediate_outputs 只能保存小体量摘要，不能保存明细或大对象。",
-                diagnostics=intermediate_issue,
-                repair_instructions=[
-                    "删除完整 DataFrame、明细行数组、大列表和调试变量。",
-                    "只保留用户理解指标必要的分子、分母、聚合行数、样本数等小体量摘要。",
-                ],
-                analysis_report=exec_result.analysis_report,
-            )
-        query_refs = item.get('query_refs') or []
-        if not isinstance(query_refs, list) or not query_refs:
-            return request_retry(
-                retry_type="invalid_evidence_query_ref",
-                message="EvidenceDefinition.query_refs 不能为空。",
-                diagnostics={"evidence_key": evidence_key},
-                repair_instructions=["每条 EvidenceDefinition 至少引用一个真实 query_key。"],
-                analysis_report=exec_result.analysis_report,
-            )
-        evidence_by_key[evidence_key] = item
-
-    query_snapshots = exec_result.query_snapshots or {}
-    missing_query_refs: list[dict[str, Any]] = []
-    for evidence_key, item in evidence_by_key.items():
-        for query_ref in item.get('query_refs') or []:
-            if str(query_ref) not in query_snapshots:
-                missing_query_refs.append({"evidence_key": evidence_key, "query_ref": query_ref})
-    if missing_query_refs:
-        return request_retry(
-            retry_type="invalid_evidence_query_ref",
-            message="EvidenceDefinition.query_refs 引用了不存在的 query snapshot。",
-            diagnostics={
-                "missing_query_refs": missing_query_refs[:20],
-                "available_query_keys": sorted(query_snapshots.keys()),
-            },
-            repair_instructions=[
-                "query_refs 只能引用 validate_query_constraints(...) 成功采集到的 query_key。",
-                "如果是多查询场景，请在 validate_query_constraints(query_key=...) 中显式声明稳定 query_key。",
-            ],
-            analysis_report=exec_result.analysis_report,
+        encoding = (
+            contract.get("encoding")
+            if isinstance(contract.get("encoding"), dict)
+            else {}
         )
-
-    reduction_clauses = _extract_sql_limit_clauses(generated_code) + _extract_dataframe_reduction_clauses(generated_code)
-    if reduction_clauses:
-        missing_quality_notes = []
-        for evidence_key, item in evidence_by_key.items():
-            quality_text = json.dumps(item.get('quality_notes') or [], ensure_ascii=False, default=str)
-            if not _text_discloses_limit_usage(quality_text):
-                missing_quality_notes.append(evidence_key)
-        if missing_quality_notes:
-            return request_retry(
-                retry_type="invalid_evidence_definition",
-                message="代码使用了 LIMIT/采样/截取策略，但部分 Evidence.quality_notes 没有披露该风险。",
-                diagnostics={
-                    "reduction_clauses": reduction_clauses[:10],
-                    "missing_quality_notes": missing_quality_notes[:20],
-                },
-                repair_instructions=[
-                    "保留已通过的查询和产物结构，在对应 EvidenceDefinition.quality_notes 中说明 LIMIT、TopN、采样或截取口径。",
-                    "如果当前指标未受截取影响，请在 quality_notes 中明确说明原因。",
-                ],
-                analysis_report=exec_result.analysis_report,
+        if not encoding:
+            chart_document = (
+                chart.get("chart_document")
+                if isinstance(chart.get("chart_document"), dict)
+                else {}
             )
-
-    used_evidence_keys: set[str] = set()
-    for group_name, refs in trace_ref_groups.items():
-        for index, ref in enumerate(refs):
-            if not isinstance(ref, dict):
-                return request_retry(
-                    retry_type="invalid_evidence_definition",
-                    message=f"{group_name} 中的每一项都必须是 dict。",
-                    diagnostics={"group": group_name, "index": index},
-                    repair_instructions=["按 trace ref 结构重写 refs。"],
-                    analysis_report=exec_result.analysis_report,
-                )
-            evidence_key = str(ref.get('evidence_key') or '').strip()
-            if evidence_key not in evidence_by_key:
-                return request_retry(
-                    retry_type="invalid_evidence_definition",
-                    message=f"{group_name} 引用了不存在的 evidence_key。",
-                    diagnostics={"group": group_name, "index": index, "evidence_key": evidence_key},
-                    repair_instructions=["修正 trace ref 的 evidence_key，使其命中 evidence_definitions。"],
-                    analysis_report=exec_result.analysis_report,
-                )
-            used_evidence_keys.add(evidence_key)
-
-    for index, ref in enumerate(exec_result.report_trace_refs or []):
-        try:
-            start = int(ref.get('start'))
-            end = int(ref.get('end'))
-        except Exception:
-            return request_retry(
-                retry_type="invalid_report_trace_ref",
-                message="report_trace_refs 的 start/end 必须是整数。",
-                diagnostics={"index": index, "ref": ref},
-                repair_instructions=["优先使用 build_report_result(...) 生成 report_trace_refs，不要手写字符区间。"],
-                analysis_report=exec_result.analysis_report,
+            encoding = (
+                chart_document.get("encoding")
+                if isinstance(chart_document.get("encoding"), dict)
+                else {}
             )
-        text = str(ref.get('text') or '')
-        if start < 0 or end < start or exec_result.analysis_report[start:end] != text:
-            return request_retry(
-                retry_type="invalid_report_trace_ref",
-                message="report_trace_refs 的字符区间与最终 Markdown 不一致。",
-                diagnostics={"index": index, "ref": ref},
-                repair_instructions=["使用 build_report_result(...) 从 trace 标签生成干净 Markdown 和 report_trace_refs。"],
-                analysis_report=exec_result.analysis_report,
-            )
-
-    if _report_has_traceable_numeric_value(exec_result.analysis_report) and not exec_result.report_trace_refs:
-        return request_retry(
-            retry_type="invalid_report_trace_ref",
-            message="报告中包含计算数值，但缺少 report_trace_refs，报告数值无法点击查看证据链。",
-            diagnostics={"analysis_report_preview": str(exec_result.analysis_report or '')[:500]},
-            repair_instructions=[
-                "将报告中的核心计算数值用 [[trace:evidence_key=xxx]]数值[[/trace]] 包裹。",
-                "调用 build_report_result(...) 生成干净 analysis_report 和 report_trace_refs。",
-                "把 report_trace_refs 传给 save_analysis_result(...)。",
-            ],
-            analysis_report=exec_result.analysis_report,
-        )
-
-    uncovered_report_values = _uncovered_report_numeric_values(
-        exec_result.analysis_report,
-        exec_result.report_trace_refs or [],
-    )
-    if uncovered_report_values:
-        return request_retry(
-            retry_type="invalid_report_trace_ref",
-            message="报告中仍有计算数值没有被 report_trace_refs 覆盖，无法点击查看证据链。",
-            diagnostics={
-                "uncovered_numeric_values": uncovered_report_values[:12],
-                "report_trace_ref_count": len(exec_result.report_trace_refs or []),
-            },
-            repair_instructions=[
-                "将报告正文中所有由代码计算、聚合、统计或格式化得到的数值都用 [[trace:evidence_key=xxx]]数值[[/trace]] 包裹。",
-                "同一计算逻辑下的多个报告数值可以复用同一个 evidence_key，例如分布数量和占比可绑定到对应分布 EvidenceDefinition。",
-                "章节编号、普通序号、非计算性的日期参数不需要 trace；但概览数值、分布数量/占比、平均值、最大值、最小值、总数、TopN 数值都必须 trace。",
-                "调用 build_report_result(...) 生成干净 analysis_report 和完整 report_trace_refs，并传给 save_analysis_result(...)。",
-            ],
-            analysis_report=exec_result.analysis_report,
-        )
-
-    expected_chart_refs = _expected_chart_trace_refs(exec_result.charts or [])
-    actual_chart_ref_keys = {
-        (_normalize_ref_chart_index(ref), _ref_value_field(ref))
-        for ref in (exec_result.chart_trace_refs or [])
-        if isinstance(ref, dict)
-    }
-    missing_chart_refs = [
-        item for item in expected_chart_refs
-        if (int(item["chart_index"]), str(item["value_field"])) not in actual_chart_ref_keys
-    ]
-    if expected_chart_refs and missing_chart_refs:
-        return request_retry(
-            retry_type="invalid_chart_trace_ref",
-            message="图表中的指标字段缺少 chart_trace_refs，无法定位到 Evidence。",
-            diagnostics={"missing_chart_refs": missing_chart_refs[:20]},
-            repair_instructions=[
-                "为每个 chart_document.encoding.value_field 或 value_fields[*] 补充 chart_trace_refs。",
-                "chart_trace_refs 使用 chart_index、value_field 和 evidence_key；同一计算逻辑可以共享同一个 evidence_key。",
-            ],
-            analysis_report=exec_result.analysis_report,
-        )
-    invalid_chart_refs = []
-    for index, ref in enumerate(exec_result.chart_trace_refs or []):
-        if not isinstance(ref, dict):
+        category_field = str(
+            encoding.get("category_field") or encoding.get("x_field") or ""
+        ).strip().lower()
+        if not category_field:
             continue
-        chart_index = _normalize_ref_chart_index(ref)
-        value_field = _ref_value_field(ref)
-        if chart_index < 0 or chart_index >= len(exec_result.charts or []):
-            invalid_chart_refs.append({"index": index, "reason": "chart_index 越界", "ref": ref})
+        source_query_key = str(contract.get("source_query_key") or "").strip()
+        table_names, output_origins = query_details(source_query_key)
+        origin_fields = output_origins.get(category_field) or {category_field}
+        observed_categories = [
+            value
+            for value in chart_category_values(chart, category_field)
+            if str(value or "").strip()
+        ]
+        if observed_categories and all(looks_like_opaque_value(value) for value in observed_categories):
+            findings.append({
+                "chart_index": chart_index,
+                "chart_title": str(chart.get("title") or ""),
+                "source_query_key": source_query_key,
+                "category_field": category_field,
+                "reason": "all_structured_category_values_are_opaque_identifiers",
+            })
             continue
-        columns = _chart_document_columns((exec_result.charts or [])[chart_index])
-        if columns and value_field and value_field not in columns:
-            invalid_chart_refs.append({"index": index, "reason": "value_field 不存在于 chart_document.dataset", "ref": ref})
-    if invalid_chart_refs:
-        return request_retry(
-            retry_type="invalid_chart_trace_ref",
-            message="chart_trace_refs 指向了不存在的图表或字段。",
-            diagnostics={"invalid_chart_refs": invalid_chart_refs[:20]},
-            repair_instructions=["按 chart_document.dataset.columns 和 encoding 字段修正 chart_trace_refs。"],
-            analysis_report=exec_result.analysis_report,
-        )
-
-    expected_table_refs = _expected_table_trace_refs(exec_result.tables or [], exec_result.table_trace_metadata or {})
-    actual_table_ref_keys = {
-        (_normalize_ref_table_index(ref), _ref_table_column(ref))
-        for ref in (exec_result.table_trace_refs or [])
-        if isinstance(ref, dict)
-    }
-    missing_table_refs = [
-        item for item in expected_table_refs
-        if (int(item["table_index"]), str(item["column_key"])) not in actual_table_ref_keys
-    ]
-    if expected_table_refs and missing_table_refs:
-        return request_retry(
-            retry_type="invalid_table_trace_ref",
-            message="表格 metric 列缺少 table_trace_refs，无法定位到 Evidence。",
-            diagnostics={"missing_table_refs": missing_table_refs[:20]},
-            repair_instructions=[
-                "通过 build_table_result(...) 声明 metric 列，并为每个 metric 列补充 table_trace_refs。",
-                "table_trace_refs 使用 table_index、column_key 或 value_column、evidence_key；列级 Evidence 优先 row_scope=all。",
-            ],
-            analysis_report=exec_result.analysis_report,
-        )
-    invalid_table_refs = []
-    for index, ref in enumerate(exec_result.table_trace_refs or []):
-        if not isinstance(ref, dict):
-            continue
-        table_index = _normalize_ref_table_index(ref)
-        column_key = _ref_table_column(ref)
-        if table_index < 0 or table_index >= len(exec_result.tables or []):
-            invalid_table_refs.append({"index": index, "reason": "table_index 越界", "ref": ref})
-            continue
-        column_keys = _table_column_keys((exec_result.tables or [])[table_index])
-        if column_keys and column_key and column_key not in column_keys:
-            invalid_table_refs.append({"index": index, "reason": "列不存在于表格 columns", "ref": ref})
-    if invalid_table_refs:
-        return request_retry(
-            retry_type="invalid_table_trace_ref",
-            message="table_trace_refs 指向了不存在的表格或列。",
-            diagnostics={"invalid_table_refs": invalid_table_refs[:20]},
-            repair_instructions=["按表格 columns 中的 key/label 修正 table_trace_refs。"],
-            analysis_report=exec_result.analysis_report,
-        )
-
-    unused_evidence_keys = sorted(set(evidence_by_key) - used_evidence_keys)
-    if unused_evidence_keys:
-        return request_retry(
-            retry_type="invalid_evidence_definition",
-            message="存在未被任何 trace ref 使用的 EvidenceDefinition。",
-            diagnostics={"unused_evidence_keys": unused_evidence_keys[:20]},
-            repair_instructions=[
-                "删除未使用的 EvidenceDefinition，或补充对应 chart/table/report trace refs。",
-            ],
-            analysis_report=exec_result.analysis_report,
-        )
-
-    return None
+        for source_tokens, opaque_fields in opaque_fields_by_source:
+            if table_names and not (source_tokens & table_names):
+                continue
+            matched_fields = sorted(origin_fields & opaque_fields)
+            if not matched_fields:
+                continue
+            findings.append({
+                "chart_index": chart_index,
+                "chart_title": str(chart.get("title") or ""),
+                "source_query_key": source_query_key,
+                "category_field": category_field,
+                "opaque_source_fields": matched_fields,
+            })
+            break
+    return findings
 
 
 def _validate_structured_result_contract(
@@ -3927,7 +4338,7 @@ def _validate_structured_result_contract(
             },
             repair_instructions=[
                 "下一版代码保留已生成的 charts 结构化产物，但必须重写 analysis_report。",
-                "analysis_report 只能包含 Markdown 自然语言结论、指标说明和表格文本；不要插入 charts[0]、charts[0]['chart_document']、chart_spec、chart_document 或图表 dict。",
+                "analysis_report 只能包含 Markdown 自然语言解读和表格文本；不要插入 charts[0]、charts[0]['chart_document']、chart_spec、chart_document 或图表 dict。",
                 "如果报告中需要引用图表，只写自然语言，例如：下方图表展示每日产量变化趋势。",
                 "图表对象只能通过 save_analysis_result(..., charts=charts, ...) 的 charts 参数返回。",
             ],
@@ -3937,7 +4348,18 @@ def _validate_structured_result_contract(
     sql_limit_clauses = _extract_sql_limit_clauses(generated_code)
     dataframe_reduction_clauses = _extract_dataframe_reduction_clauses(generated_code)
     reduction_clauses = sql_limit_clauses + dataframe_reduction_clauses
-    if reduction_clauses and not _report_discloses_limit_usage(exec_result):
+    reduction_affects_visible_result = bool(exec_result.charts or exec_result.tables) or not (
+        _is_no_data_like_report(report_text)
+    )
+    if (
+        reduction_clauses
+        and reduction_affects_visible_result
+        and not _result_discloses_limit_usage(exec_result)
+        and not (
+            len(reduction_clauses) == 1
+            and _text_discloses_relative_window(_result_to_scan_text(exec_result))
+        )
+    ):
         return request_retry(
             retry_type="result_contract_error",
             message="当前代码对查询或图表数据做了 LIMIT/head/tail/sample/iloc 等截取或采样，但 analysis_report 正文没有披露该限制，容易让用户误以为图表覆盖了完整时间范围。",
@@ -3957,25 +4379,46 @@ def _validate_structured_result_contract(
             analysis_report=report_text,
         )
 
-    untracked_mentions = _find_untracked_datasource_mentions(
+    untracked_accesses = _find_untracked_datasource_accesses(
         exec_result,
         used_datasource_ids=used_datasource_ids,
         selected_datasource_snapshot=selected_datasource_snapshot,
     )
-    if untracked_mentions:
+    if untracked_accesses:
         return request_retry(
             retry_type="result_contract_error",
-            message="当前结果提到了未在 used_datasource_ids 中声明的数据源，无法确认这些数据源被本轮代码实际查询或读取。",
+            message="当前代码实际查询了未在 used_datasource_ids 中声明的数据源，无法完整记录本轮数据访问范围。",
             diagnostics={
                 "analysis_report_preview": report_text[:800],
                 "used_datasource_ids": used_datasource_ids or [],
-                "untracked_datasource_mentions": untracked_mentions,
+                "untracked_datasource_accesses": untracked_accesses,
             },
             repair_instructions=[
-                "下一版代码必须让 used_datasource_ids、实际查询代码、analysis_report、charts 和 tables 保持一致。",
-                "如果某个数据源已经被实际查询或探测，请把它的 datasource_id 加入 used_datasource_ids。",
-                "如果某个数据源没有被实际查询或探测，不要在最终报告、表格或图表中声称分析了它，也不要展示它的数据覆盖状态。",
-                "数据源展示名称必须使用上下文里的 datasource_name，不要从表名、点位名或标识中裁剪、改写出新名称。",
+                "下一版调用 execute_python 时，把结构化诊断列出的 datasource_id 加入 used_datasource_ids。",
+                "used_datasource_ids 应覆盖 query_snapshots 中记录的实际数据访问，不需要因为报告中的业务建议或数据缺口说明而额外声明数据源。",
+            ],
+            analysis_report=report_text,
+        )
+
+    opaque_dimension_artifacts = _find_opaque_dimension_artifacts(
+        exec_result,
+        selected_datasource_snapshot,
+    )
+    if opaque_dimension_artifacts:
+        return request_retry(
+            retry_type="result_contract_error",
+            message=(
+                "当前结果把已确认仅用于关联的原始标识字段作为面向用户的图表分类，"
+                "无法形成业务可读的洞察。"
+            ),
+            diagnostics={
+                "violated_contract": "opaque_identifier_as_business_dimension",
+                "opaque_dimension_artifacts": opaque_dimension_artifacts,
+            },
+            repair_instructions=[
+                "若已选数据源中存在经过确认的标识到业务名称关系，请使用关系中的可读标签字段。",
+                "若当前数据范围没有可验证的标签映射，保留可确认的总量、趋势或其他可读维度分析，并说明该维度暂不可解释；不要展示原始标识值。",
+                "同步移除报告、图表和表格中的原始标识分类，所有产物消费同一份业务可读结果。",
             ],
             analysis_report=report_text,
         )
@@ -4039,10 +4482,6 @@ def _validate_structured_result_contract(
             ],
             analysis_report=report_text,
         )
-
-    evidence_retry = _validate_evidence_contract(exec_result, generated_code=generated_code)
-    if evidence_retry is not None:
-        return evidence_retry
 
     return None
 
@@ -4322,7 +4761,10 @@ def _validate_tool_used_datasource_ids(
 
 def _build_execution_namespace() -> dict[str, Any]:
     """向生成代码暴露允许使用的辅助函数命名空间。"""
+    import pandas as pd
+
     return {
+        'pd': pd,
         'load_local_file': load_local_file,
         'load_local_file_low_memory': load_local_file_low_memory,
         'load_minio_file': load_minio_file,
@@ -4334,10 +4776,8 @@ def _build_execution_namespace() -> dict[str, Any]:
         'probe_text_candidates': probe_text_candidates,
         'get_analysis_parameters': get_analysis_parameters,
         'validate_query_constraints': validate_query_constraints,
-        'define_evidence': define_evidence,
         'build_markdown_table': build_markdown_table,
         'build_table_result': build_table_result,
-        'build_report_result': build_report_result,
         'build_chart_document': build_chart_document,
         'build_chart_result': build_chart_result,
         'build_chart_suite': build_chart_suite,
@@ -4354,12 +4794,58 @@ def _serialize_runtime_user_context(runtime_context: CustomContext | None) -> di
     if runtime_context is None:
         return {}
 
+    numeric_field_profiles = _build_datasource_numeric_field_profiles(
+        _get_runtime_selected_datasource_snapshot(runtime_context)
+    )
     return {
         'token': getattr(runtime_context, 'auth_token', '') or '',
         'database_conn_info': dict(getattr(runtime_context, 'database_conn_info', {}) or {}),
         'expected_time_range': dict(getattr(runtime_context, 'expected_time_range', {}) or {}),
         'analysis_parameters_override': dict(getattr(runtime_context, 'analysis_parameters_override', {}) or {}),
+        'datasource_numeric_fields': numeric_field_profiles,
     }
+
+
+def _build_datasource_numeric_field_profiles(
+    selected_datasource_snapshot: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    numeric_types = {
+        "number", "integer", "int", "int32", "int64", "long", "short",
+        "float", "float32", "float64", "double", "decimal", "numeric",
+    }
+    profiles: list[dict[str, Any]] = []
+    for datasource in selected_datasource_snapshot:
+        if not isinstance(datasource, dict):
+            continue
+        identifier = str(datasource.get("datasource_identifier") or "").strip()
+        if not identifier:
+            continue
+        schema = datasource.get("metadata_schema") if isinstance(datasource.get("metadata_schema"), dict) else {}
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        fields = []
+        for name, definition in properties.items():
+            if not isinstance(definition, dict):
+                continue
+            field_type = str(
+                definition.get("type")
+                or definition.get("data_type")
+                or definition.get("dataType")
+                or ""
+            ).strip().lower()
+            if field_type in numeric_types or any(token in field_type for token in ("decimal", "numeric", "float", "double", "int")):
+                fields.append(str(name))
+        if not fields:
+            continue
+        identifier_parts = identifier.split(".")
+        identifiers = [identifier]
+        if len(identifier_parts) >= 2:
+            identifiers.append(".".join(identifier_parts[-2:]))
+        identifiers.append(identifier_parts[-1])
+        profiles.append({
+            "identifiers": list(dict.fromkeys(item for item in identifiers if item)),
+            "fields": sorted(set(fields)),
+        })
+    return profiles
 
 
 def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -> None:
@@ -4368,6 +4854,11 @@ def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -
     CURRENT_EXPECTED_TIME_RANGE.set(dict(payload.get('expected_time_range') or {}))
     CURRENT_TIME_RANGE_GUARD_ACTIVE.set(bool(payload.get('time_range_guard_active')))
     CURRENT_ANALYSIS_PARAMETERS_OVERRIDE.set(dict(payload.get('analysis_parameters_override') or {}))
+    CURRENT_DATASOURCE_NUMERIC_FIELDS.set([
+        dict(item)
+        for item in payload.get('datasource_numeric_fields') or []
+        if isinstance(item, dict)
+    ])
     CURRENT_QUERY_SNAPSHOTS.set({})
     CURRENT_LAST_QUERY_KEY.set('')
     conn_info_payload = payload.get('database_conn_info') or {}
@@ -4386,6 +4877,621 @@ def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -
     token = str(payload.get('token') or '').strip()
     if token:
         supos_kernel_api.get_database_conn_info(token)
+
+
+def _relationship_key_counts(
+    datasource: dict[str, Any],
+    fields: list[str],
+) -> dict[tuple[str, ...], int]:
+    """Load only candidate key columns and count their normalized tuples."""
+    from collections import Counter
+
+    datasource_type = str(datasource.get("datasource_type") or "").strip()
+    identifier = str(datasource.get("datasource_identifier") or "").strip()
+    if not identifier:
+        raise ValueError("relationship Probe datasource lacks datasource_identifier")
+
+    def consume(frame: Any, counts: Counter) -> None:
+        missing = [field for field in fields if field not in frame.columns]
+        if missing:
+            raise ValueError(
+                "relationship Probe fields are unavailable: " + ", ".join(missing)
+            )
+        for row in frame[fields].itertuples(index=False, name=None):
+            if any(value is None for value in row):
+                continue
+            normalized = tuple(str(value).strip() for value in row)
+            if any(not value for value in normalized):
+                continue
+            counts[normalized] += 1
+
+    counts: Counter = Counter()
+    if datasource_type == "table":
+        columns = ", ".join(fields)
+        non_null = " AND ".join(f"{field} IS NOT NULL" for field in fields)
+        frame = load_data_with_sql(
+            f"SELECT {columns} FROM {identifier} WHERE {non_null}"
+        )
+        consume(frame, counts)
+        return dict(counts)
+
+    if datasource_type == "local_file":
+        if datasource.get("recommended_loader") == "load_local_file_low_memory":
+            for frame in load_local_file_low_memory(identifier, usecols=fields):
+                consume(frame, counts)
+        else:
+            consume(load_local_file(identifier), counts)
+        return dict(counts)
+
+    raise ValueError(
+        f"relationship Probe does not support datasource_type={datasource_type}"
+    )
+
+
+def _inspect_preparation_relationship(
+    relationship: dict[str, Any],
+    datasources_by_id: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
+    left_id = int(relationship.get("left_datasource_id") or 0)
+    right_id = int(relationship.get("right_datasource_id") or 0)
+    left_fields = [str(item) for item in relationship.get("left_fields") or []]
+    right_fields = [str(item) for item in relationship.get("right_fields") or []]
+    left_source = datasources_by_id[left_id]
+    right_source = datasources_by_id[right_id]
+    if (
+        str(left_source.get("datasource_type") or "") == "table"
+        and str(right_source.get("datasource_type") or "") == "table"
+    ):
+        return _inspect_sql_preparation_relationship(
+            relationship=relationship,
+            left_source=left_source,
+            right_source=right_source,
+            left_fields=left_fields,
+            right_fields=right_fields,
+        )
+    left_counts = _relationship_key_counts(left_source, left_fields)
+    right_counts = _relationship_key_counts(right_source, right_fields)
+    left_keys = set(left_counts)
+    right_keys = set(right_counts)
+    matched_keys = left_keys & right_keys
+    left_coverage = len(matched_keys) / len(left_keys) if left_keys else 0.0
+    right_coverage = len(matched_keys) / len(right_keys) if right_keys else 0.0
+    left_max = max(left_counts.values(), default=0)
+    right_max = max(right_counts.values(), default=0)
+    cardinality = (
+        "unknown"
+        if not left_keys or not right_keys or not matched_keys
+        else "one_to_one"
+        if left_max <= 1 and right_max <= 1
+        else "many_to_one"
+        if right_max <= 1
+        else "one_to_many"
+        if left_max <= 1
+        else "many_to_many"
+    )
+    return {
+        "observation_id": f"probe:{relationship.get('relationship_id')}",
+        "kind": "relationship_coverage",
+        "status": "verified",
+        "complete": True,
+        "facts": {
+            "join_supported": bool(matched_keys),
+            "left_distinct_key_count": len(left_keys),
+            "right_distinct_key_count": len(right_keys),
+            "matched_distinct_key_count": len(matched_keys),
+            "left_match_coverage_ratio": left_coverage,
+            "right_match_coverage_ratio": right_coverage,
+            "left_max_rows_per_key": left_max,
+            "right_max_rows_per_key": right_max,
+            "cardinality": cardinality,
+            "left_measure_aggregation_safe": right_max <= 1,
+            "right_measure_aggregation_safe": left_max <= 1,
+        },
+    }
+
+
+def _inspect_sql_preparation_relationship(
+    *,
+    relationship: dict[str, Any],
+    left_source: dict[str, Any],
+    right_source: dict[str, Any],
+    left_fields: list[str],
+    right_fields: list[str],
+) -> dict[str, Any]:
+    """Measure a table relationship at the database and return one summary row."""
+    left_identifier = str(left_source.get("datasource_identifier") or "").strip()
+    right_identifier = str(right_source.get("datasource_identifier") or "").strip()
+    left_columns = ", ".join(left_fields)
+    right_columns = ", ".join(right_fields)
+    left_non_null = " AND ".join(f"{field} IS NOT NULL" for field in left_fields)
+    right_non_null = " AND ".join(f"{field} IS NOT NULL" for field in right_fields)
+    left_non_null_qualified = " AND ".join(
+        f"l.{field} IS NOT NULL" for field in left_fields
+    )
+    right_non_null_qualified = " AND ".join(
+        f"r.{field} IS NOT NULL" for field in right_fields
+    )
+    join_condition = " AND ".join(
+        f"l.{left_field} = r.{right_field}"
+        for left_field, right_field in zip(left_fields, right_fields)
+    )
+    left_matched_columns = ", ".join(f"l.{field}" for field in left_fields)
+    right_matched_columns = ", ".join(f"r.{field}" for field in right_fields)
+    sql = f"""
+SELECT
+    (SELECT COUNT(*) FROM (
+        SELECT {left_columns} FROM {left_identifier}
+        WHERE {left_non_null} GROUP BY {left_columns}
+    ) left_distinct) AS left_distinct_key_count,
+    (SELECT COUNT(*) FROM (
+        SELECT {right_columns} FROM {right_identifier}
+        WHERE {right_non_null} GROUP BY {right_columns}
+    ) right_distinct) AS right_distinct_key_count,
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT {left_matched_columns}
+        FROM {left_identifier} l
+        JOIN {right_identifier} r ON {join_condition}
+        WHERE {left_non_null_qualified}
+    ) matched_left) AS matched_left_key_count,
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT {right_matched_columns}
+        FROM {left_identifier} l
+        JOIN {right_identifier} r ON {join_condition}
+        WHERE {right_non_null_qualified}
+    ) matched_right) AS matched_right_key_count,
+    COALESCE((SELECT MAX(rows_per_key) FROM (
+        SELECT COUNT(*) AS rows_per_key FROM {left_identifier}
+        WHERE {left_non_null} GROUP BY {left_columns}
+    ) left_frequency), 0) AS left_max_rows_per_key,
+    COALESCE((SELECT MAX(rows_per_key) FROM (
+        SELECT COUNT(*) AS rows_per_key FROM {right_identifier}
+        WHERE {right_non_null} GROUP BY {right_columns}
+    ) right_frequency), 0) AS right_max_rows_per_key
+"""
+    numeric_columns = [
+        "left_distinct_key_count",
+        "right_distinct_key_count",
+        "matched_left_key_count",
+        "matched_right_key_count",
+        "left_max_rows_per_key",
+        "right_max_rows_per_key",
+    ]
+    frame = load_data_with_sql(sql, numeric_columns=numeric_columns)
+    if frame.empty:
+        raise ValueError("relationship Probe summary query returned no row")
+    row = frame.iloc[0]
+    left_count = int(row["left_distinct_key_count"] or 0)
+    right_count = int(row["right_distinct_key_count"] or 0)
+    matched_left = int(row["matched_left_key_count"] or 0)
+    matched_right = int(row["matched_right_key_count"] or 0)
+    left_max = int(row["left_max_rows_per_key"] or 0)
+    right_max = int(row["right_max_rows_per_key"] or 0)
+    left_coverage = matched_left / left_count if left_count else 0.0
+    right_coverage = matched_right / right_count if right_count else 0.0
+    cardinality = (
+        "unknown"
+        if not matched_left
+        else "one_to_one"
+        if left_max <= 1 and right_max <= 1
+        else "many_to_one"
+        if right_max <= 1
+        else "one_to_many"
+        if left_max <= 1
+        else "many_to_many"
+    )
+    return {
+        "observation_id": f"probe:{relationship.get('relationship_id')}",
+        "kind": "relationship_coverage",
+        "status": "verified",
+        "complete": True,
+        "facts": {
+            "join_supported": bool(matched_left),
+            "left_distinct_key_count": left_count,
+            "right_distinct_key_count": right_count,
+            "matched_distinct_key_count": min(matched_left, matched_right),
+            "left_match_coverage_ratio": left_coverage,
+            "right_match_coverage_ratio": right_coverage,
+            "left_max_rows_per_key": left_max,
+            "right_max_rows_per_key": right_max,
+            "cardinality": cardinality,
+            "left_measure_aggregation_safe": right_max <= 1,
+            "right_measure_aggregation_safe": left_max <= 1,
+        },
+    }
+
+
+def _inspect_preparation_schema_fact(
+    request: dict[str, Any],
+    datasource: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a bounded aggregate/profile observation, never source sample rows."""
+    from collections import Counter
+
+    datasource_id = int(request.get("datasource_id") or 0)
+    field = str(request.get("field") or "").strip()
+    kind = str(request.get("probe_kind") or "").strip()
+    top_n = min(max(int(request.get("top_n") or 20), 1), 50)
+    identifier = str(datasource.get("datasource_identifier") or "").strip()
+    datasource_type = str(datasource.get("datasource_type") or "").strip()
+    if not identifier or not field:
+        raise ValueError("Schema Probe requires a datasource identifier and field")
+
+    facts: dict[str, Any]
+    if datasource_type == "table":
+        if kind == "distinct_values":
+            frame = load_data_with_sql(
+                f"SELECT {field} AS probed_value, COUNT(*) AS frequency "
+                f"FROM {identifier} WHERE {field} IS NOT NULL "
+                f"GROUP BY {field} ORDER BY frequency DESC LIMIT {top_n}",
+                numeric_columns=["frequency"],
+            )
+            values = [
+                {
+                    "value": _serialize_probe_value(row.get("probed_value")),
+                    "count": int(row.get("frequency") or 0),
+                }
+                for row in frame.to_dict("records")
+            ]
+            facts = {"values": values, "top_n": top_n}
+            expected_values = [
+                str(item).strip()
+                for item in request.get("expected_values") or []
+                if str(item).strip()
+            ]
+            if expected_values:
+                facts["requested_value_resolutions"] = _resolve_requested_enum_values(
+                    expected_values,
+                    [str(item.get("value") or "").strip() for item in values],
+                )
+        elif kind == "time_coverage":
+            frame = load_data_with_sql(
+                f"SELECT COUNT(*) AS total_count, COUNT({field}) AS non_null_count, "
+                f"MIN({field}) AS min_value, MAX({field}) AS max_value "
+                f"FROM {identifier}",
+                numeric_columns=["total_count", "non_null_count"],
+            )
+            row = frame.iloc[0] if not frame.empty else {}
+            facts = {
+                "total_count": int(row.get("total_count") or 0),
+                "non_null_count": int(row.get("non_null_count") or 0),
+                "min_value": _serialize_probe_value(row.get("min_value")),
+                "max_value": _serialize_probe_value(row.get("max_value")),
+            }
+        elif kind == "field_profile":
+            frame = load_data_with_sql(
+                f"SELECT COUNT(*) AS total_count, COUNT({field}) AS non_null_count, "
+                f"COUNT(DISTINCT {field}) AS distinct_count FROM {identifier}",
+                numeric_columns=["total_count", "non_null_count", "distinct_count"],
+            )
+            row = frame.iloc[0] if not frame.empty else {}
+            facts = {
+                "total_count": int(row.get("total_count") or 0),
+                "non_null_count": int(row.get("non_null_count") or 0),
+                "distinct_count": int(row.get("distinct_count") or 0),
+            }
+        else:
+            raise ValueError(f"unsupported Schema Probe kind={kind}")
+    elif datasource_type == "local_file":
+        if datasource.get("recommended_loader") == "load_local_file_low_memory":
+            frames = load_local_file_low_memory(identifier, usecols=[field])
+        else:
+            frames = [load_local_file(identifier)[[field]]]
+        total_count = 0
+        non_null_count = 0
+        distinct_values: set[str] = set()
+        counts: Counter[str] = Counter()
+        min_value = None
+        max_value = None
+        for frame in frames:
+            if field not in frame.columns:
+                raise ValueError(f"Schema Probe field is unavailable: {field}")
+            series = frame[field]
+            total_count += int(len(series))
+            valid = series.dropna()
+            non_null_count += int(len(valid))
+            if kind == "distinct_values":
+                for value, count in valid.value_counts().items():
+                    counts[str(_serialize_probe_value(value))] += int(count)
+            elif kind == "field_profile":
+                distinct_values.update(str(_serialize_probe_value(value)) for value in valid)
+            elif kind == "time_coverage":
+                parsed = pd.to_datetime(valid, errors="coerce").dropna()
+                if not parsed.empty:
+                    current_min = parsed.min()
+                    current_max = parsed.max()
+                    min_value = current_min if min_value is None else min(min_value, current_min)
+                    max_value = current_max if max_value is None else max(max_value, current_max)
+            else:
+                raise ValueError(f"unsupported Schema Probe kind={kind}")
+        if kind == "distinct_values":
+            facts = {
+                "values": [
+                    {"value": value, "count": count}
+                    for value, count in counts.most_common(top_n)
+                ],
+                "top_n": top_n,
+            }
+            expected_values = [
+                str(item).strip()
+                for item in request.get("expected_values") or []
+                if str(item).strip()
+            ]
+            if expected_values:
+                facts["requested_value_resolutions"] = _resolve_requested_enum_values(
+                    expected_values,
+                    [str(item.get("value") or "").strip() for item in facts["values"]],
+                )
+        elif kind == "field_profile":
+            facts = {
+                "total_count": total_count,
+                "non_null_count": non_null_count,
+                "distinct_count": len(distinct_values),
+            }
+        else:
+            facts = {
+                "total_count": total_count,
+                "non_null_count": non_null_count,
+                "min_value": _serialize_probe_value(min_value),
+                "max_value": _serialize_probe_value(max_value),
+            }
+    else:
+        raise ValueError(
+            f"Schema Probe does not support datasource_type={datasource_type}"
+        )
+
+    return {
+        "observation_id": f"probe:{request.get('request_id')}",
+        "kind": kind,
+        "status": "verified",
+        "complete": True,
+        "datasource_id": datasource_id,
+        "field": field,
+        "purpose": str(request.get("purpose") or ""),
+        "related_fact_ids": list(request.get("related_fact_ids") or []),
+        "facts": facts,
+    }
+
+
+def _resolve_requested_enum_values(
+    requested_values: list[str],
+    observed_values: list[str],
+) -> list[dict[str, Any]]:
+    """Resolve explicit requested labels against a bounded observed enumeration."""
+    observed = list(dict.fromkeys(
+        str(item).strip() for item in observed_values if str(item).strip()
+    ))
+    normalized_observed = {
+        value: re.sub(r"[\s\-_]+", "", value).casefold()
+        for value in observed
+    }
+    resolutions = []
+    for requested in requested_values:
+        requested_text = str(requested).strip()
+        requested_normalized = re.sub(r"[\s\-_]+", "", requested_text).casefold()
+        exact = next(
+            (
+                value for value, normalized in normalized_observed.items()
+                if normalized == requested_normalized
+            ),
+            None,
+        )
+        if exact is not None:
+            resolutions.append({
+                "requested_value": requested_text,
+                "status": "exact",
+                "observed_value": exact,
+                "similarity": 1.0,
+            })
+            continue
+
+        ranked = sorted(
+            (
+                (
+                    SequenceMatcher(None, requested_normalized, normalized).ratio(),
+                    value,
+                )
+                for value, normalized in normalized_observed.items()
+            ),
+            reverse=True,
+        )
+        best_score, best_value = ranked[0] if ranked else (0.0, "")
+        second_score = ranked[1][0] if len(ranked) > 1 else 0.0
+        if best_score >= 0.8 and best_score - second_score >= 0.1:
+            status = "similar"
+            observed_value = best_value
+        else:
+            status = "unresolved"
+            observed_value = ""
+        resolutions.append({
+            "requested_value": requested_text,
+            "status": status,
+            "observed_value": observed_value,
+            "similarity": round(best_score, 4),
+        })
+    return resolutions
+
+
+def _preparation_schema_probe_worker(
+    requests: list[dict[str, Any]],
+    datasources: list[dict[str, Any]],
+    runtime_user_context: dict[str, Any],
+    result_queue: mp.Queue,
+) -> None:
+    try:
+        _prime_worker_runtime_context(runtime_user_context)
+        datasources_by_id = {
+            int(item.get("datasource_id") or item.get("id") or 0): item
+            for item in datasources
+            if isinstance(item, dict)
+        }
+        observations = []
+        for item in requests:
+            try:
+                observations.append(_inspect_preparation_schema_fact(
+                    item,
+                    datasources_by_id[int(item.get("datasource_id") or 0)],
+                ))
+            except Exception as exc:
+                observations.append({
+                    "observation_id": f"probe:{item.get('request_id')}",
+                    "kind": str(item.get("probe_kind") or ""),
+                    "status": "unavailable",
+                    "complete": False,
+                    "datasource_id": int(item.get("datasource_id") or 0),
+                    "field": str(item.get("field") or ""),
+                    "purpose": str(item.get("purpose") or ""),
+                    "related_fact_ids": list(item.get("related_fact_ids") or []),
+                    "error": str(exc),
+                })
+        result_queue.put({"status": "success", "observations": observations})
+    except Exception as exc:
+        result_queue.put({
+            "status": "error",
+            "error_message": str(exc),
+            "traceback": traceback.format_exc(),
+        })
+
+
+def _preparation_relationship_probe_worker(
+    relationships: list[dict[str, Any]],
+    datasources: list[dict[str, Any]],
+    runtime_user_context: dict[str, Any],
+    result_queue: mp.Queue,
+) -> None:
+    try:
+        _prime_worker_runtime_context(runtime_user_context)
+        datasources_by_id = {
+            int(item.get("datasource_id") or item.get("id") or 0): item
+            for item in datasources
+            if isinstance(item, dict)
+        }
+        observations = [
+            _inspect_preparation_relationship(item, datasources_by_id)
+            for item in relationships
+        ]
+        result_queue.put({"status": "success", "observations": observations})
+    except Exception as exc:
+        result_queue.put({
+            "status": "error",
+            "error_message": str(exc),
+            "traceback": traceback.format_exc(),
+        })
+
+
+def execute_preparation_relationship_probe(
+    *,
+    relationships: list[dict[str, Any]],
+    datasources: list[dict[str, Any]],
+    runtime_user_context: dict[str, Any],
+    timeout_seconds: int = 90,
+    cancelled: Any = None,
+) -> list[dict[str, Any]]:
+    """Execute bounded relationship checks for Business Context."""
+    if not relationships:
+        return []
+    result_queue: mp.Queue = mp.Queue()
+    process = mp.Process(
+        target=_preparation_relationship_probe_worker,
+        args=(relationships, datasources, runtime_user_context, result_queue),
+        daemon=True,
+    )
+    process.start()
+    deadline = time.time() + max(int(timeout_seconds or 90), 1)
+    result: dict[str, Any] | None = None
+    try:
+        while time.time() < deadline:
+            if cancelled is not None:
+                cancelled()
+            try:
+                result = result_queue.get(
+                    timeout=min(0.5, max(deadline - time.time(), 0.01))
+                )
+                break
+            except Empty:
+                if not process.is_alive():
+                    break
+        if result is None:
+            raise RuntimeError(
+                "Business Context relationship Probe timed out"
+                if process.is_alive()
+                else "Business Context relationship Probe exited without a result"
+            )
+        if result.get("status") != "success":
+            raise RuntimeError(
+                str(result.get("error_message") or "relationship Probe failed")
+            )
+        return [
+            item for item in result.get("observations") or []
+            if isinstance(item, dict)
+        ]
+    finally:
+        if process.is_alive():
+            process.terminate()
+        process.join(5)
+        if process.is_alive():
+            process.kill()
+            process.join(5)
+        process.close()
+        result_queue.close()
+        result_queue.join_thread()
+
+
+def execute_preparation_schema_probe(
+    *,
+    requests: list[dict[str, Any]],
+    datasources: list[dict[str, Any]],
+    runtime_user_context: dict[str, Any],
+    timeout_seconds: int = 90,
+    cancelled: Any = None,
+) -> list[dict[str, Any]]:
+    """Execute bounded Schema fact checks for Business Context."""
+    if not requests:
+        return []
+    result_queue: mp.Queue = mp.Queue()
+    process = mp.Process(
+        target=_preparation_schema_probe_worker,
+        args=(requests, datasources, runtime_user_context, result_queue),
+        daemon=True,
+    )
+    process.start()
+    deadline = time.time() + max(int(timeout_seconds or 90), 1)
+    result: dict[str, Any] | None = None
+    try:
+        while time.time() < deadline:
+            if cancelled is not None:
+                cancelled()
+            try:
+                result = result_queue.get(
+                    timeout=min(0.5, max(deadline - time.time(), 0.01))
+                )
+                break
+            except Empty:
+                if not process.is_alive():
+                    break
+        if result is None:
+            raise RuntimeError(
+                "Business Context Schema Probe timed out"
+                if process.is_alive()
+                else "Business Context Schema Probe exited without a result"
+            )
+        if result.get("status") != "success":
+            raise RuntimeError(
+                str(result.get("error_message") or "Schema Probe failed")
+            )
+        return [
+            item for item in result.get("observations") or []
+            if isinstance(item, dict)
+        ]
+    finally:
+        if process.is_alive():
+            process.terminate()
+        process.join(5)
+        if process.is_alive():
+            process.kill()
+            process.join(5)
+        process.close()
+        result_queue.close()
+        result_queue.join_thread()
 
 
 def _execute_generated_code_worker(
@@ -5286,6 +6392,11 @@ def execute_python(
     )
     if contract_retry is None:
         contract_retry = _validate_generated_code_contract(code)
+    if contract_retry is None:
+        contract_retry = _validate_analysis_relationship_contract(
+            runtime.context,
+            code,
+        )
     if contract_retry is None:
         contract_retry = _validate_explicit_time_range_guard(
             code=code,

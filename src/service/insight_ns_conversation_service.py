@@ -511,6 +511,14 @@ class InsightNsConversationService:
                 context["dimensions"] = {
                     key: value for key, value in rows[data_index].items() if key != value_field
                 }
+            elif data_index >= 0 and value_field:
+                compiled_context = self._compiled_chart_point_context(
+                    content,
+                    selection if isinstance(selection, dict) else {},
+                    data_index=data_index,
+                    value_field=value_field,
+                )
+                context.update(compiled_context)
             elif isinstance(selection, dict) and selection.get('raw_value') not in (None, ''):
                 context["raw_value"] = selection.get('raw_value')
                 context["display_value"] = str(selection.get('raw_value'))
@@ -522,6 +530,57 @@ class InsightNsConversationService:
                 context["raw_value"] = report[start:end]
                 context["display_value"] = report[start:end]
         return context
+
+    @staticmethod
+    def _compiled_chart_point_context(
+        content: dict[str, Any],
+        selection: dict[str, Any],
+        *,
+        data_index: int,
+        value_field: str,
+    ) -> dict[str, Any]:
+        chart_spec = content.get('chart_spec') if isinstance(content.get('chart_spec'), dict) else {}
+        series = chart_spec.get('series') if isinstance(chart_spec.get('series'), list) else []
+        contract = content.get('chart_data_contract') if isinstance(content.get('chart_data_contract'), dict) else {}
+        encoding = contract.get('encoding') if isinstance(contract.get('encoding'), dict) else {}
+        value_fields = [str(item or '').strip() for item in (encoding.get('value_fields') or [])]
+        series_index = to_int(selection.get('series_index'), -1)
+        if not 0 <= series_index < len(series) and value_field in value_fields:
+            series_index = value_fields.index(value_field)
+        if not 0 <= series_index < len(series):
+            series_index = 0 if len(series) == 1 else -1
+        if series_index < 0:
+            return {}
+
+        selected_series = series[series_index] if isinstance(series[series_index], dict) else {}
+        series_data = selected_series.get('data') if isinstance(selected_series.get('data'), list) else []
+        if not 0 <= data_index < len(series_data):
+            return {}
+        point = series_data[data_index]
+        raw_value = point.get('value') if isinstance(point, dict) else point
+        if isinstance(raw_value, list):
+            raw_value = raw_value[-1] if raw_value else None
+        if raw_value is None:
+            return {}
+
+        dimensions: dict[str, Any] = {}
+        category_field = str(encoding.get('category_field') or '').strip()
+        category_value = point.get('name') if isinstance(point, dict) else None
+        if category_value in (None, ''):
+            x_axis = chart_spec.get('xAxis') if isinstance(chart_spec.get('xAxis'), dict) else {}
+            categories = x_axis.get('data') if isinstance(x_axis.get('data'), list) else []
+            if 0 <= data_index < len(categories):
+                category_value = categories[data_index]
+        if category_field and category_value not in (None, ''):
+            dimensions[category_field] = category_value
+        series_name = selected_series.get('name')
+        if series_name not in (None, ''):
+            dimensions['series_name'] = series_name
+        return {
+            'raw_value': raw_value,
+            'display_value': str(raw_value),
+            'dimensions': dimensions,
+        }
 
     @staticmethod
     def _artifact_has_evidence_id(artifact_view: dict[str, Any], evidence_id: str) -> bool:

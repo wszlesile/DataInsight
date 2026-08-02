@@ -11,7 +11,11 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from agent import CustomContext, get_data_insight_agent, get_input
 from agent.analysis_preparation import (
+    BusinessFactCoverageContract,
+    BusinessFactRequirementContract,
     BusinessContextContract,
+    BusinessQuestionContract,
+    BusinessQuestionCoverageContract,
     DatasourceSelectionContract,
     IntentContract,
     PreparationResult,
@@ -94,14 +98,6 @@ NO_DATASOURCE_ANALYSIS_REPLY = (
     '当前会话还没有关联任何数据源，暂时无法执行数据分析。'
     '请先在当前会话中关联相关数据源，然后再发起分析。'
 )
-TOO_MANY_DATASOURCES_ANALYSIS_REPLY_TEMPLATE = (
-    '当前会话关联了 {count} 个数据源，超过当前可安全分析的上限 {limit} 个，'
-    '暂时无法直接执行分析。为了避免上下文过长导致选错数据源或分析失败，'
-    '请先减少当前会话关联的数据源数量，建议只保留和本次问题最相关的 {limit} 个以内，'
-    '然后再发起分析。'
-)
-
-
 @dataclass
 class AgentRequest:
     """控制器层传入 Agent 层的标准化请求对象。"""
@@ -633,19 +629,6 @@ def _build_agent_input_with_runtime_instruction(
 ):
     """在必要时追加一条很短的运行时修复指令。"""
     extra_system_messages = [runtime_instruction] if runtime_instruction else []
-    if preparation is not None:
-        extra_system_messages.append(
-            "本轮选源使用的业务意图：\n"
-            + json.dumps(
-                {
-                    "business_goal": preparation.intent.business_goal,
-                    "business_subjects": preparation.intent.business_subjects,
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            + "\n该摘要只帮助理解用户问题，不限制查询、指标、图表、表格或报告表达。"
-        )
     return get_input(
         agent_request.user_message,
         namespace_id=runtime.conversation.insight_namespace_id,
@@ -703,6 +686,10 @@ def _prepare_analysis_context(
             datasource_snapshot=source_snapshot,
             conversation_context=conversation_context,
             runtime_config=runtime_config,
+            execution_context={
+                "token": agent_request.auth_token or "",
+                "database_conn_info": dict(agent_request.database_conn_info or {}),
+            },
             cancelled=lambda: _raise_if_analysis_task_cancelled(runtime),
             stage_callback=lambda stage: logger.info(
                 "analysis preparation stage started: conversation_id=%s turn_id=%s stage=%s",
@@ -736,10 +723,29 @@ def _prepare_analysis_context(
         result = PreparationResult(
             intent=IntentContract(
                 business_goal=user_query or "完成本轮数据洞察分析",
-                business_questions=[user_query or "完成本轮数据洞察分析"],
+                business_questions=[BusinessQuestionContract(
+                    question_id="question_1",
+                    business_question=user_query or "完成本轮数据洞察分析",
+                    required_business_facts=[BusinessFactRequirementContract(
+                        fact_id="question_1_fact_1",
+                        business_fact=user_query or "完成本轮数据洞察分析",
+                        semantic_definition="用户当前明确要求理解的业务事实",
+                    )],
+                )],
             ),
             selection=DatasourceSelectionContract(
                 selected_datasource_ids=selected_ids,
+                question_coverage=[BusinessQuestionCoverageContract(
+                    question_id="question_1",
+                    datasource_ids=selected_ids,
+                    fact_coverage=[BusinessFactCoverageContract(
+                        fact_id="question_1_fact_1",
+                        coverage_status="direct",
+                        datasource_ids=selected_ids,
+                        coverage_reason="保留原版数据源范围供正式分析核验",
+                    )],
+                    coverage_reason="Preparation 不可用，保留原版数据源范围",
+                )],
                 selection_reason="Preparation 不可用，保留原版数据源范围",
             ),
             business_context=BusinessContextContract(
@@ -1176,7 +1182,7 @@ def _build_followup_hint_instruction(
             '',
             '本轮 followup 规划要求：',
             '- 如果当前用户只是要求换图表、补图表、补报告、换展示方式、继续展示，且没有明确新增数据源/对象/时间范围/指标，优先围绕上述最近成功 used_datasource_ids 重新生成结果。',
-            '- selected_datasource_ids 只是当前会话候选全集；不在最近成功 used_datasource_ids 中的数据源，只有在当前用户明确点名、历史纠错明确要求补充，或最近成功结果无法满足当前追问时才需要探测或分析。',
+            '- 如果存在 analysis_semantic_context，selected_datasource_ids 是 Preparation 为本轮追问确定的业务语义空间；否则它才是当前会话候选全集。应优先延续最近成功 used_datasource_ids，同时完整覆盖本轮明确新增的业务问题。',
             '- 对于表型数据源，SQL 必须使用 datasource_identifier；不要根据其它 selected 数据源名称自行猜 catalog、schema 或表名。',
         ])
     return '\n'.join(lines)
@@ -1311,7 +1317,7 @@ def _build_rerun_instruction(
                 '',
                 '本轮是刷新一个 followup 分析结果：',
                 '- 如果本轮原始问题只是换图表、补图表、补报告、换展示方式或继续展示，刷新时必须优先围绕上述最近成功 used_datasource_ids 重新生成结果。',
-                '- selected_datasource_ids 只是当前会话候选全集；不在最近成功 used_datasource_ids 中的数据源，不应在刷新时被当作新目标重新探测或分析。',
+                '- 如果存在 analysis_semantic_context，selected_datasource_ids 是 Preparation 为本轮原始问题确定的业务语义空间；否则它才是当前会话候选全集。刷新不得把范围内的数据源自行解释成新的分析目标。',
                 '- 只有本轮原始问题明确新增数据源、对象、时间范围或指标时，才允许扩展到其它候选数据源。',
             ])
     return '\n'.join(lines)
@@ -1331,42 +1337,6 @@ def _has_bound_datasource(runtime: ConversationRunContext) -> bool:
         if isinstance(item, dict) and item
     ]
     return bool(selected_ids or selected_items)
-
-
-def _get_too_many_datasource_policy(runtime: ConversationRunContext) -> dict[str, int]:
-    """基于当前会话真实数据源数量实时判断是否超出安全上下文上限。"""
-    snapshot = runtime.active_datasource_snapshot if isinstance(runtime.active_datasource_snapshot, dict) else {}
-    selected_ids = [
-        item
-        for item in snapshot.get('selected_datasource_ids', [])
-        if item
-    ]
-    selected_items = [
-        item
-        for item in snapshot.get('selected_datasource_snapshot', [])
-        if isinstance(item, dict) and item
-    ]
-    count = len(selected_ids) if selected_ids else len(selected_items)
-    try:
-        limit = max(int(getattr(Config, 'DATASOURCE_CONTEXT_MAX_COUNT', 30) or 0), 0)
-    except (TypeError, ValueError):
-        limit = 0
-    if count <= 0 or limit <= 0 or count <= limit:
-        return {}
-    return {"count": count, "limit": limit}
-
-
-def _should_finish_with_too_many_datasources(runtime: ConversationRunContext, user_message: str) -> bool:
-    """分析型请求在数据源过多时，不进入 execute_python。"""
-    return _is_analysis_request_expected(runtime, user_message) and bool(_get_too_many_datasource_policy(runtime))
-
-
-def _build_too_many_datasources_reply(runtime: ConversationRunContext) -> str:
-    policy = _get_too_many_datasource_policy(runtime)
-    return TOO_MANY_DATASOURCES_ANALYSIS_REPLY_TEMPLATE.format(
-        count=policy.get('count', 0),
-        limit=policy.get('limit', 0),
-    )
 
 
 def _should_finish_without_datasource(runtime: ConversationRunContext, user_message: str) -> bool:
@@ -2257,28 +2227,6 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
             else None
         )
 
-        if (
-            _should_finish_with_too_many_datasources(runtime, agent_request.user_message)
-            and (
-                preparation is None
-                or len(preparation.selection.selected_datasource_ids)
-                > Config.DATASOURCE_CONTEXT_MAX_COUNT
-            )
-        ):
-            assistant_message = _build_too_many_datasources_reply(runtime)
-            allow_report_only = True
-            return _finalize_run_with_fresh_session(
-                runtime=runtime,
-                username=agent_request.username,
-                user_message=agent_request.user_message,
-                analysis_flow_started=analysis_flow_started,
-                assistant_message=assistant_message,
-                analysis_report=analysis_report,
-                charts=charts,
-                tables=tables,
-                allow_report_only=allow_report_only,
-            )
-
         agent = get_data_insight_agent(runtime_config)
 
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
@@ -2528,41 +2476,6 @@ def _stream_with_runtime(
             if analysis_request_expected
             else None
         )
-
-        if (
-            _should_finish_with_too_many_datasources(runtime, agent_request.user_message)
-            and (
-                preparation is None
-                or len(preparation.selection.selected_datasource_ids)
-                > Config.DATASOURCE_CONTEXT_MAX_COUNT
-            )
-        ):
-            assistant_message = _build_too_many_datasources_reply(runtime)
-            allow_report_only = True
-            yield _build_progress_event(
-                'assistant',
-                conversation_id=runtime.conversation.id,
-                turn_id=runtime.turn.id,
-                stage='too_many_datasources',
-                message=assistant_message,
-            )
-            _finalize_run_with_fresh_session(
-                runtime=runtime,
-                username=agent_request.username,
-                user_message=agent_request.user_message,
-                analysis_flow_started=analysis_flow_started,
-                assistant_message=assistant_message,
-                analysis_report=analysis_report,
-                charts=charts,
-                tables=tables,
-                allow_report_only=allow_report_only,
-            )
-            yield _build_progress_event(
-                'done',
-                conversation_id=runtime.conversation.id,
-                turn_id=runtime.turn.id,
-            )
-            return
 
         agent = get_data_insight_agent(runtime_config)
 
@@ -2976,11 +2889,27 @@ def stream_existing_turn_events(
         ).first()
         if conversation is None or turn is None:
             raise ValueError('分析轮次不存在或已被删除')
+        selected_datasource_ids = safe_json_loads(turn.selected_datasource_ids_json, [])
+        selected_datasource_snapshot = safe_json_loads(turn.selected_datasource_snapshot_json, [])
+        if selected_datasource_ids and not selected_datasource_snapshot:
+            selected_datasource_snapshot = ConversationContextService(
+                session
+            )._build_turn_datasource_snapshot(
+                conversation_id=conversation.id,
+                datasource_ids=selected_datasource_ids,
+            )
+            logger.info(
+                "rehydrated missing turn datasource snapshot: conversation_id=%s "
+                "turn_id=%s datasource_count=%s",
+                conversation.id,
+                turn.id,
+                len(selected_datasource_snapshot),
+            )
         active_snapshot = {
             "namespace_id": conversation.insight_namespace_id,
             "conversation_id": conversation.id,
-            "selected_datasource_ids": safe_json_loads(turn.selected_datasource_ids_json, []),
-            "selected_datasource_snapshot": safe_json_loads(turn.selected_datasource_snapshot_json, []),
+            "selected_datasource_ids": selected_datasource_ids,
+            "selected_datasource_snapshot": selected_datasource_snapshot,
         }
         return ConversationRunContext(
             conversation=conversation,

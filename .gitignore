@@ -9,7 +9,6 @@ wheels/
 # Virtual environments
 .venv
 uv.lock
-pyproject.toml
 # Generated files
 *.db
 *.html

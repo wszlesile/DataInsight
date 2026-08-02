@@ -1,3 +1,4 @@
+import copy
 import json
 import re
 from typing import Any
@@ -177,6 +178,39 @@ def _build_datasource_payload_item(datasource: InsightDatasource) -> dict[str, A
     return payload
 
 
+def _build_datasource_prompt_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Remove duplicated schema indexes while preserving every field definition."""
+    payload = copy.deepcopy(item)
+    schema = payload.get("metadata_schema")
+    if not isinstance(schema, dict):
+        return payload
+
+    properties = schema.get("properties")
+    property_names = list(properties) if isinstance(properties, dict) else []
+    required = schema.get("required")
+    if (
+        property_names
+        and isinstance(required, list)
+        and set(str(value) for value in required) == set(property_names)
+    ):
+        schema.pop("required", None)
+        schema["all_properties_required"] = True
+
+    capabilities = payload.get("field_capabilities")
+    if isinstance(capabilities, dict):
+        queryable_fields = capabilities.get("queryable_fields")
+        if (
+            property_names
+            and isinstance(queryable_fields, list)
+            and set(str(value) for value in queryable_fields) == set(property_names)
+        ):
+            capabilities.pop("queryable_fields", None)
+            capabilities["all_properties_queryable"] = True
+        if not any(capabilities.values()):
+            payload.pop("field_capabilities", None)
+    return payload
+
+
 def _build_execution_context_item(execution: InsightNsExecution, include_code: bool = False) -> dict[str, Any]:
     payload = {
         "execution_id": execution.id,
@@ -265,41 +299,13 @@ def get_datasource_message(
     elif namespace_id_int <= 0:
         namespace_id_int = to_int(snapshot.get('namespace_id'), 0)
 
-    selected_ids = [
-        item
-        for item in snapshot.get('selected_datasource_ids', [])
-        if item
-    ]
-    selected_items = [
-        item
-        for item in snapshot.get('selected_datasource_snapshot', [])
-        if isinstance(item, dict) and item
-    ]
-    datasource_limit = max(int(getattr(Config, 'DATASOURCE_CONTEXT_MAX_COUNT', 10) or 0), 0)
-    datasource_count = len(selected_ids) if selected_ids else len(selected_items)
-    if datasource_limit > 0 and datasource_count > datasource_limit:
-        policy = {
-            "status": "too_many_datasources",
-            "bound_datasource_count": datasource_count,
-            "max_datasource_count": datasource_limit,
-        }
-        payload: dict[str, Any] = {
-            "datasources": [],
-            "selected_datasource_ids": [],
-            "datasource_context_policy": policy,
-        }
-        if namespace_id_int > 0:
-            payload["namespace_id"] = namespace_id_int
-        return SystemMessage(
-            "当前会话关联的数据源数量超过当前安全上下文上限。\n"
-            "- 如果用户当前是在发起数据分析、统计、绘图、报表或依赖数据源内容的问题，不要调用 `execute_python`，不要生成 Python 代码。\n"
-            "- 请直接用自然语言告诉用户：当前会话关联的数据源过多，需要先减少到更聚焦的范围后再进行分析。\n"
-            f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
-        )
-
     snapshot_items = snapshot.get('selected_datasource_snapshot', [])
     if snapshot_items:
-        datasource_items = snapshot_items
+        datasource_items = [
+            _build_datasource_prompt_item(item)
+            for item in snapshot_items
+            if isinstance(item, dict)
+        ]
     else:
         datasource_items = [
             _build_datasource_payload_item(datasource)
@@ -316,7 +322,9 @@ def get_datasource_message(
             f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
         )
 
-    payload: dict[str, Any] = {"datasources": datasource_items}
+    semantic_context = snapshot.get("analysis_semantic_context")
+    payload: dict[str, Any] = {}
+    payload["datasources"] = datasource_items
     selected_ids = [
         to_int(item, 0)
         for item in snapshot.get('selected_datasource_ids', [])
@@ -326,6 +334,10 @@ def get_datasource_message(
         payload["selected_datasource_ids"] = selected_ids
     if namespace_id_int > 0:
         payload["namespace_id"] = namespace_id_int
+    if isinstance(semantic_context, dict) and semantic_context:
+        # Close the large Schema payload with the business purpose it serves.
+        # This keeps the handoff salient without duplicating or strengthening it.
+        payload["analysis_semantic_context"] = semantic_context
 
     instruction_lines = [
         "当前洞察空间可用的数据源信息：",
@@ -336,7 +348,29 @@ def get_datasource_message(
         "- 如果 `local_file` 数据源包含 `recommended_loader`，必须优先遵守该推荐加载函数。",
         "- `recommended_loader=load_local_file` 表示普通文件读取，返回完整 DataFrame；`recommended_loader=load_local_file_low_memory` 表示大文件分批读取，返回批次迭代器，必须用 `for chunk in ...` 逐批处理。",
     ]
-    if selected_ids:
+    if selected_ids and semantic_context:
+        instruction_lines.append(
+            f"- `selected_datasource_ids` 当前为 {selected_ids}，表示 Preparation 已围绕本轮完整业务意图确定的数据源语义空间；正式分析不再重新选源，也不能静默丢弃其中的业务问题。"
+        )
+        instruction_lines.append(
+            "- `analysis_semantic_context` 说明业务目标、逐问题覆盖和洞察业务血缘。它不是 SQL、指标、图表或报告模板；查询、计算和洞察表达仍由正式分析根据真实数据自主完成。"
+        )
+        instruction_lines.append(
+            "- Schema 字段的 `observed_value_profile` 是 Preparation Probe 回写的字段语义结论，不包含样本行：`empty` 表示未观察到有效值，`opaque_identifier` 表示值仅适合作为关联标识；`requested_value_resolutions` 中的 exact/similar 是已核实的业务枚举映射，unresolved 不能直接用于精确筛选。"
+        )
+        instruction_lines.append(
+            "- Schema 关系的 `aggregation_safety` 按当前数据源方向描述连接后的度量可加性；`unsafe_repeated_by_join` 表示该侧度量会被另一侧多行展开。除非存在明确分摊规则或已确认函数依赖，不能把该侧度量归因到另一侧维度；整体值应在原事实粒度独立聚合。"
+        )
+        instruction_lines.append(
+            "- `question_coverage` 是选源判断，`insight_lineage` 是结合完整 Schema 与关系后的最终语义判断；两者不一致时以后者为准。"
+        )
+        instruction_lines.append(
+            "- `partial/unresolved` 事实不得由相邻字段或代理指标冒充。`unsupported_field_bindings` 只用于排除错误字段映射，`business_impact` 是该缺口的业务边界；字段、关系和基数信息只用于实现查询与计算。正式 probe 只核实查询值格式、时间边界和无数据口径，不再重做跨源关系发现。`unknown/alignable/not_joinable` 关系不得当作已确认 JOIN。"
+        )
+        instruction_lines.append(
+            "- `used_datasource_ids` 仍只填写本轮代码真实访问的数据源。无需为了形式访问语义空间内每个来源，但必须完整回答业务问题并保留其事实边界。"
+        )
+    elif selected_ids:
         instruction_lines.append(
             f"- `selected_datasource_ids` 当前为 {selected_ids}，表示这些数据源是当前会话已选候选范围，可从中选择本轮真正相关的数据源，不表示必须全部访问。"
         )
@@ -446,6 +480,11 @@ def get_memory_messages(
             active_snapshot_override=active_snapshot_override,
         )
         if analysis_state_payload:
+            if active_snapshot_override:
+                # The same snapshot is already part of the mandatory datasource
+                # message. Keeping it here would duplicate full schemas and may
+                # present the canonical semantic context as optional memory.
+                analysis_state_payload.pop("active_datasource_snapshot", None)
             analysis_state_payload = _prune_analysis_state_payload(
                 analysis_state_payload,
                 mode=context_mode,

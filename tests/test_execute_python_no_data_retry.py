@@ -12,7 +12,6 @@ from agent import load_system_prompt  # noqa: E402
 from agent.tools import (  # noqa: E402
     NoDataFoundError,
     _classify_execution_error,
-    _extract_retryable_no_data_from_result,
     raise_no_data_error,
     save_empty_analysis_result,
 )
@@ -31,21 +30,6 @@ class ExecutePythonNoDataRetryTestCase(unittest.TestCase):
             _classify_execution_error(ctx.exception, str(ctx.exception)),
             "no_data_found",
         )
-
-    def test_legacy_empty_analysis_result_is_downgraded_to_no_data_feedback(self) -> None:
-        empty_result = save_empty_analysis_result(
-            title="分析结果",
-            reason="按当前筛选条件过滤后无数据。",
-            detail_lines=["时间范围：2026-04-01 ~ 2026-04-19"],
-        )
-
-        feedback = _extract_retryable_no_data_from_result(empty_result)
-
-        self.assertIsNotNone(feedback)
-        assert feedback is not None
-        self.assertEqual(feedback["error_type"], "no_data_found")
-        self.assertIn("按当前筛选条件过滤后无数据。", feedback["error_message"])
-        self.assertIn("时间范围：2026-04-01 ~ 2026-04-19", feedback["error_message"])
 
     def test_system_prompt_mentions_no_data_retry_contract(self) -> None:
         load_system_prompt.cache_clear()

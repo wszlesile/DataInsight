@@ -43,6 +43,14 @@ def build_chart_document(
     x_name = _coalesce_field(x_field, category_field)
     y_name = _coalesce_field(y_field, value_field)
 
+    if chart_kind_value in {"bar", "line"}:
+        dataset = _reshape_wide_series_dataset(
+            dataset,
+            category_field=category_name,
+            value_field=value_name,
+            series_field=str(series_field or "").strip() or None,
+        )
+
     if chart_kind_value in {"bar", "line", "boxplot"}:
         if not category_name or not value_name:
             raise ValueError(f"{chart_kind_value} chart_document requires category_field and value_field.")
@@ -124,12 +132,16 @@ def build_chart_result(
         top_n=top_n,
         value_precision=value_precision,
     )
-    return {
+    result = {
         "title": str(title or "").strip(),
         "chart_type": "echarts",
         "description": str(description or "").strip(),
         "chart_document": document,
     }
+    source_query_key = _data_source_query_key(data)
+    if source_query_key:
+        result["chart_data_contract"] = {"source_query_key": source_query_key}
+    return result
 
 
 def build_multi_metric_chart_result(
@@ -141,6 +153,7 @@ def build_multi_metric_chart_result(
     description: str = "",
     value_labels: list[str] | tuple[str, ...] | None = None,
     chart_kind: str = "bar",
+    series_field: str | None = None,
     sort_field: str | None = None,
     sort_order: str = "",
     limit: int | None = None,
@@ -150,13 +163,13 @@ def build_multi_metric_chart_result(
     value_precision: int = 2,
 ) -> dict[str, Any]:
     chart_kind_value = _normalize_chart_kind(chart_kind)
-    if chart_kind_value != "bar":
-        raise ValueError("build_multi_metric_chart_result currently supports chart_kind='bar' only.")
+    if chart_kind_value not in {"bar", "line"}:
+        raise ValueError("build_multi_metric_chart_result supports chart_kind='bar' or 'line'.")
 
     dataset = _normalize_dataset(data)
     normalized_value_fields = _normalize_string_list(value_fields)
-    if len(normalized_value_fields) < 2:
-        raise ValueError("build_multi_metric_chart_result requires at least two value_fields.")
+    if not normalized_value_fields:
+        raise ValueError("build_multi_metric_chart_result requires at least one value_field.")
 
     normalized_value_labels = _normalize_string_list(value_labels or [], dedupe=False)
     if normalized_value_labels and len(normalized_value_labels) != len(normalized_value_fields):
@@ -165,6 +178,24 @@ def build_multi_metric_chart_result(
     category_name = str(category_field or "").strip()
     if not category_name:
         raise ValueError("build_multi_metric_chart_result requires category_field.")
+
+    if len(normalized_value_fields) == 1:
+        return build_chart_result(
+            chart_kind=chart_kind_value,
+            data=data,
+            title=title,
+            description=description,
+            category_field=category_name,
+            value_field=normalized_value_fields[0],
+            series_field=series_field,
+            sort_field=sort_field,
+            sort_order=sort_order,
+            limit=limit,
+            orientation=orientation,
+            label_mode=label_mode,
+            stack=stack,
+            value_precision=value_precision,
+        )
 
     document = {
         "version": DEFAULT_DOCUMENT_VERSION,
@@ -177,13 +208,16 @@ def build_multi_metric_chart_result(
             "value_field": normalized_value_fields[0],
             "value_fields": normalized_value_fields,
             "value_labels": normalized_value_labels,
-            "series_field": None,
+            "series_field": str(series_field or "").strip() or None,
             "x_field": category_name,
             "y_field": normalized_value_fields[0],
         },
         "transform": {
-            "sort_field": str(sort_field or normalized_value_fields[0]).strip() or None,
-            "sort_order": "asc" if str(sort_order or "").lower() == "asc" else "desc",
+            "sort_field": str(
+                sort_field
+                or (category_name if chart_kind_value == "line" else normalized_value_fields[0])
+            ).strip() or None,
+            "sort_order": "asc" if str(sort_order or ("asc" if chart_kind_value == "line" else "desc")).lower() == "asc" else "desc",
             "limit": _to_positive_int(limit),
             "top_n": None,
         },
@@ -196,12 +230,16 @@ def build_multi_metric_chart_result(
         },
     }
     _validate_chart_document(document)
-    return {
+    result = {
         "title": str(title or "").strip(),
         "chart_type": "echarts",
         "description": str(description or "").strip(),
         "chart_document": document,
     }
+    source_query_key = _data_source_query_key(data)
+    if source_query_key:
+        result["chart_data_contract"] = {"source_query_key": source_query_key}
+    return result
 
 
 def build_chart_suite(
@@ -223,6 +261,7 @@ def build_chart_suite(
     max_charts: int = 3,
     value_precision: int = 2,
 ) -> list[dict[str, Any]]:
+    source_query_key = _data_source_query_key(data)
     dataset = _normalize_dataset(data)
     rows = dataset["rows"]
     categories = _ordered_unique([row.get(category_field) for row in rows if category_field in row])
@@ -319,6 +358,10 @@ def build_chart_suite(
         deduped_suite.append(item)
         if len(deduped_suite) >= max(1, int(max_charts or 1)):
             break
+    if source_query_key:
+        for chart in deduped_suite:
+            contract = chart.setdefault("chart_data_contract", {})
+            contract["source_query_key"] = source_query_key
     return deduped_suite
 
 
@@ -337,11 +380,23 @@ def normalize_chart_result_item(chart: Any, index: int = 1) -> dict[str, Any]:
         )
         _validate_chart_semantic_encoding(document)
         compiled_spec = mark_chart_spec_backend_managed(compile_chart_document(document))
+        existing_contract = (
+            chart.get("chart_data_contract")
+            if isinstance(chart.get("chart_data_contract"), dict)
+            else {}
+        )
+        data_contract = {
+            "encoding": dict(document.get("encoding") or {}),
+        }
+        source_query_key = str(existing_contract.get("source_query_key") or "").strip()
+        if source_query_key:
+            data_contract["source_query_key"] = source_query_key
         return {
             "title": document.get("title") or str(chart.get("title") or f"Chart {index}").strip(),
             "chart_type": "echarts",
             "description": document.get("description") or str(chart.get("description") or "").strip(),
             "chart_spec": finalize_chart_spec(compiled_spec),
+            "chart_data_contract": data_contract,
         }
 
     if not isinstance(chart_spec, dict) or not chart_spec:
@@ -360,12 +415,24 @@ def normalize_chart_result_item(chart: Any, index: int = 1) -> dict[str, Any]:
         if inferred_document
         else finalize_chart_spec(mark_chart_spec_backend_managed(chart_spec))
     )
-    return {
+    normalized = {
         "title": title,
         "chart_type": chart_type,
         "description": description,
         "chart_spec": final_spec,
     }
+    if inferred_document:
+        normalized["chart_data_contract"] = {
+            "encoding": dict(inferred_document.get("encoding") or {}),
+        }
+    return normalized
+
+
+def _data_source_query_key(data: Any) -> str:
+    attrs = getattr(data, "attrs", None)
+    if not isinstance(attrs, dict):
+        return ""
+    return str(attrs.get("data_insight_query_key") or "").strip()
 
 
 def _validate_chart_semantic_encoding(document: dict[str, Any]) -> None:
@@ -617,8 +684,8 @@ def _compile_cartesian_chart(document: dict[str, Any]) -> dict[str, Any]:
     value_fields = list(encoding.get("value_fields") or [])
     series_field = encoding.get("series_field")
 
-    if chart_kind == "bar" and len(value_fields) > 1 and not series_field:
-        return _compile_multi_metric_bar_chart(document, rows)
+    if chart_kind in {"bar", "line"} and len(value_fields) > 1:
+        return _compile_multi_metric_chart(document, rows)
 
     rows = _sort_rows(rows, transform.get("sort_field"), transform.get("sort_order"))
     if transform.get("limit"):
@@ -689,14 +756,16 @@ def _compile_cartesian_chart(document: dict[str, Any]) -> dict[str, Any]:
     return spec
 
 
-def _compile_multi_metric_bar_chart(document: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _compile_multi_metric_chart(document: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
     encoding = document["encoding"]
     presentation = document["presentation"]
     transform = document["transform"]
+    chart_kind = document["chart_kind"]
 
     category_field = encoding["category_field"]
     value_fields = list(encoding.get("value_fields") or [])
     value_labels = list(encoding.get("value_labels") or [])
+    series_field = encoding.get("series_field")
 
     rows = _sort_rows(rows, transform.get("sort_field"), transform.get("sort_order"))
     rows = _limit_rows(rows, transform.get("limit"))
@@ -704,27 +773,35 @@ def _compile_multi_metric_bar_chart(document: dict[str, Any], rows: list[dict[st
     categories = _ordered_unique([row.get(category_field) for row in rows])
     categories = ["" if value is None else str(value) for value in categories]
 
-    category_rows: dict[str, dict[str, Any]] = {}
+    category_rows: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows:
         category_value = "" if row.get(category_field) is None else str(row.get(category_field))
-        category_rows[category_value] = row
+        series_value = "" if not series_field or row.get(series_field) is None else str(row.get(series_field))
+        category_rows[(category_value, series_value)] = row
 
     series_items = []
-    for index, value_field in enumerate(value_fields):
-        display_name = value_labels[index] if index < len(value_labels) and value_labels[index] else value_field
-        series_items.append({
-            "type": "bar",
-            "name": display_name,
-            "data": [category_rows.get(category, {}).get(value_field) for category in categories],
-            "label": {"show": presentation["label_mode"] == "always"},
-        })
+    series_values = _ordered_unique([row.get(series_field) for row in rows]) if series_field else [""]
+    for series_value in series_values:
+        normalized_series = "" if series_value is None else str(series_value)
+        for index, value_field in enumerate(value_fields):
+            value_label = value_labels[index] if index < len(value_labels) and value_labels[index] else value_field
+            display_name = f"{normalized_series} · {value_label}" if normalized_series else value_label
+            series_items.append({
+                "type": chart_kind,
+                "name": display_name,
+                "data": [
+                    category_rows.get((category, normalized_series), {}).get(value_field)
+                    for category in categories
+                ],
+                "label": {"show": presentation["label_mode"] == "always"},
+            })
 
     if presentation.get("stack"):
         for item in series_items:
             item["stack"] = "total"
 
-    orientation = _resolve_bar_orientation(categories, "bar", presentation.get("orientation"))
-    if orientation == "horizontal":
+    orientation = _resolve_bar_orientation(categories, chart_kind, presentation.get("orientation"))
+    if chart_kind == "bar" and orientation == "horizontal":
         x_axis = {"type": "value"}
         y_axis = {"type": "category", "data": categories}
     else:
@@ -885,12 +962,12 @@ def _validate_chart_document(document: dict[str, Any]) -> None:
         if not encoding.get("category_field") or (not encoding.get("value_field") and not value_fields):
             raise ValueError(f"{chart_kind} chart_document requires category_field and value_field.")
     if len(value_fields) > 1:
-        if chart_kind not in {"bar", "boxplot"}:
-            raise ValueError("multi-metric chart_document currently supports bar and boxplot charts only.")
+        if chart_kind not in {"bar", "line", "boxplot"}:
+            raise ValueError("multi-metric chart_document supports bar, line, and boxplot charts.")
         if chart_kind == "boxplot" and not _is_boxplot_five_number_fields(value_fields):
             raise ValueError("boxplot chart_document value_fields must contain five-number summary fields.")
-        if encoding.get("series_field"):
-            raise ValueError("multi-metric chart_document cannot be combined with series_field.")
+        if chart_kind == "boxplot" and encoding.get("series_field"):
+            raise ValueError("boxplot five-number summaries cannot be combined with series_field.")
     if chart_kind == "scatter":
         if not encoding.get("x_field") or not encoding.get("y_field"):
             raise ValueError("scatter chart_document requires x_field and y_field.")
@@ -993,6 +1070,58 @@ def _normalize_dataset(data: Any) -> dict[str, Any]:
         raise ValueError("unsupported dataset row type.")
 
     raise ValueError("unsupported chart_document dataset type.")
+
+
+def _reshape_wide_series_dataset(
+    dataset: dict[str, Any],
+    *,
+    category_field: str | None,
+    value_field: str | None,
+    series_field: str | None,
+) -> dict[str, Any]:
+    """Normalize an unambiguous pivot table into the chart API's long-form contract."""
+    columns = list(dataset.get("columns") or [])
+    if (
+        not category_field
+        or not value_field
+        or not series_field
+        or category_field not in columns
+        or value_field in columns
+        or series_field in columns
+    ):
+        return dataset
+
+    series_columns = [column for column in columns if column != category_field]
+    if not series_columns:
+        return dataset
+
+    rows = list(dataset.get("rows") or [])
+    for row in rows:
+        for column in series_columns:
+            value = row.get(column)
+            if value is not None and _coerce_number_or_none(value) is None:
+                return dataset
+
+    long_rows = []
+    for row in rows:
+        for column in series_columns:
+            value = row.get(column)
+            if value is None:
+                continue
+            long_rows.append(
+                {
+                    category_field: row.get(category_field),
+                    series_field: column,
+                    value_field: value,
+                }
+            )
+
+    if not long_rows:
+        return dataset
+    return {
+        "columns": [category_field, series_field, value_field],
+        "rows": long_rows,
+    }
 
 
 def _normalize_row(row: dict[str, Any], columns: list[str]) -> dict[str, Any]:

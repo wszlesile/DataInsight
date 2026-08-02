@@ -2,7 +2,11 @@ from types import SimpleNamespace
 
 import agent.invoker as invoker
 from agent.analysis_preparation import (
+    BusinessFactCoverageContract,
+    BusinessFactRequirementContract,
     BusinessContextContract,
+    BusinessQuestionContract,
+    BusinessQuestionCoverageContract,
     DatasourceSelectionContract,
     IntentContract,
     PreparationResult,
@@ -54,10 +58,29 @@ def _preparation(snapshot: dict) -> PreparationResult:
         intent=IntentContract(
             business_goal="分析合同情况",
             business_subjects=["合同"],
-            business_questions=["合同情况如何"],
+            business_questions=[BusinessQuestionContract(
+                question_id="question_1",
+                business_question="合同情况如何",
+                required_business_facts=[BusinessFactRequirementContract(
+                    fact_id="question_1_fact_1",
+                    business_fact="合同事实",
+                    semantic_definition="合同业务事实",
+                )],
+            )],
         ),
         selection=DatasourceSelectionContract(
             selected_datasource_ids=[11],
+            question_coverage=[BusinessQuestionCoverageContract(
+                question_id="question_1",
+                datasource_ids=[11],
+                fact_coverage=[BusinessFactCoverageContract(
+                    fact_id="question_1_fact_1",
+                    coverage_status="direct",
+                    datasource_ids=[11],
+                    coverage_reason="合同数据源直接覆盖",
+                )],
+                coverage_reason="合同数据源直接覆盖",
+            )],
             selection_reason="合同事实来源",
         ),
         business_context=BusinessContextContract(),

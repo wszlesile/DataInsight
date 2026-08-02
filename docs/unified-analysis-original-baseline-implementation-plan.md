@@ -52,23 +52,26 @@
 
 ### 1A. Intent Analysis
 
-只输出供选源使用的业务意图摘要，不输出分析模式、指标、报告结构或执行约束。
+输出供选源使用的完整业务意图：业务目标、共同构成完整回答的业务问题，以及每个问题所需的业务事实概念。不输出字段、分析模式、指标、报告结构或执行约束。
 
 ### 1B. 渐进式选源
 
-1. 本地检索先生成高召回候选。
-2. LLM 根据业务意图和候选概要请求必要的完整 Schema。
-3. 最终选择相关数据源。
-4. 候选阈值不能由正式 Prompt 容量反向决定。
-5. 一个数据源的 Schema 一旦披露必须完整，不裁剪字段。
+1. Intent 为每项业务事实分配稳定 `fact_id` 并定义业务语义，避免 Selection 和 Business Context 分别改写“营收、签约额、报价”等口径。
+2. 本地检索先生成高召回候选。
+3. LLM 根据业务意图和候选概要请求必要的完整 Schema。
+4. 对每个业务问题中的每个 `fact_id` 分别建立 `direct/partial/unresolved` 覆盖和来源映射；问题状态、问题来源集合与最终选源集合由本地代码从事实覆盖确定性推导，LLM 不重复输出派生并集。
+5. 候选阈值不能由正式 Prompt 容量反向决定。
+6. 一个数据源的 Schema 一旦披露必须完整，不裁剪字段。
 
-### 1C. ER 关系补充
+### 1C. 洞察分析业务血缘
 
 1. 在 Selection 的同一 Preparation 语义中判断数据源关系。
 2. Schema 已明确声明的关系直接记录。
 3. 只有关系选择确实依赖枚举、格式或覆盖事实时，才调用受限 Probe API。
 4. 无法确认的关系记录为 unresolved。
-5. 关系写回数据源 Schema，不形成额外大对象。
+5. 为每个业务问题建立业务事实到真实字段、数据源和关系路径的 lineage。
+6. lineage 只定位事实语义，不规划 SQL、算法、Metric、图表或报告。
+7. 正式交付为完整已选 Schema 与轻量 `analysis_semantic_context`，不再额外注入零散 Intent 文本。
 
 ### 1D. 降级
 
@@ -82,6 +85,8 @@ Preparation 任何非授权类错误都不能终止正式分析。降级顺序�
 
 - 单数据源简单问题最多增加一次 Intent/Selection 调用，或通过合并调用避免额外开销。
 - 多数据源问题选源召回率不低于原版。
+- 用户明确提出的每个业务对象和口径均有 question coverage，不得静默遗漏。
+- Business Context 不只输出物理 ER，还能说明各数据源如何共同支撑当前业务问题。
 - 正式 Agent 收到完整选中 Schema。
 - Preparation 不生成失败报告，不冻结洞察语义。
 
@@ -148,50 +153,51 @@ Preparation 任何非授权类错误都不能终止正式分析。降级顺序�
 - 确认无数据时生成完整无数据洞察报告。
 - 修复后报告内容和图表不因无关错误被删除。
 
-## 7. 阶段四：Metric/Evidence Runtime
+## 7. 阶段四：后置 Evidence 编译
 
-此阶段必须拆成独立小批次，不能一次替换原版结果保存协议。
+此阶段必须拆成独立小批次，不能一边修改正式 Agent 契约，一边试验 Evidence 编译。
+详细设计以 `post-analysis-evidence-architecture.md` 为准。
 
-### 4A. QueryResult 注册
+### 4A. 成功执行快照
 
-- 正式查询与派生变换注册为可追溯 QueryResult。
-- 保留原版所有数据源查询能力。
+- 冻结成功 execution 的代码、查询快照、完整 Schema 和最终产物。
+- 对代码与结果生成 hash，禁止跨 execution 拼接 Evidence。
 
-### 4B. Metric 对象
+### 4B. Lineage Index
 
-- 聚合、分组、identity 和派生计算通过 Runtime API 注册。
-- MetricDefinition 保存真实查询、字段、过滤、分组、公式和单位。
-- 不同 metric key 声称相同计算边界时明确拒绝，不能静默复用另一个 Metric。
+- 使用 Python AST、SQL AST 和运行时 render event 建立查询、操作和产物位置关系。
+- 正式 Agent 不调用 Metric API，也不为 Evidence 改写业务计算。
+- 不支持的计算标记 unresolved，不能按名称或数值相等猜测。
 
-### 4C. Evidence 自动生成
+### 4C. Evidence Planner 与 Compiler
 
-- 每个 Metric 自动生成唯一 Evidence。
-- Evidence 的技术谱系由 Runtime 生成。
-- 面向用户的计算说明由结构化业务名称、操作和口径生成，不暴露 Runtime 术语。
+- Compiler 根据真实 lineage 先生成不可变计算候选、唯一 Evidence、selector 和 refs。
+- 专用 Planner 不选择 lineage 节点，只为本地候选生成业务名称与可读解释。
+- Evidence 的技术谱系由本地 Compiler 生成，不由 LLM 复述或伪造。
 
-### 4D. Trace 自动绑定
+### 4D. 后置绑定与独立失败边界
 
-- 报告使用 MetricTrace。
-- 图表按数值字段绑定 Metric。
-- 表格按业务数值列绑定 Metric。
-- grouped Metric 的成员通过 selector 定位。
-- 禁止手写 evidence key/ref。
+- 图表按 value field、表格按业务数值列、报告按代码表达式锚点绑定。
+- grouped 结果的成员通过 selector 定位，不按点或单元格复制 Evidence。
+- Evidence 最多独立修复一次，不能回流并重写正式分析代码。
+- 只保存通过验证的 refs；Evidence 失败不改变分析 execution 的成功状态。
 
 ### 4E. 兼容移除
 
-新路径稳定后删除：
+后置路径稳定并原子切换后删除：
 
 - 手写 EvidenceDefinition 路径
 - 手写 metric_evidence_bindings
-- Markdown 数字扫描
+- 报告 trace 标签与 Markdown 数字扫描
 - legacy Evidence 兼容路径
 
 ### 通过门槛
 
-- metric 数量与唯一 evidence 数量一致。
+- calculation signature 数量与唯一 evidence 数量一致。
 - 不同计算签名不能引用同一 Evidence。
-- 同一 grouped Metric 不按行或单元格复制 Evidence。
+- 同一 grouped 计算不按行或单元格复制 Evidence。
 - 报告、图表、表格点击值与 Evidence 当前值、单位完全一致。
+- Evidence 错误不会增加正式分析代码重试。
 - 本地重新执行能重新生成同样的绑定关系。
 
 ## 8. 阶段五：同轮次澄清
@@ -266,4 +272,3 @@ Preparation 任何非授权类错误都不能终止正式分析。降级顺序�
 - 原版 Probe/No Data/修复行为未改变；
 
 才进入正式上下文和 Runtime 改造。
-

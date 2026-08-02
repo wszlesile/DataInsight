@@ -3,13 +3,22 @@ import json
 import re
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Literal, TypedDict
+from zoneinfo import ZoneInfo
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from config import Config
 from utils import logger
@@ -54,19 +63,56 @@ def _requires_datasource_shortlist(catalog: list[dict[str, Any]]) -> bool:
     return len(catalog) > trigger_count or catalog_chars > trigger_chars
 
 
+class BusinessFactRequirementContract(BaseModel):
+    """Canonical business meaning required by one planned question."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    fact_id: str = Field(min_length=1)
+    business_fact: str = Field(min_length=1)
+    semantic_definition: str = Field(min_length=1)
+
+
+class BusinessQuestionContract(BaseModel):
+    """One business question and the facts a selector must cover."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    question_id: str = Field(min_length=1)
+    business_question: str = Field(min_length=1)
+    required_business_facts: list[BusinessFactRequirementContract] = Field(
+        min_length=1
+    )
+
+    @model_validator(mode="after")
+    def ensure_unique_fact_ids(self) -> "BusinessQuestionContract":
+        fact_ids = [item.fact_id for item in self.required_business_facts]
+        if len(fact_ids) != len(set(fact_ids)):
+            raise ValueError("required business fact IDs must be unique per question")
+        return self
+
+
 class IntentContract(BaseModel):
-    """Business intent only; formal analysis owns all analytical semantics."""
+    """Business intent used to retrieve a complete datasource semantic space."""
 
     model_config = ConfigDict(extra="forbid")
 
     business_goal: str = Field(min_length=1)
     business_subjects: list[str] = Field(default_factory=list)
-    business_questions: list[str] = Field(default_factory=list)
+    business_questions: list[BusinessQuestionContract] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def ensure_business_questions(self) -> "IntentContract":
-        if not self.business_questions:
-            self.business_questions = [self.business_goal]
+    def ensure_unique_business_questions(self) -> "IntentContract":
+        question_ids = [item.question_id for item in self.business_questions]
+        if len(question_ids) != len(set(question_ids)):
+            raise ValueError("business question IDs must be unique")
+        fact_ids = [
+            fact.fact_id
+            for question in self.business_questions
+            for fact in question.required_business_facts
+        ]
+        if len(fact_ids) != len(set(fact_ids)):
+            raise ValueError("business fact IDs must be unique in the intent")
         return self
 
 
@@ -77,23 +123,199 @@ class DatasourceShortlistContract(BaseModel):
     coverage_reason: str
 
 
-class DatasourceSelectionContract(BaseModel):
-    """Selected datasource set only; formal analysis owns role and grain."""
+class BusinessFactCoverageContract(BaseModel):
+    """Datasource support for one canonical fact from the business intent."""
 
     model_config = ConfigDict(extra="forbid")
 
-    selected_datasource_ids: list[int] = Field(min_length=1)
+    fact_id: str = Field(min_length=1)
+    coverage_status: Literal["direct", "partial", "unresolved"]
+    datasource_ids: list[int] = Field(default_factory=list)
+    supporting_datasource_ids: list[int] = Field(default_factory=list)
+    derived_from_fact_ids: list[str] = Field(default_factory=list)
+    coverage_reason: str = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_fact_id_echo_alias(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "coverage_id" not in value:
+            return value
+        normalized = dict(value)
+        alias = str(normalized.get("coverage_id") or "").strip()
+        fact_id = str(normalized.get("fact_id") or "").strip()
+        if fact_id and alias and fact_id != alias:
+            return value
+        normalized["fact_id"] = fact_id or alias
+        normalized.pop("coverage_id", None)
+        return normalized
+
+    @model_validator(mode="after")
+    def normalize_ids(self) -> "BusinessFactCoverageContract":
+        self.datasource_ids = list(dict.fromkeys(
+            int(item)
+            for item in self.datasource_ids
+            if int(item or 0) > 0
+        ))
+        self.supporting_datasource_ids = list(dict.fromkeys(
+            int(item)
+            for item in self.supporting_datasource_ids
+            if int(item or 0) > 0 and int(item) not in self.datasource_ids
+        ))
+        self.derived_from_fact_ids = list(dict.fromkeys(
+            str(item).strip()
+            for item in self.derived_from_fact_ids
+            if str(item).strip()
+        ))
+        if (
+            self.coverage_status in {"direct", "partial"}
+            and not self.datasource_ids
+            and not self.derived_from_fact_ids
+        ):
+            raise ValueError(f"{self.coverage_status} fact coverage requires datasources")
+        return self
+
+
+class BusinessQuestionCoverageContract(BaseModel):
+    """Datasource coverage for one planned business question."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    question_id: str = Field(min_length=1)
+    coverage_status: Literal["direct", "partial", "unresolved"] = "direct"
+    datasource_ids: list[int] = Field(default_factory=list)
+    fact_coverage: list[BusinessFactCoverageContract] = Field(min_length=1)
+    coverage_reason: str = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_read_only_question_echo(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "business_question" not in value:
+            return value
+        normalized = dict(value)
+        normalized.pop("business_question", None)
+        return normalized
+
+    @model_validator(mode="after")
+    def normalize_ids(self) -> "BusinessQuestionCoverageContract":
+        fact_ids = [item.fact_id for item in self.fact_coverage]
+        if len(fact_ids) != len(set(fact_ids)):
+            raise ValueError("fact_coverage must contain unique fact IDs")
+        fact_datasource_ids = {
+            datasource_id
+            for item in self.fact_coverage
+            for datasource_id in [
+                *item.datasource_ids,
+                *item.supporting_datasource_ids,
+            ]
+        }
+        self.datasource_ids = sorted(fact_datasource_ids)
+        fact_statuses = {item.coverage_status for item in self.fact_coverage}
+        derived_status = (
+            "direct"
+            if fact_statuses == {"direct"}
+            else "unresolved"
+            if fact_statuses == {"unresolved"}
+            else "partial"
+        )
+        self.coverage_status = derived_status
+        return self
+
+
+class DatasourceSelectionContract(BaseModel):
+    """Complete datasource coverage for the planned business intent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    selected_datasource_ids: list[int] = Field(default_factory=list)
+    question_coverage: list[BusinessQuestionCoverageContract] = Field(min_length=1)
     selection_reason: str
 
     @model_validator(mode="after")
     def normalize_ids(self) -> "DatasourceSelectionContract":
-        self.selected_datasource_ids = list(dict.fromkeys(
-            int(item)
-            for item in self.selected_datasource_ids
-            if int(item or 0) > 0
-        ))
-        if not self.selected_datasource_ids:
-            raise ValueError("selection requires at least one datasource")
+        coverage_ids = [item.question_id for item in self.question_coverage]
+        if len(coverage_ids) != len(set(coverage_ids)):
+            raise ValueError("question_coverage must contain unique question IDs")
+        coverage_by_fact = {
+            fact.fact_id: fact
+            for question in self.question_coverage
+            for fact in question.fact_coverage
+        }
+        if len(coverage_by_fact) != sum(
+            len(question.fact_coverage) for question in self.question_coverage
+        ):
+            raise ValueError("fact coverage IDs must be globally unique")
+
+        resolved: set[str] = set()
+        resolving: set[str] = set()
+
+        def resolve_fact(fact_id: str) -> BusinessFactCoverageContract:
+            fact = coverage_by_fact[fact_id]
+            if fact_id in resolved:
+                return fact
+            if fact_id in resolving:
+                raise ValueError("derived fact dependencies must not contain cycles")
+            resolving.add(fact_id)
+            dependencies = set(fact.derived_from_fact_ids)
+            if fact_id in dependencies or not dependencies.issubset(coverage_by_fact):
+                raise ValueError(
+                    f"derived fact {fact_id} must reference another selected business fact"
+                )
+            dependency_items = [resolve_fact(item) for item in dependencies]
+            if dependency_items:
+                if not fact.datasource_ids:
+                    fact.datasource_ids = sorted({
+                        datasource_id
+                        for dependency in dependency_items
+                        for datasource_id in dependency.datasource_ids
+                    })
+                if not fact.supporting_datasource_ids:
+                    fact.supporting_datasource_ids = sorted({
+                        datasource_id
+                        for dependency in dependency_items
+                        for datasource_id in dependency.supporting_datasource_ids
+                        if datasource_id not in fact.datasource_ids
+                    })
+                dependency_statuses = {
+                    dependency.coverage_status for dependency in dependency_items
+                }
+                fact.coverage_status = (
+                    "direct"
+                    if dependency_statuses == {"direct"}
+                    else "unresolved"
+                    if dependency_statuses == {"unresolved"}
+                    else "partial"
+                )
+            resolving.remove(fact_id)
+            resolved.add(fact_id)
+            return fact
+
+        for fact_id in coverage_by_fact:
+            resolve_fact(fact_id)
+        for question in self.question_coverage:
+            question.datasource_ids = sorted({
+                datasource_id
+                for fact in question.fact_coverage
+                for datasource_id in [
+                    *fact.datasource_ids,
+                    *fact.supporting_datasource_ids,
+                ]
+            })
+            fact_statuses = {fact.coverage_status for fact in question.fact_coverage}
+            question.coverage_status = (
+                "direct"
+                if fact_statuses == {"direct"}
+                else "unresolved"
+                if fact_statuses == {"unresolved"}
+                else "partial"
+            )
+        covered_ids = {
+            datasource_id
+            for item in self.question_coverage
+            for datasource_id in item.datasource_ids
+        }
+        if not covered_ids:
+            raise ValueError("selection requires at least one supported datasource")
+        self.selected_datasource_ids = sorted(covered_ids)
         return self
 
 
@@ -118,21 +340,164 @@ class BusinessRelationshipContract(BaseModel):
     business_meaning: str
     evidence_basis: Literal["schema", "probe", "unresolved"] = "unresolved"
     observation_id: str = ""
+    probe_facts: dict[str, Any] = Field(default_factory=dict)
 
 
-class BusinessContextContract(BaseModel):
-    """ER graph only; no source roles, grain, metrics, or report plan."""
+class BusinessFactBindingContract(BaseModel):
+    """Schema-grounded location of one business fact, without calculation rules."""
 
     model_config = ConfigDict(extra="forbid")
 
+    fact_id: str = Field(min_length=1)
+    datasource_id: int = Field(default=0, ge=0)
+    fields: list[str] = Field(default_factory=list)
+    derived_from_fact_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("datasource_id", mode="before")
+    @classmethod
+    def normalize_logical_datasource_id(cls, value: Any) -> Any:
+        return 0 if value is None else value
+
+    @model_validator(mode="after")
+    def require_physical_or_derived_lineage(self) -> "BusinessFactBindingContract":
+        self.fields = list(dict.fromkeys(
+            str(item).strip() for item in self.fields if str(item).strip()
+        ))
+        self.derived_from_fact_ids = list(dict.fromkeys(
+            str(item).strip()
+            for item in self.derived_from_fact_ids
+            if str(item).strip()
+        ))
+        if not self.fields and not self.derived_from_fact_ids:
+            raise ValueError("fact binding requires fields or derived fact dependencies")
+        if self.fields and self.datasource_id <= 0:
+            raise ValueError("physical fact binding requires a datasource")
+        if self.derived_from_fact_ids and not self.fields:
+            self.datasource_id = 0
+        if self.fact_id in self.derived_from_fact_ids:
+            raise ValueError("derived fact binding cannot reference itself")
+        return self
+
+
+class UnsupportedBusinessFieldBindingContract(BaseModel):
+    """Schema fields that were checked but cannot represent a required fact."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    datasource_id: int = Field(gt=0)
+    fields: list[str] = Field(min_length=1)
+    business_reason: str = Field(min_length=1)
+
+
+class UnresolvedBusinessFactContract(BaseModel):
+    """A canonical business fact that remains unsupported after Schema review."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    fact_id: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    business_impact: str = ""
+    unsupported_field_bindings: list[UnsupportedBusinessFieldBindingContract] = Field(
+        default_factory=list
+    )
+
+
+class BusinessContextProbeRequest(BaseModel):
+    """Bounded Schema fact requested to finish business-lineage resolution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str = Field(min_length=1)
+    datasource_id: int = Field(gt=0)
+    field: str = Field(min_length=1)
+    probe_kind: Literal["distinct_values", "time_coverage", "field_profile"]
+    purpose: str = Field(min_length=1)
+    related_fact_ids: list[str] = Field(default_factory=list)
+    expected_values: list[str] = Field(default_factory=list)
+    top_n: int = Field(default=20, ge=1, le=50)
+
+    @field_validator("top_n", mode="before")
+    @classmethod
+    def normalize_optional_top_n(cls, value: Any) -> Any:
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            return 20
+        return normalized if normalized > 0 else 20
+
+
+class InsightLineageContract(BaseModel):
+    """How selected facts form one coherent answerable business question."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    question_id: str = Field(min_length=1)
+    business_question: str = Field(min_length=1)
+    lineage_status: Literal["direct", "partial", "unresolved"] = "direct"
+    datasource_ids: list[int] = Field(default_factory=list)
+    fact_bindings: list[BusinessFactBindingContract] = Field(default_factory=list)
+    relationship_ids: list[str] = Field(default_factory=list)
+    unresolved_business_facts: list[UnresolvedBusinessFactContract] = Field(
+        default_factory=list
+    )
+    synthesis_path: str = Field(min_length=1)
+
+    @field_validator("lineage_status", mode="before")
+    @classmethod
+    def normalize_lineage_status(cls, value: Any) -> Any:
+        normalized = str(value or "").strip().lower()
+        return {
+            "confirmed": "direct",
+            "verified": "direct",
+            "supported": "direct",
+        }.get(normalized, value)
+
+
+class BusinessContextContract(BaseModel):
+    """Question-oriented business lineage over the selected datasource schemas."""
+
+    # The contract body remains strict; top-level explanatory annotations from the
+    # model are not part of the canonical context and can be discarded safely.
+    model_config = ConfigDict(extra="ignore")
+
     relationships: list[BusinessRelationshipContract] = Field(default_factory=list)
+    insight_lineage: list[InsightLineageContract] = Field(default_factory=list)
     unresolved_relationships: list[str] = Field(default_factory=list)
+    probe_requests: list[BusinessContextProbeRequest] = Field(default_factory=list)
+
+    @field_validator("unresolved_relationships", mode="before")
+    @classmethod
+    def normalize_unresolved_relationships(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        normalized: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                text = item.strip()
+            elif isinstance(item, dict):
+                text = str(
+                    item.get("description")
+                    or item.get("business_meaning")
+                    or item.get("reason")
+                    or json.dumps(item, ensure_ascii=False, default=str)
+                ).strip()
+            else:
+                text = str(item or "").strip()
+            if text:
+                normalized.append(text)
+        return normalized
 
     @model_validator(mode="after")
     def validate_relationship_ids(self) -> "BusinessContextContract":
         relationship_ids = [item.relationship_id for item in self.relationships]
         if len(relationship_ids) != len(set(relationship_ids)):
             raise ValueError("relationship_id must be unique")
+        lineage_ids = [item.question_id for item in self.insight_lineage]
+        if len(lineage_ids) != len(set(lineage_ids)):
+            raise ValueError("insight_lineage must contain unique question IDs")
+        request_ids = [item.request_id for item in self.probe_requests]
+        if len(request_ids) != len(set(request_ids)):
+            raise ValueError("probe request_id must be unique")
         return self
 
 
@@ -183,7 +548,275 @@ class PreparationResult:
             return None
 
     def prompt_snapshot(self) -> dict[str, Any]:
-        return compact_datasource_snapshot(self.selected_snapshot)
+        snapshot = compact_datasource_snapshot(self.selected_snapshot)
+        _apply_probe_field_profiles(snapshot, self.probe_observations)
+        _apply_relationship_execution_semantics(snapshot, self.business_context)
+        business_fact_names = {
+            fact.fact_id: fact.business_fact
+            for question in self.intent.business_questions
+            for fact in question.required_business_facts
+        }
+
+        runtime_lineage: list[dict[str, Any]] = []
+        for lineage in self.business_context.insight_lineage:
+            item = lineage.model_dump(exclude={"unresolved_business_facts"})
+            item["unresolved_business_facts"] = [
+                {
+                    "fact_id": fact.fact_id,
+                    "unsupported_field_bindings": [
+                        item.model_dump()
+                        for item in fact.unsupported_field_bindings
+                    ],
+                    "business_impact": (
+                        fact.business_impact.strip()
+                        or (
+                            f"当前数据无法可靠支持“{business_fact_names[fact.fact_id]}”，"
+                            "该部分不纳入结论。"
+                            if fact.fact_id in business_fact_names
+                            else "当前数据无法可靠支持该业务事实，该部分不纳入结论。"
+                        )
+                    ),
+                }
+                for fact in lineage.unresolved_business_facts
+            ]
+            runtime_lineage.append(item)
+
+        runtime_relationships: list[dict[str, Any]] = []
+        for relationship in self.business_context.relationships:
+            item = relationship.model_dump(exclude={
+                "evidence_basis",
+                "observation_id",
+                "probe_facts",
+            })
+            for key in (
+                "cardinality",
+                "left_measure_aggregation_safe",
+                "right_measure_aggregation_safe",
+            ):
+                if key in relationship.probe_facts:
+                    item[key] = relationship.probe_facts[key]
+            if (
+                relationship.evidence_basis == "probe"
+                and relationship.probe_facts.get("join_supported") is True
+                and str(relationship.probe_facts.get("cardinality") or "unknown")
+                != "unknown"
+            ):
+                item["joinability"] = "joinable"
+            aggregation_safety = _relationship_aggregation_safety(
+                relationship.probe_facts
+            )
+            if aggregation_safety:
+                item["aggregation_safety"] = {
+                    "left_measure_after_join": aggregation_safety[
+                        "local_measure_after_join"
+                    ],
+                    "right_measure_after_join": aggregation_safety[
+                        "target_measure_after_join"
+                    ],
+                }
+            runtime_relationships.append(item)
+
+        snapshot["analysis_semantic_context"] = {
+            "analysis_as_of_date": datetime.now(
+                ZoneInfo("Asia/Shanghai")
+            ).date().isoformat(),
+            "business_goal": self.intent.business_goal,
+            "business_subjects": self.intent.business_subjects,
+            "business_questions": [
+                item.model_dump()
+                for item in self.intent.business_questions
+            ],
+            "question_coverage": [
+                item.model_dump()
+                for item in self.selection.question_coverage
+            ],
+            "relationships": runtime_relationships,
+            "insight_lineage": runtime_lineage,
+        }
+        return snapshot
+
+
+def _apply_probe_field_profiles(
+    snapshot: dict[str, Any],
+    observations: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> None:
+    """Fold value-format conclusions into Schema without forwarding sample data."""
+    rows_by_id = {
+        int(item.get("datasource_id") or item.get("id") or 0): item
+        for item in snapshot.get("selected_datasource_snapshot") or []
+        if isinstance(item, dict)
+    }
+    for observation in observations:
+        if not isinstance(observation, dict):
+            continue
+        if (
+            observation.get("kind") != "distinct_values"
+            or observation.get("status") != "verified"
+            or not bool(observation.get("complete"))
+        ):
+            continue
+        datasource_id = int(observation.get("datasource_id") or 0)
+        field = str(observation.get("field") or "").strip()
+        datasource = rows_by_id.get(datasource_id)
+        if datasource is None or not field:
+            continue
+        schema = datasource.get("metadata_schema")
+        properties = schema.get("properties") if isinstance(schema, dict) else None
+        definition = properties.get(field) if isinstance(properties, dict) else None
+        if not isinstance(definition, dict):
+            continue
+        facts = observation.get("facts") if isinstance(observation.get("facts"), dict) else {}
+        raw_values = facts.get("values") or []
+        values = [
+            item.get("value") if isinstance(item, dict) else item
+            for item in raw_values
+        ] if isinstance(raw_values, list) else []
+        non_null_values = [item for item in values if item is not None and str(item).strip()]
+        if not non_null_values:
+            availability = "empty"
+            readability = "unknown"
+        else:
+            availability = "non_empty"
+            normalized = [str(item).strip() for item in non_null_values]
+            opaque_count = sum(
+                bool(
+                    re.fullmatch(r"[-+]?\d{8,}", item)
+                    or re.fullmatch(
+                        r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}",
+                        item,
+                    )
+                    or re.fullmatch(r"[0-9a-fA-F]{24,}", item)
+                )
+                for item in normalized
+            )
+            readability = (
+                "opaque_identifier"
+                if opaque_count == len(normalized)
+                else "categorical_values"
+            )
+        definition["observed_value_profile"] = {
+            "availability": availability,
+            "readability": readability,
+            "observed_distinct_value_count": len(non_null_values),
+        }
+        if readability == "categorical_values":
+            definition["observed_value_profile"]["observed_values"] = [
+                str(item).strip()
+                for item in non_null_values[:50]
+            ]
+            resolutions = facts.get("requested_value_resolutions")
+            if isinstance(resolutions, list) and resolutions:
+                definition["observed_value_profile"]["requested_value_resolutions"] = [
+                    {
+                        "requested_value": str(item.get("requested_value") or "").strip(),
+                        "status": str(item.get("status") or "unresolved").strip(),
+                        "observed_value": str(item.get("observed_value") or "").strip(),
+                    }
+                    for item in resolutions
+                    if isinstance(item, dict)
+                    and str(item.get("requested_value") or "").strip()
+                ]
+
+
+def _relationship_aggregation_safety(
+    probe_facts: dict[str, Any] | None,
+    *,
+    reverse: bool = False,
+) -> dict[str, Any]:
+    """Project cardinality facts into an orientation-aware execution policy."""
+    facts = probe_facts if isinstance(probe_facts, dict) else {}
+    if not facts or "cardinality" not in facts:
+        return {}
+
+    local_safe_key = (
+        "right_measure_aggregation_safe"
+        if reverse
+        else "left_measure_aggregation_safe"
+    )
+    target_safe_key = (
+        "left_measure_aggregation_safe"
+        if reverse
+        else "right_measure_aggregation_safe"
+    )
+
+    def side_policy(safe: Any, side: str) -> dict[str, str]:
+        if safe is True:
+            return {
+                "status": "safe",
+                "strategy": "may_aggregate_after_join",
+            }
+        if safe is False:
+            return {
+                "status": "unsafe_repeated_by_join",
+                "strategy": (
+                    f"do_not_attribute_{side}_measure_to_the_other_side_dimensions_"
+                    "without_an_explicit_allocation_or_functional_dependency"
+                ),
+            }
+        return {
+            "status": "unknown",
+            "strategy": "verify_cardinality_before_aggregating_after_join",
+        }
+
+    cardinality = str(facts.get("cardinality") or "unknown")
+    if reverse:
+        cardinality = {
+            "one_to_many": "many_to_one",
+            "many_to_one": "one_to_many",
+        }.get(cardinality, cardinality)
+    return {
+        "cardinality": cardinality,
+        "local_measure_after_join": side_policy(facts.get(local_safe_key), "local"),
+        "target_measure_after_join": side_policy(
+            facts.get(target_safe_key), "target"
+        ),
+    }
+
+
+def _apply_relationship_execution_semantics(
+    snapshot: dict[str, Any],
+    business_context: BusinessContextContract,
+) -> None:
+    """Reproject canonical relation facts for fresh and resumed Preparation data."""
+    relationships_by_id = {
+        item.relationship_id: item for item in business_context.relationships
+    }
+    for datasource in snapshot.get("selected_datasource_snapshot") or []:
+        if not isinstance(datasource, dict):
+            continue
+        datasource_id = int(datasource.get("datasource_id") or 0)
+        schema = datasource.get("metadata_schema")
+        relationships = schema.get("relationships") if isinstance(schema, dict) else None
+        if not isinstance(relationships, list):
+            continue
+        for item in relationships:
+            if not isinstance(item, dict):
+                continue
+            canonical = relationships_by_id.get(str(item.get("relationship_id") or ""))
+            if canonical is None:
+                continue
+            facts = canonical.probe_facts
+            if (
+                canonical.evidence_basis == "probe"
+                and facts.get("join_supported") is True
+                and str(facts.get("cardinality") or "unknown") != "unknown"
+            ):
+                item["joinability"] = "joinable"
+            aggregation_safety = _relationship_aggregation_safety(
+                facts,
+                reverse=datasource_id == canonical.right_datasource_id,
+            )
+            if not aggregation_safety:
+                continue
+            item["cardinality"] = aggregation_safety["cardinality"]
+            item["aggregation_safety"] = {
+                "local_measure_after_join": aggregation_safety[
+                    "local_measure_after_join"
+                ],
+                "target_measure_after_join": aggregation_safety[
+                    "target_measure_after_join"
+                ],
+            }
 
 
 def _message_text(content: Any) -> str:
@@ -610,19 +1243,60 @@ def build_datasource_discovery_catalog(
                 ranked_fields.append((score, -index, {
                     "name": str(detail.get("name") or ""),
                     "type": str(detail.get("type") or ""),
-                    "description": description[:160],
+                    "description": description[:100],
                 }))
         ranked_fields.sort(reverse=True, key=lambda item: (item[0], item[1]))
-        matched_fields = [item[2] for item in ranked_fields[:8]]
+        matched_fields = [item[2] for item in ranked_fields[:5]]
         result.append({
             "datasource_id": item["datasource_id"],
             "datasource_name": item.get("datasource_name"),
             "datasource_type": item.get("datasource_type"),
-            "description": str(item.get("description") or "")[:500],
+            "description": str(item.get("description") or "")[:180],
             "field_count": len(item.get("fields") or []),
             "matched_fields": matched_fields,
         })
     return result
+
+
+def recall_datasources_for_business_facts(
+    catalog: list[dict[str, Any]],
+    intent: IntentContract,
+    *,
+    per_fact: int = 2,
+) -> list[int]:
+    """Keep the strongest Schema candidates for every canonical business fact."""
+    recalled: list[int] = []
+    for question in intent.business_questions:
+        for fact in question.required_business_facts:
+            tokens = _search_tokens(
+                " ".join([
+                    fact.business_fact,
+                    fact.semantic_definition,
+                    question.business_question,
+                ])
+            )
+            ranked: list[tuple[int, int]] = []
+            for item in catalog:
+                datasource_id = int(item.get("datasource_id") or 0)
+                datasource_text = " ".join([
+                    str(item.get("datasource_name") or ""),
+                    str(item.get("description") or ""),
+                ]).lower()
+                score = sum(3 * int(token in datasource_text) for token in tokens)
+                for detail in item.get("field_details") or []:
+                    name = str(detail.get("name") or "").lower()
+                    description = str(detail.get("description") or "").lower()
+                    score += sum(
+                        4 * int(token in name) + int(token in description)
+                        for token in tokens
+                    )
+                if datasource_id > 0 and score > 0:
+                    ranked.append((score, datasource_id))
+            ranked.sort(key=lambda item: (-item[0], item[1]))
+            recalled.extend(
+                datasource_id for _, datasource_id in ranked[:max(per_fact, 1)]
+            )
+    return list(dict.fromkeys(recalled))
 
 
 def filter_datasource_snapshot(
@@ -717,6 +1391,7 @@ def enrich_selected_datasource_schemas(
         business_meaning: str,
         evidence_basis: str,
         observation_id: str = "",
+        probe_facts: dict[str, Any] | None = None,
     ) -> None:
         if (
             left_datasource_id not in rows_by_id
@@ -739,7 +1414,12 @@ def enrich_selected_datasource_schemas(
                 left_fields,
             ),
         )
-        for source_id, target_id, local_fields, target_fields in orientations:
+        for orientation_index, (
+            source_id,
+            target_id,
+            local_fields,
+            target_fields,
+        ) in enumerate(orientations):
             item = {
                 "relationship_id": relationship_id,
                 "target_datasource_id": target_id,
@@ -753,6 +1433,22 @@ def enrich_selected_datasource_schemas(
             }
             if observation_id:
                 item["observation_id"] = observation_id
+            if probe_facts:
+                item["probe_facts"] = dict(probe_facts)
+                aggregation_safety = _relationship_aggregation_safety(
+                    probe_facts,
+                    reverse=orientation_index == 1,
+                )
+                if aggregation_safety:
+                    item["cardinality"] = aggregation_safety["cardinality"]
+                    item["aggregation_safety"] = {
+                        "local_measure_after_join": aggregation_safety[
+                            "local_measure_after_join"
+                        ],
+                        "target_measure_after_join": aggregation_safety[
+                            "target_measure_after_join"
+                        ],
+                    }
             relationships_by_datasource[source_id].append(item)
 
     known_signatures: set[tuple[int, int, tuple[str, ...], tuple[str, ...]]] = set()
@@ -781,6 +1477,7 @@ def enrich_selected_datasource_schemas(
             business_meaning=relationship.business_meaning,
             evidence_basis=relationship.evidence_basis,
             observation_id=relationship.observation_id,
+            probe_facts=relationship.probe_facts,
         )
 
     # Preserve explicit physical FK metadata even when the advisory LLM stage
@@ -886,6 +1583,7 @@ def validate_business_context(
     schemas: list[dict[str, Any]],
     *,
     selection: DatasourceSelectionContract,
+    intent: IntentContract | None = None,
     probe_observations: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
 ) -> None:
     fields_by_id = {
@@ -907,6 +1605,15 @@ def validate_business_context(
         for relationship in item.get("declared_relationships") or []:
             if isinstance(relationship, dict):
                 declared_relationships.append(relationship)
+    for request in contract.probe_requests:
+        if request.datasource_id not in selected_ids:
+            raise ValueError(
+                f"Probe request {request.request_id} references an unselected datasource"
+            )
+        if request.field not in fields_by_id.get(request.datasource_id, set()):
+            raise ValueError(
+                f"Probe request {request.request_id} references an unavailable field"
+            )
     for relationship in contract.relationships:
         if (
             relationship.left_datasource_id not in selected_ids
@@ -928,7 +1635,17 @@ def validate_business_context(
             raise ValueError(
                 f"relationship {relationship.relationship_id} references unavailable fields"
             )
-        if len(relationship.left_fields) != len(relationship.right_fields):
+        if (
+            relationship.relationship_type in {
+                "same_entity",
+                "parent_child",
+                "event_of_entity",
+                "dimension_enrichment",
+                "bridge",
+            }
+            and relationship.joinability == "joinable"
+            and len(relationship.left_fields) != len(relationship.right_fields)
+        ):
             raise ValueError(
                 f"relationship {relationship.relationship_id} must map the same number "
                 "of left and right key fields"
@@ -979,6 +1696,174 @@ def validate_business_context(
                     "verified relationship_coverage observation"
                 )
 
+    available_relationship_ids = {
+        item.relationship_id
+        for item in contract.relationships
+    }
+    relationships_by_id = {
+        item.relationship_id: item
+        for item in contract.relationships
+    }
+    coverage_by_question = {
+        item.question_id: item
+        for item in selection.question_coverage
+    }
+    expected_question_ids = (
+        {item.question_id for item in intent.business_questions}
+        if intent is not None
+        else set(coverage_by_question)
+    )
+    actual_question_ids = {
+        item.question_id
+        for item in contract.insight_lineage
+    }
+    if actual_question_ids != expected_question_ids:
+        raise ValueError(
+            "insight_lineage must cover every planned business question exactly"
+        )
+    required_fact_ids_by_question = {
+        item.question_id: {
+            fact.fact_id for fact in item.required_business_facts
+        }
+        for item in (intent.business_questions if intent is not None else [])
+    }
+    all_required_fact_ids = {
+        fact_id
+        for fact_ids in required_fact_ids_by_question.values()
+        for fact_id in fact_ids
+    }
+    for lineage in contract.insight_lineage:
+        lineage_datasource_ids = set(lineage.datasource_ids)
+        if not lineage_datasource_ids.issubset(selected_ids):
+            raise ValueError(
+                f"lineage {lineage.question_id} references an unselected datasource"
+            )
+        coverage = coverage_by_question.get(lineage.question_id)
+        if coverage is None or not lineage_datasource_ids.issubset(
+            set(coverage.datasource_ids)
+        ):
+            raise ValueError(
+                f"lineage {lineage.question_id} uses a datasource outside question coverage"
+            )
+        if not set(lineage.relationship_ids).issubset(available_relationship_ids):
+            raise ValueError(
+                f"lineage {lineage.question_id} references an unavailable relationship"
+            )
+        binding_datasource_ids: set[int] = set()
+        bound_fact_ids: set[str] = set()
+        binding_keys: set[tuple[str, int]] = set()
+        for binding in lineage.fact_bindings:
+            binding_key = (binding.fact_id, binding.datasource_id)
+            if binding_key in binding_keys:
+                raise ValueError(
+                    f"lineage {lineage.question_id} repeats a fact binding"
+                )
+            binding_keys.add(binding_key)
+            bound_fact_ids.add(binding.fact_id)
+            if binding.datasource_id > 0:
+                binding_datasource_ids.add(binding.datasource_id)
+            if (
+                binding.datasource_id > 0
+                and binding.datasource_id not in lineage_datasource_ids
+            ):
+                raise ValueError(
+                    f"lineage {lineage.question_id} binds a fact outside its datasource set"
+                )
+            if (
+                binding.datasource_id > 0
+                and set(binding.fields) - fields_by_id.get(binding.datasource_id, set())
+            ):
+                raise ValueError(
+                    f"lineage {lineage.question_id} references unavailable fact fields"
+                )
+            if all_required_fact_ids and not set(
+                binding.derived_from_fact_ids
+            ).issubset(all_required_fact_ids):
+                raise ValueError(
+                    f"lineage {lineage.question_id} derives a fact from an unavailable fact ID"
+                )
+        unresolved_fact_ids = {
+            item.fact_id for item in lineage.unresolved_business_facts
+        }
+        if len(unresolved_fact_ids) != len(lineage.unresolved_business_facts):
+            raise ValueError(
+                f"lineage {lineage.question_id} repeats unresolved fact IDs"
+            )
+        for unresolved_fact in lineage.unresolved_business_facts:
+            for unsupported in unresolved_fact.unsupported_field_bindings:
+                if unsupported.datasource_id not in selected_ids:
+                    raise ValueError(
+                        f"lineage {lineage.question_id} excludes a field from an "
+                        "unselected datasource"
+                    )
+                if set(unsupported.fields) - fields_by_id.get(
+                    unsupported.datasource_id,
+                    set(),
+                ):
+                    raise ValueError(
+                        f"lineage {lineage.question_id} excludes unavailable fields"
+                    )
+        required_fact_ids = required_fact_ids_by_question.get(
+            lineage.question_id,
+            bound_fact_ids | unresolved_fact_ids,
+        )
+        if bound_fact_ids | unresolved_fact_ids != required_fact_ids:
+            raise ValueError(
+                f"lineage {lineage.question_id} must account for every required fact ID"
+            )
+        relationship_datasource_ids = {
+            datasource_id
+            for relationship_id in lineage.relationship_ids
+            for relationship in [relationships_by_id.get(relationship_id)]
+            if relationship is not None
+            for datasource_id in (
+                relationship.left_datasource_id,
+                relationship.right_datasource_id,
+            )
+        }
+        if lineage_datasource_ids and not lineage_datasource_ids.issubset(
+            binding_datasource_ids | relationship_datasource_ids
+        ):
+            raise ValueError(
+                f"lineage {lineage.question_id} does not bind facts for every datasource"
+            )
+        if lineage.lineage_status == "direct" and (
+            not lineage_datasource_ids
+            or bound_fact_ids != required_fact_ids
+            or unresolved_fact_ids
+        ):
+            raise ValueError(
+                f"direct lineage {lineage.question_id} requires every fact to be grounded"
+            )
+        unresolved_join_relationships = [
+            relationship_id
+            for relationship_id in lineage.relationship_ids
+            for relationship in [relationships_by_id.get(relationship_id)]
+            if relationship is not None
+            and relationship.relationship_type in {
+                "same_entity",
+                "parent_child",
+                "event_of_entity",
+                "dimension_enrichment",
+                "bridge",
+            }
+            and relationship.joinability != "joinable"
+        ]
+        if (
+            lineage.lineage_status == "direct"
+            and unresolved_join_relationships
+        ):
+            raise ValueError(
+                f"direct lineage {lineage.question_id} depends on unresolved "
+                "cross-source relationships"
+            )
+        if lineage.lineage_status in {"partial", "unresolved"} and not (
+            lineage.unresolved_business_facts
+        ):
+            raise ValueError(
+                f"lineage {lineage.question_id} must state unresolved business facts"
+            )
+
 
 class AnalysisPreparationState(TypedDict, total=False):
     catalog: list[dict[str, Any]]
@@ -1027,12 +1912,21 @@ class AnalysisPreparationWorkflow:
         query = self.user_query.strip() or "完成本轮数据洞察分析"
         return IntentContract(
             business_goal=query,
-            business_questions=[query],
+            business_questions=[BusinessQuestionContract(
+                question_id="question_1",
+                business_question=query,
+                required_business_facts=[BusinessFactRequirementContract(
+                    fact_id="question_1_fact_1",
+                    business_fact=query,
+                    semantic_definition="用户当前明确要求理解的业务事实",
+                )],
+            )],
         )
 
     @staticmethod
     def _fallback_selection(
         catalog: list[dict[str, Any]],
+        intent: IntentContract,
     ) -> DatasourceSelectionContract:
         datasource_ids = [
             int(item.get("datasource_id") or 0)
@@ -1043,6 +1937,23 @@ class AnalysisPreparationWorkflow:
             raise ValueError("no datasource is available for analysis")
         return DatasourceSelectionContract(
             selected_datasource_ids=datasource_ids,
+            question_coverage=[
+                BusinessQuestionCoverageContract(
+                    question_id=question.question_id,
+                    datasource_ids=datasource_ids,
+                    fact_coverage=[
+                        BusinessFactCoverageContract(
+                            fact_id=fact.fact_id,
+                            coverage_status="direct",
+                            datasource_ids=datasource_ids,
+                            coverage_reason="保留当前候选集合供正式业务血缘核验",
+                        )
+                        for fact in question.required_business_facts
+                    ],
+                    coverage_reason="保留当前候选集合以覆盖该业务问题",
+                )
+                for question in intent.business_questions
+            ],
             selection_reason="选源判断未完全定稿，保留候选来源交由统一洞察阶段复核",
         )
 
@@ -1050,21 +1961,141 @@ class AnalysisPreparationWorkflow:
     def _normalize_selection(
         selection: DatasourceSelectionContract,
         catalog: list[dict[str, Any]],
+        intent: IntentContract,
     ) -> DatasourceSelectionContract:
         available_ids = {
             int(item.get("datasource_id") or 0)
             for item in catalog
             if int(item.get("datasource_id") or 0) > 0
         }
-        selected_ids = [
-            datasource_id
-            for datasource_id in selection.selected_datasource_ids
-            if datasource_id in available_ids
-        ]
-        if not selected_ids:
-            return AnalysisPreparationWorkflow._fallback_selection(catalog)
-        return selection.model_copy(update={
-            "selected_datasource_ids": selected_ids,
+        selected_ids = set(selection.selected_datasource_ids)
+        if not selected_ids or not selected_ids.issubset(available_ids):
+            raise ValueError("selection references unavailable datasource IDs")
+        coverage_by_question = {
+            item.question_id: item
+            for item in selection.question_coverage
+        }
+        expected_question_ids = {
+            item.question_id for item in intent.business_questions
+        }
+        if set(coverage_by_question) != expected_question_ids:
+            raise ValueError("question_coverage must exactly match intent business questions")
+        for question in intent.business_questions:
+            coverage = coverage_by_question[question.question_id]
+            expected_facts = {
+                item.fact_id for item in question.required_business_facts
+            }
+            actual_facts = {
+                item.fact_id for item in coverage.fact_coverage
+            }
+            if actual_facts != expected_facts:
+                raise ValueError(
+                    f"fact_coverage for {question.question_id} must exactly match "
+                    "intent required_business_facts"
+                )
+        return selection
+
+    @staticmethod
+    def _complete_derived_fact_lineage(
+        candidate: BusinessContextContract,
+        selection: DatasourceSelectionContract,
+    ) -> BusinessContextContract:
+        """Project Selection-owned derived facts into Business Context lineage."""
+        coverage_by_question = {
+            item.question_id: item
+            for item in selection.question_coverage
+        }
+        normalized_lineage: list[InsightLineageContract] = []
+        for lineage in candidate.insight_lineage:
+            coverage = coverage_by_question.get(lineage.question_id)
+            if coverage is None:
+                normalized_lineage.append(lineage)
+                continue
+            bindings = list(lineage.fact_bindings)
+            bound_fact_ids = {item.fact_id for item in bindings}
+            unresolved = list(lineage.unresolved_business_facts)
+            unresolved_by_id = {item.fact_id: item for item in unresolved}
+            for fact in coverage.fact_coverage:
+                if not fact.derived_from_fact_ids or fact.fact_id in bound_fact_ids:
+                    continue
+                if fact.coverage_status == "unresolved":
+                    continue
+                bindings.append(BusinessFactBindingContract(
+                    fact_id=fact.fact_id,
+                    datasource_id=0,
+                    derived_from_fact_ids=fact.derived_from_fact_ids,
+                ))
+                bound_fact_ids.add(fact.fact_id)
+                unresolved_by_id.pop(fact.fact_id, None)
+            normalized_lineage.append(lineage.model_copy(update={
+                "fact_bindings": bindings,
+                "unresolved_business_facts": list(unresolved_by_id.values()),
+            }))
+        return candidate.model_copy(update={"insight_lineage": normalized_lineage})
+
+    @staticmethod
+    def _scope_lineage_relationships(
+        candidate: BusinessContextContract,
+    ) -> BusinessContextContract:
+        """Keep only relationships that participate in an actual question lineage."""
+        relationships_by_id = {
+            item.relationship_id: item for item in candidate.relationships
+        }
+        normalized_lineage: list[InsightLineageContract] = []
+        for lineage in candidate.insight_lineage:
+            datasource_ids = set(lineage.datasource_ids)
+            relationship_ids = [
+                relationship_id
+                for relationship_id in lineage.relationship_ids
+                for relationship in [relationships_by_id.get(relationship_id)]
+                if relationship is not None
+                and {
+                    relationship.left_datasource_id,
+                    relationship.right_datasource_id,
+                }.issubset(datasource_ids)
+            ]
+            normalized_lineage.append(lineage.model_copy(update={
+                "relationship_ids": list(dict.fromkeys(relationship_ids)),
+            }))
+        referenced_ids = {
+            relationship_id
+            for lineage in normalized_lineage
+            for relationship_id in lineage.relationship_ids
+        }
+        return candidate.model_copy(update={
+            "relationships": [
+                item for item in candidate.relationships
+                if item.relationship_id in referenced_ids
+            ],
+            "insight_lineage": normalized_lineage,
+        })
+
+    @staticmethod
+    def _remove_intrasource_relationships(
+        candidate: BusinessContextContract,
+    ) -> BusinessContextContract:
+        """ER lineage contains edges between sources, not fields inside one source."""
+        removed_ids = {
+            item.relationship_id
+            for item in candidate.relationships
+            if item.left_datasource_id == item.right_datasource_id
+        }
+        if not removed_ids:
+            return candidate
+        return candidate.model_copy(update={
+            "relationships": [
+                item for item in candidate.relationships
+                if item.relationship_id not in removed_ids
+            ],
+            "insight_lineage": [
+                lineage.model_copy(update={
+                    "relationship_ids": [
+                        item for item in lineage.relationship_ids
+                        if item not in removed_ids
+                    ],
+                })
+                for lineage in candidate.insight_lineage
+            ],
         })
 
     @staticmethod
@@ -1079,116 +2110,6 @@ class AnalysisPreparationWorkflow:
             ),
         )
 
-    @staticmethod
-    def _compile_relationship_probe_program(
-        relationships: list[BusinessRelationshipContract],
-        schemas: list[dict[str, Any]],
-    ) -> str:
-        """Compile semantic relationship candidates into a bounded Probe program."""
-        schemas_by_id = {
-            int(item.get("datasource_id") or item.get("id") or 0): item
-            for item in schemas
-            if isinstance(item, dict)
-        }
-        lines = ['analysis = begin_analysis(execution_mode="probe")']
-        observation_names: list[str] = []
-        safe_name = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-        for index, relationship in enumerate(relationships):
-            left_schema = schemas_by_id.get(relationship.left_datasource_id)
-            right_schema = schemas_by_id.get(relationship.right_datasource_id)
-            if left_schema is None or right_schema is None:
-                raise ValueError(
-                    f"relationship {relationship.relationship_id} references "
-                    "an unavailable datasource"
-                )
-            if (
-                not relationship.left_fields
-                or len(relationship.left_fields) != len(relationship.right_fields)
-                or any(
-                    not safe_name.fullmatch(field)
-                    for field in [
-                        *relationship.left_fields,
-                        *relationship.right_fields,
-                    ]
-                )
-            ):
-                raise ValueError(
-                    f"relationship {relationship.relationship_id} has invalid Probe keys"
-                )
-
-            def add_query(
-                *,
-                variable: str,
-                query_key: str,
-                schema: dict[str, Any],
-                fields: list[str],
-            ) -> None:
-                datasource_id = int(
-                    schema.get("datasource_id") or schema.get("id") or 0
-                )
-                identifier = str(
-                    schema.get("datasource_identifier") or ""
-                ).strip()
-                if not identifier:
-                    raise ValueError(
-                        f"datasource {datasource_id} lacks a query identifier"
-                    )
-                columns = ", ".join(fields)
-                non_null = " AND ".join(
-                    f"{field} IS NOT NULL" for field in fields
-                )
-                sql = (
-                    f"SELECT {columns} FROM {identifier} "
-                    f"WHERE {non_null}"
-                )
-                lines.extend([
-                    f"{variable} = analysis.query.sql(",
-                    f"    key={json.dumps(query_key)},",
-                    f"    datasource_id={datasource_id},",
-                    f"    sql={json.dumps(sql)},",
-                    f"    description={json.dumps('验证数据源关系键')},",
-                    "    sql_context={\"fragments\": [{",
-                    f"        \"datasource_id\": {datasource_id},",
-                    f"        \"datasource_identifier\": {json.dumps(identifier)},",
-                    "    }]},",
-                    ")",
-                ])
-
-            left_name = f"left_keys_{index}"
-            right_name = f"right_keys_{index}"
-            observation_name = f"relationship_{index}"
-            add_query(
-                variable=left_name,
-                query_key=f"bc_left_{index}",
-                schema=left_schema,
-                fields=relationship.left_fields,
-            )
-            add_query(
-                variable=right_name,
-                query_key=f"bc_right_{index}",
-                schema=right_schema,
-                fields=relationship.right_fields,
-            )
-            lines.extend([
-                f"{observation_name} = analysis.query.inspect_relationship(",
-                f"    key={json.dumps(relationship.relationship_id)},",
-                f"    left={left_name},",
-                f"    right={right_name},",
-                f"    left_on={relationship.left_fields!r},",
-                f"    right_on={relationship.right_fields!r},",
-                ")",
-            ])
-            observation_names.append(observation_name)
-        if not observation_names:
-            raise ValueError("no relationship candidate is available for Probe")
-        lines.extend([
-            "result = analysis.complete_probe(",
-            f"    message={json.dumps('已核验候选数据源关系')},",
-            f"    observations=[{', '.join(observation_names)}],",
-            ")",
-        ])
-        return "\n".join(lines)
-
     def _probe_relationship_candidates(
         self,
         *,
@@ -1196,41 +2117,76 @@ class AnalysisPreparationWorkflow:
         schemas: list[dict[str, Any]],
         selection: DatasourceSelectionContract,
     ) -> tuple[BusinessContextContract, list[dict[str, Any]]]:
-        """Verify candidate ER edges without asking the model to author Probe code."""
-        from agent.tools import execute_preparation_probe_program
+        """Verify unresolved ER edges with the bounded Preparation Probe API."""
+        from agent.tools import execute_preparation_relationship_probe
 
-        probe_code = self._compile_relationship_probe_program(
-            candidate.relationships,
-            schemas,
-        )
-        probe_result = execute_preparation_probe_program(
-            code=probe_code,
-            runtime_user_context={
-                **self.execution_context,
-                "allowed_datasource_ids": selection.selected_datasource_ids,
-            },
-            timeout_seconds=max(
-                int(Config.PYTHON_EXEC_TIMEOUT_SECONDS or 90),
-                1,
-            ),
-            cancelled=self.cancelled,
-        )
-        typed_observations = [
-            item
-            for item in (
-                probe_result.observations.get("typed_observations") or []
-                if isinstance(probe_result.observations, dict)
-                else []
-            )
-            if isinstance(item, dict)
+        referenced_relationship_ids = {
+            relationship_id
+            for lineage in candidate.insight_lineage
+            for relationship_id in lineage.relationship_ids
+        }
+        probe_candidates = [
+            relationship
+            for relationship in candidate.relationships
+            if relationship.relationship_id in referenced_relationship_ids
+            and relationship.joinability in {"unknown", "alignable"}
+            and relationship.relationship_type in {
+                "same_entity",
+                "parent_child",
+                "event_of_entity",
+                "dimension_enrichment",
+                "bridge",
+            }
+            and relationship.left_fields
+            and len(relationship.left_fields) == len(relationship.right_fields)
         ]
+        if not probe_candidates:
+            return candidate, []
+
+        try:
+            typed_observations = execute_preparation_relationship_probe(
+                relationships=[item.model_dump() for item in probe_candidates],
+                datasources=schemas,
+                runtime_user_context={
+                    **self.execution_context,
+                    "allowed_datasource_ids": selection.selected_datasource_ids,
+                },
+                timeout_seconds=max(
+                    int(Config.PYTHON_EXEC_TIMEOUT_SECONDS or 90),
+                    1,
+                ),
+                cancelled=self.cancelled,
+            )
+        except AnalysisTaskCancelled:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "business context relationship Probe unavailable; preserving "
+                "unresolved candidates: %s",
+                exc,
+            )
+            unresolved = list(candidate.unresolved_relationships)
+            unresolved.append(f"关系 Probe 未完成：{exc}")
+            return candidate.model_copy(update={
+                "unresolved_relationships": list(dict.fromkeys(unresolved)),
+            }), []
         observations_by_id = {
             str(item.get("observation_id") or ""): item
             for item in typed_observations
         }
+        probe_candidate_ids = {
+            item.relationship_id for item in probe_candidates
+        }
         resolved_relationships: list[BusinessRelationshipContract] = []
-        unresolved = list(candidate.unresolved_relationships)
+        unresolved: list[str] = []
         for relationship in candidate.relationships:
+            if relationship.relationship_id not in probe_candidate_ids:
+                resolved_relationships.append(relationship)
+                if relationship.joinability == "unknown":
+                    unresolved.append(
+                        f"关系 {relationship.relationship_id} 仍缺少可验证的关系键"
+                    )
+                continue
             observation_id = f"probe:{relationship.relationship_id}"
             observation = observations_by_id.get(observation_id)
             if (
@@ -1248,14 +2204,17 @@ class AnalysisPreparationWorkflow:
                 )
                 continue
             facts = observation.get("facts") or {}
+            cardinality = str(facts.get("cardinality") or "unknown")
+            join_supported = bool(facts.get("join_supported"))
             resolved_relationships.append(relationship.model_copy(update={
                 "joinability": (
-                    "joinable"
-                    if bool(facts.get("join_supported"))
+                    "joinable" if join_supported and cardinality != "unknown"
+                    else "alignable" if join_supported
                     else "not_joinable"
                 ),
                 "evidence_basis": "probe",
                 "observation_id": observation_id,
+                "probe_facts": dict(facts),
             }))
         return (
             candidate.model_copy(update={
@@ -1264,6 +2223,51 @@ class AnalysisPreparationWorkflow:
             }),
             typed_observations,
         )
+
+    def _probe_schema_requests(
+        self,
+        *,
+        candidate: BusinessContextContract,
+        schemas: list[dict[str, Any]],
+        selection: DatasourceSelectionContract,
+    ) -> list[dict[str, Any]]:
+        """Resolve only the bounded Schema facts explicitly requested by Business Context."""
+        if not candidate.probe_requests:
+            return []
+        from agent.tools import execute_preparation_schema_probe
+
+        try:
+            return execute_preparation_schema_probe(
+                requests=[item.model_dump() for item in candidate.probe_requests],
+                datasources=schemas,
+                runtime_user_context={
+                    **self.execution_context,
+                    "allowed_datasource_ids": selection.selected_datasource_ids,
+                },
+                timeout_seconds=max(
+                    int(Config.PYTHON_EXEC_TIMEOUT_SECONDS or 90),
+                    1,
+                ),
+                cancelled=self.cancelled,
+            )
+        except AnalysisTaskCancelled:
+            raise
+        except Exception as exc:
+            logger.warning("business context Schema Probe unavailable: %s", exc)
+            return [
+                {
+                    "observation_id": f"probe:{item.request_id}",
+                    "kind": item.probe_kind,
+                    "status": "unavailable",
+                    "complete": False,
+                    "datasource_id": item.datasource_id,
+                    "field": item.field,
+                    "purpose": item.purpose,
+                    "related_fact_ids": item.related_fact_ids,
+                    "error": str(exc),
+                }
+                for item in candidate.probe_requests
+            ]
 
     @staticmethod
     def _normalize_probe_backed_relationships(
@@ -1278,10 +2282,8 @@ class AnalysisPreparationWorkflow:
         }
         normalized: list[BusinessRelationshipContract] = []
         for relationship in candidate.relationships:
-            if relationship.evidence_basis != "probe":
-                normalized.append(relationship)
-                continue
-            observation = observations_by_id.get(relationship.observation_id)
+            expected_observation_id = f"probe:{relationship.relationship_id}"
+            observation = observations_by_id.get(expected_observation_id)
             if (
                 observation is None
                 or observation.get("status") != "verified"
@@ -1290,14 +2292,65 @@ class AnalysisPreparationWorkflow:
                 normalized.append(relationship)
                 continue
             facts = observation.get("facts") or {}
+            cardinality = str(facts.get("cardinality") or "unknown")
+            join_supported = bool(facts.get("join_supported"))
             normalized.append(relationship.model_copy(update={
                 "joinability": (
-                    "joinable"
-                    if bool(facts.get("join_supported"))
+                    "joinable" if join_supported and cardinality != "unknown"
+                    else "alignable" if join_supported
                     else "not_joinable"
                 ),
+                "probe_facts": dict(facts),
+                "evidence_basis": "probe",
+                "observation_id": str(observation.get("observation_id") or ""),
             }))
         return candidate.model_copy(update={"relationships": normalized})
+
+    @staticmethod
+    def _reconcile_finalized_relationships(
+        candidate: BusinessContextContract,
+        draft: BusinessContextContract,
+    ) -> BusinessContextContract:
+        """Keep relation identity and evidence binding owned by the pre-Probe draft."""
+        draft_by_id = {
+            item.relationship_id: item for item in draft.relationships
+        }
+        finalized_by_id = {
+            item.relationship_id: item for item in candidate.relationships
+        }
+        referenced_ids = {
+            relationship_id
+            for lineage in candidate.insight_lineage
+            for relationship_id in lineage.relationship_ids
+            if relationship_id in draft_by_id
+        }
+        relationships = []
+        for draft_relationship in draft.relationships:
+            relationship_id = draft_relationship.relationship_id
+            if relationship_id not in referenced_ids:
+                continue
+            finalized_relationship = finalized_by_id.get(relationship_id)
+            relationships.append(draft_relationship.model_copy(update={
+                "business_meaning": (
+                    finalized_relationship.business_meaning
+                    if finalized_relationship is not None
+                    else draft_relationship.business_meaning
+                ),
+            }))
+        lineage = [
+            item.model_copy(update={
+                "relationship_ids": [
+                    relationship_id
+                    for relationship_id in item.relationship_ids
+                    if relationship_id in referenced_ids
+                ],
+            })
+            for item in candidate.insight_lineage
+        ]
+        return candidate.model_copy(update={
+            "relationships": relationships,
+            "insight_lineage": lineage,
+        })
 
     @staticmethod
     def _normalize_unverified_schema_relationships(
@@ -1339,6 +2392,10 @@ class AnalysisPreparationWorkflow:
                 payload={
                     "user_query": self.user_query,
                     "context_mode": self.context_mode,
+                    "analysis_as_of_date": datetime.now(
+                        ZoneInfo("Asia/Shanghai")
+                    ).date().isoformat(),
+                    "expected_time_range": self.expected_time_range,
                     "conversation_context": self.conversation_context,
                 },
                 output_model=IntentContract,
@@ -1353,6 +2410,18 @@ class AnalysisPreparationWorkflow:
                 exc,
             )
             intent = self._fallback_intent()
+        logger.info(
+            "analysis intent resolved goal=%s questions=%s",
+            intent.business_goal,
+            [
+                {
+                    "question_id": item.question_id,
+                    "business_question": item.business_question,
+                    "required_business_facts": item.required_business_facts,
+                }
+                for item in intent.business_questions
+            ],
+        )
         return {"intent": intent}
 
     def select_datasources(
@@ -1363,8 +2432,26 @@ class AnalysisPreparationWorkflow:
         catalog = state["catalog"]
         intent = state["intent"]
         if len(catalog) == 1:
+            datasource_id = int(catalog[0]["datasource_id"])
             selection = DatasourceSelectionContract(
-                selected_datasource_ids=[catalog[0]["datasource_id"]],
+                selected_datasource_ids=[datasource_id],
+                question_coverage=[
+                    BusinessQuestionCoverageContract(
+                        question_id=question.question_id,
+                        datasource_ids=[datasource_id],
+                        fact_coverage=[
+                            BusinessFactCoverageContract(
+                                fact_id=fact.fact_id,
+                                coverage_status="direct",
+                                datasource_ids=[datasource_id],
+                                coverage_reason="当前唯一数据源提供可核验的事实入口",
+                            )
+                            for fact in question.required_business_facts
+                        ],
+                        coverage_reason="当前唯一数据源承载该业务问题的可用事实",
+                    )
+                    for question in intent.business_questions
+                ],
                 selection_reason="当前会话只有一个可用数据源",
             )
             selected_snapshot = filter_datasource_snapshot(
@@ -1389,7 +2476,15 @@ class AnalysisPreparationWorkflow:
                         self.user_query,
                         intent.business_goal,
                         *intent.business_subjects,
-                        *intent.business_questions,
+                        *(
+                            question.business_question
+                            for question in intent.business_questions
+                        ),
+                        *(
+                            fact.business_fact
+                            for question in intent.business_questions
+                            for fact in question.required_business_facts
+                        ),
                     ]),
                 )
                 logger.info(
@@ -1414,11 +2509,17 @@ class AnalysisPreparationWorkflow:
                     cancelled=self.cancelled,
                 )
                 by_id = {item["datasource_id"]: item for item in catalog}
+                recalled_ids = recall_datasources_for_business_facts(
+                    catalog,
+                    intent,
+                )
+                shortlist_ids = list(dict.fromkeys([
+                    *shortlist.shortlisted_datasource_ids,
+                    *recalled_ids,
+                ]))
                 shortlisted = [
                     by_id[datasource_id]
-                    for datasource_id in dict.fromkeys(
-                        shortlist.shortlisted_datasource_ids
-                    )
+                    for datasource_id in shortlist_ids
                     if datasource_id in by_id
                 ]
                 if shortlisted:
@@ -1454,11 +2555,15 @@ class AnalysisPreparationWorkflow:
                 runtime_config=self.runtime_config,
                 cancelled=self.cancelled,
             )
-            selection = self._normalize_selection(selection, catalog)
+            selection = self._normalize_selection(selection, catalog, intent)
             logger.info(
-                "datasource selection resolved selected_count=%s selected_ids=%s",
+                "datasource selection resolved selected_count=%s selected_ids=%s coverage=%s",
                 len(selection.selected_datasource_ids),
                 selection.selected_datasource_ids,
+                [
+                    item.model_dump()
+                    for item in selection.question_coverage
+                ],
             )
         except AnalysisTaskCancelled:
             raise
@@ -1467,7 +2572,7 @@ class AnalysisPreparationWorkflow:
                 "selection unresolved; preserving candidate sources: %s",
                 exc,
             )
-            selection = self._fallback_selection(catalog)
+            selection = self._fallback_selection(catalog, intent)
         selected_snapshot = filter_datasource_snapshot(
             self.datasource_snapshot,
             selection.selected_datasource_ids,
@@ -1489,16 +2594,6 @@ class AnalysisPreparationWorkflow:
     ) -> AnalysisPreparationState:
         self._start_stage("business_context")
         selection = state["selection"]
-        if len(selection.selected_datasource_ids) == 1:
-            contract = self._fallback_business_context(selection)
-            return {
-                "business_context": contract,
-                "selected_snapshot": enrich_selected_datasource_schemas(
-                    state["selected_snapshot"],
-                    selection=selection,
-                    business_context=contract,
-                ),
-            }
         payload = {
             "user_query": self.user_query,
             "intent_context": state["intent"].model_dump(),
@@ -1509,25 +2604,119 @@ class AnalysisPreparationWorkflow:
             ),
         }
         try:
-            candidate = _invoke_contract(
-                stage="business_context",
-                payload=payload,
-                output_model=BusinessContextContract,
-                runtime_config=self.runtime_config,
-                cancelled=self.cancelled,
-            )
-            candidate = self._normalize_unverified_schema_relationships(
-                candidate,
-                state["selected_schemas"],
-            )
-            validate_business_context(
-                candidate,
-                state["selected_schemas"],
-                selection=selection,
-            )
-            contract = candidate
+            probe_observations: list[dict[str, Any]] = []
+            semantic_error = ""
+            previous_output: dict[str, Any] | None = None
+            for semantic_attempt in range(2):
+                attempt_payload = dict(payload)
+                if semantic_error:
+                    attempt_payload["contract_feedback"] = {
+                        "error": semantic_error,
+                        "previous_output": previous_output,
+                        "instruction": (
+                            "保持原业务意图与选源范围，只修正 Schema 引用、"
+                            "问题覆盖或关系引用错误"
+                        ),
+                    }
+                candidate = _invoke_contract(
+                    stage="business_context",
+                    payload=attempt_payload,
+                    output_model=BusinessContextContract,
+                    runtime_config=self.runtime_config,
+                    cancelled=self.cancelled,
+                )
+                candidate = self._normalize_unverified_schema_relationships(
+                    candidate,
+                    state["selected_schemas"],
+                )
+                candidate = self._complete_derived_fact_lineage(
+                    candidate,
+                    selection,
+                )
+                candidate = self._remove_intrasource_relationships(candidate)
+                candidate = self._scope_lineage_relationships(candidate)
+                try:
+                    candidate, relationship_observations = self._probe_relationship_candidates(
+                        candidate=candidate,
+                        schemas=state["selected_schemas"],
+                        selection=selection,
+                    )
+                    schema_observations = self._probe_schema_requests(
+                        candidate=candidate,
+                        schemas=state["selected_schemas"],
+                        selection=selection,
+                    )
+                    current_observations = [
+                        *relationship_observations,
+                        *schema_observations,
+                    ]
+                    probe_observations.extend(current_observations)
+                    if current_observations:
+                        probe_draft = candidate
+                        candidate = _invoke_contract(
+                            stage="business_context",
+                            payload={
+                                **payload,
+                                "resolution_phase": "finalize_after_probe",
+                                "business_context_draft": candidate.model_dump(),
+                                "probe_observations": current_observations,
+                            },
+                            output_model=BusinessContextContract,
+                            runtime_config=self.runtime_config,
+                            cancelled=self.cancelled,
+                        )
+                        candidate = self._reconcile_finalized_relationships(
+                            candidate,
+                            probe_draft,
+                        )
+                        candidate = self._normalize_unverified_schema_relationships(
+                            candidate,
+                            state["selected_schemas"],
+                        )
+                        candidate = self._normalize_probe_backed_relationships(
+                            candidate,
+                            relationship_observations,
+                        )
+                        candidate = self._complete_derived_fact_lineage(
+                            candidate,
+                            selection,
+                        )
+                        candidate = self._remove_intrasource_relationships(candidate)
+                        candidate = self._scope_lineage_relationships(candidate)
+                        if candidate.probe_requests:
+                            remaining = [
+                                f"Schema fact Probe request {item.request_id} remains unresolved"
+                                for item in candidate.probe_requests
+                            ]
+                            candidate = candidate.model_copy(update={
+                                "probe_requests": [],
+                                "unresolved_relationships": list(dict.fromkeys([
+                                    *candidate.unresolved_relationships,
+                                    *remaining,
+                                ])),
+                            })
+                    validate_business_context(
+                        candidate,
+                        state["selected_schemas"],
+                        selection=selection,
+                        intent=state["intent"],
+                        probe_observations=probe_observations,
+                    )
+                    contract = candidate
+                    break
+                except ValueError as exc:
+                    if semantic_attempt >= 1:
+                        raise
+                    semantic_error = str(exc)
+                    previous_output = candidate.model_dump()
+                    logger.info(
+                        "business context semantic repair requested error=%s",
+                        semantic_error,
+                    )
+            else:
+                raise ValueError("business context semantic repair did not resolve")
             logger.info(
-                "business context resolved relationships=%s unresolved=%s",
+                "business context resolved relationships=%s lineage=%s unresolved=%s",
                 [
                     {
                         "left_datasource_id": item.left_datasource_id,
@@ -1540,6 +2729,21 @@ class AnalysisPreparationWorkflow:
                     }
                     for item in contract.relationships
                 ],
+                [
+                    {
+                        "question_id": item.question_id,
+                        "status": item.lineage_status,
+                        "datasource_ids": item.datasource_ids,
+                        "business_facts": [
+                            binding.fact_id
+                            for binding in item.fact_bindings
+                        ],
+                        "unresolved_business_facts": (
+                            item.unresolved_business_facts
+                        ),
+                    }
+                    for item in contract.insight_lineage
+                ],
                 contract.unresolved_relationships,
             )
         except AnalysisTaskCancelled:
@@ -1550,9 +2754,10 @@ class AnalysisPreparationWorkflow:
                 exc,
             )
             contract = self._fallback_business_context(selection)
+            probe_observations = []
         return {
             "business_context": contract,
-            "probe_observations": (),
+            "probe_observations": tuple(probe_observations),
             "selected_snapshot": enrich_selected_datasource_schemas(
                 state["selected_snapshot"],
                 selection=selection,
