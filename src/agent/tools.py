@@ -19,8 +19,10 @@ from zoneinfo import ZoneInfo
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langgraph.graph import END
 from langgraph.config import get_stream_writer
 from langgraph.prebuilt import ToolRuntime
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from agent.context_engineering_runtime import CustomContext
@@ -1417,6 +1419,7 @@ def load_data_with_sql(
     sql: str,
     params: Optional[list[Any]] = None,
     numeric_columns: Optional[list[str]] = None,
+    text_columns: Optional[list[str]] = None,
 ):
     _begin_query_snapshot_execution(sql=sql, params=params)
     start_time = time.time()
@@ -1426,8 +1429,23 @@ def load_data_with_sql(
         explicit_numeric_columns = list(dict.fromkeys(
             str(item) for item in (numeric_columns or []) if str(item)
         ))
+        explicit_text_columns = list(dict.fromkeys(
+            str(item) for item in (text_columns or []) if str(item)
+        ))
+        conflicting_columns = sorted(
+            set(explicit_numeric_columns) & set(explicit_text_columns)
+        )
+        if conflicting_columns:
+            raise ValueError(
+                "columns cannot be both numeric_columns and text_columns: "
+                + ", ".join(conflicting_columns)
+            )
         missing_explicit_columns = [
             column for column in explicit_numeric_columns
+            if column not in data.columns
+        ]
+        missing_text_columns = [
+            column for column in explicit_text_columns
             if column not in data.columns
         ]
         if missing_explicit_columns:
@@ -1435,13 +1453,18 @@ def load_data_with_sql(
                 "numeric_columns references unavailable query result columns: "
                 + ", ".join(missing_explicit_columns)
             )
+        if missing_text_columns:
+            raise ValueError(
+                "text_columns references unavailable query result columns: "
+                + ", ".join(missing_text_columns)
+            )
         inferred_numeric_columns = [
             column
             for column in [
                 *_infer_sql_aggregate_numeric_columns(sql),
                 *_infer_schema_numeric_result_columns(sql, list(data.columns)),
             ]
-            if column in data.columns
+            if column in data.columns and column not in explicit_text_columns
         ]
         effective_numeric_columns = list(dict.fromkeys([
             *explicit_numeric_columns,
@@ -1451,6 +1474,10 @@ def load_data_with_sql(
             import pandas as pd
             for column in effective_numeric_columns:
                 data[column] = pd.to_numeric(data[column], errors="raise")
+        for column in explicit_text_columns:
+            data[column] = data[column].map(
+                lambda value: "" if value is None else str(value).strip()
+            )
         population_diagnostics = _inspect_zero_population_aggregate(sql, data)
     except Exception:
         _mark_latest_query_snapshot_execution(status='failed', duration_ms=int((time.time() - start_time) * 1000))
@@ -1465,6 +1492,47 @@ def load_data_with_sql(
     if isinstance(attrs, dict):
         attrs['data_insight_query_key'] = str(CURRENT_LAST_QUERY_KEY.get() or '').strip()
     return data
+
+
+def probe_data_with_sql(
+    sql: str,
+    params: Optional[list[Any]] = None,
+    numeric_columns: Optional[list[str]] = None,
+    text_columns: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Execute one diagnostic SQL query without hiding its outcome.
+
+    Probe programs often need to inspect several independent candidate queries.
+    This wrapper keeps query failures as structured observations so one invalid
+    candidate does not force generated code to invent broad exception handling.
+    Formal analysis code must continue to use ``load_data_with_sql`` directly.
+    """
+    if CURRENT_EXECUTION_INTENT.get() != "probe":
+        raise RuntimeError("probe_data_with_sql(...) is only available to probe code")
+    try:
+        data = load_data_with_sql(
+            sql=sql,
+            params=params,
+            numeric_columns=numeric_columns,
+            text_columns=text_columns,
+        )
+    except Exception as exc:
+        error_message = str(exc)
+        error_type = _classify_execution_error(exc, error_message)
+        return {
+            "status": "no_data" if error_type == "no_data_found" else "query_error",
+            "data": None,
+            "row_count": 0,
+            "error_type": error_type,
+            "error_message": error_message,
+        }
+    return {
+        "status": "success",
+        "data": data,
+        "row_count": int(len(data)),
+        "error_type": "",
+        "error_message": "",
+    }
 
 
 def _restore_sql_projection_column_names(sql: str, data: Any) -> Any:
@@ -2146,6 +2214,8 @@ def _serialize_probe_value(value: Any) -> Any:
             return None
     except Exception:
         pass
+    if isinstance(value, datetime):
+        return value.isoformat()
     return value.item() if hasattr(value, 'item') else value
 
 
@@ -2341,6 +2411,34 @@ def request_retry(
         normalized_instructions = _normalize_probe_feedback_repair_instructions(normalized_instructions)
     normalized_diagnostics = _copy_jsonable(diagnostics or {}, {})
     if normalized_retry_type == "probe_feedback":
+        query_observations = normalized_diagnostics.get("query_observations")
+        if isinstance(query_observations, list):
+            outcome_groups = {
+                "successful": [],
+                "no_data": [],
+                "unavailable": [],
+            }
+            for observation in query_observations:
+                if not isinstance(observation, dict):
+                    continue
+                try:
+                    datasource_id = int(observation.get("datasource_id") or 0)
+                except (TypeError, ValueError):
+                    datasource_id = 0
+                item = {
+                    "datasource_id": datasource_id,
+                    "datasource_name": str(observation.get("datasource_name") or ""),
+                    "error_type": str(observation.get("error_type") or ""),
+                }
+                status = str(observation.get("status") or "")
+                row_count = int(observation.get("row_count") or 0)
+                if status == "success" and row_count > 0:
+                    outcome_groups["successful"].append(item)
+                elif status == "no_data" or (status == "success" and row_count == 0):
+                    outcome_groups["no_data"].append(item)
+                else:
+                    outcome_groups["unavailable"].append(item)
+            normalized_diagnostics["_probe_outcome_summary"] = outcome_groups
         expected_time_range = CURRENT_EXPECTED_TIME_RANGE.get()
         normalized_diagnostics["_probe_contract"] = {
             "time_coverage_role": "diagnostic_only",
@@ -3029,7 +3127,18 @@ def _validate_analysis_relationship_contract(
             dict,
         )
     ]
-    if not unresolved_pairs and not fanout_pairs and not key_domain_pairs:
+    normalization_pairs = [
+        item
+        for item in governed_relationships
+        if item.get("joinability") == "joinable"
+        and item.get("key_normalization") == "integral_numeric_text"
+    ]
+    if (
+        not unresolved_pairs
+        and not fanout_pairs
+        and not key_domain_pairs
+        and not normalization_pairs
+    ):
         return None
     try:
         tree = ast.parse(code or "")
@@ -3042,6 +3151,70 @@ def _validate_analysis_relationship_contract(
         for item in snapshot.get("selected_datasource_snapshot") or []
         if isinstance(item, dict) and int(item.get("datasource_id") or 0) > 0
     }
+
+    normalized_code = re.sub(r'["`\[\]\s]+', "", code or "").lower()
+    referenced_source_ids = {
+        datasource_id
+        for datasource_id, identifier in identifiers.items()
+        if identifier and re.sub(r'["`\[\]\s]+', "", identifier).lower()
+        in normalized_code
+    }
+    called_functions = _called_function_names(tree)
+    declared_text_columns = {
+        str(item.value)
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and (
+            (isinstance(call.func, ast.Name) and call.func.id == "load_data_with_sql")
+            or (
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr == "load_data_with_sql"
+            )
+        )
+        for keyword in call.keywords
+        if keyword.arg == "text_columns" and isinstance(keyword.value, (ast.List, ast.Tuple))
+        for item in keyword.value.elts
+        if isinstance(item, ast.Constant) and isinstance(item.value, str)
+    }
+    for relationship in normalization_pairs:
+        relationship_source_ids = {
+            int(relationship.get("left_datasource_id") or 0),
+            int(relationship.get("right_datasource_id") or 0),
+        }
+        if not relationship_source_ids.issubset(referenced_source_ids):
+            continue
+        relationship_fields = {
+            str(field)
+            for field in [
+                *(relationship.get("left_fields") or []),
+                *(relationship.get("right_fields") or []),
+            ]
+            if str(field)
+        }
+        if (
+            "normalize_relationship_key" in called_functions
+            and relationship_fields.issubset(declared_text_columns)
+        ):
+            continue
+        return request_retry(
+            retry_type="query_constraint_violation",
+            message=(
+                "当前代码使用了需要数值标识规范化的已确认关系，但没有通过 "
+                "Runtime 标准能力保真加载并统一关联键。"
+            ),
+            diagnostics={
+                "violated_contract": "relationship_key_normalization_required",
+                "relationship_id": relationship.get("relationship_id"),
+                "required_text_columns": sorted(relationship_fields),
+                "declared_text_columns": sorted(declared_text_columns),
+                "required_helper": "normalize_relationship_key",
+            },
+            repair_instructions=[
+                "两侧关系键所在查询都通过 load_data_with_sql(..., text_columns=[...]) 保留原始标识精度。",
+                "分别调用 normalize_relationship_key(dataframe[key_field]) 生成规范键，再按规范键 JOIN 或 merge。",
+                "不要使用 str()、astype(str)、float 或自行 int(float(...)) 转换大整数标识。",
+            ],
+        )
 
     def _relationship_retry(relationship: dict[str, Any]) -> RetryResult:
         left_id = int(relationship.get("left_datasource_id") or 0)
@@ -3734,6 +3907,7 @@ def _handler_records_query_failure(handler: ast.ExceptHandler) -> bool:
 
 
 def _validate_sql_load_error_handling_contract(tree: ast.AST) -> RetryResult | None:
+    execution_intent = _extract_static_string_assignment(tree, 'execution_intent')
     for node in ast.walk(tree):
         if not isinstance(node, ast.Try):
             continue
@@ -3746,6 +3920,25 @@ def _validate_sql_load_error_handling_contract(tree: ast.AST) -> RetryResult | N
             handler_module = ast.Module(body=handler.body, type_ignores=[])
             if _node_calls_function(handler_module, 'request_retry') or any(isinstance(child, ast.Raise) for child in ast.walk(handler_module)):
                 continue
+            if execution_intent == 'probe':
+                return request_retry(
+                    retry_type="contract_error",
+                    message=(
+                        "多查询 Probe 使用了宽泛 try/except 包裹 load_data_with_sql(...)，"
+                        "无法稳定保留每条候选路径的成功、空集和查询失败状态。"
+                    ),
+                    diagnostics={
+                        'violated_contract': 'probe_sql_outcomes_require_structured_helper',
+                        'try_line_no': getattr(node, 'lineno', None),
+                        'except_line_no': getattr(handler, 'lineno', None),
+                    },
+                    repair_instructions=[
+                        "保持当前 Probe 的完整数据源和 SQL 范围，不要缩成单个数据源逐轮试错。",
+                        "删除包裹 load_data_with_sql(...) 的 try/except；对循环中的每条 SQL 调用 probe_data_with_sql(...)。",
+                        "按返回的 status 区分 success、成功空集和 query_error，把每条路径的 datasource_id、datasource_name、row_count、error_type、error_message 汇总进同一次 request_retry(..., diagnostics=...)。",
+                        "query_error 是已观测的数据源不可用状态，不是无数据；后续正式分析只计算 Probe 成功且非空的路径，并在报告中披露空集和不可用路径。",
+                    ],
+                )
             records_query_failure = _handler_records_query_failure(handler)
             if (
                 _handler_has_pass_only(handler)
@@ -4090,6 +4283,7 @@ def _validate_probe_observation_contract(
 
     data_access_calls = {
         "load_data_with_sql",
+        "probe_data_with_sql",
         "load_local_data_with_sql",
         "load_local_file",
         "load_local_file_low_memory",
@@ -4121,10 +4315,26 @@ def _validate_probe_observation_contract(
         return ""
 
     def target_names(target: ast.AST) -> set[str]:
-        return {
+        names = {
             item.id
             for item in ast.walk(target)
             if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store)
+        }
+        if isinstance(target, (ast.Subscript, ast.Attribute)):
+            names.update(
+                item.id
+                for item in ast.walk(target)
+                if isinstance(item, ast.Name)
+            )
+        return names
+
+    def loaded_names(node: ast.AST | None) -> set[str]:
+        if node is None:
+            return set()
+        return {
+            item.id
+            for item in ast.walk(node)
+            if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load)
         }
 
     tainted_names: set[str] = set()
@@ -4156,15 +4366,27 @@ def _validate_probe_observation_contract(
             value = getattr(node, "value", None)
             if value is None:
                 continue
-            loaded_names = {
-                item.id for item in ast.walk(value)
-                if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load)
-            }
-            if not loaded_names.intersection(tainted_names):
+            if not loaded_names(value).intersection(tainted_names):
                 continue
             raw_targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             derived_targets = set().union(*(target_names(target) for target in raw_targets))
             new_targets = derived_targets - tainted_names
+            if new_targets:
+                tainted_names.update(new_targets)
+                changed = True
+        for call in (
+            item for item in ast.walk(tree)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Attribute)
+            and item.func.attr in {"append", "extend", "insert", "update", "setdefault", "add"}
+        ):
+            container_names = loaded_names(call.func.value)
+            value_names = set().union(
+                *(loaded_names(item) for item in [*call.args, *(keyword.value for keyword in call.keywords)])
+            )
+            if not value_names.intersection(tainted_names):
+                continue
+            new_targets = container_names - tainted_names
             if new_targets:
                 tainted_names.update(new_targets)
                 changed = True
@@ -5459,11 +5681,8 @@ def _find_opaque_dimension_artifacts(
     selected_datasource_snapshot: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
     """Find user-facing chart dimensions backed by fields known to contain opaque IDs."""
-    if not selected_datasource_snapshot:
-        return []
-
     opaque_fields_by_source: list[tuple[set[str], set[str]]] = []
-    for datasource in selected_datasource_snapshot:
+    for datasource in selected_datasource_snapshot or []:
         metadata_schema = (
             datasource.get("metadata_schema")
             if isinstance(datasource.get("metadata_schema"), dict)
@@ -5491,7 +5710,8 @@ def _find_opaque_dimension_artifacts(
         if not text:
             return False
         return bool(
-            re.fullmatch(r"-?\d{10,}", text)
+            re.search(r"(?<!\d)-?\d{10,}(?:\.0+)?(?!\d)", text)
+            or re.search(r"(?<![\w.])-?\d(?:\.\d+)?[eE][+-]?\d+(?!\w)", text)
             or re.fullmatch(
                 r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
                 text,
@@ -5512,6 +5732,11 @@ def _find_opaque_dimension_artifacts(
             x_axis = x_axis[0] if x_axis else {}
         if isinstance(x_axis, dict) and isinstance(x_axis.get("data"), list):
             return x_axis["data"]
+        y_axis = spec.get("yAxis")
+        if isinstance(y_axis, list):
+            y_axis = y_axis[0] if y_axis else {}
+        if isinstance(y_axis, dict) and isinstance(y_axis.get("data"), list):
+            return y_axis["data"]
         for series in spec.get("series") or []:
             if not isinstance(series, dict) or str(series.get("type") or "").lower() != "pie":
                 continue
@@ -5635,6 +5860,32 @@ def _find_opaque_dimension_artifacts(
                 "opaque_source_fields": matched_fields,
             })
             break
+    for table_index, table in enumerate(exec_result.tables or []):
+        if not isinstance(table, dict):
+            continue
+        columns = table.get("columns") if isinstance(table.get("columns"), list) else []
+        rows = table.get("rows") if isinstance(table.get("rows"), list) else []
+        if not columns or not rows:
+            continue
+        # Structured analysis tables conventionally put their grouping/entity
+        # dimension first. Checking that explicit column avoids guessing numeric
+        # metrics from arbitrary report prose or cell text.
+        first_column = columns[0] if isinstance(columns[0], dict) else {}
+        dimension_key = str(first_column.get("key") or "").strip()
+        if not dimension_key:
+            continue
+        values = [
+            row.get(dimension_key)
+            for row in rows
+            if isinstance(row, dict) and str(row.get(dimension_key) or "").strip()
+        ]
+        if values and all(looks_like_opaque_value(value) for value in values):
+            findings.append({
+                "table_index": table_index,
+                "table_title": str(table.get("title") or ""),
+                "dimension_field": dimension_key,
+                "reason": "all_structured_dimension_values_are_opaque_identifiers",
+            })
     return findings
 
 
@@ -5727,6 +5978,7 @@ def _validate_structured_result_contract(
             },
             repair_instructions=[
                 "保留已经正确的分析报告。优先在对应图表或表格的标题、description 中说明展示条数、选择方向和范围，不要仅为披露 TopN 而重写或压缩报告正文。",
+                "不要删除、放大或绕过现有 LIMIT/head/tail/sample；本次修复只补充真实的范围披露。删除保护性截取可能让下一版查询超过运行时容量上限。",
                 "只有 analysis_report 的正文结论本身基于不完整样本时，才在正文说明该限制对结论的影响。",
                 "如果图表展示范围小于用户要求的时间范围，必须说明目标时间范围、实际展示点数、总命中点数和截取方向；例如每个数据源命中约 1193 点，图表仅展示其中 200 点。",
                 "如果标题或描述写“最近 N 个点”，代码应使用 tail(N) 或按时间倒序取最近数据；不要用 head(N) 后声称展示最近数据。",
@@ -5786,7 +6038,7 @@ def _validate_structured_result_contract(
         return request_retry(
             retry_type="result_contract_error",
             message=(
-                "当前结果把已确认仅用于关联的原始标识字段作为面向用户的图表分类，"
+                "当前结果把原始标识字段作为面向用户的图表或表格维度，"
                 "无法形成业务可读的洞察。"
             ),
             diagnostics={
@@ -6166,7 +6418,9 @@ def _build_execution_namespace() -> dict[str, Any]:
         'load_local_file_low_memory': load_local_file_low_memory,
         'load_minio_file': load_minio_file,
         'load_data_with_sql': load_data_with_sql,
+        'probe_data_with_sql': probe_data_with_sql,
         'load_data_with_api': load_data_with_api,
+        'normalize_relationship_key': normalize_relationship_key,
         'get_day_range': get_day_range,
         'describe_time_coverage': describe_time_coverage,
         'probe_distinct_values': probe_distinct_values,
@@ -6294,20 +6548,29 @@ def _relationship_key_counts(
             raise ValueError(
                 "relationship Probe fields are unavailable: " + ", ".join(missing)
             )
-        for row in frame[fields].itertuples(index=False, name=None):
-            if any(value is None for value in row):
+        has_frequency = "__relationship_frequency" in frame.columns
+        projected_columns = [
+            *fields,
+            *( ["__relationship_frequency"] if has_frequency else [] ),
+        ]
+        for row in frame[projected_columns].itertuples(index=False, name=None):
+            key_values = row[:len(fields)]
+            if any(value is None for value in key_values):
                 continue
-            normalized = tuple(str(value).strip() for value in row)
+            normalized = tuple(str(value).strip() for value in key_values)
             if any(not value for value in normalized):
                 continue
-            counts[normalized] += 1
+            frequency = row[-1] if has_frequency else 1
+            counts[normalized] += int(frequency or 0)
 
     counts: Counter = Counter()
     if datasource_type == "table":
         columns = ", ".join(fields)
         non_null = " AND ".join(f"{field} IS NOT NULL" for field in fields)
         frame = load_data_with_sql(
-            f"SELECT {columns} FROM {identifier} WHERE {non_null}"
+            f"SELECT {columns}, COUNT(*) AS __relationship_frequency "
+            f"FROM {identifier} WHERE {non_null} GROUP BY {columns} "
+            f"ORDER BY {columns} LIMIT 10000"
         )
         consume(frame, counts)
         return dict(counts)
@@ -6325,29 +6588,60 @@ def _relationship_key_counts(
     )
 
 
-def _inspect_preparation_relationship(
-    relationship: dict[str, Any],
-    datasources_by_id: dict[int, dict[str, Any]],
+def _canonical_relationship_key(value: Any) -> str:
+    """Normalize physical representations without changing ordinary text keys."""
+    from decimal import Decimal, InvalidOperation
+
+    text = str(value).strip()
+    if not text:
+        return ""
+    # Warehouses commonly expose an integer identifier from a DECIMAL column as
+    # ``123.00`` or scientific notation while a dictionary stores ``123`` as text.
+    # Restrict normalization to an explicit decimal/exponent representation so
+    # business codes such as ``0012`` keep their significant leading zeroes.
+    if "." not in text and "e" not in text.lower():
+        return text
+    try:
+        decimal_value = Decimal(text)
+    except InvalidOperation:
+        return text
+    if not decimal_value.is_finite() or decimal_value != decimal_value.to_integral_value():
+        return text
+    return format(decimal_value.quantize(Decimal(1)), "f")
+
+
+def normalize_relationship_key(value: Any) -> Any:
+    """Canonicalize scalar or pandas Series join keys without float coercion."""
+    try:
+        import pandas as pd
+
+        if isinstance(value, pd.Series):
+            return value.map(_canonical_relationship_key)
+    except ImportError:
+        pass
+    return _canonical_relationship_key(value)
+
+
+def _canonicalize_relationship_counts(
+    counts: dict[tuple[str, ...], int],
+) -> dict[tuple[str, ...], int]:
+    from collections import Counter
+
+    normalized: Counter = Counter()
+    for key, count in counts.items():
+        canonical = tuple(_canonical_relationship_key(item) for item in key)
+        if canonical and all(canonical):
+            normalized[canonical] += int(count or 0)
+    return dict(normalized)
+
+
+def _relationship_observation_from_counts(
+    *,
+    relationship_id: str,
+    left_counts: dict[tuple[str, ...], int],
+    right_counts: dict[tuple[str, ...], int],
+    key_alignment: str = "exact",
 ) -> dict[str, Any]:
-    left_id = int(relationship.get("left_datasource_id") or 0)
-    right_id = int(relationship.get("right_datasource_id") or 0)
-    left_fields = [str(item) for item in relationship.get("left_fields") or []]
-    right_fields = [str(item) for item in relationship.get("right_fields") or []]
-    left_source = datasources_by_id[left_id]
-    right_source = datasources_by_id[right_id]
-    if (
-        str(left_source.get("datasource_type") or "") == "table"
-        and str(right_source.get("datasource_type") or "") == "table"
-    ):
-        return _inspect_sql_preparation_relationship(
-            relationship=relationship,
-            left_source=left_source,
-            right_source=right_source,
-            left_fields=left_fields,
-            right_fields=right_fields,
-        )
-    left_counts = _relationship_key_counts(left_source, left_fields)
-    right_counts = _relationship_key_counts(right_source, right_fields)
     left_keys = set(left_counts)
     right_keys = set(right_counts)
     matched_keys = left_keys & right_keys
@@ -6366,25 +6660,91 @@ def _inspect_preparation_relationship(
         if left_max <= 1
         else "many_to_many"
     )
+    facts = {
+        "join_supported": bool(matched_keys),
+        "left_distinct_key_count": len(left_keys),
+        "right_distinct_key_count": len(right_keys),
+        "matched_distinct_key_count": len(matched_keys),
+        "left_match_coverage_ratio": left_coverage,
+        "right_match_coverage_ratio": right_coverage,
+        "left_max_rows_per_key": left_max,
+        "right_max_rows_per_key": right_max,
+        "cardinality": cardinality,
+        "left_measure_aggregation_safe": right_max <= 1,
+        "right_measure_aggregation_safe": left_max <= 1,
+        "key_alignment": key_alignment,
+    }
+    if key_alignment != "exact":
+        facts["key_normalization"] = "integral_numeric_text"
+        facts["join_execution_strategy"] = "normalize_relationship_key"
     return {
-        "observation_id": f"probe:{relationship.get('relationship_id')}",
+        "observation_id": f"probe:{relationship_id}",
         "kind": "relationship_coverage",
         "status": "verified",
         "complete": True,
-        "facts": {
-            "join_supported": bool(matched_keys),
-            "left_distinct_key_count": len(left_keys),
-            "right_distinct_key_count": len(right_keys),
-            "matched_distinct_key_count": len(matched_keys),
-            "left_match_coverage_ratio": left_coverage,
-            "right_match_coverage_ratio": right_coverage,
-            "left_max_rows_per_key": left_max,
-            "right_max_rows_per_key": right_max,
-            "cardinality": cardinality,
-            "left_measure_aggregation_safe": right_max <= 1,
-            "right_measure_aggregation_safe": left_max <= 1,
-        },
+        "facts": facts,
     }
+
+
+def _inspect_preparation_relationship(
+    relationship: dict[str, Any],
+    datasources_by_id: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
+    left_id = int(relationship.get("left_datasource_id") or 0)
+    right_id = int(relationship.get("right_datasource_id") or 0)
+    left_fields = [str(item) for item in relationship.get("left_fields") or []]
+    right_fields = [str(item) for item in relationship.get("right_fields") or []]
+    left_source = datasources_by_id[left_id]
+    right_source = datasources_by_id[right_id]
+    if (
+        str(left_source.get("datasource_type") or "") == "table"
+        and str(right_source.get("datasource_type") or "") == "table"
+    ):
+        exact_observation = _inspect_sql_preparation_relationship(
+            relationship=relationship,
+            left_source=left_source,
+            right_source=right_source,
+            left_fields=left_fields,
+            right_fields=right_fields,
+        )
+        if exact_observation["facts"].get("join_supported"):
+            exact_observation["facts"].setdefault("key_alignment", "exact")
+            return exact_observation
+        # A zero exact match can be a physical type mismatch rather than a
+        # business relationship failure. Recheck the candidate keys locally so
+        # the confirmed schema can carry the normalization needed by Runtime.
+        left_counts = _canonicalize_relationship_counts(
+            _relationship_key_counts(left_source, left_fields)
+        )
+        right_counts = _canonicalize_relationship_counts(
+            _relationship_key_counts(right_source, right_fields)
+        )
+        normalized_observation = _relationship_observation_from_counts(
+            relationship_id=str(relationship.get("relationship_id") or ""),
+            left_counts=left_counts,
+            right_counts=right_counts,
+            key_alignment="integral_numeric_text",
+        )
+        return (
+            normalized_observation
+            if normalized_observation["facts"].get("join_supported")
+            else exact_observation
+        )
+    left_counts = _relationship_key_counts(left_source, left_fields)
+    right_counts = _relationship_key_counts(right_source, right_fields)
+    exact_observation = _relationship_observation_from_counts(
+        relationship_id=str(relationship.get("relationship_id") or ""),
+        left_counts=left_counts,
+        right_counts=right_counts,
+    )
+    if exact_observation["facts"].get("join_supported"):
+        return exact_observation
+    return _relationship_observation_from_counts(
+        relationship_id=str(relationship.get("relationship_id") or ""),
+        left_counts=_canonicalize_relationship_counts(left_counts),
+        right_counts=_canonicalize_relationship_counts(right_counts),
+        key_alignment="integral_numeric_text",
+    )
 
 
 def _inspect_sql_preparation_relationship(
@@ -6503,6 +6863,7 @@ def _inspect_preparation_schema_fact(
 ) -> dict[str, Any]:
     """Return a bounded aggregate/profile observation, never source sample rows."""
     from collections import Counter
+    import pandas as pd
 
     datasource_id = int(request.get("datasource_id") or 0)
     field = str(request.get("field") or "").strip()
@@ -6762,10 +7123,20 @@ def _preparation_relationship_probe_worker(
             for item in datasources
             if isinstance(item, dict)
         }
-        observations = [
-            _inspect_preparation_relationship(item, datasources_by_id)
-            for item in relationships
-        ]
+        observations = []
+        for item in relationships:
+            try:
+                observations.append(
+                    _inspect_preparation_relationship(item, datasources_by_id)
+                )
+            except Exception as exc:
+                observations.append({
+                    "observation_id": f"probe:{item.get('relationship_id')}",
+                    "kind": "relationship_coverage",
+                    "status": "unavailable",
+                    "complete": False,
+                    "error": str(exc),
+                })
         result_queue.put({"status": "success", "observations": observations})
     except Exception as exc:
         result_queue.put({
@@ -7028,6 +7399,14 @@ def _classify_execution_error(error: Exception | None, error_message: str) -> st
         return 'data_type_or_time_mismatch'
     if 'not in index' in lowered or 'no such column' in lowered:
         return 'schema_or_column_mismatch'
+    if any(marker in lowered for marker in (
+        'failed to fetch result for query',
+        'binder error',
+        'catalog error',
+        'connection refused',
+        'could not connect',
+    )):
+        return 'data_source_unavailable'
     if (
         'no_data_found' in lowered
         or '未命中可分析数据' in error_message
@@ -7036,7 +7415,7 @@ def _classify_execution_error(error: Exception | None, error_message: str) -> st
         or '关联后无数据' in error_message
     ):
         return 'no_data_found'
-    if 'save_analysis_result' in lowered or 'analysis_report' in lowered or 'result' in lowered:
+    if 'save_analysis_result' in lowered or 'analysis_report' in lowered:
         return 'result_contract_error'
     return 'runtime_error'
 
@@ -7579,6 +7958,11 @@ def _tool_success_message(
     )
 
 
+def _terminal_tool_success(message: ToolMessage) -> Command:
+    """Finish the agent graph after a fully validated analysis result."""
+    return Command(update={"messages": [message]}, goto=END)
+
+
 def run_generated_code_locally(
     *,
     conversation_id: int,
@@ -7765,7 +8149,7 @@ def execute_python(
     title: str = '',
     description: str = "",
     used_datasource_ids: list[int] | None = None,
-) -> Optional[ToolMessage]:
+) -> Optional[ToolMessage | Command]:
     """
     执行模型生成的 Python 分析代码。
 
@@ -8278,12 +8662,17 @@ def execute_python(
             tool='execute_python',
             message='分析结果已生成，正在整理最终报告。',
         )
-        return _tool_success_message(
+        success_message = _tool_success_message(
             tool_call_id=runtime.tool_call_id,
             analysis_report=exec_result.analysis_report,
             charts=exec_result.charts,
             tables=exec_result.tables,
         )
+        # A contract-valid StructuredResult is the terminal product of this
+        # agent run. Returning a graph command prevents another model turn from
+        # treating the lightweight success summary as a reason to probe again.
+        # Retry/error ToolMessages above still return to the same ReAct loop.
+        return _terminal_tool_success(success_message)
 
     _update_execution_record(
         execution_id,

@@ -25,6 +25,7 @@ from agent.tools import (  # noqa: E402
     load_local_file,
     load_local_file_low_memory,
     load_data_with_sql,
+    normalize_relationship_key,
     request_retry,
     save_analysis_result,
     validate_query_constraints,
@@ -227,6 +228,30 @@ def test_explicit_numeric_projection_still_rejects_missing_result_column(monkeyp
             )
     finally:
         CURRENT_EXECUTION_INTENT.reset(intent_token)
+
+
+def test_text_projection_preserves_large_identifier_before_normalization(monkeypatch):
+    from decimal import Decimal
+
+    monkeypatch.setattr(
+        "agent.tools._load_data_with_fed_query",
+        lambda **kwargs: pd.DataFrame([{
+            "status_id": Decimal("166832699355251625.00"),
+        }]),
+    )
+    intent_token = CURRENT_EXECUTION_INTENT.set("probe")
+    try:
+        data = load_data_with_sql(
+            "SELECT status_id FROM contracts",
+            text_columns=["status_id"],
+        )
+    finally:
+        CURRENT_EXECUTION_INTENT.reset(intent_token)
+
+    assert data.iloc[0]["status_id"] == "166832699355251625.00"
+    assert normalize_relationship_key(data["status_id"]).tolist() == [
+        "166832699355251625"
+    ]
 
 
 def test_probe_may_reuse_query_validation_without_becoming_formal_analysis():

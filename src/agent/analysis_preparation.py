@@ -477,7 +477,7 @@ class BusinessContextProbeRequest(BaseModel):
     request_id: str = Field(min_length=1)
     datasource_id: int = Field(gt=0)
     field: str = Field(min_length=1)
-    probe_kind: Literal["distinct_values", "time_coverage", "field_profile"]
+    probe_kind: Literal["distinct_values", "field_profile"]
     purpose: str = Field(min_length=1)
     related_fact_ids: list[str] = Field(default_factory=list)
     expected_values: list[str] = Field(default_factory=list)
@@ -486,7 +486,16 @@ class BusinessContextProbeRequest(BaseModel):
     @field_validator("related_fact_ids", "expected_values", mode="before")
     @classmethod
     def normalize_optional_lists(cls, value: Any) -> Any:
-        return [] if value is None else value
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            return value
+        return [
+            str(item)
+            if isinstance(item, (int, float, bool))
+            else item
+            for item in value
+        ]
 
     @field_validator("top_n", mode="before")
     @classmethod
@@ -791,6 +800,9 @@ class PreparationResult:
                 "cardinality",
                 "left_measure_aggregation_safe",
                 "right_measure_aggregation_safe",
+                "key_alignment",
+                "key_normalization",
+                "join_execution_strategy",
             ):
                 if key in relationship.probe_facts:
                     item[key] = relationship.probe_facts[key]
@@ -1048,6 +1060,13 @@ def _apply_relationship_execution_semantics(
                 and str(facts.get("cardinality") or "unknown") != "unknown"
             ):
                 item["joinability"] = "joinable"
+            for key in (
+                "key_alignment",
+                "key_normalization",
+                "join_execution_strategy",
+            ):
+                if key in facts:
+                    item[key] = facts[key]
             aggregation_safety = _relationship_aggregation_safety(
                 facts,
                 reverse=datasource_id == canonical.right_datasource_id,
@@ -1684,6 +1703,13 @@ def enrich_selected_datasource_schemas(
                 item["observation_id"] = observation_id
             if probe_facts:
                 item["probe_facts"] = dict(probe_facts)
+                for key in (
+                    "key_alignment",
+                    "key_normalization",
+                    "join_execution_strategy",
+                ):
+                    if key in probe_facts:
+                        item[key] = probe_facts[key]
                 aggregation_safety = _relationship_aggregation_safety(
                     probe_facts,
                     reverse=orientation_index == 1,
@@ -2279,9 +2305,36 @@ class AnalysisPreparationWorkflow:
                 ))
                 bound_fact_ids.add(fact.fact_id)
                 unresolved_by_id.pop(fact.fact_id, None)
+            required_fact_ids = {
+                fact.fact_id for fact in coverage.fact_coverage
+            }
+            relationship_by_id = {
+                item.relationship_id: item for item in candidate.relationships
+            }
+            unresolved_join = any(
+                relationship is not None
+                and relationship.relationship_type in {
+                    "same_entity",
+                    "parent_child",
+                    "event_of_entity",
+                    "dimension_enrichment",
+                    "bridge",
+                }
+                and relationship.joinability != "joinable"
+                for relationship_id in lineage.relationship_ids
+                for relationship in [relationship_by_id.get(relationship_id)]
+            )
+            lineage_status = lineage.lineage_status
+            if (
+                bound_fact_ids == required_fact_ids
+                and not unresolved_by_id
+                and not unresolved_join
+            ):
+                lineage_status = "direct"
             normalized_lineage.append(lineage.model_copy(update={
                 "fact_bindings": bindings,
                 "unresolved_business_facts": list(unresolved_by_id.values()),
+                "lineage_status": lineage_status,
             }))
         return candidate.model_copy(update={"insight_lineage": normalized_lineage})
 
@@ -2520,6 +2573,36 @@ class AnalysisPreparationWorkflow:
                 }
                 for item in candidate.probe_requests
             ]
+
+    @staticmethod
+    def _remove_relationship_resolved_schema_probes(
+        candidate: BusinessContextContract,
+    ) -> BusinessContextContract:
+        """Do not re-probe a key whose semantic path is already verified.
+
+        A distinct-values observation on an identifier naturally returns IDs;
+        it cannot overturn a separately verified relation to a label source.
+        """
+        resolved_key_fields = {
+            (datasource_id, field)
+            for relationship in candidate.relationships
+            if relationship.joinability == "joinable"
+            and relationship.evidence_basis in {"schema", "probe"}
+            for datasource_id, fields in (
+                (relationship.left_datasource_id, relationship.left_fields),
+                (relationship.right_datasource_id, relationship.right_fields),
+            )
+            for field in fields
+        }
+        if not resolved_key_fields:
+            return candidate
+        return candidate.model_copy(update={
+            "probe_requests": [
+                request
+                for request in candidate.probe_requests
+                if (request.datasource_id, request.field) not in resolved_key_fields
+            ],
+        })
 
     @staticmethod
     def _normalize_probe_backed_relationships(
@@ -2943,6 +3026,7 @@ class AnalysisPreparationWorkflow:
                 schemas=state["selected_schemas"],
                 selection=selection,
             )
+            candidate = self._remove_relationship_resolved_schema_probes(candidate)
             schema_observations = self._probe_schema_requests(
                 candidate=candidate,
                 schemas=state["selected_schemas"],

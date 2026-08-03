@@ -11,6 +11,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 import agent.analysis_preparation as prep  # noqa: E402
+import agent.tools as runtime_tools  # noqa: E402
 from agent.analysis_preparation import (  # noqa: E402
     BusinessFactCoverageContract,
     BusinessFactBindingContract,
@@ -512,6 +513,52 @@ def test_business_context_compiler_completes_selection_owned_derived_facts():
     assert derived.derived_from_fact_ids == ["revenue"]
 
 
+def test_derived_fact_completion_promotes_fully_grounded_lineage_to_direct():
+    selection = DatasourceSelectionContract(
+        question_coverage=[BusinessQuestionCoverageContract(
+            question_id="question_1",
+            fact_coverage=[
+                BusinessFactCoverageContract(
+                    fact_id="measured_fact",
+                    coverage_status="direct",
+                    datasource_ids=[11],
+                    coverage_reason="measured directly",
+                ),
+                BusinessFactCoverageContract(
+                    fact_id="derived_advice",
+                    coverage_status="direct",
+                    derived_from_fact_ids=["measured_fact"],
+                    coverage_reason="derived from the measured fact",
+                ),
+            ],
+            coverage_reason="complete",
+        )],
+        selection_reason="complete fact graph",
+    )
+    candidate = BusinessContextContract(insight_lineage=[InsightLineageContract(
+        question_id="question_1",
+        business_question="analyze and recommend",
+        lineage_status="partial",
+        datasource_ids=[11],
+        fact_bindings=[BusinessFactBindingContract(
+            fact_id="measured_fact",
+            datasource_id=11,
+            fields=["amount"],
+        )],
+        synthesis_path="derive recommendations from the measured fact",
+    )])
+
+    completed = prep.AnalysisPreparationWorkflow._complete_derived_fact_lineage(
+        candidate,
+        selection,
+    )
+
+    assert completed.insight_lineage[0].lineage_status == "direct"
+    assert {
+        item.fact_id for item in completed.insight_lineage[0].fact_bindings
+    } == {"measured_fact", "derived_advice"}
+
+
 def test_selection_contract_covers_questions_without_metrics_or_probe_plan():
     properties = set(DatasourceSelectionContract.model_json_schema()["properties"])
     assert "question_coverage" in properties
@@ -960,8 +1007,8 @@ def test_business_context_probe_ignores_empty_top_n_for_non_enum_profiles(value)
         "request_id": "time_range",
         "datasource_id": 11,
         "field": "status",
-        "probe_kind": "time_coverage",
-        "purpose": "确认覆盖范围",
+        "probe_kind": "field_profile",
+        "purpose": "确认关系键覆盖",
         "top_n": value,
     })
 
@@ -994,6 +1041,19 @@ def test_business_context_probe_normalizes_null_optional_lists():
 
     assert request.related_fact_ids == []
     assert request.expected_values == []
+
+
+def test_business_context_probe_normalizes_json_scalar_expected_values():
+    request = BusinessContextProbeRequest.model_validate({
+        "request_id": "month_values",
+        "datasource_id": 11,
+        "field": "month_key",
+        "probe_kind": "distinct_values",
+        "purpose": "confirm the stored month representation",
+        "expected_values": [202606, 6.0, True, "06"],
+    })
+
+    assert request.expected_values == ["202606", "6.0", "True", "06"]
 
 
 def test_business_context_removes_intrasource_er_edges():
@@ -1613,6 +1673,44 @@ def test_business_context_relationship_probe_promotes_verified_candidate(monkeyp
     assert observations == [observation]
 
 
+def test_verified_relationship_removes_redundant_key_value_probe():
+    context = _business_context()
+    relationship = context.relationships[0].model_copy(update={
+        "joinability": "joinable",
+        "evidence_basis": "probe",
+        "observation_id": "probe:contract_customer",
+    })
+    candidate = context.model_copy(update={
+        "relationships": [relationship],
+        "probe_requests": [
+            BusinessContextProbeRequest(
+                request_id="customer_id_values",
+                datasource_id=11,
+                field="customer_id",
+                probe_kind="distinct_values",
+                purpose="confirm customer labels",
+            ),
+            BusinessContextProbeRequest(
+                request_id="status_values",
+                datasource_id=11,
+                field="status",
+                probe_kind="distinct_values",
+                purpose="confirm status values",
+            ),
+        ],
+    })
+
+    normalized = (
+        prep.AnalysisPreparationWorkflow._remove_relationship_resolved_schema_probes(
+            candidate
+        )
+    )
+
+    assert [item.request_id for item in normalized.probe_requests] == [
+        "status_values"
+    ]
+
+
 def test_relationship_probe_uses_only_field_pairs_present_on_both_schemas():
     context = _business_context()
     relationship = context.relationships[0].model_copy(update={
@@ -1789,6 +1887,38 @@ def test_business_context_normalizes_status_and_ignores_top_level_annotations():
 
     assert result.insight_lineage[0].lineage_status == "direct"
     assert not hasattr(result, "probe_resolution_notes")
+
+
+def test_local_file_time_coverage_schema_probe_has_its_own_pandas_runtime(monkeypatch):
+    import pandas as pd
+
+    monkeypatch.setattr(
+        runtime_tools,
+        "load_local_file",
+        lambda _path: pd.DataFrame({
+            "installed_at": ["2024-01-02", "2025-03-04", None],
+        }),
+    )
+
+    observation = runtime_tools._inspect_preparation_schema_fact(
+        {
+            "request_id": "device_installation_coverage",
+            "datasource_id": 12,
+            "field": "installed_at",
+            "probe_kind": "time_coverage",
+        },
+        {
+            "datasource_id": 12,
+            "datasource_type": "local_file",
+            "datasource_identifier": "devices.xlsx",
+        },
+    )
+
+    assert observation["status"] == "verified"
+    assert observation["facts"]["total_count"] == 3
+    assert observation["facts"]["non_null_count"] == 2
+    assert observation["facts"]["min_value"].startswith("2024-01-02")
+    assert observation["facts"]["max_value"].startswith("2025-03-04")
 
 
 def test_business_context_semantic_rejection_is_repaired_in_stage(monkeypatch):

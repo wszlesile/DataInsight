@@ -503,7 +503,8 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
 
     assert bundle["status"] == "complete", bundle["diagnostics"]
-    assert [item["text"] for item in bundle["report_trace_refs"]] == [
+    refs = sorted(bundle["report_trace_refs"], key=lambda item: item["start"])
+    assert [item["text"] for item in refs] == [
         "200.00",
         "500.00",
     ]
@@ -700,6 +701,199 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     assert len(bundle["evidence_definitions"]) == 1
 
 
+def test_nested_report_row_builder_keeps_all_metric_occurrences_in_its_section():
+    sql = "SELECT category, COUNT(*) AS count FROM assets GROUP BY category"
+    code = r'''
+sql = "SELECT category, COUNT(*) AS count FROM assets GROUP BY category"
+data = load_data_with_sql(sql=sql)
+data["ratio"] = data["count"] / data["count"].sum()
+report_sections = ["## Overview", "## Category detail"]
+detail_lines = []
+for _, row in data.iterrows():
+    detail_lines.append(f"- {row['category']}: {int(row['count'])} items ({row['ratio']:.1%})")
+report_sections.append("\n".join(detail_lines))
+report_sections.append("## Advice")
+analysis_report = "\n".join(report_sections)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    report = (
+        "## Overview\n## Category detail\n"
+        "- machine: 3 items (75.0%)\n"
+        "- vehicle: 1 items (25.0%)\n"
+        "## Advice"
+    )
+    snapshot = _snapshot(
+        code=code,
+        report=report,
+        query_snapshots={
+            "q_assets": _query_snapshot(sql, columns=["category", "count"])
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    refs = sorted(bundle["report_trace_refs"], key=lambda item: item["start"])
+    assert [item["text"] for item in refs] == [
+        "3", "75.0", "1", "25.0",
+    ]
+    assert len(bundle["evidence_definitions"]) == 2
+
+
+def test_nested_value_count_builders_keep_renamed_columns_and_reused_row_scopes():
+    sql = "SELECT category, manufacturer FROM assets"
+    code = r'''
+sql = "SELECT category, manufacturer FROM assets"
+data = load_data_with_sql(sql=sql)
+total = len(data)
+category_dist = data["category"].value_counts().reset_index()
+category_dist.columns = ["category", "count"]
+category_dist["ratio"] = category_dist["count"] / total
+manufacturer_dist = data["manufacturer"].value_counts().reset_index()
+manufacturer_dist.columns = ["manufacturer", "count"]
+manufacturer_dist["ratio"] = manufacturer_dist["count"] / total
+report_sections = ["## Category"]
+category_lines = []
+for _, row in category_dist.iterrows():
+    category_lines.append(f"- {row['category']}: {int(row['count'])} ({row['ratio']:.1%})")
+report_sections.append("\n".join(category_lines))
+report_sections.append("## Manufacturer")
+manufacturer_lines = []
+for _, row in manufacturer_dist.iterrows():
+    manufacturer_lines.append(f"- {row['manufacturer']}: {int(row['count'])} ({row['ratio']:.1%})")
+report_sections.append("\n".join(manufacturer_lines))
+analysis_report = "\n".join(report_sections)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    report = (
+        "## Category\n- machine: 3 (75.0%)\n- vehicle: 1 (25.0%)\n"
+        "## Manufacturer\n- Alpha: 2 (50.0%)\n- Beta: 2 (50.0%)"
+    )
+    snapshot = _snapshot(
+        code=code,
+        report=report,
+        query_snapshots={
+            "q_assets": _query_snapshot(sql, columns=["category", "manufacturer"])
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    refs_by_text = {}
+    for item in sorted(bundle["report_trace_refs"], key=lambda ref: ref["start"]):
+        refs_by_text.setdefault(item["text"], []).append(item["evidence_key"])
+    assert len(bundle["report_trace_refs"]) == 8
+    category_count_key = refs_by_text["3"][0]
+    manufacturer_count_key = refs_by_text["2"][0]
+    category_ratio_key = refs_by_text["75.0"][0]
+    manufacturer_ratio_key = refs_by_text["50.0"][0]
+    assert category_count_key != manufacturer_count_key
+    assert category_ratio_key != manufacturer_ratio_key
+
+
+def test_named_conditional_prose_fragments_keep_every_numeric_slot_and_occurrence():
+    sql = "SELECT status, power FROM assets"
+    code = r'''
+sql = "SELECT status, power FROM assets"
+data = load_data_with_sql(sql=sql)
+total = len(data)
+status_dist = data["status"].value_counts().reset_index()
+status_dist.columns = ["status", "count"]
+running = int(status_dist[status_dist["status"] == "running"]["count"].values[0]) if "running" in status_dist["status"].values else 0
+running_ratio = running / total
+if running_ratio >= 0.8:
+    status_finding = f"Running share {running_ratio:.1%} ({running} items), healthy"
+else:
+    status_finding = f"Running share {running_ratio:.1%} ({running} items), needs attention"
+minimum = data["power"].min()
+maximum = data["power"].max()
+average = data["power"].mean()
+suggestions = []
+suggestions.append(f"Power range {minimum:.0f}-{maximum:.0f}, average {average:.1f}.")
+report_parts = [
+    "## Summary",
+    f"- {status_finding}.",
+    "## Detail",
+    f"- {status_finding}.",
+    "## Advice",
+]
+report_parts.extend(suggestions)
+analysis_report = "\n".join(report_parts)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    report = (
+        "## Summary\n- Running share 70.0% (7 items), needs attention.\n"
+        "## Detail\n- Running share 70.0% (7 items), needs attention.\n"
+        "## Advice\nPower range 3-350, average 88.5."
+    )
+    snapshot = _snapshot(
+        code=code,
+        report=report,
+        query_snapshots={"q_assets": _query_snapshot(sql, columns=["status", "power"])},
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert [
+        item["text"]
+        for item in sorted(bundle["report_trace_refs"], key=lambda ref: ref["start"])
+    ] == ["70.0", "7", "70.0", "7", "3", "350", "88.5"]
+
+
+def test_named_aggregate_columns_used_only_by_table_keep_evidence():
+    sql = "SELECT product, price, revenue FROM sales"
+    code = r'''
+sql = "SELECT product, price, revenue FROM sales"
+data = load_data_with_sql(sql=sql)
+summary = data.groupby("product", as_index=False).agg(
+    average_price=("price", "mean"),
+    total_revenue=("revenue", "sum"),
+)
+table = build_table_result(
+    title="Product summary",
+    columns=[
+        {"key": "product", "label": "Product"},
+        {"key": "average_price", "label": "Average price"},
+        {"key": "total_revenue", "label": "Total revenue"},
+    ],
+    data=summary,
+)
+result = save_analysis_result(
+    analysis_report="## Summary\nSee the product table.",
+    charts=[],
+    tables=[table["table"]],
+)
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="## Summary\nSee the product table.",
+        query_snapshots={
+            "q_sales": _query_snapshot(sql, columns=["product", "price", "revenue"])
+        },
+        tables=[{
+            "title": "Product summary",
+            "columns": [
+                {"key": "product", "label": "Product"},
+                {"key": "average_price", "label": "Average price"},
+                {"key": "total_revenue", "label": "Total revenue"},
+            ],
+            "rows": [
+                {"product": "A", "average_price": 12.5, "total_revenue": 100.0},
+                {"product": "B", "average_price": 15.0, "total_revenue": 80.0},
+            ],
+        }],
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert {item["column_key"] for item in bundle["table_trace_refs"]} == {
+        "average_price", "total_revenue",
+    }
+
+
 def test_string_join_is_not_described_as_a_relational_data_join():
     sql = "SELECT department, SUM(amount) AS amount FROM sales GROUP BY department"
     code = r'''
@@ -787,6 +981,72 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     lineage = LineageIndexer().build(snapshot)
 
     assert not [item for item in lineage["output_nodes"] if item["artifact_type"] == "report"]
+
+
+def test_formatted_top_n_table_keeps_one_sequential_calculation_boundary_per_column():
+    sql = "SELECT department, SUM(shipped_sets) AS shipped_sets, SUM(total_sets) AS total_sets FROM contracts GROUP BY department ORDER BY SUM(shipped_sets) DESC"
+    code = r'''
+sql = "SELECT department, SUM(shipped_sets) AS shipped_sets, SUM(total_sets) AS total_sets FROM contracts GROUP BY department ORDER BY SUM(shipped_sets) DESC"
+data = load_data_with_sql(sql=sql)
+top_departments = data.head(10).copy()
+top_departments["shipment_rate"] = top_departments.apply(
+    lambda row: row["shipped_sets"] / row["total_sets"] * 100 if row["total_sets"] else 0,
+    axis=1,
+)
+display = top_departments.head(5).copy()
+display["Shipped sets"] = display["shipped_sets"].map(lambda value: f"{value:,.0f}")
+display["Total sets"] = display["total_sets"].map(lambda value: f"{value:,.0f}")
+display["Shipment rate"] = display["shipment_rate"].map(lambda value: f"{value:.1f}%")
+tables = [build_table_result(
+    title="Top departments",
+    columns=[
+        {"key": "department", "label": "Department"},
+        {"key": "Shipped sets", "label": "Shipped sets"},
+        {"key": "Total sets", "label": "Total sets"},
+        {"key": "Shipment rate", "label": "Shipment rate"},
+    ],
+    rows=display.to_dict("records"),
+)]
+result = save_analysis_result(analysis_report="", charts=[], tables=tables)
+'''
+    snapshot = _snapshot(
+        code=code,
+        tables=[{
+            "title": "Top departments",
+            "columns": [
+                {"key": "department", "label": "Department"},
+                {"key": "Shipped sets", "label": "Shipped sets"},
+                {"key": "Total sets", "label": "Total sets"},
+                {"key": "Shipment rate", "label": "Shipment rate"},
+            ],
+            "rows": [{
+                "department": "Operations",
+                "Shipped sets": "8,226",
+                "Total sets": "9,049",
+                "Shipment rate": "90.9%",
+            }],
+        }],
+        query_snapshots={
+            "q_contracts": _query_snapshot(
+                sql,
+                columns=["department", "shipped_sets", "total_sets"],
+            )
+        },
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    outputs = [
+        item for item in lineage["output_nodes"]
+        if item.get("artifact_type") == "table"
+    ]
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert {item["field"] for item in outputs} == {
+        "Shipped sets", "Total sets", "Shipment rate",
+    }
+    assert all(item["ambiguous_calculation_boundary"] is False for item in outputs)
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert len(bundle["table_trace_refs"]) == 3
 
 
 def test_heterogeneous_chart_value_column_is_not_bound_to_one_evidence():
@@ -1352,6 +1612,88 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
 
     assert bundle["status"] == "complete", bundle["diagnostics"]
     assert [item["text"] for item in bundle["report_trace_refs"]] == ["1,280.50", "12"]
+
+
+def test_report_concatenation_with_joined_row_fragments_keeps_all_numeric_slots():
+    sql = "SELECT status, amount FROM contracts"
+    code = r'''
+sql = "SELECT status, amount FROM contracts"
+data = load_data_with_sql(sql=sql)
+total_count = len(data)
+total_amount = data["amount"].sum()
+status_detail = data.groupby("status", as_index=False).agg(
+    contract_count=("status", "size"),
+    total_amount=("amount", "sum"),
+)
+status_lines = []
+for _, row in status_detail.iterrows():
+    status_lines.append(
+        f"- {row['status']}: {int(row['contract_count'])} contracts, "
+        f"amount {row['total_amount']:,.2f}."
+    )
+analysis_report = (
+    f"Total: {total_count} contracts, amount {total_amount:,.2f}.\n"
+    "## Detail\n"
+    + "\n".join(status_lines)
+)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    report = (
+        "Total: 3 contracts, amount 600.00.\n"
+        "## Detail\n"
+        "- active: 2 contracts, amount 500.00.\n"
+        "- pending: 1 contracts, amount 100.00."
+    )
+    snapshot = _snapshot(
+        code=code,
+        report=report,
+        query_snapshots={"q_contracts": _query_snapshot(sql, columns=["status", "amount"])},
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    refs = sorted(bundle["report_trace_refs"], key=lambda item: item["start"])
+    assert [item["text"] for item in refs] == [
+        "3", "600.00", "2", "500.00", "1", "100.00",
+    ]
+    metric_fields = {
+        field
+        for definition in bundle["evidence_definitions"]
+        for field in definition["calculation"]["metric_fields"]
+    }
+    assert metric_fields == {"contract_count", "total_amount", "total_count"}
+
+
+def test_filtered_generator_report_builder_keeps_dynamic_precision_slots():
+    sql = "SELECT amount, contract_count FROM sales"
+    code = r'''
+sql = "SELECT amount, contract_count FROM sales"
+data = load_data_with_sql(sql=sql)
+precision = 1
+total_amount = data["amount"].sum()
+total_count = data["contract_count"].sum()
+report_sections = [
+    "## Summary",
+    f"Amount: {total_amount:,.{precision}f} yuan.",
+    "" if total_count <= 0 else f"Contracts: {total_count:,.{precision}f}.",
+]
+analysis_report = "\n".join(section for section in report_sections if section)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="## Summary\nAmount: 1,280.5 yuan.\nContracts: 12.0.",
+        query_snapshots={
+            "q_sales": _query_snapshot(sql, columns=["amount", "contract_count"]),
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    refs = sorted(bundle["report_trace_refs"], key=lambda item: item["start"])
+    assert [item["text"] for item in refs] == ["1,280.5", "12.0"]
 
 
 def test_report_embedded_conditional_fragments_keep_their_numeric_slots():

@@ -14,19 +14,25 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from agent.tools import (  # noqa: E402
+    CURRENT_EXECUTION_INTENT,
     CURRENT_DATASOURCE_NUMERIC_FIELDS,
     StructuredResult,
     _build_execution_namespace,
     _extract_dataframe_reduction_clauses,
+    _classify_execution_error,
     _inspect_preparation_relationship,
     _inspect_preparation_schema_fact,
     _inspect_sql_preparation_relationship,
     _normalize_chart_items,
     _restore_sql_projection_column_names,
+    _terminal_tool_success,
+    _tool_success_message,
     _validate_analysis_relationship_contract,
     _validate_generated_code_contract,
     _validate_structured_result_contract,
     load_data_with_sql,
+    probe_data_with_sql,
+    request_retry,
     save_analysis_result,
     validate_query_constraints,
 )
@@ -34,6 +40,18 @@ from utils.chart_document_utils import build_chart_result, normalize_chart_resul
 
 
 class ChartContractValidationTestCase(unittest.TestCase):
+
+    def test_valid_analysis_result_terminates_the_agent_graph(self) -> None:
+        message = _tool_success_message(
+            tool_call_id="call-1",
+            analysis_report="# report",
+            charts=[{"title": "trend"}],
+        )
+
+        command = _terminal_tool_success(message)
+
+        self.assertEqual(command.goto, "__end__")
+        self.assertEqual(command.update, {"messages": [message]})
 
     def test_probe_rejects_a_static_inspection_plan_without_data_access(self) -> None:
         code = '''
@@ -72,6 +90,125 @@ result = request_retry(
 '''
 
         self.assertIsNone(_validate_generated_code_contract(code))
+
+    def test_probe_accepts_observations_accumulated_with_list_append(self) -> None:
+        code = '''
+execution_intent = "probe"
+observations = []
+for sql in probe_queries:
+    outcome = probe_data_with_sql(sql=sql)
+    observations.append({
+        "status": outcome["status"],
+        "row_count": outcome["row_count"],
+    })
+result = request_retry(
+    retry_type="probe_feedback",
+    message="observed candidate queries",
+    diagnostics={"observations": observations},
+)
+'''
+
+        self.assertIsNone(_validate_generated_code_contract(code))
+
+    def test_probe_accepts_observations_accumulated_by_dict_key(self) -> None:
+        code = '''
+execution_intent = "probe"
+observations = {}
+for name, sql in probe_queries.items():
+    outcome = probe_data_with_sql(sql=sql)
+    entry = {"status": outcome["status"], "row_count": outcome["row_count"]}
+    observations[name] = entry
+result = request_retry(
+    retry_type="probe_feedback",
+    message="observed candidate queries",
+    diagnostics={"observations": observations},
+)
+'''
+
+        self.assertIsNone(_validate_generated_code_contract(code))
+
+    def test_probe_sql_wrapper_returns_structured_query_error(self) -> None:
+        token = CURRENT_EXECUTION_INTENT.set("probe")
+        try:
+            with patch("agent.tools.load_data_with_sql", side_effect=ValueError("bad sql")):
+                outcome = probe_data_with_sql("SELECT broken")
+        finally:
+            CURRENT_EXECUTION_INTENT.reset(token)
+
+        self.assertEqual(outcome["status"], "query_error")
+        self.assertEqual(outcome["row_count"], 0)
+        self.assertEqual(outcome["error_message"], "bad sql")
+        self.assertIsNone(outcome["data"])
+
+    def test_probe_sql_wrapper_distinguishes_empty_timeseries_path(self) -> None:
+        token = CURRENT_EXECUTION_INTENT.set("probe")
+        try:
+            with patch(
+                "agent.tools.load_data_with_sql",
+                side_effect=RuntimeError("unknown tag"),
+            ):
+                outcome = probe_data_with_sql("SELECT broken")
+        finally:
+            CURRENT_EXECUTION_INTENT.reset(token)
+
+        self.assertEqual(outcome["status"], "no_data")
+        self.assertEqual(outcome["error_type"], "no_data_found")
+
+    def test_query_fetch_failure_is_not_misclassified_as_result_contract(self) -> None:
+        error_message = 'IO Error: Failed to fetch result for query "SELECT *"'
+
+        self.assertEqual(
+            _classify_execution_error(RuntimeError(error_message), error_message),
+            "data_source_unavailable",
+        )
+
+    def test_probe_feedback_adds_authoritative_outcome_summary(self) -> None:
+        retry = request_retry(
+            retry_type="probe_feedback",
+            message="done",
+            diagnostics={"query_observations": [
+                {"datasource_id": 1, "datasource_name": "A", "status": "success", "row_count": 2},
+                {"datasource_id": 2, "datasource_name": "B", "status": "no_data", "row_count": 0, "error_type": "no_data_found"},
+                {"datasource_id": 3, "datasource_name": "C", "status": "query_error", "row_count": 0, "error_type": "data_source_unavailable"},
+            ]},
+        )
+
+        summary = retry.diagnostics["_probe_outcome_summary"]
+        self.assertEqual([item["datasource_id"] for item in summary["successful"]], [1])
+        self.assertEqual([item["datasource_id"] for item in summary["no_data"]], [2])
+        self.assertEqual([item["datasource_id"] for item in summary["unavailable"]], [3])
+
+    def test_probe_broad_sql_exception_feedback_preserves_multi_source_scope(self) -> None:
+        retry = _validate_generated_code_contract('''
+execution_intent = "probe"
+observations = []
+for sql in ["SELECT 1", "SELECT 2"]:
+    try:
+        frame = load_data_with_sql(sql=sql)
+        observations.append({"status": "success", "rows": len(frame)})
+    except Exception as exc:
+        observations.append({"status": "query_error", "error": str(exc)})
+result = request_retry(
+    retry_type="probe_feedback",
+    message="done",
+    diagnostics={"observations": observations},
+)
+''')
+
+        self.assertIsNotNone(retry)
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "probe_sql_outcomes_require_structured_helper",
+        )
+        self.assertTrue(any(
+            "不要缩成单个数据源" in item
+            for item in retry.repair_instructions
+        ))
+        self.assertTrue(any(
+            "probe_data_with_sql" in item
+            for item in retry.repair_instructions
+        ))
+
     def test_sql_projection_restores_schema_field_casing(self) -> None:
         raw = pd.DataFrame([{
             "wm_extra_ts_expiration_time_year": 2026,
@@ -148,6 +285,27 @@ result = request_retry(
         self.assertTrue(observation["facts"]["left_measure_aggregation_safe"])
 
     @patch("agent.tools.load_data_with_sql")
+    def test_relationship_key_fallback_is_bounded_and_deterministic(self, load_sql) -> None:
+        load_sql.return_value = pd.DataFrame([
+            {"code": "A", "__relationship_frequency": 3},
+        ])
+
+        from agent.tools import _relationship_key_counts
+
+        counts = _relationship_key_counts(
+            {
+                "datasource_type": "table",
+                "datasource_identifier": "dw.contracts",
+            },
+            ["code"],
+        )
+
+        sql = load_sql.call_args.args[0]
+        self.assertIn("GROUP BY code", sql)
+        self.assertIn("ORDER BY code LIMIT 10000", sql)
+        self.assertEqual(counts, {("A",): 3})
+
+    @patch("agent.tools.load_data_with_sql")
     def test_sql_relationship_probe_aggregates_at_source(self, load_sql) -> None:
         load_sql.return_value = pd.DataFrame([{
             "left_distinct_key_count": 12000,
@@ -171,6 +329,71 @@ result = request_retry(
         self.assertNotIn("LIMIT", sql.upper())
         self.assertEqual(observation["facts"]["cardinality"], "many_to_one")
         self.assertEqual(observation["facts"]["left_match_coverage_ratio"], 0.75)
+
+    @patch("agent.tools._relationship_key_counts")
+    @patch("agent.tools._inspect_sql_preparation_relationship")
+    def test_sql_relationship_probe_reconciles_decimal_and_text_identifiers(
+        self,
+        inspect_sql,
+        key_counts,
+    ) -> None:
+        inspect_sql.return_value = {
+            "observation_id": "probe:status_dictionary",
+            "kind": "relationship_coverage",
+            "status": "verified",
+            "complete": True,
+            "facts": {"join_supported": False, "cardinality": "unknown"},
+        }
+        key_counts.side_effect = [
+            {("166832699355251625.00",): 12},
+            {("166832699355251625",): 1},
+        ]
+
+        observation = _inspect_preparation_relationship(
+            {
+                "relationship_id": "status_dictionary",
+                "left_datasource_id": 11,
+                "right_datasource_id": 12,
+                "left_fields": ["status_id"],
+                "right_fields": ["id"],
+            },
+            {
+                11: {"datasource_type": "table"},
+                12: {"datasource_type": "table"},
+            },
+        )
+
+        self.assertTrue(observation["facts"]["join_supported"])
+        self.assertEqual(
+            observation["facts"]["key_normalization"],
+            "integral_numeric_text",
+        )
+
+    def test_structured_table_rejects_opaque_first_dimension_column(self) -> None:
+        result = StructuredResult(
+            analysis_report="## Department performance",
+            charts=[],
+            tables=[{
+                "title": "Department performance",
+                "columns": [
+                    {"key": "department", "label": "Department"},
+                    {"key": "amount", "label": "Amount"},
+                ],
+                "rows": [
+                    {"department": "5313416643652174324", "amount": "10.00"},
+                    {"department": "6325791984017753736", "amount": "20.00"},
+                ],
+            }],
+        )
+
+        retry = _validate_structured_result_contract(result)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["opaque_dimension_artifacts"][0]["reason"],
+            "all_structured_dimension_values_are_opaque_identifiers",
+        )
 
     @patch("agent.tools.load_data_with_sql")
     def test_schema_fact_probe_returns_bounded_enum_summary(self, load_sql) -> None:
@@ -700,6 +923,26 @@ charts = [build_chart_result(data=top_rows)]
             retry.diagnostics["opaque_dimension_artifacts"][0]["reason"],
             "all_structured_category_values_are_opaque_identifiers",
         )
+
+    def test_wrapped_scientific_identifier_category_is_rejected(self) -> None:
+        result = StructuredResult(
+            analysis_report="## Delivery status",
+            charts=[build_chart_result(
+                chart_kind="pie",
+                data=[
+                    {"status": "unknown(1.6683269935525162e+17)", "count": 12},
+                    {"status": "unknown(-1.261257595985902e+18)", "count": 8},
+                ],
+                title="Delivery status",
+                category_field="status",
+                value_field="count",
+            )],
+            tables=[],
+        )
+
+        retry = _validate_structured_result_contract(result)
+
+        self.assertIsNotNone(retry)
 
     def test_execution_namespace_exposes_pandas_alias(self) -> None:
         namespace = _build_execution_namespace()
@@ -1287,6 +1530,76 @@ data = load_data_with_sql(sql=sql)
 population_df = data.drop_duplicates(subset=["id"])
 total_contracts = len(population_df)
 status_dist = population_df["status"].value_counts().reset_index()
+'''
+
+        self.assertIsNone(_validate_analysis_relationship_contract(context, code))
+
+    def test_analysis_requires_runtime_normalization_for_numeric_text_relation(self) -> None:
+        context = SimpleNamespace(active_datasource_snapshot={
+            "selected_datasource_snapshot": [
+                {"datasource_id": 11, "datasource_identifier": "dw.contracts"},
+                {"datasource_id": 12, "datasource_identifier": "dw.status_labels"},
+            ],
+            "analysis_semantic_context": {
+                "relationships": [{
+                    "relationship_id": "contract_status",
+                    "left_datasource_id": 11,
+                    "right_datasource_id": 12,
+                    "left_fields": ["status_id"],
+                    "right_fields": ["id"],
+                    "relationship_type": "dimension_enrichment",
+                    "joinability": "joinable",
+                    "key_normalization": "integral_numeric_text",
+                }]
+            },
+        })
+        code = '''
+execution_intent = "analysis"
+contracts = load_data_with_sql("SELECT status_id FROM dw.contracts")
+labels = load_data_with_sql("SELECT id, label FROM dw.status_labels")
+contracts["key"] = contracts["status_id"].astype(str)
+result_data = contracts.merge(labels, left_on="key", right_on="id")
+'''
+
+        retry = _validate_analysis_relationship_contract(context, code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "relationship_key_normalization_required",
+        )
+
+    def test_analysis_accepts_runtime_normalization_for_numeric_text_relation(self) -> None:
+        context = SimpleNamespace(active_datasource_snapshot={
+            "selected_datasource_snapshot": [
+                {"datasource_id": 11, "datasource_identifier": "dw.contracts"},
+                {"datasource_id": 12, "datasource_identifier": "dw.status_labels"},
+            ],
+            "analysis_semantic_context": {
+                "relationships": [{
+                    "relationship_id": "contract_status",
+                    "left_datasource_id": 11,
+                    "right_datasource_id": 12,
+                    "left_fields": ["status_id"],
+                    "right_fields": ["id"],
+                    "relationship_type": "dimension_enrichment",
+                    "joinability": "joinable",
+                    "key_normalization": "integral_numeric_text",
+                }]
+            },
+        })
+        code = '''
+execution_intent = "analysis"
+contracts = load_data_with_sql(
+    "SELECT status_id FROM dw.contracts", text_columns=["status_id"]
+)
+labels = load_data_with_sql(
+    "SELECT id, label FROM dw.status_labels", text_columns=["id"]
+)
+contracts["key"] = normalize_relationship_key(contracts["status_id"])
+labels["key"] = normalize_relationship_key(labels["id"])
+result_data = contracts.merge(labels, on="key")
 '''
 
         self.assertIsNone(_validate_analysis_relationship_contract(context, code))

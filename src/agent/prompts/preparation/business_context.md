@@ -69,9 +69,11 @@
 ## 待证事实与定稿
 
 - Schema 无法确认、但字段真实取值或覆盖情况能够确认的业务血缘事实，必须通过 `probe_requests` 请求受控核验，不能直接留给正式分析。
-- `probe_kind` 只可使用：`distinct_values`（分类/枚举实际值）、`time_coverage`（时间覆盖起止）、`field_profile`（非空数和唯一值数量）。这里只确认 Schema 语义，不设计筛选条件、SQL、指标或报告。
+- `probe_kind` 只可使用：`distinct_values`（分类/枚举实际值）、`field_profile`（关系键的非空数和唯一值数量）。这里只确认数据源关系所需的 Schema 语义，不设计筛选条件、SQL、指标或报告。
+- 不得在 Business Context 探测实际时间覆盖、当前有无数据、趋势密度或查询可用性。这些是正式分析的数据口径与多路径 Probe 职责，不是业务血缘关系；时序来源只要 Schema 已提供时间和值字段，就可以形成独立或可比的直接血缘。
 - `distinct_values` 用于核实用户明确提到的状态、部门、产品等候选值时，把这些原始候选写入 `expected_values`；Probe 会返回精确命中、唯一高置信近似值或 unresolved，避免正式分析继续使用未命中的字面量。
 - Probe 确认的枚举、字段格式和覆盖信息会内聚进该字段 Schema，供正式分析在完整洞察语义中使用；Business Context 不重复设计查询筛选集合或字段解析规则。
+- 已验证关系的键覆盖与字典/维度标签路径是该字段可解释性的权威事实。键字段自身的 distinct values 仍是 ID，不得据此否定已验证的标签关系，也不得再把该关系键列为 unsupported field。
 - 如果上下文包含 `resolution_phase=finalize_after_probe`，必须结合 `business_context_draft` 和 `probe_observations` 定稿：已证实的事实更新 lineage、关系和 unresolved 项；不可用的观察保留为明确缺口；输出 `probe_requests=[]`，不得把同一疑问再次交给正式分析。
 - Probe 返回的是聚合事实摘要，不是分析数据。不得把枚举频次、覆盖率或基数本身规划成用户报告结论。
 
