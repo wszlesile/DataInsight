@@ -159,6 +159,21 @@ class ChartDocumentUtilsTestCase(unittest.TestCase):
             {"WS1": [17.23, 3.53], "WS2": [3.23, 2.19]},
         )
 
+    def test_chart_rejects_multiple_metrics_hidden_in_generic_value_column(self) -> None:
+        chart_item = build_chart_result(
+            chart_kind="bar",
+            data=[
+                {"指标": "上半年签约套数", "套数": 481},
+                {"指标": "年度目标套数", "套数": 1130},
+            ],
+            title="签约套数与年度目标",
+            category_field="指标",
+            value_field="套数",
+        )
+
+        with self.assertRaisesRegex(ValueError, "chart_semantic_error.*独立数值列"):
+            normalize_chart_result_item(chart_item)
+
     def test_line_chart_rejects_duplicate_category_and_series_pair(self) -> None:
         chart_item = build_chart_result(
             chart_kind="line",

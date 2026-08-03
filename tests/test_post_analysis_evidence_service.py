@@ -79,6 +79,61 @@ def _semantic_plan(payload: dict) -> EvidencePlan:
     ])
 
 
+def test_planner_payload_collapses_duplicate_annotations_for_one_calculation():
+    payload = {
+        "metrics": [
+            {
+                "calculation_id": "calc_shared",
+                "metric_key": "contract_count",
+                "business_name": "合同数量",
+                "business_explanation": "按合同实例去重统计。",
+                "value_type": "integer",
+                "display_unit": "",
+            },
+            {
+                "calculation_id": "calc_shared",
+                "metric_key": "contract_count_in_chart",
+                "business_name": "合同数量（图表）",
+                "business_explanation": "",
+                "value_type": "integer",
+                "display_unit": "个",
+            },
+        ]
+    }
+
+    canonical = PostAnalysisEvidenceCompiler._canonicalize_planner_payload(payload)
+
+    assert len(canonical["metrics"]) == 1
+    assert canonical["metrics"][0]["calculation_id"] == "calc_shared"
+    assert canonical["metrics"][0]["business_name"] == "合同数量"
+    assert canonical["metrics"][0]["display_unit"] == "个"
+
+
+def test_report_string_concatenation_preserves_numeric_expression_lineage():
+    sql = "SELECT COUNT(*) AS contract_count FROM contracts"
+    code = r'''
+sql = "SELECT COUNT(*) AS contract_count FROM contracts"
+data = load_data_with_sql(sql=sql)
+contract_count = int(data["contract_count"].iloc[0])
+ratio = contract_count / 200
+analysis_report = "合同总数 **" + str(contract_count) + "** 个，占比 " + f"{ratio:.1%}" + "。"
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="合同总数 **143** 个，占比 71.5%。",
+        query_snapshots={"q_contracts": _query_snapshot(sql, columns=["contract_count"])},
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    report_outputs = [
+        item for item in lineage["output_nodes"] if item["artifact_type"] == "report"
+    ]
+
+    assert [item["text"] for item in report_outputs] == ["143", "71.5"]
+    assert all(item["direct_operation_node_ids"] for item in report_outputs)
+
+
 def test_grouped_chart_and_table_reuse_boundary_while_total_is_distinct():
     sql = "SELECT month, region, SUM(amount) AS sales_amount FROM sales GROUP BY month, region"
     code = r'''
@@ -115,8 +170,189 @@ result = save_analysis_result(analysis_report=analysis_report, charts=charts, ta
     assert len(bundle["chart_trace_refs"]) == 1
     assert len(bundle["table_trace_refs"]) == 1
     assert len(bundle["report_trace_refs"]) == 1
+    assert bundle["diagnostics"]["structured_output_slot_count"] == 2
+    assert bundle["diagnostics"]["structured_output_bound_count"] == 2
+    assert bundle["diagnostics"]["unresolved_structured_output_node_ids"] == []
     assert bundle["chart_trace_refs"][0]["evidence_key"] == bundle["table_trace_refs"][0]["evidence_key"]
     assert bundle["report_trace_refs"][0]["evidence_key"] != bundle["chart_trace_refs"][0]["evidence_key"]
+
+
+def test_unit_bearing_table_values_compile_one_column_level_evidence_ref():
+    sql = "SELECT contract_name, subscription_cycle, expiration_date FROM contracts"
+    code = r'''
+sql = "SELECT contract_name, subscription_cycle, expiration_date FROM contracts"
+data = load_data_with_sql(sql=sql)
+cycle_counts = data["subscription_cycle"].value_counts().reset_index()
+cycle_counts.columns = ["subscription_cycle", "contract_count"]
+most_common_cycle = cycle_counts.iloc[0]["subscription_cycle"]
+detail_df = data[["contract_name", "subscription_cycle", "expiration_date"]].copy()
+detail_df = detail_df.rename(columns={
+    "contract_name": "合同名称",
+    "subscription_cycle": "订阅周期",
+    "expiration_date": "到期日期",
+})
+tables = []
+tables.append({
+    "title": "Contract details",
+    "table": {
+        "columns": [
+            {"key": "合同名称", "label": "Contract"},
+            {"key": "订阅周期", "label": "Subscription duration"},
+            {"key": "到期日期", "label": "Expiration date"},
+        ],
+        "rows": detail_df.head(20).to_dict("records"),
+    },
+})
+result = save_analysis_result(analysis_report="Contract details.", charts=[], tables=tables)
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Contract details.",
+        tables=[{
+            "title": "Contract details",
+            "columns": [
+                {"key": "合同名称", "label": "Contract"},
+                {"key": "订阅周期", "label": "Subscription duration"},
+                {"key": "到期日期", "label": "Expiration date"},
+            ],
+            "rows": [
+                {"合同名称": "A", "订阅周期": "455天", "到期日期": "2027-10-01"},
+                {"合同名称": "B", "订阅周期": "365天", "到期日期": "2027-07-03"},
+            ],
+        }],
+        query_snapshots={
+            "q_contracts": _query_snapshot(
+                sql,
+                columns=["contract_name", "subscription_cycle", "expiration_date"],
+            ),
+        },
+    )
+    seen_payload: dict = {}
+
+    lineage = LineageIndexer().build(snapshot)
+    table_output = next(
+        item for item in lineage["output_nodes"]
+        if item["artifact_type"] == "table"
+    )
+    operation_by_id = {
+        item["operation_node_id"]: item for item in lineage["operation_nodes"]
+    }
+    assert table_output["source_frame"] == "detail_df"
+    assert {
+        operation_by_id[item]["kind"]
+        for item in table_output["boundary_operation_node_ids"]
+    } == {"query_projection"}
+
+    def plan(payload: dict) -> EvidencePlan:
+        seen_payload.update(payload)
+        metrics = []
+        for item in payload["calculation_candidates"]:
+            output = item["outputs"][0]
+            metrics.append(PlannedMetric(
+                calculation_id=item["calculation_id"],
+                metric_key="subscription_duration",
+                business_name="订阅周期",
+                business_explanation="展示合同记录中的订阅周期。",
+                value_type="duration",
+                display_unit=output.get("display_unit_hint") or "",
+            ))
+        return EvidencePlan(metrics=metrics)
+
+    bundle = PostAnalysisEvidenceCompiler(planner=plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert bundle["table_trace_refs"] == [{
+        "table_index": 0,
+        "artifact_id": 0,
+        "column_key": "订阅周期",
+        "row_scope": "all",
+        "evidence_key": bundle["table_trace_refs"][0]["evidence_key"],
+        "display_unit": "天",
+    }]
+    assert bundle["diagnostics"]["structured_output_slot_count"] == 1
+    assert seen_payload["calculation_candidates"][0]["outputs"][0]["display_unit_hint"] == "天"
+
+
+def test_unit_bearing_grouping_dimension_does_not_become_table_metric():
+    sql = "SELECT subscription_cycle FROM contracts"
+    code = r'''
+sql = "SELECT subscription_cycle FROM contracts"
+data = load_data_with_sql(sql=sql)
+cycle_dist = data["subscription_cycle"].value_counts().reset_index(name="contract_count")
+tables = [build_table_result(
+    title="Cycle distribution",
+    columns=[
+        {"key": "subscription_cycle", "label": "Cycle"},
+        {"key": "contract_count", "label": "Contracts"},
+    ],
+    rows=cycle_dist.to_dict("records"),
+)]
+result = save_analysis_result(analysis_report="Cycle distribution.", charts=[], tables=tables)
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Cycle distribution.",
+        tables=[{
+            "title": "Cycle distribution",
+            "columns": [
+                {"key": "subscription_cycle", "label": "Cycle"},
+                {"key": "contract_count", "label": "Contracts"},
+            ],
+            "rows": [
+                {"subscription_cycle": "1年", "contract_count": 60},
+                {"subscription_cycle": "3年", "contract_count": 20},
+            ],
+        }],
+        query_snapshots={
+            "q_contracts": _query_snapshot(sql, columns=["subscription_cycle"]),
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert [item["column_key"] for item in bundle["table_trace_refs"]] == ["contract_count"]
+
+
+def test_same_named_chart_values_keep_distinct_grouping_boundaries():
+    sql = "SELECT status, cycle FROM contracts"
+    code = r'''
+sql = "SELECT status, cycle FROM contracts"
+data = load_data_with_sql(sql=sql)
+status_dist = data.groupby("status").size().reset_index(name="instance_count")
+cycle_dist = data.groupby("cycle").size().reset_index(name="instance_count")
+chart_status = build_chart_result(data=status_dist, chart_kind="pie", category_field="status", value_field="instance_count")
+chart_cycle = build_chart_result(data=cycle_dist, chart_kind="bar", category_field="cycle", value_field="instance_count")
+result = save_analysis_result(analysis_report="合同结构。", charts=[chart_status, chart_cycle], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="合同结构。",
+        charts=[
+            {
+                "title": "状态分布",
+                "chart_document": {
+                    "dataset": {"rows": [{"status": "有效", "instance_count": 12}]},
+                    "encoding": {"category_field": "status", "value_field": "instance_count"},
+                },
+            },
+            {
+                "title": "周期分布",
+                "chart_document": {
+                    "dataset": {"rows": [{"cycle": "1年", "instance_count": 8}]},
+                    "encoding": {"category_field": "cycle", "value_field": "instance_count"},
+                },
+            },
+        ],
+        query_snapshots={"q_contracts": _query_snapshot(sql, columns=["status", "cycle"])},
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert len(bundle["chart_trace_refs"]) == 2
+    assert len(bundle["evidence_definitions"]) == 2
+    assert bundle["chart_trace_refs"][0]["evidence_key"] != bundle["chart_trace_refs"][1]["evidence_key"]
 
 
 def test_multi_metric_chart_fields_keep_distinct_evidence_boundaries():
@@ -583,6 +819,335 @@ result = save_analysis_result(analysis_report="", charts=charts, tables=[])
     assert bundle["status"] == "partial"
 
 
+def test_categorical_counts_share_one_column_level_evidence_boundary():
+    sql = "SELECT contract_no, status FROM contracts"
+    code = r'''
+sql = "SELECT contract_no, status FROM contracts"
+data = load_data_with_sql(sql=sql)
+active_contracts = len(data[data["status"] == "active"])
+expired_contracts = len(data[data["status"] == "expired"])
+chart_data = pd.DataFrame({
+    "status_label": ["Active", "Expired"],
+    "count": [active_contracts, expired_contracts],
+})
+charts = [build_chart_result(data=chart_data, chart_kind="pie", category_field="status_label", value_field="count")]
+result = save_analysis_result(analysis_report="", charts=charts, tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        charts=[{
+            "title": "Contract status",
+            "chart_data_contract": {"encoding": {"category_field": "status_label", "value_field": "count"}},
+        }],
+        query_snapshots={"q_contracts": _query_snapshot(sql, columns=["contract_no", "status"])},
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    output = next(item for item in lineage["output_nodes"] if item["artifact_type"] == "chart")
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert output["ambiguous_calculation_boundary"] is False
+    assert len(output["boundary_operation_node_ids"]) == 2
+    assert len(bundle["chart_trace_refs"]) == 1
+    assert len(bundle["evidence_definitions"]) == 1
+
+
+def test_value_counts_reset_index_chart_keeps_column_level_evidence_boundary():
+    sql = "SELECT status, customer FROM contracts"
+    code = r'''
+sql = "SELECT status, customer FROM contracts"
+data = load_data_with_sql(sql=sql)
+status_counts = data["status"].value_counts()
+status_data = status_counts.reset_index()
+status_data.columns = ["status_label", "count"]
+charts = [build_chart_result(
+    data=status_data,
+    chart_kind="pie",
+    category_field="status_label",
+    value_field="count",
+)]
+result = save_analysis_result(analysis_report="Status distribution.", charts=charts, tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Status distribution.",
+        charts=[{
+            "title": "Contract status",
+            "chart_document": {
+                "chart_kind": "pie",
+                "dataset": {"rows": [
+                    {"status_label": "Active", "count": 8},
+                    {"status_label": "Expired", "count": 2},
+                ]},
+                "encoding": {
+                    "category_field": "status_label",
+                    "value_field": "count",
+                },
+            },
+        }],
+        query_snapshots={
+            "q_contracts": _query_snapshot(sql, columns=["status", "customer"])
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert len(bundle["chart_trace_refs"]) == 1
+    assert len(bundle["evidence_definitions"]) == 1
+    assert bundle["evidence_definitions"][0]["query_refs"] == ["q_contracts"]
+
+
+def test_skipped_conditional_chart_does_not_drop_other_chart_lineage():
+    sql = "SELECT status, customer FROM contracts"
+    code = r'''
+sql = "SELECT status, customer FROM contracts"
+data = load_data_with_sql(sql=sql)
+status_counts = data["status"].value_counts().reset_index(name="count")
+customer_counts = data["customer"].value_counts().reset_index(name="count")
+empty_months = data[data["status"] == "never"]["status"].value_counts().reset_index(name="count")
+charts = []
+if not status_counts.empty:
+    charts.append(build_chart_result(data=status_counts, title="Status", chart_kind="pie", category_field="status", value_field="count"))
+if not empty_months.empty:
+    charts.append(build_chart_result(data=empty_months, title="Months", chart_kind="line", category_field="status", value_field="count"))
+if not customer_counts.empty:
+    charts.append(build_chart_result(data=customer_counts, title="Customers", chart_kind="bar", category_field="customer", value_field="count"))
+result = save_analysis_result(analysis_report="Summary.", charts=charts, tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Summary.",
+        charts=[
+            {
+                "title": "Status",
+                "chart_document": {
+                    "chart_kind": "pie",
+                    "dataset": {"rows": [{"status": "Active", "count": 8}]},
+                    "encoding": {"category_field": "status", "value_field": "count"},
+                },
+            },
+            {
+                "title": "Customers",
+                "chart_document": {
+                    "chart_kind": "bar",
+                    "dataset": {"rows": [{"customer": "A", "count": 6}]},
+                    "encoding": {"category_field": "customer", "value_field": "count"},
+                },
+            },
+        ],
+        query_snapshots={
+            "q_contracts": _query_snapshot(sql, columns=["status", "customer"])
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert len(bundle["chart_trace_refs"]) == 2
+
+
+def test_inline_report_ratio_is_compiled_as_one_formula_boundary():
+    sql = "SELECT status, COUNT(*) AS contract_count FROM contracts GROUP BY status"
+    code = r'''
+sql = "SELECT status, COUNT(*) AS contract_count FROM contracts GROUP BY status"
+data = load_data_with_sql(sql=sql)
+total_count = data["contract_count"].sum()
+active_row = data[data["status"] == "active"]
+active_count = int(active_row["contract_count"].iloc[0]) if not active_row.empty else 0
+analysis_report = f"Active share: {active_count/total_count*100:.1f}%."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Active share: 80.0%.",
+        query_snapshots={"q_contracts": _query_snapshot(sql, columns=["status", "contract_count"])},
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    output = next(item for item in lineage["output_nodes"] if item["artifact_type"] == "report")
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert output["ambiguous_calculation_boundary"] is False
+    assert len(output["boundary_operation_node_ids"]) == 1
+    boundary = next(
+        item for item in lineage["operation_nodes"]
+        if item["operation_node_id"] == output["boundary_operation_node_ids"][0]
+    )
+    assert boundary["semantic_kind"] == "formula"
+    assert len(bundle["report_trace_refs"]) == 1
+
+
+def test_multiline_report_keeps_ast_numeric_slots_when_dynamic_prose_changes_lines():
+    sql = "SELECT status, COUNT(*) AS contract_count FROM contracts GROUP BY status"
+    code = r'''
+sql = "SELECT status, COUNT(*) AS contract_count FROM contracts GROUP BY status"
+data = load_data_with_sql(sql=sql)
+total_count = int(data["contract_count"].sum())
+active_count = int(data.loc[data["status"] == "active", "contract_count"].sum())
+active_share = active_count / total_count * 100 if total_count else 0
+dynamic_observation = "Active contracts dominate.\nThe remaining contracts need review."
+analysis_report = f"""## Overview
+There are {total_count} contracts in total.
+
+## Status
+There are {active_count} active contracts, representing {active_share:.1f}%.
+{dynamic_observation}
+"""
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    report = """## Overview
+There are 10 contracts in total.
+
+## Status
+There are 8 active contracts, representing 80.0%.
+Active contracts dominate.
+The remaining contracts need review.
+"""
+    snapshot = _snapshot(
+        code=code,
+        report=report,
+        query_snapshots={
+            "q_contracts": _query_snapshot(sql, columns=["status", "contract_count"]),
+        },
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    report_values = {
+        item["text"] for item in lineage["output_nodes"]
+        if item["artifact_type"] == "report"
+    }
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert {"10", "8", "80.0"}.issubset(report_values)
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert len(bundle["report_trace_refs"]) == 3
+
+
+def test_multiline_report_local_slot_keeps_percent_format_suffix():
+    sql = "SELECT status, COUNT(*) AS contract_count FROM contracts GROUP BY status"
+    code = r'''
+sql = "SELECT status, COUNT(*) AS contract_count FROM contracts GROUP BY status"
+data = load_data_with_sql(sql=sql)
+total_count = int(data["contract_count"].sum())
+active_count = int(data.loc[data["status"] == "active", "contract_count"].sum())
+active_share = active_count / total_count if total_count else 0
+dynamic_observation = "Active contracts dominate.\nReview the remainder."
+analysis_report = f"""## Overview
+There are {total_count} contracts.
+{dynamic_observation}
+Active share is {active_share:.1%}.
+"""
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="## Overview\nThere are 10 contracts.\nActive contracts dominate.\nReview the remainder.\nActive share is 80.0%.\n",
+        query_snapshots={
+            "q_contracts": _query_snapshot(sql, columns=["status", "contract_count"]),
+        },
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    report_values = {
+        item["text"] for item in lineage["output_nodes"]
+        if item["artifact_type"] == "report"
+    }
+
+    assert {"10", "80.0"}.issubset(report_values)
+
+
+def test_dataframe_record_with_dynamic_column_names_keeps_positional_lineage():
+    sql = "SELECT expiration_year, COUNT(*) AS contract_count FROM contracts GROUP BY expiration_year"
+    code = r'''
+sql = "SELECT expiration_year, COUNT(*) AS contract_count FROM contracts GROUP BY expiration_year"
+data = load_data_with_sql(sql=sql)
+current_year = 2026
+this_year_count = int(data.loc[data["expiration_year"] == current_year, "contract_count"].sum())
+last_year_count = int(data.loc[data["expiration_year"] == current_year - 1, "contract_count"].sum())
+summary = pd.DataFrame([{
+    f"{current_year} contracts": this_year_count,
+    f"{current_year - 1} contracts": last_year_count,
+}])
+tables = [build_table_result(
+    title="Year summary",
+    columns=[
+        {"key": f"{current_year} contracts", "label": f"{current_year} contracts"},
+        {"key": f"{current_year - 1} contracts", "label": f"{current_year - 1} contracts"},
+    ],
+    rows=summary.to_dict("records"),
+)]
+result = save_analysis_result(analysis_report="Year summary.", charts=[], tables=tables)
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Year summary.",
+        tables=[{
+            "title": "Year summary",
+            "columns": [
+                {"key": "2026 contracts", "label": "2026 contracts"},
+                {"key": "2025 contracts", "label": "2025 contracts"},
+            ],
+            "rows": [{"2026 contracts": 49, "2025 contracts": 0}],
+        }],
+        query_snapshots={
+            "q_contracts": _query_snapshot(sql, columns=["expiration_year", "contract_count"]),
+        },
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    table_outputs = [item for item in lineage["output_nodes"] if item["artifact_type"] == "table"]
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert len(table_outputs) == 2
+    assert all(item["boundary_operation_node_ids"] for item in table_outputs)
+    assert len(bundle["table_trace_refs"]) == 2
+
+
+def test_filtered_frame_count_keeps_lineage_in_dynamic_table_column():
+    sql = "SELECT expiration_year FROM contracts"
+    code = r'''
+sql = "SELECT expiration_year FROM contracts"
+data = load_data_with_sql(sql=sql)
+current_year = 2026
+current_contracts = data[data["expiration_year"] == current_year]
+current_count = len(current_contracts)
+summary = pd.DataFrame([{f"{current_year} contracts": current_count}])
+tables = [build_table_result(
+    title="Current year",
+    columns=[{"key": f"{current_year} contracts", "label": "Current year contracts"}],
+    rows=summary.to_dict("records"),
+)]
+result = save_analysis_result(analysis_report="Current-year contracts.", charts=[], tables=tables)
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Current-year contracts.",
+        tables=[{
+            "title": "Current year",
+            "columns": [{"key": "2026 contracts", "label": "Current year contracts"}],
+            "rows": [{"2026 contracts": 49}],
+        }],
+        query_snapshots={"q_contracts": _query_snapshot(sql, columns=["expiration_year"])},
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    table_output = next(
+        item for item in lineage["output_nodes"]
+        if item["artifact_type"] == "table"
+    )
+    operation_by_id = {
+        item["operation_node_id"]: item for item in lineage["operation_nodes"]
+    }
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert {
+        operation_by_id[item]["source"]
+        for item in table_output["boundary_operation_node_ids"]
+    } == {"current_count = len(current_contracts)"}
+    assert len(bundle["table_trace_refs"]) == 1
+
+
 def test_planner_failure_never_guesses_evidence():
     sql = "SELECT SUM(amount) AS sales_amount FROM sales"
     code = r'''
@@ -671,3 +1236,167 @@ def test_compiled_pie_chart_selection_resolves_named_point():
 
     assert context["raw_value"] == 1200
     assert context["dimensions"] == {"source": "Direct", "series_name": "Revenue source"}
+
+
+def test_list_built_report_keeps_repeated_tables_in_their_own_lineage_regions():
+    sql = "SELECT status, customer, expiry_year FROM contracts"
+    code = r'''
+sql = "SELECT status, customer, expiry_year FROM contracts"
+data = load_data_with_sql(sql=sql)
+total = len(data)
+status_dist = data["status"].value_counts().reset_index()
+status_dist.columns = ["status", "count"]
+status_dist["ratio"] = status_dist["count"] / total * 100
+status_map = {}
+for _, row in status_dist.iterrows():
+    status_map[row["status"]] = row["count"]
+active_count = status_map.get("active", 0)
+expired_count = status_map.get("expired", 0)
+active_ratio = active_count / total * 100
+customer_dist = data["customer"].value_counts().reset_index()
+customer_dist.columns = ["customer", "count"]
+customer_dist["ratio"] = customer_dist["count"] / total * 100
+top_customers = customer_dist.head(2)
+expiry_dist = data.groupby("expiry_year").size().reset_index()
+expiry_dist.columns = ["year", "count"]
+report_parts = []
+report_parts.append("## Summary\n")
+report_parts.append(f"Active: {active_count}; expired: {expired_count}.\n")
+report_parts.append("## Status\n| status | count | ratio |\n")
+for _, row in status_dist.iterrows():
+    report_parts.append(f"| {row['status']} | {row['count']} | {row['ratio']:.1f}% |\n")
+report_parts.append("## Customers\n| rank | customer | count | ratio |\n")
+for rank, (_, row) in enumerate(top_customers.iterrows(), 1):
+    report_parts.append(f"| {rank} | {row['customer']} | {row['count']} | {row['ratio']:.1f}% |\n")
+report_parts.append("## Expiry\n| year | count |\n")
+for _, row in expiry_dist.iterrows():
+    report_parts.append(f"| {int(row['year'])} | {row['count']} |\n")
+report_parts.append("Health: {:.1f}%.\n".format(active_ratio))
+analysis_report = "".join(report_parts)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    report = (
+        "## Summary\nActive: 8; expired: 2.\n"
+        "## Status\n| status | count | ratio |\n"
+        "| active | 8 | 80.0% |\n| expired | 2 | 20.0% |\n"
+        "## Customers\n| rank | customer | count | ratio |\n"
+        "| 1 | Alpha | 7 | 70.0% |\n| 2 | Beta | 3 | 30.0% |\n"
+        "## Expiry\n| year | count |\n"
+        "| 2026 | 6 |\n| 2027 | 4 |\n"
+        "Health: 80.0%."
+    )
+    snapshot = _snapshot(
+        code=code,
+        report=report,
+        query_snapshots={
+            "q_contracts": _query_snapshot(
+                sql,
+                columns=["status", "customer", "expiry_year"],
+            )
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    refs_by_start = {item["start"]: item for item in bundle["report_trace_refs"]}
+
+    def ref_for(fragment: str, numeric_text: str, occurrence: int = 0):
+        fragment_start = report.index(fragment)
+        numeric_start = report.index(numeric_text, fragment_start)
+        if occurrence:
+            for _ in range(occurrence):
+                numeric_start = report.index(numeric_text, numeric_start + 1)
+        return refs_by_start[numeric_start]
+
+    active_summary = ref_for("Active:", "8")
+    active_row = ref_for("| active", "8")
+    customer_row = ref_for("| 1 | Alpha", "7")
+    expiry_row = ref_for("| 2026", "6", occurrence=1)
+    assert active_summary["evidence_key"]
+    assert active_row["evidence_key"]
+    assert customer_row["evidence_key"] != active_row["evidence_key"]
+    assert expiry_row["evidence_key"] != active_row["evidence_key"]
+    assert ref_for("Health:", "80.0")["evidence_key"]
+    assert report.index("2026") not in refs_by_start
+    assert report.index("1 | Alpha") not in refs_by_start
+
+
+def test_report_list_initializers_and_extend_calls_are_declared_report_slots():
+    sql = "SELECT SUM(amount) AS amount, COUNT(*) AS record_count FROM sales"
+    code = r'''
+sql = "SELECT SUM(amount) AS amount, COUNT(*) AS record_count FROM sales"
+data = load_data_with_sql(sql=sql)
+amount = data.iloc[0]["amount"]
+record_count = data.iloc[0]["record_count"]
+report_sections = [
+    "## Summary",
+    f"Amount: {amount:,.2f}.",
+]
+report_sections.extend([
+    "## Coverage",
+    f"Records: {record_count}.",
+])
+analysis_report = "\n".join(report_sections)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="## Summary\nAmount: 1,280.50.\n## Coverage\nRecords: 12.",
+        query_snapshots={
+            "q_sales": _query_snapshot(sql, columns=["amount", "record_count"])
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert [item["text"] for item in bundle["report_trace_refs"]] == ["1,280.50", "12"]
+
+
+def test_report_embedded_conditional_fragments_keep_their_numeric_slots():
+    sql = "SELECT status FROM contracts"
+    code = r'''
+sql = "SELECT status FROM contracts"
+data = load_data_with_sql(sql=sql)
+total = len(data)
+active = (data["status"] == "active").sum()
+expired = (data["status"] == "expired").sum()
+active_rate = active / total * 100 if total else 0
+if active_rate >= 90:
+    status_finding = f"Healthy: {active} active ({active_rate:.1f}%), {expired} expired."
+else:
+    status_finding = f"Attention: {active} active ({active_rate:.1f}%), {expired} expired."
+analysis_report = f"""## Summary
+Total: {total}.
+## Finding
+{status_finding}
+## Restatement
+Total contracts: {total}.
+"""
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    report = (
+        "## Summary\nTotal: 100.\n"
+        "## Finding\nHealthy: 95 active (95.0%), 5 expired.\n"
+        "## Restatement\nTotal contracts: 100.\n"
+    )
+    snapshot = _snapshot(
+        code=code,
+        report=report,
+        query_snapshots={"q_contracts": _query_snapshot(sql, columns=["status"])},
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    refs_by_start = {item["start"]: item for item in bundle["report_trace_refs"]}
+    expected_positions = [
+        report.index("100"),
+        report.index("95 active"),
+        report.index("95.0"),
+        report.index("5 expired"),
+        report.rindex("100"),
+    ]
+    assert all(position in refs_by_start for position in expected_positions)
+    assert len(bundle["report_trace_refs"]) == len(expected_positions)

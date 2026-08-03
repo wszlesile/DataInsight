@@ -27,7 +27,7 @@ from utils.llm_model_factory import (
 from utils.token_budget import describe_budget_split, estimate_message_tokens, estimate_messages_tokens
 
 MessageT = TypeVar("MessageT", bound=BaseMessage, covariant=True)
-SYS_PROMPT_PATH = Path(__file__).resolve().with_name('sys_prompt.md')
+SYS_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "runtime" / "sys_prompt.md"
 
 
 class CustomAgentState(AgentState):
@@ -256,8 +256,8 @@ def build_prompt_messages(
 
     组装顺序是刻意设计的：
     1. 系统提示词与运行时配置
-    2. 数据源上下文
-    3. 记忆与历史上下文
+    2. 记忆与历史上下文
+    3. 当前数据源与业务语义上下文
     4. 当前用户问题
     """
     datasource_message = get_datasource_message(
@@ -273,19 +273,23 @@ def build_prompt_messages(
     # Keep these sections mandatory. MiniMax still receives one merged
     # SystemMessage, but budget trimming must not drop system rules,
     # current datasource context, runtime repair hints, or the user tail.
-    mandatory_system_messages: list[BaseMessage] = [
+    base_system_messages: list[BaseMessage] = [
         SystemMessage(load_system_prompt()),
     ]
     conversation_prompt_message = _build_conversation_prompt_message(namespace_id, conversation_id)
     if conversation_prompt_message is not None:
-        mandatory_system_messages.append(conversation_prompt_message)
-    mandatory_system_messages.append(_build_runtime_environment_message())
+        base_system_messages.append(conversation_prompt_message)
+    base_system_messages.append(_build_runtime_environment_message())
     relative_date_hint = _build_relative_date_hint_message(user_message)
     if relative_date_hint is not None:
-        mandatory_system_messages.append(relative_date_hint)
+        base_system_messages.append(relative_date_hint)
+
+    current_system_messages: list[BaseMessage] = []
     if datasource_message is not None:
-        mandatory_system_messages.append(datasource_message)
-    mandatory_system_messages.extend(runtime_messages)
+        current_system_messages.append(datasource_message)
+    current_system_messages.extend(runtime_messages)
+
+    mandatory_system_messages = [*base_system_messages, *current_system_messages]
 
     mandatory_system_content = _merge_system_messages(mandatory_system_messages)
     mandatory_system_message = SystemMessage(mandatory_system_content) if mandatory_system_content else None
@@ -321,8 +325,9 @@ def build_prompt_messages(
     )
 
     merged_system_content = _merge_system_messages(
-        mandatory_system_message,
+        base_system_messages,
         memory_messages,
+        current_system_messages,
     )
 
     messages: list[BaseMessage] = []

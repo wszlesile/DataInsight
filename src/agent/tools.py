@@ -44,6 +44,7 @@ CURRENT_ANALYSIS_PARAMETERS_OVERRIDE = ContextVar('current_analysis_parameters_o
 CURRENT_QUERY_SNAPSHOTS = ContextVar('current_query_snapshots', default={})
 CURRENT_LAST_QUERY_KEY = ContextVar('current_last_query_key', default='')
 CURRENT_DATASOURCE_NUMERIC_FIELDS = ContextVar('current_datasource_numeric_fields', default=[])
+CURRENT_EXECUTION_INTENT = ContextVar('current_execution_intent', default='')
 
 TOOL_ERROR_CURRENT_CODE_MAX_CHARS = int(os.environ.get('TOOL_ERROR_CURRENT_CODE_MAX_CHARS', '3500'))
 TOOL_ERROR_TEXT_MAX_CHARS = int(os.environ.get('TOOL_ERROR_TEXT_MAX_CHARS', '1800'))
@@ -511,6 +512,16 @@ def _check_time_range_constraint(query_constraints: dict[str, Any], code: str) -
     if not missing_parts:
         return None
 
+    observed_date_literals = sorted(set(re.findall(
+        r'(?<!\d)\d{4}-\d{2}-\d{2}(?:[T ][0-2]\d:[0-5]\d(?::[0-5]\d)?(?:Z|[+-]\d{2}:?\d{2})?)?(?!\d)',
+        str(code or ''),
+    )))
+    expected_boundaries = {
+        'start': start or None,
+        'end': end or None,
+        'end_exclusive': bool(time_range.get('end_exclusive')),
+    }
+
     return _build_query_constraint_error(
         'query_constraint_violation',
         f'query_constraints 中声明的时间范围没有完整体现在当前代码里，缺失部分：{", ".join(missing_parts)}。',
@@ -518,10 +529,20 @@ def _check_time_range_constraint(query_constraints: dict[str, Any], code: str) -
             'violated_constraint': 'time_range',
             'time_range': time_range,
             'missing_parts': missing_parts,
-            'repair_strategy': (
-                'filter_the_original_time_field_with_the_declared_start_and_end; '
-                'derived year/month predicates are only equivalent when they preserve the exact boundary'
-            ),
+            'expected_boundaries': expected_boundaries,
+            'observed_date_literals': observed_date_literals,
+            'repair_strategy': {
+                'preserve_declared_constraint': True,
+                'align_sql_and_query_params_to': expected_boundaries,
+                'boundary_rule': (
+                    'When end_exclusive is true, SQL/filter/query parameters must use the declared '
+                    'exclusive end instead of the inclusive display date.'
+                ),
+                'derived_grain_rule': (
+                    'Year/month predicates are equivalent only when they preserve the exact start '
+                    'and exclusive-end boundary.'
+                ),
+            },
         },
     )
 
@@ -1089,7 +1110,7 @@ def load_local_file(file_path: str, sheet_name: Optional[str] = None):
     """
     加载本地 CSV 或 Excel 文件，并返回 pandas DataFrame。
 
-    这个辅助函数属于 `sys_prompt.md` 中约定的 Python 执行工具契约。
+    这个辅助函数属于 `prompts/runtime/sys_prompt.md` 中约定的 Python 执行工具契约。
     """
     import pandas as pd
 
@@ -1401,26 +1422,36 @@ def load_data_with_sql(
     start_time = time.time()
     try:
         data = _load_data_with_fed_query(sql=sql, params=params)
+        data = _restore_sql_projection_column_names(sql, data)
+        explicit_numeric_columns = list(dict.fromkeys(
+            str(item) for item in (numeric_columns or []) if str(item)
+        ))
+        missing_explicit_columns = [
+            column for column in explicit_numeric_columns
+            if column not in data.columns
+        ]
+        if missing_explicit_columns:
+            raise ValueError(
+                "numeric_columns references unavailable query result columns: "
+                + ", ".join(missing_explicit_columns)
+            )
+        inferred_numeric_columns = [
+            column
+            for column in [
+                *_infer_sql_aggregate_numeric_columns(sql),
+                *_infer_schema_numeric_result_columns(sql, list(data.columns)),
+            ]
+            if column in data.columns
+        ]
         effective_numeric_columns = list(dict.fromkeys([
-            *[str(item) for item in (numeric_columns or [])],
-            *_infer_sql_aggregate_numeric_columns(sql),
-            *_infer_schema_numeric_result_columns(sql, list(data.columns)),
+            *explicit_numeric_columns,
+            *inferred_numeric_columns,
         ]))
         if effective_numeric_columns:
             import pandas as pd
-
-            missing_columns = [
-                str(column)
-                for column in effective_numeric_columns
-                if str(column) not in data.columns
-            ]
-            if missing_columns:
-                raise ValueError(
-                    "numeric_columns references unavailable query result columns: "
-                    + ", ".join(missing_columns)
-                )
             for column in effective_numeric_columns:
                 data[column] = pd.to_numeric(data[column], errors="raise")
+        population_diagnostics = _inspect_zero_population_aggregate(sql, data)
     except Exception:
         _mark_latest_query_snapshot_execution(status='failed', duration_ms=int((time.time() - start_time) * 1000))
         raise
@@ -1428,11 +1459,103 @@ def load_data_with_sql(
         status='success',
         duration_ms=int((time.time() - start_time) * 1000),
         data=data,
+        diagnostics=population_diagnostics,
     )
     attrs = getattr(data, 'attrs', None)
     if isinstance(attrs, dict):
         attrs['data_insight_query_key'] = str(CURRENT_LAST_QUERY_KEY.get() or '').strip()
     return data
+
+
+def _restore_sql_projection_column_names(sql: str, data: Any) -> Any:
+    """Align DataFrame labels with unambiguous names declared by SELECT."""
+    columns = [str(item) for item in getattr(data, "columns", [])]
+    if not columns:
+        return data
+    try:
+        from sqlglot import exp, parse_one
+
+        statement = parse_one(str(sql or ""))
+        select = statement.find(exp.Select)
+    except Exception:
+        return data
+    if select is None:
+        return data
+
+    declared_names: list[str] = []
+    for projection in select.expressions:
+        if isinstance(projection, exp.Star):
+            continue
+        if isinstance(projection, exp.Alias):
+            declared = str(projection.alias or "").strip()
+        elif isinstance(projection, exp.Column):
+            declared = str(projection.name or "").strip()
+        else:
+            declared = ""
+        if declared:
+            declared_names.append(declared)
+
+    actual_by_folded: dict[str, list[str]] = {}
+    for column in columns:
+        actual_by_folded.setdefault(column.casefold(), []).append(column)
+    rename_map: dict[str, str] = {}
+    claimed_targets = set(columns)
+    for declared in declared_names:
+        if declared in claimed_targets:
+            continue
+        matches = actual_by_folded.get(declared.casefold(), [])
+        if len(matches) != 1:
+            continue
+        actual = matches[0]
+        if actual in rename_map or declared in claimed_targets:
+            continue
+        rename_map[actual] = declared
+        claimed_targets.add(declared)
+    return data.rename(columns=rename_map) if rename_map else data
+
+
+def _inspect_zero_population_aggregate(sql: str, data: Any) -> dict[str, Any]:
+    """Describe a one-row aggregate whose unconditional population counts are all zero."""
+    if CURRENT_EXECUTION_INTENT.get() != 'analysis':
+        return {}
+    if data is None or len(data) != 1:
+        return {}
+    try:
+        from sqlglot import exp, parse_one
+
+        statement = parse_one(str(sql or ''))
+        select = statement.find(exp.Select)
+    except Exception:
+        return {}
+    if select is None or select.args.get('group') is not None:
+        return {}
+
+    count_columns: list[str] = []
+    for projection in select.expressions:
+        source = projection.this if isinstance(projection, exp.Alias) else projection
+        if not isinstance(source, exp.Count):
+            continue
+        if any(isinstance(node, (exp.Case, exp.If)) for node in source.walk()):
+            continue
+        alias = str(projection.alias_or_name or '').strip()
+        if alias and alias in data.columns:
+            count_columns.append(alias)
+    if not count_columns:
+        return {}
+
+    values: list[float] = []
+    for column in count_columns:
+        try:
+            values.append(float(data.iloc[0][column] or 0))
+        except (TypeError, ValueError):
+            return {}
+    if values and all(value <= 0 for value in values):
+        return {
+            'effective_no_data': True,
+            'population_count_columns': count_columns,
+            'population_count_values': values,
+        }
+    return {}
 
 
 def _infer_schema_numeric_result_columns(sql: str, result_columns: list[Any]) -> list[str]:
@@ -1524,9 +1647,25 @@ def load_local_data_with_sql(sql: str, params: Optional[list[Any]] = None):
         return pd.read_sql(sql, connection, params=params if params else None)
 
 
+def _json_default(value: Any) -> Any:
+    item = getattr(value, 'item', None)
+    if callable(item):
+        try:
+            return item()
+        except Exception:
+            pass
+    isoformat = getattr(value, 'isoformat', None)
+    if callable(isoformat):
+        try:
+            return isoformat()
+        except Exception:
+            pass
+    return str(value)
+
+
 def _copy_jsonable(value: Any, fallback: Any) -> Any:
     try:
-        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+        return json.loads(json.dumps(value, ensure_ascii=False, default=_json_default))
     except Exception:
         return fallback
 
@@ -1743,6 +1882,7 @@ def _mark_latest_query_snapshot_execution(
     query_key: str = '',
     row_count: int | None = None,
     columns: list[str] | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> None:
     query_key = str(query_key or CURRENT_LAST_QUERY_KEY.get() or '').strip()
     if not query_key:
@@ -1770,6 +1910,8 @@ def _mark_latest_query_snapshot_execution(
         execution["row_count"] = max(int(row_count), 0)
     if columns is not None:
         execution["columns"] = [str(column) for column in columns]
+    if diagnostics:
+        execution.update(_copy_jsonable(diagnostics, {}))
     execution["executed_at"] = datetime.now().isoformat()
     snapshot["execution"] = execution
     snapshots[query_key] = snapshot
@@ -2014,6 +2156,8 @@ def build_markdown_table(dataframe, columns: Optional[list[Any]] = None, max_row
     这个辅助函数适合在“需要输出 Markdown 表格”的场景中直接复用，
     用来减少手写表格拼接时的引号、换行和格式错误。
     如果当前分析任务并不需要表格展示，则不必使用它。
+    columns 可以传字符串列表，也可以传 {"key": ..., "label": ...} 列表；
+    当 DataFrame 使用底层字段名时，应使用后一种形式提供用户可读表头。
     """
     import pandas as pd
 
@@ -2120,6 +2264,8 @@ PROBE_TIME_RANGE_DRIFT_PATTERNS = (
     re.compile(r'改查.*时间范围'),
     re.compile(r'查询可用.*时间范围'),
     re.compile(r'使用.*数据覆盖范围.*分析'),
+    re.compile(r'(?:基于|按照|使用).*?(?:实际)?时间覆盖范围.*?(?:设置|调整|更新).*?time_range', re.I),
+    re.compile(r'(?:使用|采用).*?(?:实际)?(?:expiration_time|时间).*?范围.*?(?:查询|分析)', re.I),
 )
 
 PROBE_TIME_RANGE_GUARD_INSTRUCTIONS = [
@@ -2193,10 +2339,26 @@ def request_retry(
     ]
     if normalized_retry_type == "probe_feedback":
         normalized_instructions = _normalize_probe_feedback_repair_instructions(normalized_instructions)
+    normalized_diagnostics = _copy_jsonable(diagnostics or {}, {})
+    if normalized_retry_type == "probe_feedback":
+        expected_time_range = CURRENT_EXPECTED_TIME_RANGE.get()
+        normalized_diagnostics["_probe_contract"] = {
+            "time_coverage_role": "diagnostic_only",
+            "explicit_user_time_range": (
+                dict(expected_time_range)
+                if isinstance(expected_time_range, dict) and expected_time_range
+                else None
+            ),
+            "formal_scope_policy": (
+                "Probe time coverage may diagnose a failed query, but it does not define "
+                "the formal population. Keep an explicit user range unchanged; without "
+                "one, do not use observed coverage to window an overall baseline."
+            ),
+        }
     return RetryResult(
         retry_type=normalized_retry_type,  # type: ignore[arg-type]
         message=normalized_message,
-        diagnostics=diagnostics or {},
+        diagnostics=normalized_diagnostics,
         repair_instructions=normalized_instructions,
         analysis_report=str(analysis_report or "").strip(),
     )
@@ -2332,6 +2494,11 @@ def _validate_analysis_sql_validation_order(tree: ast.AST) -> RetryResult | None
 def _validate_query_mapping_default_contract(tree: ast.AST) -> RetryResult | None:
     """Reject silent zero defaults for keys missing from query-derived mappings."""
     mapping_names: set[str] = set()
+    count_mapping_names: set[str] = set()
+    count_field_pattern = re.compile(
+        r"(?:count|cnt|quantity|number|数量|个数|次数|记录数)$",
+        re.IGNORECASE,
+    )
     for node in ast.walk(tree):
         if not isinstance(node, (ast.Assign, ast.AnnAssign)):
             continue
@@ -2343,9 +2510,17 @@ def _validate_query_mapping_default_contract(tree: ast.AST) -> RetryResult | Non
         ):
             continue
         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        mapping_names.update(
+        target_names = {
             target.id for target in targets if isinstance(target, ast.Name)
-        )
+        }
+        mapping_names.update(target_names)
+        projected_fields = {
+            str(item.value).strip()
+            for item in ast.walk(value.func.value)
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        }
+        if any(count_field_pattern.search(field) for field in projected_fields):
+            count_mapping_names.update(target_names)
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or len(node.args) < 2:
@@ -2366,6 +2541,18 @@ def _validate_query_mapping_default_contract(tree: ast.AST) -> RetryResult | Non
             and default.value == 0
         ):
             continue
+        # A fixed category absent from a count distribution has a well-defined
+        # count of zero. Keep rejecting variable-key lookups and non-count
+        # measures, where a type mismatch or missing period must remain distinct
+        # from a measured zero.
+        key = node.args[0]
+        if (
+            func.value.id in count_mapping_names
+            and isinstance(key, ast.Constant)
+            and isinstance(key.value, (str, int))
+            and not isinstance(key.value, bool)
+        ):
+            continue
         return request_retry(
             retry_type="contract_error",
             message=(
@@ -2384,6 +2571,418 @@ def _validate_query_mapping_default_contract(tree: ast.AST) -> RetryResult | Non
             ],
         )
     return None
+
+
+def _validate_report_extrema_selection_contract(
+    tree: ast.AST,
+    code: str,
+) -> RetryResult | None:
+    """Require explicit extrema calculations for superlative report claims.
+
+    A positional row can represent the latest period, the first category, or an
+    arbitrary SQL order. It is not proof of a maximum/minimum unless the metric
+    extremum was calculated explicitly. Restrict this check to report templates
+    that make a superlative claim; ordinary positional presentation remains valid.
+    """
+
+    superlative_markers = (
+        "最高", "最低", "最多", "最少", "峰值", "高峰", "为主", "主导",
+        "highest", "lowest", "largest", "smallest", "peak", "dominant", "most ",
+    )
+    findings: list[dict[str, Any]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.JoinedStr):
+            continue
+        literal_text = "".join(
+            str(item.value)
+            for item in node.values
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        )
+        normalized_text = literal_text.lower()
+        if not any(marker.lower() in normalized_text for marker in superlative_markers):
+            continue
+        positional_expressions: list[str] = []
+        for formatted in node.values:
+            if not isinstance(formatted, ast.FormattedValue):
+                continue
+            if any(
+                isinstance(item, ast.Attribute) and item.attr == "iloc"
+                for item in ast.walk(formatted.value)
+            ):
+                positional_expressions.append(
+                    ast.get_source_segment(code, formatted.value)
+                    or ast.unparse(formatted.value)
+                )
+        if positional_expressions:
+            findings.append({
+                "line_no": int(getattr(node, "lineno", 0) or 0),
+                "claim_preview": literal_text[:240],
+                "positional_expressions": positional_expressions,
+            })
+    if not findings:
+        return None
+    return request_retry(
+        retry_type="contract_error",
+        message=(
+            "报告使用 DataFrame 位置行直接支撑最高、最低、最多、峰值或主导项判断；"
+            "位置顺序不能证明业务极值。"
+        ),
+        diagnostics={
+            "violated_contract": "report_superlative_requires_explicit_extrema",
+            "findings": findings[:12],
+        },
+        repair_instructions=[
+            "保留现有查询、指标、图表和报告结构，只修正极值/主导项的计算变量及其引用。",
+            "按报告声称的业务度量显式使用 idxmax()/idxmin()，或先按该度量明确排序后选行；不要用未证明顺序的 iloc[0]/iloc[-1] 直接声称最高、最低、最多、峰值或主导。",
+            "维度值与对应度量必须来自同一条已选中的极值记录；同步修正报告中复用该记录的结论和建议。",
+        ],
+    )
+
+
+def _validate_report_bounded_time_window_contract(
+    tree: ast.AST,
+    code: str,
+) -> RetryResult | None:
+    """Reject one-sided date filters presented as a bounded report period.
+
+    The check follows AST assignments from the numeric slot next to an explicit
+    bounded-period phrase. It does not scan rendered Markdown numbers or attempt
+    open-ended natural-language validation. SQL-backed metrics and calculations
+    whose date predicate cannot be proven statically remain untouched.
+    """
+
+    bounded_period = re.compile(
+        r"(?:未来|接下来|随后)\s*(?:半(?:年|个月)|[一二三四五六七八九十百\d]+(?:个)?(?:天|周|月|季度|年))"
+        r"|\bnext\s+(?:half\s+year|\d+\s+(?:day|week|month|quarter|year)s?)\b",
+        re.IGNORECASE,
+    )
+    date_markers = re.compile(
+        r"date|time|day|week|month|quarter|year|日期|时间|日|周|月|季度|年|到期|签约|创建",
+        re.IGNORECASE,
+    )
+    assignments: dict[str, list[ast.AST]] = {}
+
+    def assignment_target_names(node: ast.Assign | ast.AnnAssign) -> list[str]:
+        raw_targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        return [
+            item.id
+            for target in raw_targets
+            for item in ast.walk(target)
+            if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store)
+        ]
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = getattr(node, "value", None)
+        if value is None:
+            continue
+        for target_name in assignment_target_names(node):
+            assignments.setdefault(target_name, []).append(value)
+
+    def dependency_nodes(expression: ast.AST) -> list[ast.AST]:
+        collected: list[ast.AST] = []
+        pending = [expression]
+        visited_names: set[str] = set()
+        while pending:
+            current = pending.pop()
+            collected.append(current)
+            for loaded in (
+                item.id for item in ast.walk(current)
+                if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load)
+            ):
+                if loaded in visited_names:
+                    continue
+                visited_names.add(loaded)
+                pending.extend(assignments.get(loaded) or [])
+        return collected
+
+    def is_numeric_metric_expression(formatted: ast.FormattedValue) -> bool:
+        if formatted.format_spec is not None:
+            return True
+        direct_nodes = [formatted.value]
+        if isinstance(formatted.value, ast.Name):
+            direct_nodes.extend(assignments.get(formatted.value.id) or [])
+        numeric_calls = {"abs", "count", "float", "int", "len", "max", "mean", "min", "nunique", "round", "size", "sum"}
+        for direct in direct_nodes:
+            for item in ast.walk(direct):
+                if isinstance(item, ast.BinOp) and isinstance(
+                    item.op,
+                    (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow),
+                ):
+                    return True
+                if isinstance(item, ast.Call):
+                    function_name = (
+                        item.func.id if isinstance(item.func, ast.Name)
+                        else item.func.attr if isinstance(item.func, ast.Attribute)
+                        else ""
+                    )
+                    if function_name in numeric_calls:
+                        return True
+        return False
+
+    findings: list[dict[str, Any]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.JoinedStr):
+            continue
+        values = list(node.values)
+        for index, formatted in enumerate(values):
+            if not isinstance(formatted, ast.FormattedValue):
+                continue
+            prefix = (
+                str(values[index - 1].value)
+                if index > 0
+                and isinstance(values[index - 1], ast.Constant)
+                and isinstance(values[index - 1].value, str)
+                else ""
+            )
+            claim = bounded_period.search(prefix[-120:])
+            if claim is None or not is_numeric_metric_expression(formatted):
+                continue
+            related_nodes = dependency_nodes(formatted.value)
+            date_comparison_count = 0
+            has_between = False
+            for related in related_nodes:
+                for item in ast.walk(related):
+                    if isinstance(item, ast.Compare):
+                        comparison_source = ast.get_source_segment(code, item) or ast.unparse(item)
+                        if date_markers.search(comparison_source):
+                            date_comparison_count += max(1, len(item.ops))
+                    elif (
+                        isinstance(item, ast.Call)
+                        and isinstance(item.func, ast.Attribute)
+                        and item.func.attr == "between"
+                    ):
+                        call_source = ast.get_source_segment(code, item) or ast.unparse(item)
+                        if date_markers.search(call_source):
+                            has_between = True
+            # No statically visible date predicate means there is no safe basis
+            # for a rejection (the boundary may live in SQL or a helper API).
+            if has_between or date_comparison_count == 0 or date_comparison_count >= 2:
+                continue
+            findings.append({
+                "line_no": int(getattr(formatted, "lineno", 0) or 0),
+                "period_claim": claim.group(0),
+                "metric_expression": (
+                    ast.get_source_segment(code, formatted.value)
+                    or ast.unparse(formatted.value)
+                ),
+                "date_comparison_count": date_comparison_count,
+            })
+    if not findings:
+        return None
+    return request_retry(
+        retry_type="contract_error",
+        message=(
+            "报告把只有单侧日期边界的计算表述为固定长度的未来时间窗口，"
+            "该计算会把窗口之外的数据一并计入。"
+        ),
+        diagnostics={
+            "violated_contract": "bounded_report_period_requires_two_date_boundaries",
+            "findings": findings[:12],
+        },
+        repair_instructions=[
+            "保留现有查询、产物和报告结构，只修正该时间窗口指标的日期范围计算。",
+            "固定长度的未来窗口必须同时包含开始边界和结束边界；可使用 between，或显式组合 >= 开始时间与 < 结束时间。",
+            "窗口结束时间必须由报告声明的天、周、月、季度或年长度计算，不要把所有未来记录表述成有限窗口。",
+            "图表、报告结论及建议必须复用修正后的同一窗口数据。",
+        ],
+    )
+
+
+def _validate_report_paired_metric_population_contract(
+    tree: ast.AST,
+    code: str,
+) -> RetryResult | None:
+    """Keep an explicitly paired percentage and count on one population.
+
+    This is intentionally narrower than natural-language report validation. It
+    only handles a structural report form such as ``80% (120 items)`` where the
+    count is presented as the concrete population behind the percentage. The
+    check follows Python assignments and derived DataFrame columns; it never
+    scans rendered Markdown for arbitrary numbers.
+    """
+    assignments: dict[str, list[tuple[int, ast.AST]]] = {}
+    column_assignments: dict[tuple[str, str], list[tuple[int, ast.AST]]] = {}
+
+    def subscript_field(node: ast.AST) -> tuple[str, str] | None:
+        if not (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, str)
+        ):
+            return None
+        return node.value.id, str(node.slice.value)
+
+    for node in sorted(
+        (
+            item for item in ast.walk(tree)
+            if isinstance(item, (ast.Assign, ast.AnnAssign))
+        ),
+        key=lambda item: int(getattr(item, "lineno", 0) or 0),
+    ):
+        value = getattr(node, "value", None)
+        if value is None:
+            continue
+        raw_targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        line_no = int(getattr(node, "lineno", 0) or 0)
+        for target in raw_targets:
+            if isinstance(target, ast.Name):
+                assignments.setdefault(target.id, []).append((line_no, value))
+            field = subscript_field(target)
+            if field is not None:
+                column_assignments.setdefault(field, []).append((line_no, value))
+
+    def latest_definition(
+        definitions: list[tuple[int, ast.AST]],
+        before_line: int,
+    ) -> tuple[int, ast.AST] | None:
+        eligible = [item for item in definitions if item[0] <= before_line]
+        return max(eligible, key=lambda item: item[0], default=None)
+
+    def dependency_nodes(expression: ast.AST) -> list[ast.AST]:
+        pending = [(expression, int(getattr(expression, "lineno", 0) or 10**9))]
+        collected: list[ast.AST] = []
+        visited_names: set[tuple[str, int]] = set()
+        visited_fields: set[tuple[str, str, int]] = set()
+        while pending:
+            current, before_line = pending.pop()
+            collected.append(current)
+            for item in ast.walk(current):
+                if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load):
+                    definition = latest_definition(assignments.get(item.id) or [], before_line)
+                    marker = (item.id, definition[0] if definition else 0)
+                    if definition is not None and marker not in visited_names:
+                        visited_names.add(marker)
+                        pending.append((definition[1], definition[0]))
+                field = subscript_field(item)
+                if field is not None:
+                    definition = latest_definition(column_assignments.get(field) or [], before_line)
+                    marker = (*field, definition[0] if definition else 0)
+                    if definition is not None and marker not in visited_fields:
+                        visited_fields.add(marker)
+                        pending.append((definition[1], definition[0]))
+        return collected
+
+    def root_fields(expression: ast.AST) -> set[str]:
+        fields: set[str] = set()
+        for related in dependency_nodes(expression):
+            for item in ast.walk(related):
+                field = subscript_field(item)
+                if field is None:
+                    continue
+                before_line = int(getattr(item, "lineno", 0) or 10**9)
+                if latest_definition(column_assignments.get(field) or [], before_line) is not None:
+                    continue
+                fields.add(field[1])
+        return fields
+
+    def has_population_selector(expression: ast.AST) -> bool:
+        selector_calls = {"groupby", "value_counts", "nunique", "count"}
+        return any(
+            isinstance(item, ast.Compare)
+            or (
+                isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Attribute)
+                and item.func.attr in selector_calls
+            )
+            for related in dependency_nodes(expression)
+            for item in ast.walk(related)
+        )
+
+    def format_spec_text(node: ast.FormattedValue) -> str:
+        if not isinstance(node.format_spec, ast.JoinedStr):
+            return ""
+        return "".join(
+            str(item.value)
+            for item in node.format_spec.values
+            if isinstance(item, ast.Constant)
+        )
+
+    count_unit = re.compile(
+        r"^\s*(?:万元|亿元|公斤|千克|个|份|台|条|笔|项|家|人|次|件|套|辆|座|吨|元)"
+        r"(?=\s|[）)\]】,，。；;]|$)"
+    )
+    findings: list[dict[str, Any]] = []
+    for joined in ast.walk(tree):
+        if not isinstance(joined, ast.JoinedStr):
+            continue
+        values = list(joined.values)
+        formatted_positions = [
+            index for index, item in enumerate(values)
+            if isinstance(item, ast.FormattedValue)
+        ]
+        for pair_index in range(len(formatted_positions) - 1):
+            percent_pos = formatted_positions[pair_index]
+            count_pos = formatted_positions[pair_index + 1]
+            percent_expr = values[percent_pos]
+            count_expr = values[count_pos]
+            if not isinstance(percent_expr, ast.FormattedValue) or not isinstance(count_expr, ast.FormattedValue):
+                continue
+            between = "".join(
+                str(item.value)
+                for item in values[percent_pos + 1:count_pos]
+                if isinstance(item, ast.Constant) and isinstance(item.value, str)
+            )
+            suffix = (
+                str(values[count_pos + 1].value)
+                if count_pos + 1 < len(values)
+                and isinstance(values[count_pos + 1], ast.Constant)
+                and isinstance(values[count_pos + 1].value, str)
+                else ""
+            )
+            is_percentage = (
+                "%" in format_spec_text(percent_expr)
+                or bool(re.match(r"^\s*%", between))
+            )
+            is_parenthesized_count = (
+                (between.count("（") + between.count("("))
+                > (between.count("）") + between.count(")"))
+                and bool(count_unit.match(suffix))
+            )
+            if not is_percentage or not is_parenthesized_count:
+                continue
+            percent_fields = root_fields(percent_expr.value)
+            count_fields = root_fields(count_expr.value)
+            if (
+                not percent_fields
+                or not count_fields
+                or not percent_fields.isdisjoint(count_fields)
+                or not has_population_selector(percent_expr.value)
+                or not has_population_selector(count_expr.value)
+            ):
+                continue
+            findings.append({
+                "line_no": int(getattr(joined, "lineno", 0) or 0),
+                "percentage_expression": (
+                    ast.get_source_segment(code, percent_expr.value)
+                    or ast.unparse(percent_expr.value)
+                ),
+                "count_expression": (
+                    ast.get_source_segment(code, count_expr.value)
+                    or ast.unparse(count_expr.value)
+                ),
+                "percentage_population_fields": sorted(percent_fields),
+                "count_population_fields": sorted(count_fields),
+            })
+    if not findings:
+        return None
+    return request_retry(
+        retry_type="contract_error",
+        message=(
+            "报告把占比与括号内数量表达为同一业务群体，但两者实际来自不同的筛选或分组总体。"
+        ),
+        diagnostics={
+            "violated_contract": "paired_report_metrics_require_shared_population",
+            "findings": findings[:12],
+        },
+        repair_instructions=[
+            "保留现有洞察结构，只修正成对展示的占比和数量口径。",
+            "先为该业务群体构造一份明确的布尔筛选、分组行或数量变量；括号内数量直接复用该变量，占比分子也必须复用同一变量或同一筛选结果。",
+            "如果两个指标本来描述不同业务群体，不要放在占比（数量）的成对表达中，应分别陈述并明确各自口径。",
+        ],
+    )
 
 
 def _validate_analysis_relationship_contract(
@@ -2421,7 +3020,16 @@ def _validate_analysis_relationship_contract(
             for policy in (item.get("aggregation_safety") or {}).values()
         )
     ]
-    if not unresolved_pairs and not fanout_pairs:
+    key_domain_pairs = [
+        item
+        for item in governed_relationships
+        if item.get("joinability") == "joinable"
+        and isinstance(
+            (item.get("aggregation_safety") or {}).get("key_domain_coverage"),
+            dict,
+        )
+    ]
+    if not unresolved_pairs and not fanout_pairs and not key_domain_pairs:
         return None
     try:
         tree = ast.parse(code or "")
@@ -2471,6 +3079,8 @@ def _validate_analysis_relationship_contract(
 
     sql_sources_by_name: dict[str, set[int]] = {}
     dataframe_sources_by_name: dict[str, set[int]] = {}
+    sql_text_by_name: dict[str, str] = {}
+    dataframe_sql_text_by_name: dict[str, str] = {}
     assignments = [node for node in ast.walk(tree) if isinstance(node, ast.Assign)]
     for assignment in assignments:
         if len(assignment.targets) != 1 or not isinstance(assignment.targets[0], ast.Name):
@@ -2480,6 +3090,11 @@ def _validate_analysis_relationship_contract(
         source_ids = _source_ids_in_text(source_text)
         if source_ids:
             sql_sources_by_name[target_name] = source_ids
+        if isinstance(assignment.value, ast.Constant) and isinstance(
+            assignment.value.value,
+            str,
+        ):
+            sql_text_by_name[target_name] = assignment.value.value
         if not isinstance(assignment.value, ast.Call):
             continue
         call = assignment.value
@@ -2500,10 +3115,19 @@ def _validate_analysis_relationship_contract(
             dataframe_sources_by_name[target_name] = set(
                 sql_sources_by_name.get(sql_node.id, set())
             )
-        elif sql_node is not None:
-            dataframe_sources_by_name[target_name] = _source_ids_in_text(
-                ast.get_source_segment(code, sql_node) or ""
+            dataframe_sql_text_by_name[target_name] = sql_text_by_name.get(
+                sql_node.id,
+                "",
             )
+        elif sql_node is not None:
+            inline_sql = (
+                sql_node.value
+                if isinstance(sql_node, ast.Constant)
+                and isinstance(sql_node.value, str)
+                else ast.get_source_segment(code, sql_node) or ""
+            )
+            dataframe_sources_by_name[target_name] = _source_ids_in_text(inline_sql)
+            dataframe_sql_text_by_name[target_name] = inline_sql
 
     for _ in range(3):
         for assignment in assignments:
@@ -2530,6 +3154,378 @@ def _validate_analysis_relationship_contract(
             if isinstance(child, ast.Name)
             for datasource_id in dataframe_sources_by_name.get(child.id, set())
         }
+
+    coverage_name_pattern = re.compile(
+        r"(?:^|_)(?:cover(?:age|ed)?|match(?:ed)?|link(?:ed)?|associate(?:d)?|"
+        r"bound|binding|with|without)(?:_|$)",
+        re.IGNORECASE,
+    )
+    ratio_name_pattern = re.compile(
+        r"(?:^|_)(?:rate|ratio|share|pct|percentage)(?:_|$)",
+        re.IGNORECASE,
+    )
+
+    def _cross_source_coverage_retry(
+        relationship: dict[str, Any],
+        node: ast.AST,
+        names: list[str],
+    ) -> RetryResult:
+        return request_retry(
+            retry_type="query_constraint_violation",
+            message=(
+                "当前代码用两个数据源各自独立统计的键数量计算覆盖或匹配关系，"
+                "辅助数据源中的孤立键可能使覆盖数量超过主体总体。"
+            ),
+            diagnostics={
+                "violated_contract": "cross_source_key_domain_coverage",
+                "relationship_id": relationship.get("relationship_id"),
+                "left_datasource_id": relationship.get("left_datasource_id"),
+                "right_datasource_id": relationship.get("right_datasource_id"),
+                "coverage_variables": names,
+                "line_no": getattr(node, "lineno", None),
+                "key_domain_coverage": (
+                    relationship.get("aggregation_safety") or {}
+                ).get("key_domain_coverage") or {},
+            },
+            repair_instructions=[
+                "覆盖分子必须从主体键与辅助键的交集、EXISTS/SEMI JOIN，或按已确认关系键合并后的去重主体集合计算。",
+                "覆盖分母必须使用同一筛选口径下的主体键去重数；辅助表独有键不能进入分子。",
+                "如果只想披露辅助表自身涉及的键数量，应将其作为独立事实说明，不得命名或解释为主体覆盖数量、覆盖率或缺失量。",
+            ],
+        )
+
+    def _expression_aligns_key_domains(node: ast.AST) -> bool:
+        return any(
+            (
+                isinstance(item, ast.BinOp)
+                and isinstance(item.op, ast.BitAnd)
+            )
+            or (
+                isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Attribute)
+                and item.func.attr in {"intersection", "isin", "merge", "join"}
+            )
+            or (
+                isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Name)
+                and item.func.id == "merge"
+            )
+            for item in ast.walk(node)
+        )
+
+    for relationship in key_domain_pairs:
+        pair = {
+            int(relationship.get("left_datasource_id") or 0),
+            int(relationship.get("right_datasource_id") or 0),
+        }
+        if len(pair) != 2:
+            continue
+
+        relationship_fields = {
+            int(relationship.get("left_datasource_id") or 0): [
+                str(item) for item in relationship.get("left_fields") or []
+                if str(item).strip()
+            ],
+            int(relationship.get("right_datasource_id") or 0): [
+                str(item) for item in relationship.get("right_fields") or []
+                if str(item).strip()
+            ],
+        }
+
+        def _distinct_relationship_key_aliases(
+            dataframe_name: str,
+            datasource_id: int,
+        ) -> set[str]:
+            sql_text = dataframe_sql_text_by_name.get(dataframe_name, "")
+            aliases: set[str] = set()
+            for field_name in relationship_fields.get(datasource_id, []):
+                field_pattern = re.escape(field_name)
+                aliases.update(
+                    match.group("alias")
+                    for match in re.finditer(
+                        rf"count\s*\(\s*distinct\s+(?:[\w\"`]+\.)?[\"`]?{field_pattern}[\"`]?\s*\)\s+(?:as\s+)?[\"`]?(?P<alias>[A-Za-z_]\w*)[\"`]?",
+                        sql_text,
+                        re.IGNORECASE,
+                    )
+                )
+            return aliases
+
+        key_count_variables: dict[str, set[int]] = {}
+        for assignment in assignments:
+            if len(assignment.targets) != 1 or not isinstance(assignment.targets[0], ast.Name):
+                continue
+            target_name = assignment.targets[0].id
+            for item in ast.walk(assignment.value):
+                if not isinstance(item, ast.Subscript) or not isinstance(item.value, ast.Name):
+                    continue
+                dataframe_name = item.value.id
+                column_name = (
+                    item.slice.value
+                    if isinstance(item.slice, ast.Constant)
+                    and isinstance(item.slice.value, str)
+                    else ""
+                )
+                if not column_name:
+                    continue
+                for datasource_id in dataframe_sources_by_name.get(dataframe_name, set()):
+                    if datasource_id not in pair:
+                        continue
+                    if column_name in _distinct_relationship_key_aliases(
+                        dataframe_name,
+                        datasource_id,
+                    ):
+                        key_count_variables.setdefault(target_name, set()).add(
+                            datasource_id
+                        )
+
+        for assignment in assignments:
+            if len(assignment.targets) != 1 or not isinstance(assignment.targets[0], ast.Name):
+                continue
+            target_name = assignment.targets[0].id
+            if not ratio_name_pattern.search(target_name):
+                continue
+            for item in ast.walk(assignment.value):
+                if not isinstance(item, ast.BinOp) or not isinstance(item.op, ast.Div):
+                    continue
+                numerator_sources = {
+                    datasource_id
+                    for child in ast.walk(item.left)
+                    if isinstance(child, ast.Name)
+                    for datasource_id in key_count_variables.get(child.id, set())
+                }
+                denominator_sources = {
+                    datasource_id
+                    for child in ast.walk(item.right)
+                    if isinstance(child, ast.Name)
+                    for datasource_id in key_count_variables.get(child.id, set())
+                }
+                if (
+                    numerator_sources
+                    and denominator_sources
+                    and numerator_sources.isdisjoint(denominator_sources)
+                    and pair.issubset(numerator_sources | denominator_sources)
+                ):
+                    return _cross_source_coverage_retry(
+                        relationship,
+                        item,
+                        [
+                            target_name,
+                            *[
+                                child.id
+                                for child in ast.walk(item)
+                                if isinstance(child, ast.Name)
+                            ],
+                        ],
+                    )
+
+        all_code_source_ids = {
+            datasource_id
+            for source_ids in dataframe_sources_by_name.values()
+            for datasource_id in source_ids
+        }
+        coverage_nodes: list[tuple[ast.AST, list[str]]] = []
+        for assignment in assignments:
+            if len(assignment.targets) != 1 or not isinstance(assignment.targets[0], ast.Name):
+                continue
+            target_name = assignment.targets[0].id
+            referenced_names = [
+                item.id for item in ast.walk(assignment.value) if isinstance(item, ast.Name)
+            ]
+            if coverage_name_pattern.search(target_name):
+                assignment_sources = _sources_for_expression(assignment.value)
+                left_datasource_id = int(
+                    relationship.get("left_datasource_id") or 0
+                )
+                right_datasource_id = int(
+                    relationship.get("right_datasource_id") or 0
+                )
+                if (
+                    pair.issubset(all_code_source_ids)
+                    and right_datasource_id in assignment_sources
+                    and left_datasource_id not in assignment_sources
+                    and coverage_name_pattern.search(target_name)
+                ):
+                    return _cross_source_coverage_retry(
+                        relationship,
+                        assignment.value,
+                        [target_name, *referenced_names],
+                    )
+                coverage_nodes.append((assignment.value, referenced_names))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Compare):
+                continue
+            referenced_names = [
+                item.id for item in ast.walk(node) if isinstance(item, ast.Name)
+            ]
+            if any(coverage_name_pattern.search(name) for name in referenced_names):
+                coverage_nodes.append((node, referenced_names))
+
+        for node, referenced_names in coverage_nodes:
+            source_ids = _sources_for_expression(node)
+            if not pair.issubset(source_ids):
+                continue
+            if _expression_aligns_key_domains(node):
+                continue
+            has_aligned_domain = any(
+                pair.issubset(dataframe_sources_by_name.get(name, set()))
+                for name in referenced_names
+            )
+            if has_aligned_domain:
+                continue
+            return _cross_source_coverage_retry(
+                relationship,
+                node,
+                list(dict.fromkeys(referenced_names)),
+            )
+
+    query_constraints = _extract_query_constraints_literal(tree)
+    aggregation = (
+        query_constraints.get("aggregation")
+        if isinstance(query_constraints, dict)
+        else None
+    )
+    aggregation_grain = str(
+        aggregation.get("grain") if isinstance(aggregation, dict) else ""
+    ).strip().lower()
+
+    if fanout_pairs and aggregation_grain in {"overall", "snapshot"}:
+        def _is_raw_fanout_query(sql_text: str) -> bool:
+            try:
+                from sqlglot import exp, parse_one
+
+                statement = parse_one(str(sql_text or ""))
+                # SQL aggregation has already established a result grain. Unsafe
+                # aggregate expressions on a repeated side are checked above.
+                return statement.find(exp.Group) is None and not any(
+                    isinstance(item, exp.AggFunc)
+                    for item in statement.walk()
+                )
+            except Exception:
+                return True
+
+        fanout_frame_names: set[str] = {
+            frame_name
+            for frame_name, source_ids in dataframe_sources_by_name.items()
+            if frame_name in dataframe_sql_text_by_name
+            and _is_raw_fanout_query(dataframe_sql_text_by_name[frame_name])
+            and any({
+                int(relationship.get("left_datasource_id") or 0),
+                int(relationship.get("right_datasource_id") or 0),
+            }.issubset(source_ids) for relationship in fanout_pairs)
+        }
+
+        # Propagate raw-row expansion risk, not the much weaker fact that an
+        # expression mentions both domains. Deduplication and explicit key-domain
+        # intersections restore a safe grain.
+        changed = True
+        while changed:
+            changed = False
+            for assignment in assignments:
+                if len(assignment.targets) != 1 or not isinstance(assignment.targets[0], ast.Name):
+                    continue
+                target_name = assignment.targets[0].id
+                if target_name in fanout_frame_names:
+                    continue
+                source_names = {
+                    item.id
+                    for item in ast.walk(assignment.value)
+                    if isinstance(item, ast.Name)
+                }
+                if not (source_names & fanout_frame_names):
+                    continue
+                if _expression_aligns_key_domains(assignment.value):
+                    continue
+                if (
+                    isinstance(assignment.value, ast.Call)
+                    and isinstance(assignment.value.func, ast.Attribute)
+                    and assignment.value.func.attr == "drop_duplicates"
+                ):
+                    continue
+                fanout_frame_names.add(target_name)
+                changed = True
+
+        deduplicated_names = {
+            assignment.targets[0].id
+            for assignment in assignments
+            if len(assignment.targets) == 1
+            and isinstance(assignment.targets[0], ast.Name)
+            and isinstance(assignment.value, ast.Call)
+            and isinstance(assignment.value.func, ast.Attribute)
+            and assignment.value.func.attr == "drop_duplicates"
+            and bool(_sources_for_expression(assignment.value.func.value) & {
+                source_id
+                for relationship in fanout_pairs
+                for source_id in (
+                    int(relationship.get("left_datasource_id") or 0),
+                    int(relationship.get("right_datasource_id") or 0),
+                )
+            })
+        }
+
+        def _root_frame_name(node: ast.AST | None) -> str:
+            current = node
+            while current is not None:
+                if isinstance(current, ast.Name):
+                    return current.id
+                if isinstance(current, ast.Subscript):
+                    current = current.value
+                    continue
+                if isinstance(current, ast.Attribute):
+                    current = current.value
+                    continue
+                if isinstance(current, ast.Call):
+                    current = (
+                        current.func.value
+                        if isinstance(current.func, ast.Attribute)
+                        else None
+                    )
+                    continue
+                return ""
+            return ""
+
+        unsafe_reductions: list[dict[str, Any]] = []
+        for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+            if isinstance(call.func, ast.Name) and call.func.id == "len" and call.args:
+                frame_name = _root_frame_name(call.args[0])
+                operation = "len"
+            elif (
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr in {"value_counts", "size", "count"}
+            ):
+                frame_name = _root_frame_name(call.func.value)
+                operation = call.func.attr
+            else:
+                continue
+            if frame_name not in fanout_frame_names or frame_name in deduplicated_names:
+                continue
+            unsafe_reductions.append({
+                "dataframe": frame_name,
+                "operation": operation,
+                "line_no": getattr(call, "lineno", None),
+            })
+
+        if unsafe_reductions:
+            relationship = fanout_pairs[0]
+            return request_retry(
+                retry_type="query_constraint_violation",
+                message=(
+                    "当前总体分析在一对多关联展开结果上直接按行计数或分组计数，"
+                    "会把辅助明细行误当成业务主体。"
+                ),
+                diagnostics={
+                    "violated_contract": "relationship_fanout_population_grain",
+                    "relationship_id": relationship.get("relationship_id"),
+                    "cardinality": relationship.get("cardinality"),
+                    "unsafe_reductions": unsafe_reductions[:12],
+                    "left_fields": relationship.get("left_fields") or [],
+                    "right_fields": relationship.get("right_fields") or [],
+                },
+                repair_instructions=[
+                    "先从关联结果按业务主体键 drop_duplicates(...) 形成 population_df，再用 population_df 计算主体总数、状态构成、占比和主体级图表。",
+                    "辅助明细的行数、授权数或合同编号数保留为独立明细口径，不能替代主体数量；如只需主体分析，可取消不必要的一对多 JOIN。",
+                    "报告、图表和表格必须消费同一份主体粒度结果；主体分组数量之和不得超过主体总数。",
+                ],
+            )
 
     for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
         if not isinstance(call.func, ast.Attribute) or call.func.attr not in {"merge", "join"}:
@@ -3086,6 +4082,126 @@ def _validate_explicit_time_range_guard(
     return _build_explicit_time_range_drift_retry(expected_time_range, actual_time_range)
 
 
+def _validate_probe_observation_contract(
+    tree: ast.AST,
+    calls: set[str],
+) -> RetryResult | None:
+    """Ensure a Probe returns observed facts rather than a plan to inspect data."""
+
+    data_access_calls = {
+        "load_data_with_sql",
+        "load_local_data_with_sql",
+        "load_local_file",
+        "load_local_file_low_memory",
+        "load_minio_file",
+        "load_data_with_api",
+    }
+    used_access_calls = sorted(calls & data_access_calls)
+    if not used_access_calls:
+        return request_retry(
+            retry_type="contract_error",
+            message="Probe 代码没有执行任何数据读取，无法产生可供正式分析使用的观测事实。",
+            diagnostics={
+                "violated_contract": "probe_requires_observed_data",
+                "called_functions": sorted(calls),
+                "supported_data_access_calls": sorted(data_access_calls),
+            },
+            repair_instructions=[
+                "保留当前需要核实的字段和范围，使用对应数据源的只读 loader 执行一次轻量查询或采样读取。",
+                "基于实际返回的 DataFrame 调用 probe_distinct_values(...)、probe_text_candidates(...)、describe_time_coverage(...)，或计算行数、非空数、min/max 等有界摘要。",
+                "把这些实际观测结果放进 request_retry(..., diagnostics=...)；不要只返回 SQL 字符串、检查计划或预期值。",
+            ],
+        )
+
+    def call_name(node: ast.Call) -> str:
+        if isinstance(node.func, ast.Name):
+            return node.func.id
+        if isinstance(node.func, ast.Attribute):
+            return node.func.attr
+        return ""
+
+    def target_names(target: ast.AST) -> set[str]:
+        return {
+            item.id
+            for item in ast.walk(target)
+            if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store)
+        }
+
+    tainted_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = getattr(node, "value", None)
+            if value is None or not any(
+                isinstance(item, ast.Call) and call_name(item) in data_access_calls
+                for item in ast.walk(value)
+            ):
+                continue
+            raw_targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in raw_targets:
+                tainted_names.update(target_names(target))
+        elif isinstance(node, (ast.For, ast.AsyncFor)) and any(
+            isinstance(item, ast.Call) and call_name(item) in data_access_calls
+            for item in ast.walk(node.iter)
+        ):
+            tainted_names.update(target_names(node.target))
+
+    assignments = [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for node in assignments:
+            value = getattr(node, "value", None)
+            if value is None:
+                continue
+            loaded_names = {
+                item.id for item in ast.walk(value)
+                if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load)
+            }
+            if not loaded_names.intersection(tainted_names):
+                continue
+            raw_targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            derived_targets = set().union(*(target_names(target) for target in raw_targets))
+            new_targets = derived_targets - tainted_names
+            if new_targets:
+                tainted_names.update(new_targets)
+                changed = True
+
+    diagnostics_nodes: list[ast.AST] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or call_name(node) != "request_retry":
+            continue
+        diagnostics_nodes.extend(
+            keyword.value for keyword in node.keywords if keyword.arg == "diagnostics"
+        )
+    observed_names = sorted({
+        item.id
+        for diagnostics in diagnostics_nodes
+        for item in ast.walk(diagnostics)
+        if isinstance(item, ast.Name)
+        and isinstance(item.ctx, ast.Load)
+        and item.id in tainted_names
+    })
+    if observed_names:
+        return None
+    return request_retry(
+        retry_type="contract_error",
+        message="Probe 虽然读取了数据，但 diagnostics 没有消费任何由读取结果派生的观测值。",
+        diagnostics={
+            "violated_contract": "probe_diagnostics_require_observed_values",
+            "data_access_calls": used_access_calls,
+            "observed_value_candidates": sorted(tainted_names),
+        },
+        repair_instructions=[
+            "从已加载结果生成有界摘要，例如字段枚举及频次、总行数、非空数、时间 min/max 或候选值匹配结果。",
+            "将摘要变量直接写入 request_retry(..., diagnostics=...)，让下一版正式分析获得真实观测，而不是操作说明。",
+            "Probe 不生成正式图表、表格或报告；完成观测后仍以 retry_type=\"probe_feedback\" 返回。",
+        ],
+    )
+
+
 def _validate_generated_code_contract(code: str) -> RetryResult | None:
     """Validate the static tool contract of generated Python code before execution."""
     try:
@@ -3167,16 +4283,24 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
         if mapping_default_retry is not None:
             return mapping_default_retry
 
+        report_extrema_retry = _validate_report_extrema_selection_contract(tree, code or '')
+        if report_extrema_retry is not None:
+            return report_extrema_retry
+
+        bounded_period_retry = _validate_report_bounded_time_window_contract(tree, code or '')
+        if bounded_period_retry is not None:
+            return bounded_period_retry
+
+        paired_metric_retry = _validate_report_paired_metric_population_contract(tree, code or '')
+        if paired_metric_retry is not None:
+            return paired_metric_retry
+
         helper_chart_retry = _validate_helper_chart_usage_contract(tree, calls)
         if helper_chart_retry is not None:
             return helper_chart_retry
 
     if execution_intent == 'probe':
         violations: list[str] = []
-        if has_query_constraints:
-            violations.append('probe 代码不要声明 query_constraints')
-        if 'validate_query_constraints' in calls:
-            violations.append('probe 代码不要调用 validate_query_constraints(...)')
         if 'request_retry' not in calls:
             violations.append('probe 代码必须调用 request_retry(...)')
         if 'save_analysis_result' in calls:
@@ -3193,9 +4317,13 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
                 },
                 repair_instructions=[
                     'probe 代码只做轻量探测，并调用 request_retry(retry_type="probe_feedback", ...) 返回结构化反馈。',
-                    'probe 代码不要生成 query_constraints，也不要调用 validate_query_constraints(...) 或 save_analysis_result(...)。',
+                    'probe 代码不要调用 save_analysis_result(...)；query_constraints 不是必需项，但已有的只读查询校验不会改变正式分析口径。',
                 ],
             )
+
+        probe_observation_retry = _validate_probe_observation_contract(tree, calls)
+        if probe_observation_retry is not None:
+            return probe_observation_retry
 
     return None
 
@@ -3243,6 +4371,45 @@ def validate_query_constraints(
         return _build_explicit_time_range_drift_retry(
             expected_time_range=expected_time_range,
             actual_time_range=query_constraints.get('time_range'),
+        )
+
+    aggregation = query_constraints.get('aggregation')
+    aggregation_grain = str(
+        aggregation.get('grain') if isinstance(aggregation, dict) else ''
+    ).strip().lower()
+    fragments = _sql_context_fragments(sql_context)
+    is_time_series_query = bool(re.search(r'\bts_query\s*\(', str(sql or ''), re.I)) or any(
+        str(item.get('kind') or '').strip().lower() == 'time_series_sql'
+        for item in fragments
+    )
+    runtime_overrides = CURRENT_ANALYSIS_PARAMETERS_OVERRIDE.get()
+    has_runtime_time_override = bool(
+        isinstance(runtime_overrides, dict)
+        and isinstance(runtime_overrides.get('time_range'), dict)
+        and runtime_overrides.get('time_range')
+    )
+    if (
+        CURRENT_EXECUTION_INTENT.get() == 'analysis'
+        and not (isinstance(expected_time_range, dict) and expected_time_range)
+        and not has_runtime_time_override
+        and aggregation_grain in {'overall', 'detail', 'snapshot'}
+        and isinstance(query_constraints.get('time_range'), dict)
+        and query_constraints.get('time_range')
+        and not is_time_series_query
+    ):
+        return request_retry(
+            retry_type='query_constraint_violation',
+            message='用户未指定时间范围，但当前总体或明细基线被一个推断时间窗截断。',
+            diagnostics={
+                'violated_constraint': 'inferred_overall_time_window',
+                'time_range': query_constraints.get('time_range'),
+                'aggregation_grain': aggregation_grain,
+            },
+            repair_instructions=[
+                '开放式概览的总体规模、状态构成和基础明细查询不要设置任意时间范围，query_constraints.time_range 应为 None。',
+                '如趋势观察确实需要时间窗，请保留不受该时间窗截断的总体基线，并为趋势使用独立、明确标注的观察窗口；不要用趋势窗口替代总体范围。',
+                'Probe 返回的数据覆盖范围只用于诊断字段格式和查询口径，不能直接成为正式总体分析的时间范围。',
+            ],
         )
 
     malformed_ts_query = _find_malformed_ts_query_literal(sql)
@@ -3438,7 +4605,17 @@ def _normalize_table_items(tables: Optional[list[dict[str, Any]]] = None) -> lis
             raise ValueError('tables 中的每一项都必须是 dict。')
         wrapped_table = table.get('table')
         if isinstance(wrapped_table, dict):
-            table = wrapped_table
+            # build_table_result returns a {"table": ...} envelope, while generated
+            # analysis code may put presentation metadata on that envelope. Treat both
+            # forms as one table contract instead of dropping the outer metadata.
+            table = {
+                **wrapped_table,
+                **{
+                    key: table[key]
+                    for key in ('title', 'description')
+                    if str(table.get(key) or '').strip()
+                },
+            }
 
         title = str(table.get('title') or f'表格 {index}').strip()
         description = str(table.get('description') or '').strip()
@@ -3580,14 +4757,22 @@ def save_analysis_result(
     if not report_text:
         raise ValueError('analysis_report 不能为空，必须传入完整的 Markdown 分析报告。')
 
-    normalized_charts = _normalize_chart_items(charts=charts or [])
-    normalized_tables = _normalize_table_items(tables=tables)
+    _raise_if_all_query_snapshots_no_data()
+
+    normalized_charts = _copy_jsonable(
+        _normalize_chart_items(charts=_copy_jsonable(charts or [], [])),
+        [],
+    )
+    normalized_tables = _copy_jsonable(
+        _normalize_table_items(tables=_copy_jsonable(tables or [], [])),
+        [],
+    )
     return StructuredResult(
         analysis_report=report_text,
         charts=normalized_charts,
         tables=normalized_tables,
-        analysis_parameters_schema=analysis_parameters_schema or {},
-        analysis_parameters=analysis_parameters or {},
+        analysis_parameters_schema=_copy_jsonable(analysis_parameters_schema or {}, {}),
+        analysis_parameters=_copy_jsonable(analysis_parameters or {}, {}),
         query_snapshots=_copy_jsonable(CURRENT_QUERY_SNAPSHOTS.get() or {}, {}),
     )
 
@@ -3640,6 +4825,51 @@ def _build_no_data_feedback(
     error_message = normalized_reason
     if normalized_details:
         error_message = f"{normalized_reason} 细节：{'；'.join(normalized_details[:5])}"
+    executed_query_contexts: list[dict[str, Any]] = []
+    for query_key, raw_snapshot in (CURRENT_QUERY_SNAPSHOTS.get() or {}).items():
+        if not isinstance(raw_snapshot, dict):
+            continue
+        implementation = raw_snapshot.get('implementation') or {}
+        execution = raw_snapshot.get('execution') or {}
+        if not isinstance(implementation, dict) or not isinstance(execution, dict):
+            continue
+        if not implementation.get('physical_execution') and 'row_count' not in execution:
+            continue
+        query_constraints = raw_snapshot.get('query_constraints') or {}
+        query_constraints = query_constraints if isinstance(query_constraints, dict) else {}
+        row_count = execution.get('row_count')
+        empty_observation = (
+            str(execution.get('status') or '').lower() == 'failed'
+            or row_count == 0
+            or bool(execution.get('effective_no_data'))
+        )
+        executed_query_contexts.append({
+            'query_key': str(query_key),
+            'applied_constraints': {
+                'time_range': _copy_jsonable(query_constraints.get('time_range'), None),
+                'target_filters': _copy_jsonable(query_constraints.get('target_filters') or [], []),
+                'aggregation': _copy_jsonable(query_constraints.get('aggregation') or {}, {}),
+            },
+            'filter_expressions': list(implementation.get('filter_expressions') or [])[:40],
+            'sql': str(implementation.get('sql') or '')[:2000],
+            'loader': str(implementation.get('loader') or ''),
+            'datasource_identifier': str(implementation.get('datasource_identifier') or ''),
+            'execution_status': str(execution.get('status') or ''),
+            'row_count': row_count,
+            'empty_observation': empty_observation,
+            'columns': list(execution.get('columns') or [])[:80],
+        })
+    executed_query_contexts = executed_query_contexts[-5:]
+    probe_targets = [
+        item for item in executed_query_contexts if item.get('empty_observation')
+    ] or executed_query_contexts[-1:]
+    diagnostics = {
+        'executed_query_contexts': executed_query_contexts,
+        'probe_targets': probe_targets,
+        'probe_scope': (
+            'Probe only the query implementations and applied filter fields listed in probe_targets.'
+        ),
+    }
     return {
         'error_type': 'no_data_found',
         'error_message': error_message,
@@ -3648,7 +4878,10 @@ def _build_no_data_feedback(
             'signature_type': 'no_data_found',
             'reason': normalized_reason,
             'detail_lines': normalized_details[:5],
+            'recommended_next_execution_intent': 'probe',
+            **diagnostics,
         },
+        'diagnostics': diagnostics,
         'repair_instructions': _build_repair_instructions('no_data_found'),
     }
 
@@ -3891,7 +5124,10 @@ def _extract_dataframe_reduction_clauses(code: str) -> list[str]:
 
 def _text_discloses_limit_usage(text: str) -> bool:
     scan_text = str(text or '').lower()
-    if re.search(r'\btop\s*\d+\b', scan_text, re.IGNORECASE):
+    # A trailing ``\b`` does not match ``Top5客户`` because Python treats
+    # CJK characters as word characters.  Only guard the ASCII identifier side
+    # so Top-N disclosures remain detectable in natural Chinese labels.
+    if re.search(r'(?<![a-z0-9_])top\s*\d+', scan_text, re.IGNORECASE):
         return True
     disclosure_markers = (
         'limit',
@@ -3927,6 +5163,59 @@ def _text_discloses_relative_window(text: str) -> bool:
             re.IGNORECASE,
         )
     )
+
+
+def _raise_if_all_query_snapshots_no_data() -> None:
+    """Keep partial-data analysis valid, but reject an ordinary result built on no population."""
+    if CURRENT_EXECUTION_INTENT.get() != 'analysis':
+        return
+    snapshots = CURRENT_QUERY_SNAPSHOTS.get() or {}
+    executions: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for snapshot in snapshots.values():
+        if not isinstance(snapshot, dict):
+            continue
+        implementation = snapshot.get('implementation')
+        execution = snapshot.get('execution')
+        if not isinstance(implementation, dict) or not implementation.get('physical_execution'):
+            continue
+        if not isinstance(execution, dict) or execution.get('status') != 'success':
+            continue
+        executions.append((implementation, execution))
+    if not executions:
+        return
+
+    def _is_no_data(execution: dict[str, Any]) -> bool:
+        if execution.get('effective_no_data') is True:
+            return True
+        row_count = execution.get('row_count')
+        return isinstance(row_count, int) and row_count == 0
+
+    root_executions = [
+        execution
+        for implementation, execution in executions
+        if not str(implementation.get('scope_source_query_key') or '').strip()
+    ]
+    no_data_executions = root_executions or [
+        execution for _, execution in executions
+    ]
+    if all(_is_no_data(execution) for execution in no_data_executions):
+        root_scope = bool(root_executions)
+        raise NoDataFoundError(
+            reason=(
+                '本轮已声明查询口径的总体查询均未命中可分析数据。'
+                if root_scope
+                else '本轮所有实际查询均未命中可分析数据。'
+            ),
+            detail_lines=[
+                f'已检查查询数：{len(no_data_executions)}',
+                *(
+                    ['未单独声明查询口径的后续辅助查询不能替代总体查询。']
+                    if root_scope
+                    else []
+                ),
+                '请先探测筛选枚举、时间边界或关联口径；确认仍无数据后再生成无数据原因与建议报告。',
+            ],
+        )
 
 
 def _result_visible_text(exec_result: StructuredResult) -> str:
@@ -4040,6 +5329,12 @@ def _query_snapshot_table_names(query_snapshots: dict[str, Any]) -> set[str]:
             if isinstance(snapshot.get('implementation'), dict)
             else {}
         )
+        datasource_identifier = str(
+            implementation.get('datasource_identifier') or ''
+        ).strip().strip('`"[]').lower()
+        if datasource_identifier:
+            table_names.add(datasource_identifier)
+            table_names.add(datasource_identifier.rsplit('.', 1)[-1])
         sql = str(implementation.get('sql') or '').strip()
         if not sql:
             continue
@@ -4062,6 +5357,48 @@ def _query_snapshot_table_names(query_snapshots: dict[str, Any]) -> set[str]:
                     table_names.add(token)
                     table_names.add(token.rsplit('.', 1)[-1])
     return table_names
+
+
+def _find_declared_but_unaccessed_datasources(
+    exec_result: StructuredResult,
+    *,
+    used_datasource_ids: list[int] | None,
+    selected_datasource_snapshot: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Find selected datasource IDs declared as used without a physical access."""
+
+    if not used_datasource_ids or not selected_datasource_snapshot:
+        return []
+    accessed_tokens = _query_snapshot_table_names(exec_result.query_snapshots)
+    if not accessed_tokens:
+        return []
+    selected_by_id: dict[int, dict[str, Any]] = {}
+    actually_accessed_ids: set[int] = set()
+    for item in selected_datasource_snapshot:
+        try:
+            datasource_id = int(item.get('datasource_id') or item.get('id') or 0)
+        except (TypeError, ValueError):
+            continue
+        if datasource_id <= 0:
+            continue
+        selected_by_id[datasource_id] = item
+        if _datasource_relation_tokens(item) & accessed_tokens:
+            actually_accessed_ids.add(datasource_id)
+    # If none of the physical accesses can be mapped to selected schemas, retain
+    # the declaration instead of guessing from an unsupported datasource form.
+    if not actually_accessed_ids:
+        return []
+    findings: list[dict[str, Any]] = []
+    for datasource_id in used_datasource_ids:
+        if datasource_id in actually_accessed_ids or datasource_id not in selected_by_id:
+            continue
+        item = selected_by_id[datasource_id]
+        findings.append({
+            'datasource_id': datasource_id,
+            'datasource_name': item.get('datasource_name'),
+            'datasource_identifier': item.get('datasource_identifier'),
+        })
+    return findings
 
 
 def _datasource_relation_tokens(item: dict[str, Any]) -> set[str]:
@@ -4345,6 +5682,23 @@ def _validate_structured_result_contract(
             analysis_report=report_text,
         )
 
+    repeated_units = _find_repeated_numeric_display_units(report_text)
+    if repeated_units:
+        return request_retry(
+            retry_type="result_contract_error",
+            message="分析报告给同一个动态数值重复拼接了展示单位。",
+            diagnostics={
+                "violated_contract": "repeated_numeric_display_unit",
+                "repeated_units": repeated_units,
+            },
+            repair_instructions=[
+                "保留查询、计算、图表和报告叙事，只修正数值展示格式。",
+                "先检查维度值或格式化变量是否已经包含单位；已有单位时直接展示原值，只有纯数值才追加一次单位。",
+                "同步检查报告中由同一变量生成的其他位置，避免重复出现单位。",
+            ],
+            analysis_report=report_text,
+        )
+
     sql_limit_clauses = _extract_sql_limit_clauses(generated_code)
     dataframe_reduction_clauses = _extract_dataframe_reduction_clauses(generated_code)
     reduction_clauses = sql_limit_clauses + dataframe_reduction_clauses
@@ -4359,10 +5713,11 @@ def _validate_structured_result_contract(
             len(reduction_clauses) == 1
             and _text_discloses_relative_window(_result_to_scan_text(exec_result))
         )
+
     ):
         return request_retry(
             retry_type="result_contract_error",
-            message="当前代码对查询或图表数据做了 LIMIT/head/tail/sample/iloc 等截取或采样，但 analysis_report 正文没有披露该限制，容易让用户误以为图表覆盖了完整时间范围。",
+            message="当前代码对查询或图表数据做了 LIMIT/head/tail/sample/iloc 等截取或采样，但可见产物没有披露该限制，容易让用户误以为展示了完整范围。",
             diagnostics={
                 "analysis_report_preview": report_text[:800],
                 "chart_count": len(exec_result.charts or []),
@@ -4371,7 +5726,8 @@ def _validate_structured_result_contract(
                 "dataframe_reduction_clauses": dataframe_reduction_clauses,
             },
             repair_instructions=[
-                "下一版代码可以继续使用 LIMIT、head/tail/sample/iloc 等策略，但必须在 analysis_report 正文明确写出查询或展示条数限制、截取方向、采样方式和实际覆盖范围。",
+                "保留已经正确的分析报告。优先在对应图表或表格的标题、description 中说明展示条数、选择方向和范围，不要仅为披露 TopN 而重写或压缩报告正文。",
+                "只有 analysis_report 的正文结论本身基于不完整样本时，才在正文说明该限制对结论的影响。",
                 "如果图表展示范围小于用户要求的时间范围，必须说明目标时间范围、实际展示点数、总命中点数和截取方向；例如每个数据源命中约 1193 点，图表仅展示其中 200 点。",
                 "如果标题或描述写“最近 N 个点”，代码应使用 tail(N) 或按时间倒序取最近数据；不要用 head(N) 后声称展示最近数据。",
                 "如果用户要求完整时间范围趋势，优先改为按时间桶聚合或分批查询完整时间范围，不要悄悄缩短展示范围。",
@@ -4396,6 +5752,28 @@ def _validate_structured_result_contract(
             repair_instructions=[
                 "下一版调用 execute_python 时，把结构化诊断列出的 datasource_id 加入 used_datasource_ids。",
                 "used_datasource_ids 应覆盖 query_snapshots 中记录的实际数据访问，不需要因为报告中的业务建议或数据缺口说明而额外声明数据源。",
+            ],
+            analysis_report=report_text,
+        )
+
+    unaccessed_declarations = _find_declared_but_unaccessed_datasources(
+        exec_result,
+        used_datasource_ids=used_datasource_ids,
+        selected_datasource_snapshot=selected_datasource_snapshot,
+    )
+    if unaccessed_declarations:
+        return request_retry(
+            retry_type="result_contract_error",
+            message="used_datasource_ids 声明了本轮代码未实际读取或查询的数据源。",
+            diagnostics={
+                "violated_contract": "declared_datasource_without_physical_access",
+                "used_datasource_ids": used_datasource_ids or [],
+                "unaccessed_datasources": unaccessed_declarations,
+            },
+            repair_instructions=[
+                "保持已经正确的查询和分析产物；used_datasource_ids 只保留 query_snapshots 能确认实际访问的数据源。",
+                "同步删除报告中声称使用、关联或覆盖这些未访问数据源的内容；业务建议可以提及数据缺口，但不能声称已经读取该数据源。",
+                "如果这些数据源确实是当前洞察不可缺少的事实来源，应在代码中真实查询并消费其结果，而不是只补声明。",
             ],
             analysis_report=report_text,
         )
@@ -4484,6 +5862,25 @@ def _validate_structured_result_contract(
         )
 
     return None
+
+
+def _find_repeated_numeric_display_units(report_text: str) -> list[dict[str, Any]]:
+    unit_pattern = r"(?:万元|亿元|元|个|台|条|天|月|年|小时|分钟|秒|次|份|件|人|%|‰)"
+    pattern = re.compile(
+        rf"(?P<number>[-+]?\d[\d,]*(?:\.\d+)?)\s*"
+        rf"(?P<unit>{unit_pattern})(?P=unit)"
+    )
+    findings: list[dict[str, Any]] = []
+    for match in pattern.finditer(str(report_text or "")):
+        findings.append({
+            "start": match.start(),
+            "end": match.end(),
+            "text": match.group(0),
+            "unit": match.group("unit"),
+        })
+        if len(findings) >= 20:
+            break
+    return findings
 
 
 def _classify_process_exit(process_exitcode: int | None) -> tuple[str, str]:
@@ -4794,9 +6191,8 @@ def _serialize_runtime_user_context(runtime_context: CustomContext | None) -> di
     if runtime_context is None:
         return {}
 
-    numeric_field_profiles = _build_datasource_numeric_field_profiles(
-        _get_runtime_selected_datasource_snapshot(runtime_context)
-    )
+    selected_snapshot = _get_runtime_selected_datasource_snapshot(runtime_context)
+    numeric_field_profiles = _build_datasource_numeric_field_profiles(selected_snapshot)
     return {
         'token': getattr(runtime_context, 'auth_token', '') or '',
         'database_conn_info': dict(getattr(runtime_context, 'database_conn_info', {}) or {}),
@@ -4861,6 +6257,7 @@ def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -
     ])
     CURRENT_QUERY_SNAPSHOTS.set({})
     CURRENT_LAST_QUERY_KEY.set('')
+    CURRENT_EXECUTION_INTENT.set('')
     conn_info_payload = payload.get('database_conn_info') or {}
     if conn_info_payload:
         supos_kernel_api._database_conn_info = DatabaseConnInfo(
@@ -5501,6 +6898,13 @@ def _execute_generated_code_worker(
     result_queue: mp.Queue,
 ) -> None:
     _prime_worker_runtime_context(runtime_user_context)
+    try:
+        execution_tree = ast.parse(code)
+        CURRENT_EXECUTION_INTENT.set(
+            _extract_static_string_assignment(execution_tree, 'execution_intent') or ''
+        )
+    except (SyntaxError, ValueError):
+        CURRENT_EXECUTION_INTENT.set('')
     namespace = _build_execution_namespace()
     exec_result: Any = None
     with _capture_runtime_io(username) as (stdout_buffer, stderr_buffer):
@@ -5532,6 +6936,7 @@ def _execute_generated_code_worker(
             error_type = _classify_execution_error(exc, raw_error_message)
             error_signature = _extract_error_signature(error_type, error_message)
             repair_instructions = _build_repair_instructions(error_type)
+            diagnostics: dict[str, Any] = {}
             if isinstance(exc, NoDataFoundError):
                 no_data_feedback = _build_no_data_feedback(
                     reason=exc.reason,
@@ -5540,6 +6945,7 @@ def _execute_generated_code_worker(
                 error_message = no_data_feedback['error_message']
                 error_signature = no_data_feedback['error_signature']
                 repair_instructions = no_data_feedback['repair_instructions']
+                diagnostics = no_data_feedback.get('diagnostics') or {}
             result_file_path = _write_worker_result_payload({
                 'status': 'error',
                 'error_message': error_message,
@@ -5547,6 +6953,7 @@ def _execute_generated_code_worker(
                 'error_signature': error_signature,
                 'code_error_context': code_error_context,
                 'repair_instructions': repair_instructions,
+                'diagnostics': diagnostics,
                 'stdout_text': _sanitize_tool_output(stdout_buffer.getvalue()),
                 'stderr_text': _sanitize_tool_output(
                     '\n'.join(item for item in [stderr_buffer.getvalue(), full_traceback] if item)
@@ -5900,6 +7307,7 @@ def _build_repair_instructions(error_type: str) -> list[str]:
     common_instructions = [
         '重新生成完整可执行代码，不要只修改局部片段。',
         '正式分析代码应调用 save_analysis_result(...) 并把返回值赋给 result；探测或结构化反馈代码应调用 request_retry(...) 并把返回值赋给 result。',
+        '修复技术错误时必须保持当前业务问题和 analysis_semantic_context 的事实边界不变；不得改用 unsupported_field_bindings 已排除的字段或未确认关系。可选拆解无法可靠实现时，删除该可选拆解，不要用相邻代理指标补齐。',
         '如果当前修正思路与上一次相同且未解决错误，请更换实现方式后再重试。',
     ]
 
@@ -5933,8 +7341,9 @@ def _build_repair_instructions(error_type: str) -> list[str]:
             '如果目标时间窗口没有命中数据，不要输出空图表或直接调用 save_empty_analysis_result() 收口；应调用 raise_no_data_error(reason=..., detail_lines=[...]) 把信息返回给上层重试。',
         ],
         'no_data_found': [
+            '当前正式查询未命中数据，下一版优先生成独立 probe：声明 execution_intent = "probe"，严格依据 diagnostics.probe_targets 中的真实查询实现、数据源与已应用筛选进行探测，不要扩散到其他已选数据源。',
+            'Probe 必须执行轻量只读查询，并把真实行数、枚举、格式或时间覆盖写入 request_retry(..., diagnostics=...)；不要只返回 SQL 文本、预期值或检查计划。',
             '如果错误信息里包含 unknown tag 或 no results，表示当前时序数据源在时序库中没有可查询的数据或尚未初始化；将该数据源从本轮分析中剔除。如果用户问题涉及多个互相独立的数据源，继续分析其他数据源；只有所有相关数据源都无数据时，才以整体无数据收口。',
-            '如果错误信息里包含 unknown tag 或 no results，表示当前时序数据源在时序库中没有可查询的数据或尚未初始化；按无数据处理，不要继续猜测表名、点位名或语法变体。',
             '请先复核 SQL、时间范围、筛选条件、JOIN 条件或聚合口径是否过严，再生成下一版完整代码。',
             '如果用户问题里有明确时间范围，必须保持原始 query_constraints.time_range 不变；探测得到的数据覆盖范围只能用于解释无数据原因，不能替换成正式分析的时间范围。',
             '在数据加载、过滤、关联、聚合完成后，必须先检查 DataFrame 是否为空；只要为空，就调用 raise_no_data_error(reason=..., detail_lines=[...])，不要继续生成空图表或空结果产物。',
@@ -5942,6 +7351,7 @@ def _build_repair_instructions(error_type: str) -> list[str]:
         ],
         'probe_feedback': [
             '当前反馈是数据探测结果，不是最终分析报告；请基于 diagnostics 中的候选值、时间覆盖或字段分布重写正式分析代码。',
+            'Probe 只纠正字段取值、时间边界和访问实现，不会授权使用 analysis_semantic_context 中已明确排除的事实字段或未确认关系。',
             '如果用户问题里有明确时间范围，下一版 analysis 只能保留原始 query_constraints.time_range；diagnostics 里的数据覆盖范围不能被写回 query_constraints.time_range。',
             '如果探测确认用户明确时间范围内无数据，应返回无数据反馈或无数据结论，不要为了命中数据改查其他时间范围。',
             '下一版代码应切换为 execution_intent = "analysis"，并调用 save_analysis_result(...) 返回最终分析结果。',
@@ -6025,6 +7435,26 @@ def _build_repair_instructions(error_type: str) -> list[str]:
     return [*specific_instructions.get(error_type, specific_instructions['runtime_error']), *common_instructions]
 
 
+def _augment_repair_instructions(
+    error_type: str,
+    error_message: str,
+    repair_instructions: list[str],
+) -> list[str]:
+    """Add facts learned from the concrete failure without changing analysis scope."""
+    augmented = list(repair_instructions)
+    message = str(error_message or '')
+    if (
+        error_type == 'runtime_error'
+        and 'mysql query' in message.lower()
+        and re.search(r'::\s*(?:int|integer|signed|decimal|numeric|float|double)\b', message, re.I)
+    ):
+        augmented = [
+            '错误已确认发生在 MySQL 源查询：当前 SQL 使用了 PostgreSQL 的 ::type 强转语法。保持查询口径不变，改用 MySQL CAST(expression AS SIGNED/DECIMAL)；若字段是带单位文本，优先查询原字段后在 pandas 中解析，不能再次生成 ::type。',
+            *augmented,
+        ]
+    return list(dict.fromkeys(augmented))
+
+
 def _tool_error_message(
     *,
     tool_call_id: str,
@@ -6044,6 +7474,11 @@ def _tool_error_message(
     stderr_text: str = '',
 ) -> ToolMessage:
     """构造统一的结构化工具错误反馈，供 Agent 循环继续修正。"""
+    repair_instructions = _augment_repair_instructions(
+        error_type,
+        error_message,
+        repair_instructions,
+    )
     clipped_current_code = _clip_retry_context_text(current_failed_code, TOOL_ERROR_CURRENT_CODE_MAX_CHARS)
     clipped_error_message = _clip_retry_context_text(error_message, TOOL_ERROR_TEXT_MAX_CHARS)
     clipped_error_signature = dict(error_signature or {})
@@ -6632,6 +8067,11 @@ def execute_python(
         repair_instructions = worker_payload.get('repair_instructions') or _build_repair_instructions(error_type)
         error_signature = worker_payload.get('error_signature') or _extract_error_signature(error_type, error_message)
         code_error_context = worker_payload.get('code_error_context') if isinstance(worker_payload.get('code_error_context'), dict) else {}
+        worker_diagnostics = (
+            worker_payload.get('diagnostics')
+            if isinstance(worker_payload.get('diagnostics'), dict)
+            else {}
+        )
         turn_id = int(getattr(runtime.context, 'turn_id', 0) or 0)
         failure_memory = _build_turn_failure_memory(
             turn_id=turn_id,
@@ -6645,6 +8085,7 @@ def execute_python(
                 'error_type': error_type,
                 'error_message': error_message,
                 'error_signature': error_signature,
+                'diagnostics': worker_diagnostics,
                 'code_error_context': code_error_context,
                 'repair_instructions': repair_instructions,
             }, ensure_ascii=False),
@@ -6658,6 +8099,7 @@ def execute_python(
             current_execution_id=execution_id,
             error_type=error_type,
             repair_instructions=repair_instructions,
+            diagnostics=worker_diagnostics,
         )
         with logger.context(**execution_log_context):
             logger.error(f"代码执行失败（{error_type}）：{error_message}")

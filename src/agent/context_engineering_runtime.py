@@ -353,7 +353,13 @@ def get_datasource_message(
             f"- `selected_datasource_ids` 当前为 {selected_ids}，表示 Preparation 已围绕本轮完整业务意图确定的数据源语义空间；正式分析不再重新选源，也不能静默丢弃其中的业务问题。"
         )
         instruction_lines.append(
-            "- `analysis_semantic_context` 说明业务目标、逐问题覆盖和洞察业务血缘。它不是 SQL、指标、图表或报告模板；查询、计算和洞察表达仍由正式分析根据真实数据自主完成。"
+            "- `analysis_semantic_context` 说明业务目标和 Business Context 定稿后的洞察业务血缘。它不是 SQL、指标、图表或报告模板；查询、计算和洞察表达仍由正式分析根据真实数据自主完成。"
+        )
+        instruction_lines.append(
+            "- `analysis_semantic_context.analytical_facets` 是选源时识别的开放式洞察方向，用于保持完整业务意图。它不规定报告章节或结论；正式分析应根据 Schema 和实际查询结果选择有数据支撑、对回答问题有价值的方向，并对无法支持但会影响判断的重要缺口作业务化说明。"
+        )
+        instruction_lines.append(
+            "- `analysis_semantic_context.explicit_time_range` 是用户问题的时间口径，非空时必须保持；为 null 时表示用户没有限定时间。Intent 的自然语言定义和 Probe 观察范围都不能自行创造总体时间窗口，趋势观察应使用独立查询且不得截断总体基线。"
         )
         instruction_lines.append(
             "- Schema 字段的 `observed_value_profile` 是 Preparation Probe 回写的字段语义结论，不包含样本行：`empty` 表示未观察到有效值，`opaque_identifier` 表示值仅适合作为关联标识；`requested_value_resolutions` 中的 exact/similar 是已核实的业务枚举映射，unresolved 不能直接用于精确筛选。"
@@ -362,7 +368,7 @@ def get_datasource_message(
             "- Schema 关系的 `aggregation_safety` 按当前数据源方向描述连接后的度量可加性；`unsafe_repeated_by_join` 表示该侧度量会被另一侧多行展开。除非存在明确分摊规则或已确认函数依赖，不能把该侧度量归因到另一侧维度；整体值应在原事实粒度独立聚合。"
         )
         instruction_lines.append(
-            "- `question_coverage` 是选源判断，`insight_lineage` 是结合完整 Schema 与关系后的最终语义判断；两者不一致时以后者为准。"
+            "- 计算主体被辅助明细覆盖的数量或比例时，遵守 `aggregation_safety.key_domain_coverage`：分子是主体键集合与辅助键集合的交集去重数，分母是主体人口键去重数。辅助表中的孤立键和一对多明细行都不能计入主体覆盖数。"
         )
         instruction_lines.append(
             "- `partial/unresolved` 事实不得由相邻字段或代理指标冒充。`unsupported_field_bindings` 只用于排除错误字段映射，`business_impact` 是该缺口的业务边界；字段、关系和基数信息只用于实现查询与计算。正式 probe 只核实查询值格式、时间边界和无数据口径，不再重做跨源关系发现。`unknown/alignable/not_joinable` 关系不得当作已确认 JOIN。"

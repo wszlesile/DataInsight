@@ -443,6 +443,21 @@ def _validate_chart_semantic_encoding(document: dict[str, Any]) -> None:
     encoding = document.get("encoding") if isinstance(document.get("encoding"), dict) else {}
     value_field = str(encoding.get("value_field") or "").strip()
     value_fields = [str(item or "").strip() for item in (encoding.get("value_fields") or [])]
+    category_field = str(encoding.get("category_field") or "").strip()
+    rows = (document.get("dataset") or {}).get("rows") or []
+    metric_category_names = {"指标", "指标名称", "metric", "metric_name"}
+    if (
+        chart_kind in {"bar", "line"}
+        and category_field.lower() in metric_category_names
+        and value_field
+        and len(value_fields) <= 1
+        and len({str(row.get(category_field) or "").strip() for row in rows}) > 1
+    ):
+        raise ValueError(
+            "chart_semantic_error: 图表把多个业务指标放在类别行中，并共用一个通用数值列，"
+            "无法形成稳定的指标级计算边界。请把每个业务指标放入独立数值列，"
+            "再使用 build_multi_metric_chart_result(..., value_fields=[...]) 表达对比。"
+        )
     value_field_candidates = [value_field] + [item for item in value_fields if item != value_field]
     if not any(_looks_like_identifier_field(item) for item in value_field_candidates):
         return

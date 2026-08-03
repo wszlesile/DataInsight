@@ -1,5 +1,8 @@
 import json
 
+from langchain_core.messages import SystemMessage
+
+import agent
 import agent.context_engineering_runtime as runtime_context
 
 
@@ -99,6 +102,8 @@ def test_datasource_context_preserves_preparation_semantic_handoff(monkeypatch):
     assert payload["analysis_semantic_context"] == semantic_context
     assert message.content.index('"datasources"') < message.content.index('"analysis_semantic_context"')
     assert "正式分析不再重新选源" in message.content
+    assert "开放式洞察方向" in message.content
+    assert "不规定报告章节或结论" in message.content
     assert "已选候选范围" not in message.content
 
 
@@ -139,3 +144,41 @@ def test_datasource_context_compacts_only_redundant_schema_indexes(monkeypatch):
     assert "required" not in datasource["metadata_schema"]
     assert datasource["field_capabilities"]["all_properties_queryable"] is True
     assert "queryable_fields" not in datasource["field_capabilities"]
+
+
+def test_current_semantic_context_closes_merged_system_message(monkeypatch):
+    monkeypatch.setattr(agent, "load_system_prompt", lambda: "CORE_RULES")
+    monkeypatch.setattr(agent, "_build_conversation_prompt_message", lambda *_: None)
+    monkeypatch.setattr(
+        agent,
+        "_build_runtime_environment_message",
+        lambda: SystemMessage("RUNTIME_ENVIRONMENT"),
+    )
+    monkeypatch.setattr(agent, "_build_relative_date_hint_message", lambda *_: None)
+    monkeypatch.setattr(
+        agent,
+        "get_datasource_message",
+        lambda **_: SystemMessage("CURRENT_SCHEMA_AND_SEMANTIC_CONTEXT"),
+    )
+    monkeypatch.setattr(
+        agent,
+        "get_memory_messages",
+        lambda *_, **__: [SystemMessage("HISTORICAL_MEMORY")],
+    )
+    monkeypatch.setattr(agent, "get_history_messages", lambda *_, **__: [])
+
+    messages = agent.build_prompt_messages(
+        "分析当前数据",
+        namespace_id=6,
+        conversation_id=20,
+        extra_system_messages=["CURRENT_REPAIR_INSTRUCTION"],
+    )
+
+    system_text = messages[0].content
+    assert system_text.index("CORE_RULES") < system_text.index("HISTORICAL_MEMORY")
+    assert system_text.index("HISTORICAL_MEMORY") < system_text.index(
+        "CURRENT_SCHEMA_AND_SEMANTIC_CONTEXT"
+    )
+    assert system_text.index("CURRENT_SCHEMA_AND_SEMANTIC_CONTEXT") < system_text.index(
+        "CURRENT_REPAIR_INSTRUCTION"
+    )

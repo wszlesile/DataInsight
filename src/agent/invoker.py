@@ -678,11 +678,12 @@ def _prepare_analysis_context(
         ]
 
     source_snapshot = dict(runtime.active_datasource_snapshot or {})
+    expected_time_range = _build_expected_time_range_from_user_query(user_query)
     try:
         result = prepare_analysis(
             user_query=user_query,
             context_mode=getattr(runtime, "context_mode", "") or "fresh_analysis",
-            expected_time_range=_build_expected_time_range_from_user_query(user_query),
+            expected_time_range=expected_time_range,
             datasource_snapshot=source_snapshot,
             conversation_context=conversation_context,
             runtime_config=runtime_config,
@@ -755,6 +756,7 @@ def _prepare_analysis_context(
             ),
             selected_snapshot=source_snapshot,
             query_capabilities=infer_query_capabilities(source_snapshot),
+            explicit_time_range=expected_time_range or None,
         )
     runtime.short_term_memory["preparation_result"] = result
     return result

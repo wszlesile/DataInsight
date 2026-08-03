@@ -60,7 +60,7 @@
 
 - 逐个覆盖 Intent 的全部 `question_id` 和事实 `fact_id`。事实绑定必须落到已选 Schema 中真实存在的字段。
 - Selection 中 `datasource_ids` 表示事实/度量来源，`supporting_datasource_ids` 表示标签、分类、对象属性或桥接语义来源。两者都要进入相应问题的 lineage，并通过 fact binding 说明各自承担的字段语义。
-- 原始事实 binding 填写真实 `datasource_id` 和 `fields`。比例、差值、同比等派生依赖已经由 Selection 的 `derived_from_fact_ids` 定稿，Business Context 不需要重复输出；编译器会把它们作为无物理数据源的逻辑节点内聚进 lineage。不得为派生事实虚构物理数据源或字段。
+- 原始事实 binding 填写真实 `datasource_id` 和 `fields`。无法绑定的事实只放入 `unresolved_business_facts`，不要再输出空 `fact_binding`。比例、差值、同比等派生依赖已经由 Selection 的 `derived_from_fact_ids` 定稿，Business Context 不需要重复输出；编译器会把它们作为无物理数据源的逻辑节点内聚进 lineage。不得为派生事实虚构物理数据源或字段。
 - `synthesis_path` 描述这些事实如何共同回答业务问题，不写 SQL、指标算法、图表形式、报告章节、结论或建议。
 - `reason` 是 Preparation 内部审计说明，不进入正式分析上下文。`unsupported_field_bindings` 结构化列出已经核验但不能承载该事实的真实字段，防止正式分析把它们当作代理口径；`business_reason` 说明业务语义不匹配，不写查询过程。
 - `business_impact` 只说明该缺口对用户问题的影响，必须使用业务语言，不写字段名、数据源标识、Probe、SQL 或内部协议名。三者职责不同，不能用技术诊断替代业务影响。
@@ -71,12 +71,13 @@
 - Schema 无法确认、但字段真实取值或覆盖情况能够确认的业务血缘事实，必须通过 `probe_requests` 请求受控核验，不能直接留给正式分析。
 - `probe_kind` 只可使用：`distinct_values`（分类/枚举实际值）、`time_coverage`（时间覆盖起止）、`field_profile`（非空数和唯一值数量）。这里只确认 Schema 语义，不设计筛选条件、SQL、指标或报告。
 - `distinct_values` 用于核实用户明确提到的状态、部门、产品等候选值时，把这些原始候选写入 `expected_values`；Probe 会返回精确命中、唯一高置信近似值或 unresolved，避免正式分析继续使用未命中的字面量。
+- Probe 确认的枚举、字段格式和覆盖信息会内聚进该字段 Schema，供正式分析在完整洞察语义中使用；Business Context 不重复设计查询筛选集合或字段解析规则。
 - 如果上下文包含 `resolution_phase=finalize_after_probe`，必须结合 `business_context_draft` 和 `probe_observations` 定稿：已证实的事实更新 lineage、关系和 unresolved 项；不可用的观察保留为明确缺口；输出 `probe_requests=[]`，不得把同一疑问再次交给正式分析。
 - Probe 返回的是聚合事实摘要，不是分析数据。不得把枚举频次、覆盖率或基数本身规划成用户报告结论。
 
 ## 关系证据
 
-- 关系类型可用：`same_entity`、`parent_child`、`event_of_entity`、`dimension_enrichment`、`bridge`、`comparable`、`independent`。
+- 关系类型可用：`same_entity`、`parent_child`、`event_of_entity`、`dimension_enrichment`、`bridge`、`comparable`、`independent`、`unknown`。只有无法根据 Schema 判断关系业务类型时才使用 `unknown`，并保持 `joinability=unknown`；它不会被用于 JOIN 或关系 Probe。
 - `joinability=joinable` 的关系必须左右键数量一致并逐项配对；unknown 关系可保留数量不同的候选字段集合，供 Probe 核验，不能因此直接 JOIN。`comparable` 和 `independent` 不要求键数量一致。
 - 只有 Schema 显式声明的关系可使用 `evidence_basis=schema` 并标记 `joinable/alignable`。
 - 字段同名、描述相近或业务上看似相关都不能证明关系成立。没有显式证据时保留候选字段，但使用 `evidence_basis=unresolved`、`joinability=unknown`。

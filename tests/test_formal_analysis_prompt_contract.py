@@ -1,7 +1,14 @@
 from pathlib import Path
 
 
-PROMPT_PATH = Path(__file__).resolve().parents[1] / "src" / "agent" / "sys_prompt.md"
+PROMPT_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "src"
+    / "agent"
+    / "prompts"
+    / "runtime"
+    / "sys_prompt.md"
+)
 
 
 def test_formal_prompt_requires_complete_user_requested_analysis_scope():

@@ -3,22 +3,28 @@ import sys
 from pathlib import Path
 
 import pytest
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent.invoker import _build_expected_time_range_from_user_query  # noqa: E402
 from agent.tools import (  # noqa: E402
+    CURRENT_ANALYSIS_PARAMETERS_OVERRIDE,
+    CURRENT_EXECUTION_INTENT,
+    CURRENT_EXPECTED_TIME_RANGE,
     CURRENT_LAST_QUERY_KEY,
     CURRENT_QUERY_SNAPSHOTS,
     StructuredResult,
     _begin_query_snapshot_execution,
     _build_execution_namespace,
     _check_time_range_constraint,
+    _validate_generated_code_contract,
     _resolve_requested_enum_values,
     build_markdown_table,
     build_table_result,
     load_local_file,
     load_local_file_low_memory,
+    load_data_with_sql,
     request_retry,
     save_analysis_result,
     validate_query_constraints,
@@ -68,6 +74,182 @@ def test_legacy_evidence_retry_type_is_not_a_runtime_protocol():
     assert retry.retry_type == "contract_error"
 
 
+def test_request_retry_normalizes_numpy_diagnostics_to_native_json_scalars():
+    import numpy as np
+
+    retry = request_retry(
+        retry_type="probe_feedback",
+        message="枚举探测完成",
+        diagnostics={
+            "total_rows": np.int64(143),
+            "ratio": np.float64(0.25),
+            "values": [np.int32(4)],
+        },
+    )
+
+    assert retry.diagnostics["total_rows"] == 143
+    assert isinstance(retry.diagnostics["total_rows"], int)
+    assert retry.diagnostics["ratio"] == 0.25
+    assert retry.diagnostics["values"] == [4]
+
+
+def test_probe_feedback_marks_time_coverage_as_diagnostic_only():
+    token = CURRENT_EXPECTED_TIME_RANGE.set({})
+    try:
+        retry = request_retry(
+            retry_type="probe_feedback",
+            message="已确认真实时间覆盖范围",
+            diagnostics={"actual_time_coverage": {"start": "2026-02-01", "end": "2033-06-21"}},
+            repair_instructions=[
+                "下一版代码应基于实际时间覆盖范围设置 time_range",
+                "修正状态枚举后重新查询",
+            ],
+        )
+    finally:
+        CURRENT_EXPECTED_TIME_RANGE.reset(token)
+
+    assert retry.repair_instructions == [
+        "修正状态枚举后重新查询",
+        *retry.repair_instructions[1:],
+    ]
+    assert all("设置 time_range" not in item for item in retry.repair_instructions)
+    assert retry.diagnostics["_probe_contract"]["time_coverage_role"] == "diagnostic_only"
+    assert retry.diagnostics["_probe_contract"]["explicit_user_time_range"] is None
+
+
+def test_open_overall_relational_analysis_rejects_inferred_time_window():
+    intent_token = CURRENT_EXECUTION_INTENT.set("analysis")
+    expected_token = CURRENT_EXPECTED_TIME_RANGE.set({})
+    override_token = CURRENT_ANALYSIS_PARAMETERS_OVERRIDE.set({})
+    try:
+        retry = validate_query_constraints(
+            query_key="q_contracts",
+            query_constraints={
+                "time_range": {"start": "2026-01-01", "end": "2027-01-01", "end_exclusive": True},
+                "target_filters": [],
+                "aggregation": {"grain": "overall", "metrics": ["contract_count"]},
+            },
+            sql=(
+                "SELECT COUNT(*) AS contract_count FROM contracts "
+                "WHERE expiration_time >= '2026-01-01' AND expiration_time < '2027-01-01'"
+            ),
+        )
+    finally:
+        CURRENT_ANALYSIS_PARAMETERS_OVERRIDE.reset(override_token)
+        CURRENT_EXPECTED_TIME_RANGE.reset(expected_token)
+        CURRENT_EXECUTION_INTENT.reset(intent_token)
+
+    assert retry is not None
+    assert retry.diagnostics["violated_constraint"] == "inferred_overall_time_window"
+
+
+def test_open_detail_baseline_rejects_inferred_time_window():
+    intent_token = CURRENT_EXECUTION_INTENT.set("analysis")
+    expected_token = CURRENT_EXPECTED_TIME_RANGE.set({})
+    override_token = CURRENT_ANALYSIS_PARAMETERS_OVERRIDE.set({})
+    try:
+        retry = validate_query_constraints(
+            query_key="q_contract_details",
+            query_constraints={
+                "time_range": {"start": "2025-01-01", "end": "2026-08-03", "end_exclusive": True},
+                "target_filters": [],
+                "aggregation": {"grain": "detail", "metric": "annual_fee_contracts"},
+            },
+            sql=(
+                "SELECT id, status, expiration_time FROM contracts "
+                "WHERE expiration_time >= '2025-01-01' AND expiration_time < '2026-08-03'"
+            ),
+        )
+    finally:
+        CURRENT_ANALYSIS_PARAMETERS_OVERRIDE.reset(override_token)
+        CURRENT_EXPECTED_TIME_RANGE.reset(expected_token)
+        CURRENT_EXECUTION_INTENT.reset(intent_token)
+
+    assert retry is not None
+    assert retry.diagnostics["violated_constraint"] == "inferred_overall_time_window"
+
+
+def test_open_grouped_trend_can_use_an_observation_window():
+    intent_token = CURRENT_EXECUTION_INTENT.set("analysis")
+    expected_token = CURRENT_EXPECTED_TIME_RANGE.set({})
+    override_token = CURRENT_ANALYSIS_PARAMETERS_OVERRIDE.set({})
+    try:
+        retry = validate_query_constraints(
+            query_key="q_contract_trend",
+            query_constraints={
+                "time_range": {"start": "2026-01-01", "end": "2027-01-01", "end_exclusive": True},
+                "target_filters": [],
+                "aggregation": {"grain": "month", "metrics": ["contract_count"]},
+            },
+            sql=(
+                "SELECT DATE_TRUNC('month', expiration_time) AS expiration_month, "
+                "COUNT(*) AS contract_count FROM contracts "
+                "WHERE expiration_time >= '2026-01-01' AND expiration_time < '2027-01-01' "
+                "GROUP BY expiration_month"
+            ),
+            aggregation_hints=["按月份聚合"],
+        )
+    finally:
+        CURRENT_ANALYSIS_PARAMETERS_OVERRIDE.reset(override_token)
+        CURRENT_EXPECTED_TIME_RANGE.reset(expected_token)
+        CURRENT_EXECUTION_INTENT.reset(intent_token)
+
+    assert retry is None
+
+
+def test_inferred_numeric_projection_only_converts_returned_columns(monkeypatch):
+    monkeypatch.setattr(
+        "agent.tools._load_data_with_fed_query",
+        lambda **kwargs: pd.DataFrame([{"id": "1"}]),
+    )
+    intent_token = CURRENT_EXECUTION_INTENT.set("probe")
+    try:
+        data = load_data_with_sql(
+            "SELECT id, WM_EXTRA_TS_expiration_time_YEAR FROM contracts"
+        )
+    finally:
+        CURRENT_EXECUTION_INTENT.reset(intent_token)
+
+    assert list(data.columns) == ["id"]
+
+
+def test_explicit_numeric_projection_still_rejects_missing_result_column(monkeypatch):
+    monkeypatch.setattr(
+        "agent.tools._load_data_with_fed_query",
+        lambda **kwargs: pd.DataFrame([{"id": "1"}]),
+    )
+    intent_token = CURRENT_EXECUTION_INTENT.set("probe")
+    try:
+        with pytest.raises(ValueError, match="numeric_columns references unavailable"):
+            load_data_with_sql(
+                "SELECT id FROM contracts",
+                numeric_columns=["missing_amount"],
+            )
+    finally:
+        CURRENT_EXECUTION_INTENT.reset(intent_token)
+
+
+def test_probe_may_reuse_query_validation_without_becoming_formal_analysis():
+    code = '''
+execution_intent = "probe"
+sql = "SELECT status, COUNT(*) AS count FROM contracts GROUP BY status"
+query_constraints = {
+    "time_range": None,
+    "target_filters": [],
+    "aggregation": {"grain": "overall"},
+}
+validation = validate_query_constraints(query_constraints=query_constraints, sql=sql)
+data = load_data_with_sql(sql=sql)
+result = request_retry(
+    retry_type="probe_feedback",
+    message="status values observed",
+    diagnostics={"values": data.to_dict("records")},
+)
+'''
+
+    assert _validate_generated_code_contract(code) is None
+
+
 def test_build_table_result_only_returns_display_artifact():
     result = build_table_result(
         title="区域完工率",
@@ -115,6 +297,28 @@ def test_build_table_result_accepts_records_data():
     )
 
     assert result["table"]["rows"] == [{"region": "华东", "completion_rate": 76.3}]
+
+
+def test_save_analysis_result_merges_nested_table_presentation_metadata():
+    normalized = save_analysis_result(
+        analysis_report="ok",
+        charts=[],
+        tables=[{
+            "title": "年费合同明细",
+            "description": "展示需要关注的合同。",
+            "table": {
+                "columns": [{"key": "subscription_cycle", "label": "订阅周期"}],
+                "rows": [{"subscription_cycle": "455天"}],
+            },
+        }],
+    )
+
+    assert normalized.tables == [{
+        "title": "年费合同明细",
+        "description": "展示需要关注的合同。",
+        "columns": [{"key": "subscription_cycle", "label": "订阅周期"}],
+        "rows": [{"subscription_cycle": "455天"}],
+    }]
 
 
 def test_build_table_result_rejects_metric_rows_mixed_into_period_columns():
@@ -348,6 +552,34 @@ def test_separate_year_month_columns_do_not_satisfy_incomplete_month_range():
     )
 
     assert issue is not None
+
+
+def test_time_range_mismatch_reports_expected_and_observed_boundaries():
+    query_constraints = {
+        "time_range": {
+            "start": "2026-01-01",
+            "end": "2026-07-01",
+            "end_exclusive": True,
+        }
+    }
+
+    issue = _check_time_range_constraint(
+        query_constraints,
+        "SELECT SUM(amount) FROM sales WHERE signed_at >= '2026-01-01' AND signed_at <= '2026-06-30'",
+    )
+
+    assert issue is not None
+    assert issue["diagnostics"]["missing_parts"] == ["end"]
+    assert issue["diagnostics"]["expected_boundaries"] == {
+        "start": "2026-01-01",
+        "end": "2026-07-01",
+        "end_exclusive": True,
+    }
+    assert issue["diagnostics"]["observed_date_literals"] == [
+        "2026-01-01",
+        "2026-06-30",
+    ]
+    assert issue["diagnostics"]["repair_strategy"]["preserve_declared_constraint"] is True
 
 
 def test_relational_year_column_satisfies_full_year_time_range():

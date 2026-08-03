@@ -1,5 +1,6 @@
 import sys
 import unittest
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -21,16 +22,104 @@ from agent.tools import (  # noqa: E402
     _inspect_preparation_schema_fact,
     _inspect_sql_preparation_relationship,
     _normalize_chart_items,
+    _restore_sql_projection_column_names,
     _validate_analysis_relationship_contract,
     _validate_generated_code_contract,
     _validate_structured_result_contract,
     load_data_with_sql,
+    save_analysis_result,
     validate_query_constraints,
 )
 from utils.chart_document_utils import build_chart_result, normalize_chart_result_item  # noqa: E402
 
 
 class ChartContractValidationTestCase(unittest.TestCase):
+
+    def test_probe_rejects_a_static_inspection_plan_without_data_access(self) -> None:
+        code = '''
+execution_intent = "probe"
+sql_probe = "SELECT status FROM contracts LIMIT 20"
+result = request_retry(
+    retry_type="probe_feedback",
+    message="inspect status values",
+    diagnostics={"sql": sql_probe, "actions": ["inspect status"]},
+)
+'''
+
+        retry = _validate_generated_code_contract(code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "probe_requires_observed_data",
+        )
+
+    def test_probe_accepts_bounded_observations_derived_from_loaded_data(self) -> None:
+        code = '''
+execution_intent = "probe"
+sql_probe = "SELECT status FROM contracts LIMIT 20"
+probe_data = load_data_with_sql(sql=sql_probe)
+status_values = probe_distinct_values(probe_data, "status", top_n=10)
+result = request_retry(
+    retry_type="probe_feedback",
+    message="observed status values",
+    diagnostics={
+        "row_count": len(probe_data),
+        "status_values": status_values,
+    },
+)
+'''
+
+        self.assertIsNone(_validate_generated_code_contract(code))
+    def test_sql_projection_restores_schema_field_casing(self) -> None:
+        raw = pd.DataFrame([{
+            "wm_extra_ts_expiration_time_year": 2026,
+            "contracted_customer": "A",
+        }])
+
+        restored = _restore_sql_projection_column_names(
+            "SELECT WM_EXTRA_TS_expiration_time_YEAR, contracted_customer FROM contracts",
+            raw,
+        )
+
+        self.assertEqual(
+            list(restored.columns),
+            ["WM_EXTRA_TS_expiration_time_YEAR", "contracted_customer"],
+        )
+
+    def test_sql_projection_preserves_explicit_alias_casing(self) -> None:
+        raw = pd.DataFrame([{"expiration_year": 2026}])
+
+        restored = _restore_sql_projection_column_names(
+            "SELECT WM_EXTRA_TS_expiration_time_YEAR AS expiration_year FROM contracts",
+            raw,
+        )
+
+        self.assertEqual(list(restored.columns), ["expiration_year"])
+
+    def test_save_analysis_result_normalizes_period_values_at_runtime_boundary(self) -> None:
+        result = save_analysis_result(
+            analysis_report="月度趋势。",
+            charts=[{
+                "title": "月度趋势",
+                "chart_document": {
+                    "chart_kind": "line",
+                    "dataset": {"rows": [{"month": pd.Period("2026-01", freq="M"), "count": 3}]},
+                    "encoding": {"category_field": "month", "value_field": "count"},
+                },
+            }],
+            tables=[{
+                "title": "月度明细",
+                "columns": [{"key": "month", "label": "月份"}],
+                "rows": [{"month": pd.Period("2026-01", freq="M")}],
+            }],
+        )
+
+        serialized = json.dumps(result.model_dump(), ensure_ascii=False)
+        self.assertIn("2026-01", serialized)
+        self.assertEqual(result.tables[0]["rows"][0]["month"], "2026-01")
+
     @patch("agent.tools._relationship_key_counts")
     def test_preparation_relationship_probe_reports_coverage_and_cardinality(
         self,
@@ -150,6 +239,30 @@ charts = [build_chart_result(data=top_rows)]
         retry = _validate_structured_result_contract(
             result,
             generated_code="top_rows = data.head(10)\ncharts = [build_chart_result(data=top_rows)]",
+        )
+
+        self.assertIsNone(retry)
+
+    def test_chinese_topn_text_discloses_dataframe_reduction(self) -> None:
+        result = StructuredResult(
+            analysis_report="## 客户集中度\n\nTop5客户合计占比 76.2%。",
+            charts=[build_chart_result(
+                chart_kind="bar",
+                data=[{"customer": "A", "count": 10}],
+                title="客户合同数量",
+                category_field="customer",
+                value_field="count",
+            )],
+            tables=[],
+        )
+
+        retry = _validate_structured_result_contract(
+            result,
+            generated_code=(
+                "top5 = customers.head(5)\n"
+                "top5_ratio = top5['count'].sum() / customers['count'].sum()\n"
+                "charts = [build_chart_result(data=customers)]"
+            ),
         )
 
         self.assertIsNone(retry)
@@ -379,6 +492,28 @@ charts = [build_chart_result(data=top_rows)]
         )
 
         self.assertIsNone(_validate_structured_result_contract(result))
+
+    def test_report_rejects_repeated_numeric_display_units(self) -> None:
+        result = StructuredResult(
+            analysis_report="## Subscription cycle\n\nThe leading cycle is **365天天**.",
+            charts=[build_chart_result(
+                chart_kind="bar",
+                data=[{"cycle": "365天", "count": 10}],
+                title="Subscription cycles",
+                category_field="cycle",
+                value_field="count",
+            )],
+            tables=[],
+        )
+
+        retry = _validate_structured_result_contract(result)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "repeated_numeric_display_unit",
+        )
 
     def test_bar_chart_allows_null_gaps_when_other_points_are_renderable(self) -> None:
         result = StructuredResult(
@@ -735,6 +870,173 @@ else:
             "query_dimension_missing_is_not_zero",
         )
 
+    def test_generated_code_allows_zero_for_absent_fixed_count_category(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"metric": "contract_count"}}
+validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT status, COUNT(*) AS contract_count FROM t GROUP BY status")
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql("SELECT status, COUNT(*) AS contract_count FROM t GROUP BY status")
+    values = data.set_index("status")["contract_count"].to_dict()
+    active_count = values.get("active", 0)
+    result = save_analysis_result(analysis_report=f"active={active_count}", charts=[], tables=[])
+'''
+
+        self.assertIsNone(_validate_generated_code_contract(code))
+
+    def test_generated_code_rejects_positional_row_as_superlative_evidence(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"metric": "contract_count"}}
+validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT status, COUNT(*) AS contract_count FROM t GROUP BY status")
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql("SELECT status, COUNT(*) AS contract_count FROM t GROUP BY status")
+    analysis_report = f"合同状态以 {data.iloc[0]['status']} 为主，共 {data.iloc[0]['contract_count']} 个。"
+    result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+
+        retry = _validate_generated_code_contract(code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "report_superlative_requires_explicit_extrema",
+        )
+
+    def test_generated_code_allows_explicit_extrema_row_in_report(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"metric": "contract_count"}}
+validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT status, COUNT(*) AS contract_count FROM t GROUP BY status")
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql("SELECT status, COUNT(*) AS contract_count FROM t GROUP BY status")
+    peak_row = data.loc[data["contract_count"].idxmax()]
+    analysis_report = f"合同状态以 {peak_row['status']} 为主，共 {peak_row['contract_count']} 个。"
+    result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+
+        self.assertIsNone(_validate_generated_code_contract(code))
+
+    def test_generated_code_rejects_one_sided_filter_for_bounded_future_period(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"metric": "contract_count"}}
+validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT expiration_time FROM t")
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql("SELECT expiration_time FROM t")
+    now = pd.Timestamp.now()
+    upcoming = data[data["expiration_time"] >= now]
+    upcoming_count = len(upcoming)
+    analysis_report = f"未来6个月内有 {upcoming_count} 个合同即将到期。"
+    result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+
+        retry = _validate_generated_code_contract(code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "bounded_report_period_requires_two_date_boundaries",
+        )
+
+    def test_generated_code_allows_two_sided_filter_for_bounded_future_period(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"metric": "contract_count"}}
+validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT expiration_time FROM t")
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql("SELECT expiration_time FROM t")
+    now = pd.Timestamp.now()
+    end = now + pd.DateOffset(months=6)
+    upcoming = data[(data["expiration_time"] >= now) & (data["expiration_time"] < end)]
+    upcoming_count = len(upcoming)
+    analysis_report = f"未来6个月内有 {upcoming_count} 个合同即将到期。"
+    result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+
+        self.assertIsNone(_validate_generated_code_contract(code))
+
+    def test_generated_code_rejects_paired_percentage_and_count_from_different_populations(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"metric": "contract_count"}}
+validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT status, expiration_time FROM t")
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql("SELECT status, expiration_time FROM t")
+    status_share = data["status"].value_counts(normalize=True)
+    active_pct = status_share.get("active", 0)
+    data["days_to_expire"] = (pd.to_datetime(data["expiration_time"]) - pd.Timestamp.now()).dt.days
+    active_count = len(data[data["days_to_expire"] >= 0])
+    analysis_report = f"有效合同占比 {active_pct:.1%}（{active_count} 个）。"
+    result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+
+        retry = _validate_generated_code_contract(code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "paired_report_metrics_require_shared_population",
+        )
+        self.assertEqual(
+            retry.diagnostics["findings"][0]["percentage_population_fields"],
+            ["status"],
+        )
+        self.assertEqual(
+            retry.diagnostics["findings"][0]["count_population_fields"],
+            ["expiration_time"],
+        )
+
+    def test_generated_code_allows_paired_percentage_and_count_from_one_population(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"metric": "contract_count"}}
+validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT status FROM t")
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql("SELECT status FROM t")
+    active_mask = data["status"] == "active"
+    active_count = int(active_mask.sum())
+    active_pct = active_count / len(data) if len(data) else 0
+    analysis_report = f"有效合同占比 {active_pct:.1%}（{active_count} 个）。"
+    result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+
+        self.assertIsNone(_validate_generated_code_contract(code))
+
+    def test_generated_code_does_not_treat_an_independent_sample_size_as_percentage_numerator(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"metric": "pass_rate"}}
+validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT score FROM t")
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql("SELECT score FROM t")
+    pass_rate = (data["score"] >= 60).mean()
+    sample_count = len(data)
+    analysis_report = f"样本合格率为 {pass_rate:.1%}（样本量 {sample_count} 个）。"
+    result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+
+        self.assertIsNone(_validate_generated_code_contract(code))
+
     def test_analysis_sql_cannot_join_an_unresolved_business_relationship(self) -> None:
         context = SimpleNamespace(active_datasource_snapshot={
             "selected_datasource_snapshot": [
@@ -895,6 +1197,500 @@ FROM dw.contracts c
 JOIN dw.products p ON c.code = p.code
 GROUP BY p.category
 """
+'''
+
+        self.assertIsNone(_validate_analysis_relationship_contract(context, code))
+
+    def test_analysis_rejects_pandas_entity_counts_on_fanout_join_rows(self) -> None:
+        context = SimpleNamespace(active_datasource_snapshot={
+            "selected_datasource_snapshot": [
+                {"datasource_id": 11, "datasource_identifier": "dw.contracts"},
+                {"datasource_id": 12, "datasource_identifier": "dw.contract_details"},
+            ],
+            "analysis_semantic_context": {
+                "relationships": [{
+                    "relationship_id": "contract_details",
+                    "left_datasource_id": 11,
+                    "right_datasource_id": 12,
+                    "left_fields": ["id"],
+                    "right_fields": ["contract_id"],
+                    "relationship_type": "parent_child",
+                    "joinability": "joinable",
+                    "cardinality": "one_to_many",
+                    "aggregation_safety": {
+                        "left_measure_after_join": {"status": "unsafe_repeated_by_join"},
+                        "right_measure_after_join": {"status": "safe"},
+                    },
+                }]
+            },
+        })
+        code = '''
+execution_intent = "analysis"
+query_constraints = {
+    "time_range": None,
+    "target_filters": [],
+    "aggregation": {"grain": "overall", "metric": "contract_instance"},
+}
+sql = """
+SELECT c.id, c.status, d.detail_id
+FROM dw.contracts c
+LEFT JOIN dw.contract_details d ON c.id = d.contract_id
+"""
+data = load_data_with_sql(sql=sql)
+total_contracts = len(data)
+status_dist = data["status"].value_counts().reset_index()
+'''
+
+        retry = _validate_analysis_relationship_contract(context, code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "relationship_fanout_population_grain",
+        )
+
+    def test_analysis_allows_entity_counts_after_explicit_population_dedup(self) -> None:
+        context = SimpleNamespace(active_datasource_snapshot={
+            "selected_datasource_snapshot": [
+                {"datasource_id": 11, "datasource_identifier": "dw.contracts"},
+                {"datasource_id": 12, "datasource_identifier": "dw.contract_details"},
+            ],
+            "analysis_semantic_context": {
+                "relationships": [{
+                    "relationship_id": "contract_details",
+                    "left_datasource_id": 11,
+                    "right_datasource_id": 12,
+                    "relationship_type": "parent_child",
+                    "joinability": "joinable",
+                    "cardinality": "one_to_many",
+                    "aggregation_safety": {
+                        "left_measure_after_join": {"status": "unsafe_repeated_by_join"},
+                        "right_measure_after_join": {"status": "safe"},
+                    },
+                }]
+            },
+        })
+        code = '''
+execution_intent = "analysis"
+query_constraints = {
+    "time_range": None,
+    "target_filters": [],
+    "aggregation": {"grain": "overall", "metric": "contract_instance"},
+}
+sql = """
+SELECT c.id, c.status, d.detail_id
+FROM dw.contracts c
+LEFT JOIN dw.contract_details d ON c.id = d.contract_id
+"""
+data = load_data_with_sql(sql=sql)
+population_df = data.drop_duplicates(subset=["id"])
+total_contracts = len(population_df)
+status_dist = population_df["status"].value_counts().reset_index()
+'''
+
+        self.assertIsNone(_validate_analysis_relationship_contract(context, code))
+
+    def test_analysis_allows_pandas_use_of_sql_aggregate_join_result(self) -> None:
+        context = SimpleNamespace(active_datasource_snapshot={
+            "selected_datasource_snapshot": [
+                {"datasource_id": 11, "datasource_identifier": "dw.contracts"},
+                {"datasource_id": 12, "datasource_identifier": "dw.contract_details"},
+            ],
+            "analysis_semantic_context": {
+                "relationships": [{
+                    "relationship_id": "contract_details",
+                    "left_datasource_id": 11,
+                    "right_datasource_id": 12,
+                    "relationship_type": "parent_child",
+                    "joinability": "joinable",
+                    "aggregation_safety": {
+                        "left_measure_after_join": {"status": "unsafe_repeated_by_join"},
+                        "right_measure_after_join": {"status": "safe"},
+                    },
+                }]
+            },
+        })
+        code = '''
+execution_intent = "analysis"
+query_constraints = {
+    "time_range": None,
+    "target_filters": [],
+    "aggregation": {"grain": "overall", "metric": "contract_instance"},
+}
+sql = """
+SELECT c.status, COUNT(DISTINCT c.id) AS instance_count
+FROM dw.contracts c
+LEFT JOIN dw.contract_details d ON c.id = d.contract_id
+GROUP BY c.status
+"""
+data = load_data_with_sql(sql=sql)
+status_count = len(data)
+total_contracts = int(data["instance_count"].sum())
+'''
+
+        self.assertIsNone(_validate_analysis_relationship_contract(context, code))
+
+    def test_analysis_allows_count_of_explicit_key_domain_intersection(self) -> None:
+        context = SimpleNamespace(active_datasource_snapshot={
+            "selected_datasource_snapshot": [
+                {"datasource_id": 11, "datasource_identifier": "dw.contracts"},
+                {"datasource_id": 12, "datasource_identifier": "dw.contract_details"},
+            ],
+            "analysis_semantic_context": {
+                "relationships": [{
+                    "relationship_id": "contract_details",
+                    "left_datasource_id": 11,
+                    "right_datasource_id": 12,
+                    "relationship_type": "parent_child",
+                    "joinability": "joinable",
+                    "aggregation_safety": {
+                        "left_measure_after_join": {"status": "unsafe_repeated_by_join"},
+                        "right_measure_after_join": {"status": "safe"},
+                        "key_domain_coverage": {
+                            "numerator": "distinct_local_keys_intersect_distinct_target_keys",
+                        },
+                    },
+                }]
+            },
+        })
+        code = '''
+execution_intent = "analysis"
+query_constraints = {
+    "time_range": None,
+    "target_filters": [],
+    "aggregation": {"grain": "overall", "metric": "contract_instance"},
+}
+contracts = load_data_with_sql("SELECT id FROM dw.contracts")
+details = load_data_with_sql("SELECT contract_id FROM dw.contract_details")
+contract_ids = set(contracts["id"].dropna().unique())
+detail_ids = set(details["contract_id"].dropna().unique())
+matched_ids = contract_ids & detail_ids
+covered_contracts = len(matched_ids)
+coverage_ratio = covered_contracts / len(contract_ids)
+'''
+
+        self.assertIsNone(_validate_analysis_relationship_contract(context, code))
+
+    def test_analysis_rejects_coverage_from_independent_key_domains(self) -> None:
+        context = SimpleNamespace(active_datasource_snapshot={
+            "selected_datasource_snapshot": [
+                {"datasource_id": 11, "datasource_identifier": "dw.contracts"},
+                {"datasource_id": 12, "datasource_identifier": "dw.contract_details"},
+            ],
+            "analysis_semantic_context": {
+                "relationships": [{
+                    "relationship_id": "contract_details",
+                    "left_datasource_id": 11,
+                    "right_datasource_id": 12,
+                    "relationship_type": "parent_child",
+                    "joinability": "joinable",
+                    "aggregation_safety": {
+                        "key_domain_coverage": {
+                            "numerator": "distinct_local_keys_intersect_distinct_target_keys",
+                            "denominator": "distinct_local_population_keys",
+                        },
+                    },
+                }]
+            },
+        })
+        code = '''
+execution_intent = "analysis"
+contracts = load_data_with_sql("SELECT id FROM dw.contracts")
+details = load_data_with_sql("SELECT COUNT(DISTINCT contract_id) AS covered FROM dw.contract_details")
+total_contracts = len(contracts)
+covered_contracts = int(details["covered"].iloc[0])
+coverage_ratio = covered_contracts / total_contracts
+'''
+
+        retry = _validate_analysis_relationship_contract(context, code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "cross_source_key_domain_coverage",
+        )
+
+    def test_analysis_rejects_ratio_of_independent_sql_relationship_key_counts(self) -> None:
+        context = SimpleNamespace(active_datasource_snapshot={
+            "selected_datasource_snapshot": [
+                {"datasource_id": 11, "datasource_identifier": "dw.contracts"},
+                {"datasource_id": 12, "datasource_identifier": "dw.contract_details"},
+            ],
+            "analysis_semantic_context": {
+                "relationships": [{
+                    "relationship_id": "contract_details",
+                    "left_datasource_id": 11,
+                    "right_datasource_id": 12,
+                    "left_fields": ["id"],
+                    "right_fields": ["instance_id"],
+                    "relationship_type": "parent_child",
+                    "joinability": "joinable",
+                    "aggregation_safety": {"key_domain_coverage": {}},
+                }]
+            },
+        })
+        code = '''
+execution_intent = "analysis"
+sql_main = "SELECT COUNT(DISTINCT id) AS distinct_instances FROM dw.contracts"
+main = load_data_with_sql(sql=sql_main)
+sql_detail = "SELECT COUNT(DISTINCT instance_id) AS contracted_instances FROM dw.contract_details"
+detail = load_data_with_sql(sql=sql_detail)
+distinct_instances = int(main["distinct_instances"].iloc[0])
+contracted_instances = int(detail["contracted_instances"].iloc[0])
+contract_rate = contracted_instances / distinct_instances
+'''
+
+        retry = _validate_analysis_relationship_contract(context, code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "cross_source_key_domain_coverage",
+        )
+
+    def test_analysis_allows_independent_relationship_key_count_as_standalone_fact(self) -> None:
+        context = SimpleNamespace(active_datasource_snapshot={
+            "selected_datasource_snapshot": [
+                {"datasource_id": 11, "datasource_identifier": "dw.contracts"},
+                {"datasource_id": 12, "datasource_identifier": "dw.contract_details"},
+            ],
+            "analysis_semantic_context": {
+                "relationships": [{
+                    "relationship_id": "contract_details",
+                    "left_datasource_id": 11,
+                    "right_datasource_id": 12,
+                    "left_fields": ["id"],
+                    "right_fields": ["instance_id"],
+                    "relationship_type": "parent_child",
+                    "joinability": "joinable",
+                    "aggregation_safety": {"key_domain_coverage": {}},
+                }]
+            },
+        })
+        code = '''
+execution_intent = "analysis"
+details = load_data_with_sql(
+    "SELECT COUNT(DISTINCT instance_id) AS detail_instance_count FROM dw.contract_details"
+)
+detail_instance_count = int(details["detail_instance_count"].iloc[0])
+'''
+
+        self.assertIsNone(_validate_analysis_relationship_contract(context, code))
+
+    def test_analysis_allows_primary_source_field_coverage_with_auxiliary_relationships(self) -> None:
+        context = SimpleNamespace(active_datasource_snapshot={
+            "selected_datasource_snapshot": [
+                {"datasource_id": 11, "datasource_identifier": "dw.contracts"},
+                {"datasource_id": 12, "datasource_identifier": "dw.contract_details"},
+            ],
+            "analysis_semantic_context": {
+                "relationships": [{
+                    "relationship_id": "contract_details",
+                    "left_datasource_id": 11,
+                    "right_datasource_id": 12,
+                    "left_fields": ["id"],
+                    "right_fields": ["contract_id"],
+                    "relationship_type": "parent_child",
+                    "joinability": "joinable",
+                    "aggregation_safety": {"key_domain_coverage": {}},
+                }]
+            },
+        })
+        code = '''
+execution_intent = "analysis"
+contracts = load_data_with_sql("SELECT id, license_id FROM dw.contracts")
+details = load_data_with_sql("SELECT contract_id FROM dw.contract_details")
+has_license = contracts["license_id"].notna()
+license_coverage = has_license.sum()
+license_ratio = license_coverage / len(contracts)
+'''
+
+        self.assertIsNone(_validate_analysis_relationship_contract(context, code))
+
+    def test_analysis_allows_report_to_present_independent_source_facts_together(self) -> None:
+        context = SimpleNamespace(active_datasource_snapshot={
+            "selected_datasource_snapshot": [
+                {"datasource_id": 11, "datasource_identifier": "dw.contracts"},
+                {"datasource_id": 12, "datasource_identifier": "dw.contract_details"},
+            ],
+            "analysis_semantic_context": {
+                "relationships": [{
+                    "relationship_id": "contract_details",
+                    "left_datasource_id": 11,
+                    "right_datasource_id": 12,
+                    "left_fields": ["id"],
+                    "right_fields": ["contract_id"],
+                    "relationship_type": "parent_child",
+                    "joinability": "joinable",
+                    "aggregation_safety": {"key_domain_coverage": {}},
+                }]
+            },
+        })
+        code = '''
+execution_intent = "analysis"
+contracts = load_data_with_sql("SELECT id, license_id FROM dw.contracts")
+details = load_data_with_sql("SELECT COUNT(DISTINCT contract_id) AS detail_count FROM dw.contract_details")
+license_coverage = contracts["license_id"].notna().sum()
+detail_count = int(details["detail_count"].iloc[0])
+report_sections = [
+    f"主表授权字段完整 {license_coverage} 条。",
+    f"明细表独立涉及 {detail_count} 个合同。",
+]
+analysis_report = "\\n".join(report_sections)
+'''
+
+        self.assertIsNone(_validate_analysis_relationship_contract(context, code))
+
+    def test_analysis_allows_coverage_from_aligned_key_domain(self) -> None:
+        context = SimpleNamespace(active_datasource_snapshot={
+            "selected_datasource_snapshot": [
+                {"datasource_id": 11, "datasource_identifier": "dw.contracts"},
+                {"datasource_id": 12, "datasource_identifier": "dw.contract_details"},
+            ],
+            "analysis_semantic_context": {
+                "relationships": [{
+                    "relationship_id": "contract_details",
+                    "left_datasource_id": 11,
+                    "right_datasource_id": 12,
+                    "relationship_type": "parent_child",
+                    "joinability": "joinable",
+                    "aggregation_safety": {
+                        "key_domain_coverage": {
+                            "numerator": "distinct_local_keys_intersect_distinct_target_keys",
+                            "denominator": "distinct_local_population_keys",
+                        },
+                    },
+                }]
+            },
+        })
+        code = '''
+execution_intent = "analysis"
+aligned = load_data_with_sql("""
+SELECT COUNT(DISTINCT c.id) AS total_contracts,
+       COUNT(DISTINCT CASE WHEN d.contract_id IS NOT NULL THEN c.id END) AS covered_contracts
+FROM dw.contracts c
+LEFT JOIN dw.contract_details d ON c.id = d.contract_id
+""")
+total_contracts = int(aligned["total_contracts"].iloc[0])
+covered_contracts = int(aligned["covered_contracts"].iloc[0])
+coverage_ratio = covered_contracts / total_contracts
+'''
+
+        self.assertIsNone(_validate_analysis_relationship_contract(context, code))
+
+    def test_analysis_rejects_bound_count_from_only_the_detail_key_domain(self) -> None:
+        context = SimpleNamespace(active_datasource_snapshot={
+            "selected_datasource_snapshot": [
+                {"datasource_id": 11, "datasource_identifier": "dw.contracts"},
+                {"datasource_id": 12, "datasource_identifier": "dw.contract_details"},
+            ],
+            "analysis_semantic_context": {
+                "relationships": [{
+                    "relationship_id": "contract_details",
+                    "left_datasource_id": 11,
+                    "right_datasource_id": 12,
+                    "relationship_type": "parent_child",
+                    "joinability": "joinable",
+                    "aggregation_safety": {
+                        "key_domain_coverage": {
+                            "numerator": "distinct_local_keys_intersect_distinct_target_keys",
+                            "denominator": "distinct_local_population_keys",
+                        },
+                    },
+                }]
+            },
+        })
+        code = '''
+execution_intent = "analysis"
+contracts = load_data_with_sql("SELECT id FROM dw.contracts")
+details = load_data_with_sql("SELECT COUNT(DISTINCT contract_id) AS bound_count FROM dw.contract_details")
+total_contracts = len(contracts)
+instances_with_contract = int(details["bound_count"].iloc[0])
+'''
+
+        retry = _validate_analysis_relationship_contract(context, code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "cross_source_key_domain_coverage",
+        )
+
+    def test_analysis_allows_bound_count_from_explicit_key_intersection(self) -> None:
+        context = SimpleNamespace(active_datasource_snapshot={
+            "selected_datasource_snapshot": [
+                {"datasource_id": 11, "datasource_identifier": "dw.contracts"},
+                {"datasource_id": 12, "datasource_identifier": "dw.contract_details"},
+            ],
+            "analysis_semantic_context": {
+                "relationships": [{
+                    "relationship_id": "contract_details",
+                    "left_datasource_id": 11,
+                    "right_datasource_id": 12,
+                    "relationship_type": "parent_child",
+                    "joinability": "joinable",
+                    "aggregation_safety": {
+                        "key_domain_coverage": {
+                            "numerator": "distinct_local_keys_intersect_distinct_target_keys",
+                            "denominator": "distinct_local_population_keys",
+                        },
+                    },
+                }]
+            },
+        })
+        code = '''
+execution_intent = "analysis"
+contracts = load_data_with_sql("SELECT id FROM dw.contracts")
+details = load_data_with_sql("SELECT contract_id FROM dw.contract_details")
+main_instance_ids = set(contracts["id"].dropna())
+detail_instance_ids = set(details["contract_id"].dropna())
+instances_with_contract = len(main_instance_ids & detail_instance_ids)
+'''
+
+        self.assertIsNone(_validate_analysis_relationship_contract(context, code))
+
+    def test_key_intersection_is_checked_only_against_its_own_relationship(self) -> None:
+        context = SimpleNamespace(active_datasource_snapshot={
+            "selected_datasource_snapshot": [
+                {"datasource_id": 11, "datasource_identifier": "dw.contracts"},
+                {"datasource_id": 12, "datasource_identifier": "dw.contract_details"},
+                {"datasource_id": 13, "datasource_identifier": "dw.authorizations"},
+            ],
+            "analysis_semantic_context": {
+                "relationships": [
+                    {
+                        "relationship_id": "contract_details",
+                        "left_datasource_id": 11,
+                        "right_datasource_id": 12,
+                        "relationship_type": "parent_child",
+                        "joinability": "joinable",
+                        "aggregation_safety": {"key_domain_coverage": {}},
+                    },
+                    {
+                        "relationship_id": "contract_authorizations",
+                        "left_datasource_id": 11,
+                        "right_datasource_id": 13,
+                        "relationship_type": "parent_child",
+                        "joinability": "joinable",
+                        "aggregation_safety": {"key_domain_coverage": {}},
+                    },
+                ]
+            },
+        })
+        code = '''
+execution_intent = "analysis"
+contracts = load_data_with_sql("SELECT id FROM dw.contracts")
+details = load_data_with_sql("SELECT contract_id FROM dw.contract_details")
+authorizations = load_data_with_sql("SELECT contract_id FROM dw.authorizations")
+main_ids = set(contracts["id"].dropna())
+detail_ids = set(details["contract_id"].dropna())
+authorization_ids = set(authorizations["contract_id"].dropna())
+instances_with_contract = len(main_ids & detail_ids)
+instances_with_auth = len(main_ids & authorization_ids)
 '''
 
         self.assertIsNone(_validate_analysis_relationship_contract(context, code))
