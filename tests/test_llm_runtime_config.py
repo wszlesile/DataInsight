@@ -16,18 +16,18 @@ class LlmRuntimeConfigTestCase(unittest.TestCase):
 
         with patch("utils.llm_model_factory.Config") as config:
             config.LLM_PROVIDER = "supos_llm_gateway"
-            config.SUPOS_WEB = "http://supos.example/"
             config.SUPOS_LLM_GATEWAY_API_KEY = "app-key"
+            config.BASE_URL = "http://llm-gateway.example/v1"
             config.TEMPERATURE = 0.2
 
             runtime_config = create_runtime_config(selected_model_id="model-b")
 
         self.assertEqual(runtime_config.provider, "supos_llm_gateway")
         self.assertEqual(runtime_config.model_id, "model-b")
-        self.assertEqual(runtime_config.base_url, "http://supos.example/os/llm-gateway/v1")
+        self.assertEqual(runtime_config.base_url, "http://llm-gateway.example/v1")
         self.assertEqual(
             runtime_config.cache_key,
-            "supos_llm_gateway|model-b|http://supos.example/os/llm-gateway/v1|0.2",
+            "supos_llm_gateway|model-b|http://llm-gateway.example/v1|0.2",
         )
 
     def test_agent_cache_reuses_same_model_config(self) -> None:

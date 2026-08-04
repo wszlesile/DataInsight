@@ -20,7 +20,7 @@ KERNEL_TOKEN_PATH = Path("/var/run/secrets/supos.com/serviceaccount/token")
 class SuposKernelApi:
 
     def __init__(self):
-        self.supos_web = Config.SUPOS_WEB
+        self.supos_gateway = Config.SUPOS_GATEWAY
         self.timeout = Config.SUPOS_REQUEST_TIMEOUT
         self.log_collect_track_endpoint = Config.SUPOS_LOG_COLLECT_TRACK_ENDPOINT
         self._database_conn_info = DatabaseConnInfo()
@@ -40,7 +40,7 @@ class SuposKernelApi:
         if not item_list:
             raise ValueError("item_list 不能为空")
 
-        url = f"{self.supos_web}{self.log_collect_track_endpoint}"
+        url = f"{self.supos_gateway}{self.log_collect_track_endpoint}"
         headers = {
             "Authorization": authorization,
         }
@@ -57,7 +57,7 @@ class SuposKernelApi:
         if not authorization:
             raise ValueError("SUPOS authorization 不能为空")
 
-        url = f"{self.supos_web}/os/llm-gateway/v1/models"
+        url = f"{self.supos_gateway}/os/llm-gateway/v1/models"
         headers = {
             "Authorization": authorization,
         }
@@ -70,7 +70,7 @@ class SuposKernelApi:
         if not authorization:
             raise ValueError("SUPOS authorization 不能为空")
 
-        url = f"{self.supos_web}/os/open-api/license-manager/v1/detail"
+        url = f"{self.supos_gateway}/os/open-api/license-manager/v1/detail"
         headers = {
             "Authorization": authorization,
         }
@@ -239,7 +239,7 @@ class SuposKernelApi:
         """Return current ts_query source: timescale, vxbase, or empty."""
         if not token:
             return ''
-        url = f"{self.supos_web}/os/inter-api/lake-manager/v1/resource"
+        url = f"{self.supos_gateway}/os/inter-api/lake-manager/v1/resource"
         headers = {"Authorization": token}
         params = {
             "pageNo": 1,
@@ -263,7 +263,7 @@ class SuposKernelApi:
         return ''
 
     def _fill_kernel_database_conn_info(self, token: str, conn_info: DatabaseConnInfo) -> None:
-        url = f"{self.supos_web}/apis/ns/v1/supbase-ds/SQL/fedquery/fedquery_system"
+        url = f"{self.supos_gateway}/apis/ns/v1/supbase-ds/SQL/fedquery/fedquery_system"
         params = {"{kinds}": "datasources.supos.com;v1alpha1:DSource"}
         headers = {"Authorization": token}
         try:
@@ -292,7 +292,7 @@ class SuposKernelApi:
 
     def _fetch_lake_rds_database_name(self, token: str) -> str:
         """补充当前系统默认使用的 LakeRDS 数据库名称。"""
-        url = f"{self.supos_web}/os/inter-api/fedquery/v1/databases"
+        url = f"{self.supos_gateway}/os/inter-api/fedquery/v1/databases"
         headers = {
             "Authorization": token,
         }
@@ -394,7 +394,7 @@ class SuposKernelApi:
             raise ValueError("UNS node id 不能为空")
         if not authorization:
             raise ValueError("SUPOS authorization 不能为空")
-        url = f"{self.supos_web}/inter-api/supos/uns/instance"
+        url = f"{self.supos_gateway}/inter-api/supos/uns/instance"
         headers = {
             "Authorization": authorization,
         }
@@ -421,7 +421,7 @@ class SuposKernelApi:
         """查询 UNS 树节点列表。"""
         if not authorization:
             raise ValueError("SUPOS authorization 不能为空")
-        url = f"{self.supos_web}/inter-api/supos/uns/condition/tree"
+        url = f"{self.supos_gateway}/inter-api/supos/uns/condition/tree"
         headers = {
             "Authorization": authorization,
         }

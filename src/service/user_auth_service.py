@@ -17,7 +17,7 @@ class UserAuthService:
     """用户认证服务。"""
 
     def __init__(self):
-        self.base_url = Config.SUPOS_WEB
+        self.base_url = Config.SUPOS_GATEWAY
         self.auth_endpoint = Config.USER_AUTH_ENDPOINT
         self.request_timeout = Config.SUPOS_REQUEST_TIMEOUT
         self.cache_ttl_seconds = Config.USER_CONTEXT_CACHE_TTL_SECONDS

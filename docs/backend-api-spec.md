@@ -1082,7 +1082,7 @@ GET /api/insight/namespaces/7/datasources?insight_conversation_id=19
 说明：
 - 后端会使用当前用户 `UserContext` 中的 token 调第三方 UNS 接口
 - 树节点详情接口为：
-  - `GET {SUPOS_WEB}/inter-api/supos/uns/instance?id={id}`
+  - `GET {SUPOS_GATEWAY}/inter-api/supos/uns/instance?id={id}`
 - 后端会使用当前用户 `UserContext` 中初始化好的 `LakeRDS` 数据库名
 - 导入后的数据源类型仍然是 `table`
 - 导入时表名取详情接口返回的 `data.alias`，并在 `datasource_config_json.table_name` 中保存为 `public.{alias}`
@@ -2139,7 +2139,7 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 用途：
 
 - 供前端获取平台 LLM 网关可用模型列表。
-- 后端内部调用 `{SUPOS_WEB}/os/llm-gateway/v1/models`。
+- 后端内部调用 `{SUPOS_GATEWAY}/os/llm-gateway/v1/models`。
 - 平台接口鉴权优先使用服务端配置的 `SUPOS_DATAINSIGHT-SERVER_APPKEY`，未配置时回退使用当前请求的 `Authorization`。
 
 响应 `data` 为模型数组，后端会根据当前用户的模型选择补充 `selected` 字段：

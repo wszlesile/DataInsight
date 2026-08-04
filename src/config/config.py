@@ -62,7 +62,7 @@ class Config:
     USER_CONTEXT_CACHE_TTL_SECONDS = int(os.environ.get('USER_CONTEXT_CACHE_TTL_SECONDS', 600))
 
     # SUPOS / Kernel 配置
-    SUPOS_WEB = os.environ.get('SUPOS_WEB', 'http://localhost:8080')
+    SUPOS_GATEWAY = os.environ.get('SUPOS_GATEWAY', 'http://localhost:8080')
     SUPOS_REQUEST_TIMEOUT = int(os.environ.get('SUPOS_REQUEST_TIMEOUT', 15))
     PLATFORM_LICENSE_CACHE_REFRESH_SECONDS = int(os.environ.get('PLATFORM_LICENSE_CACHE_REFRESH_SECONDS', 300))
     SUPOS_LLM_GATEWAY_MODEL_TIMEOUT_SECONDS = float(

@@ -16,7 +16,7 @@ from controller.llm_controller import LlmController  # noqa: E402
 class LlmModelsApiTestCase(unittest.TestCase):
     def test_fetch_llm_gateway_models_uses_platform_endpoint_and_authorization(self) -> None:
         api = SuposKernelApi()
-        api.supos_web = "http://supos.example"
+        api.supos_gateway = "http://supos.example"
         api.timeout = 7
         payload = {
             "data": [
