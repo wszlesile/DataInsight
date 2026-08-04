@@ -567,10 +567,15 @@ class InsightNsConversationService:
         category_field = str(encoding.get('category_field') or '').strip()
         category_value = point.get('name') if isinstance(point, dict) else None
         if category_value in (None, ''):
-            x_axis = chart_spec.get('xAxis') if isinstance(chart_spec.get('xAxis'), dict) else {}
-            categories = x_axis.get('data') if isinstance(x_axis.get('data'), list) else []
-            if 0 <= data_index < len(categories):
-                category_value = categories[data_index]
+            axes = [
+                chart_spec.get('xAxis') if isinstance(chart_spec.get('xAxis'), dict) else {},
+                chart_spec.get('yAxis') if isinstance(chart_spec.get('yAxis'), dict) else {},
+            ]
+            for axis in axes:
+                categories = axis.get('data') if isinstance(axis.get('data'), list) else []
+                if 0 <= data_index < len(categories):
+                    category_value = categories[data_index]
+                    break
         if category_field and category_value not in (None, ''):
             dimensions[category_field] = category_value
         series_name = selected_series.get('name')

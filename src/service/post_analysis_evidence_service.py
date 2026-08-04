@@ -13,7 +13,7 @@ from typing import Any, Callable, Literal
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, ValidationError
 from sqlglot import exp, parse_one
-from sqlglot.errors import ParseError
+from sqlglot.errors import ParseError, TokenError
 
 from config import Config
 from utils import logger
@@ -261,7 +261,7 @@ class LineageIndexer:
     _OPERATION_CALLS = {
         "groupby", "agg", "aggregate", "sum", "mean", "count", "nunique", "min", "max",
         "value_counts", "sort_values", "head", "tail", "rank", "pct_change", "rolling",
-        "resample", "cumsum", "cumcount", "quantile", "merge", "join", "pivot", "pivot_table",
+        "resample", "cumsum", "cumcount", "quantile", "merge", "join", "melt", "pivot", "pivot_table",
         "len", "size", "idxmin", "idxmax", "to_numeric", "astype", "fillna", "dropna",
         "replace", "rename", "drop_duplicates", "copy",
     }
@@ -309,7 +309,145 @@ class LineageIndexer:
             "query_nodes": queries,
             "operation_nodes": operations,
             "output_nodes": outputs,
+            "literal_iteration_bindings": self._literal_iteration_bindings(
+                snapshot.generated_code
+            ),
+            "report_construction_issues": self._report_construction_issues(
+                snapshot.generated_code
+            ),
         }
+
+    @staticmethod
+    def _report_construction_issues(code: str) -> list[dict[str, Any]]:
+        """Describe saved-report expressions whose provenance cannot be proven statically."""
+        try:
+            tree = ast.parse(code or "")
+        except SyntaxError:
+            return [{"reason": "generated_code_syntax_error"}]
+
+        assignments: dict[str, list[ast.AST]] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                continue
+            value = getattr(node, "value", None)
+            if value is None:
+                continue
+            for name in _target_names(node):
+                if isinstance(name, str) and name.isidentifier():
+                    assignments.setdefault(name, []).append(value)
+
+        def supported(value: ast.AST | None, visited: set[str]) -> bool:
+            if isinstance(value, ast.Constant):
+                return isinstance(value.value, str)
+            if isinstance(value, ast.JoinedStr):
+                return True
+            if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
+                return supported(value.left, visited) and supported(value.right, visited)
+            if isinstance(value, ast.IfExp):
+                return supported(value.body, visited) and supported(value.orelse, visited)
+            if isinstance(value, ast.Name):
+                if value.id in visited:
+                    return True
+                values = assignments.get(value.id) or []
+                return bool(values) and all(
+                    supported(item, {*visited, value.id}) for item in values
+                )
+            if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):
+                if value.func.attr == "format":
+                    return LineageIndexer._format_call_template(value) is not None
+                if value.func.attr == "join" and value.args:
+                    joined_value = value.args[0]
+                    if isinstance(joined_value, ast.Name):
+                        return True
+                    if isinstance(joined_value, (ast.GeneratorExp, ast.ListComp, ast.SetComp)):
+                        return True
+            return False
+
+        issues: list[dict[str, Any]] = []
+        for call in (item for item in ast.walk(tree) if isinstance(item, ast.Call)):
+            function_name = ""
+            if isinstance(call.func, ast.Name):
+                function_name = call.func.id
+            elif isinstance(call.func, ast.Attribute):
+                function_name = call.func.attr
+            if function_name != "save_analysis_result":
+                continue
+            report_value = next(
+                (keyword.value for keyword in call.keywords if keyword.arg == "analysis_report"),
+                None,
+            )
+            if report_value is not None and supported(report_value, set()):
+                continue
+            issues.append({
+                "reason": "unsupported_saved_report_construction",
+                "line": int(getattr(call, "lineno", 0) or 0),
+                "expression": (
+                    ast.get_source_segment(code, report_value)
+                    if report_value is not None
+                    else ""
+                ) or (ast.unparse(report_value) if report_value is not None else ""),
+            })
+        return issues
+
+    @staticmethod
+    def _literal_iteration_bindings(code: str) -> list[dict[str, Any]]:
+        """Return correlated loop-variable values from literal tuple sequences."""
+        try:
+            tree = ast.parse(code or "")
+        except SyntaxError:
+            return []
+        sequences: dict[str, list[list[Any]]] = {}
+        for assignment in (
+            item for item in ast.walk(tree)
+            if isinstance(item, (ast.Assign, ast.AnnAssign))
+        ):
+            value = getattr(assignment, "value", None)
+            targets = getattr(assignment, "targets", None) or [getattr(assignment, "target", None)]
+            names = [item.id for item in targets if isinstance(item, ast.Name)]
+            if len(names) != 1 or not isinstance(value, (ast.List, ast.Tuple)):
+                continue
+            rows: list[list[Any]] = []
+            for row in value.elts:
+                if not isinstance(row, (ast.List, ast.Tuple)):
+                    rows = []
+                    break
+                values: list[Any] = []
+                for cell in row.elts:
+                    try:
+                        values.append(ast.literal_eval(cell))
+                    except (ValueError, TypeError, SyntaxError):
+                        values = []
+                        break
+                if not values:
+                    rows = []
+                    break
+                rows.append(values)
+            if rows:
+                sequences[names[0]] = rows
+
+        bindings: list[dict[str, Any]] = []
+        for loop in (item for item in ast.walk(tree) if isinstance(item, ast.For)):
+            if not (
+                isinstance(loop.target, (ast.Tuple, ast.List))
+                and isinstance(loop.iter, ast.Name)
+                and loop.iter.id in sequences
+            ):
+                continue
+            target_names = [
+                item.id if isinstance(item, ast.Name) else ""
+                for item in loop.target.elts
+            ]
+            if not target_names or any(not item for item in target_names):
+                continue
+            rows = sequences[loop.iter.id]
+            if any(len(row) != len(target_names) for row in rows):
+                continue
+            bindings.append({
+                "sequence_name": loop.iter.id,
+                "line": int(getattr(loop, "lineno", 0) or 0),
+                "rows": [dict(zip(target_names, row)) for row in rows],
+            })
+        return bindings
 
     @staticmethod
     def _lineage_query_snapshots(query_snapshots: dict[str, Any]) -> dict[str, Any]:
@@ -351,6 +489,12 @@ class LineageIndexer:
             sql_projection_nodes = LineageIndexer._sql_projection_nodes(
                 query_key=str(query_key),
                 sql=str(implementation.get("sql") or ""),
+                sql_truncated=bool(implementation.get("sql_truncated")),
+                projection_semantics=(
+                    implementation.get("projection_semantics")
+                    if isinstance(implementation.get("projection_semantics"), list)
+                    else []
+                ),
             )
             nodes.extend(sql_projection_nodes)
             projected_fields = {
@@ -383,17 +527,51 @@ class LineageIndexer:
         return nodes
 
     @staticmethod
-    def _sql_projection_nodes(*, query_key: str, sql: str) -> list[dict[str, Any]]:
-        if not sql.strip():
+    def _sql_projection_nodes(
+        *,
+        query_key: str,
+        sql: str,
+        sql_truncated: bool = False,
+        projection_semantics: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        if projection_semantics:
+            nodes: list[dict[str, Any]] = []
+            for index, item in enumerate(projection_semantics):
+                if not isinstance(item, dict):
+                    continue
+                alias = str(item.get("alias") or "").strip()
+                semantic_kind = str(item.get("semantic_kind") or "projection").strip()
+                expression_source = str(item.get("expression") or alias).strip()
+                if not alias:
+                    continue
+                identity = _stable_json({
+                    "query_key": query_key,
+                    "alias": alias,
+                    "expression": expression_source,
+                })
+                nodes.append({
+                    "operation_node_id": f"op_query_projection_{_digest(identity, 12)}",
+                    "line": -(index + 1),
+                    "kind": "query_projection",
+                    "semantic_kind": semantic_kind,
+                    "projection_role": str(item.get("projection_role") or "unknown"),
+                    "query_node_id": query_key,
+                    "targets": [alias],
+                    "loads": [],
+                    "source": expression_source[:2000],
+                })
+            if nodes:
+                return nodes
+        if not sql.strip() or sql_truncated:
             return []
         try:
             statement = parse_one(sql)
-        except ParseError:
+        except (ParseError, TokenError):
             parameterized_sql = re.sub(r"%\([^)]+\)s", "0", sql)
             parameterized_sql = re.sub(r"(?<!%)%s", "0", parameterized_sql)
             try:
                 statement = parse_one(parameterized_sql)
-            except ParseError:
+            except (ParseError, TokenError):
                 return []
         select = statement.find(exp.Select)
         if select is None:
@@ -458,8 +636,8 @@ class LineageIndexer:
         list[dict[str, Any]],
         list[dict[str, Any]],
         dict[str, dict[str, str]],
-        list[str],
-        list[str],
+        list[dict[str, Any]],
+        list[dict[str, str]],
         list[set[str]],
     ]:
         try:
@@ -513,10 +691,26 @@ class LineageIndexer:
                 has_formatted_value = any(
                     isinstance(item, ast.FormattedValue) for item in ast.walk(node)
                 )
+                assignment_value = getattr(node, "value", None)
+                has_container_write = isinstance(assignment_value, ast.Dict) and any(
+                    isinstance(item, ast.Subscript) and isinstance(item.ctx, ast.Store)
+                    for item in ast.walk(node)
+                )
                 query_node_id = self._load_query_node_id(node, query_bindings)
                 has_projection = self._is_projection_assignment(node)
-                if has_operation or has_formula or has_formatted_value or query_node_id or has_projection:
-                    semantic_kind = self._operation_semantic_kind(node, query_node_id=query_node_id)
+                if (
+                    has_operation
+                    or has_formula
+                    or has_formatted_value
+                    or has_container_write
+                    or query_node_id
+                    or has_projection
+                ):
+                    semantic_kind = (
+                        "presentation"
+                        if has_container_write
+                        else self._operation_semantic_kind(node, query_node_id=query_node_id)
+                    )
                     node_id = f"op_{getattr(node, 'lineno', 0)}_{_digest(source, 8)}"
                     operations.append({
                         "operation_node_id": node_id,
@@ -547,6 +741,7 @@ class LineageIndexer:
                     if id(node) in joined_strings_in_report_concatenations:
                         expression["report_declared"] = True
                 report_expressions.extend(expressions)
+        operations.extend(self._container_iteration_operations(tree, code))
         report_expressions = [
             expression
             for expression in report_expressions
@@ -584,6 +779,64 @@ class LineageIndexer:
             self._table_structured_metric_fields(tree),
         )
 
+    @staticmethod
+    def _container_iteration_operations(
+        tree: ast.AST,
+        code: str,
+    ) -> list[dict[str, Any]]:
+        """Connect values yielded by mapping.items() to writes into that mapping."""
+        writes_by_container: dict[str, list[str]] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                continue
+            target = getattr(node, "target", None)
+            if target is None and isinstance(node, ast.Assign):
+                targets = list(node.targets)
+            else:
+                targets = [target] if target is not None else []
+            for item in targets:
+                if not (
+                    isinstance(item, ast.Subscript)
+                    and isinstance(item.value, ast.Name)
+                    and isinstance(item.ctx, ast.Store)
+                ):
+                    continue
+                writes_by_container.setdefault(item.value.id, []).append(ast.unparse(item))
+
+        operations: list[dict[str, Any]] = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.For)
+                and isinstance(node.target, (ast.Tuple, ast.List))
+                and len(node.target.elts) >= 2
+                and isinstance(node.iter, ast.Call)
+                and isinstance(node.iter.func, ast.Attribute)
+                and node.iter.func.attr == "items"
+                and isinstance(node.iter.func.value, ast.Name)
+            ):
+                continue
+            container_name = node.iter.func.value.id
+            value_target = node.target.elts[1]
+            if not isinstance(value_target, ast.Name):
+                continue
+            source_targets = list(dict.fromkeys(writes_by_container.get(container_name) or []))
+            if not source_targets:
+                continue
+            source = ast.get_source_segment(code, node.iter) or ast.unparse(node.iter)
+            operations.append({
+                "operation_node_id": (
+                    f"op_container_iter_{getattr(node, 'lineno', 0)}_{_digest(source, 8)}"
+                ),
+                "line": getattr(node, "lineno", 0),
+                "kind": "container_iteration",
+                "semantic_kind": "presentation",
+                "query_node_id": "",
+                "targets": [value_target.id],
+                "loads": source_targets,
+                "source": source[:1200],
+            })
+        return operations
+
     @classmethod
     def _report_template_metadata(
         cls,
@@ -604,8 +857,11 @@ class LineageIndexer:
                     report_value_names.add(keyword.value.id)
 
         report_builders: set[str] = set()
+        builder_owner_anchors: dict[str, tuple[list[str], list[str]]] = {}
+        iterated_builder_links: list[tuple[str, str, int, int]] = []
         direct_templates: list[ast.JoinedStr] = []
         direct_synthetic_templates: list[ast.JoinedStr] = []
+        joined_builders_by_name: dict[str, set[str]] = {}
 
         def joined_builder_name(call: ast.AST | None) -> str:
             if not (
@@ -625,11 +881,19 @@ class LineageIndexer:
             return ""
 
         for node in ast.walk(tree):
-            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-                continue
-            if not (set(_target_names(node)) & report_value_names):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                 continue
             value = getattr(node, "value", None)
+            joined_builders = {
+                joined_builder_name(item)
+                for item in ast.walk(value) if value is not None
+            }
+            joined_builders.discard("")
+            if joined_builders:
+                for name in _target_names(node):
+                    joined_builders_by_name.setdefault(name, set()).update(joined_builders)
+            if not (set(_target_names(node)) & report_value_names):
+                continue
             if isinstance(value, ast.JoinedStr):
                 direct_templates.append(value)
             elif isinstance(value, ast.Call):
@@ -646,6 +910,25 @@ class LineageIndexer:
                 builder_name = joined_builder_name(call)
                 if builder_name:
                     report_builders.add(builder_name)
+
+        owned_fragment_names = {
+            loaded_name
+            for template in [*direct_templates, *direct_synthetic_templates]
+            for loaded_name in _loaded_names(template)
+        }
+        for fragment_name in owned_fragment_names:
+            report_builders.update(joined_builders_by_name.get(fragment_name) or set())
+        for template in [*direct_templates, *direct_synthetic_templates]:
+            for expression in cls._joined_string_expressions(template, code):
+                fragment_name = str(expression.get("expression") or "").strip()
+                if fragment_name not in joined_builders_by_name:
+                    continue
+                before = [str(expression.get("prefix") or "")]
+                after = [str(expression.get("suffix") or "")]
+                before = [item for item in before if item.strip()]
+                after = [item for item in after if item.strip()]
+                for builder_name in joined_builders_by_name[fragment_name]:
+                    builder_owner_anchors[builder_name] = (before, after)
 
         # Report sections may embed another list builder through ``join``, for
         # example ``detail_lines -> report_sections -> analysis_report``. Follow
@@ -672,6 +955,38 @@ class LineageIndexer:
                     if nested_builder and nested_builder not in report_builders:
                         report_builders.add(nested_builder)
                         changed = True
+            for loop in (item for item in ast.walk(tree) if isinstance(item, ast.For)):
+                if not isinstance(loop.iter, ast.Name):
+                    continue
+                source_builder = loop.iter.id
+                target_names = set(_target_names(loop.target))
+                if not target_names:
+                    continue
+                parent_builders: set[str] = set()
+                for call in (item for item in ast.walk(loop) if isinstance(item, ast.Call)):
+                    if not (
+                        isinstance(call.func, ast.Attribute)
+                        and call.func.attr == "append"
+                        and isinstance(call.func.value, ast.Name)
+                        and call.func.value.id in report_builders
+                        and call.args
+                    ):
+                        continue
+                    loaded = set(_loaded_names(call.args[0]))
+                    if loaded.intersection(target_names):
+                        parent_builders.add(call.func.value.id)
+                for parent_builder in parent_builders:
+                    link = (
+                        parent_builder,
+                        source_builder,
+                        int(getattr(loop, "lineno", 0) or 0),
+                        int(getattr(loop, "col_offset", 0) or 0),
+                    )
+                    if link not in iterated_builder_links:
+                        iterated_builder_links.append(link)
+                if parent_builders and source_builder not in report_builders:
+                    report_builders.add(source_builder)
+                    changed = True
 
         metadata: dict[str, dict[str, Any]] = {}
         synthetic_templates: list[tuple[ast.JoinedStr, dict[str, Any]]] = []
@@ -699,7 +1014,7 @@ class LineageIndexer:
         named_string_templates: dict[str, list[ast.JoinedStr]] = {}
         for assignment in (
             item for item in ast.walk(tree)
-            if isinstance(item, (ast.Assign, ast.AnnAssign))
+            if isinstance(item, (ast.Assign, ast.AnnAssign, ast.AugAssign))
         ):
             value = getattr(assignment, "value", None)
             template = value if isinstance(value, ast.JoinedStr) else (
@@ -755,6 +1070,8 @@ class LineageIndexer:
                 entry["template"] = value
             elif isinstance(value, ast.Call):
                 entry["template"] = cls._format_call_template(value)
+            elif isinstance(value, ast.BinOp):
+                entry["template"] = cls._concatenated_string_template(value)
             entries.append(entry)
 
         for node in ast.walk(tree):
@@ -792,6 +1109,15 @@ class LineageIndexer:
                 )
             else:
                 add_entry(call.func.value.id, value)
+        for parent_builder, source_builder, line, column in iterated_builder_links:
+            entries.append({
+                "builder": parent_builder,
+                "line": line,
+                "column": column,
+                "literal": "",
+                "template": None,
+                "nested_builder": source_builder,
+            })
         entries.sort(key=lambda item: (item["line"], item["column"]))
 
         def surrounding_anchors(entry_index: int) -> tuple[list[str], list[str]]:
@@ -809,6 +1135,8 @@ class LineageIndexer:
             ]
             if before or after:
                 return before, after
+            if builder in builder_owner_anchors:
+                return builder_owner_anchors[builder]
             parent_index = next(
                 (
                     index for index, item in enumerate(entries)
@@ -1108,7 +1436,7 @@ class LineageIndexer:
                 if source_fields:
                     aliases.setdefault(frame_name, {})[str(target.slice.value)] = source_fields[0]
             if len(targets) == 1 and isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):
-                if value.func.attr == "rename" and isinstance(value.func.value, ast.Name):
+                if value.func.attr == "rename":
                     columns_node = next((item.value for item in value.keywords if item.arg == "columns"), None)
                     if isinstance(columns_node, ast.Dict):
                         for old_node, new_node in zip(columns_node.keys, columns_node.values):
@@ -1159,9 +1487,8 @@ class LineageIndexer:
                 isinstance(iterator, ast.Call)
                 and isinstance(iterator.func, ast.Attribute)
                 and iterator.func.attr in {"iterrows", "itertuples"}
-                and isinstance(iterator.func.value, ast.Name)
             ):
-                return iterator.func.value.id
+                return LineageIndexer._expression_base_frame(iterator.func.value)
         return ""
 
     @staticmethod
@@ -1267,6 +1594,19 @@ class LineageIndexer:
             while isinstance(expression, ast.Name) and expression.id in bindings and expression.id not in seen:
                 seen.add(expression.id)
                 expression = bindings[expression.id]
+            if (
+                isinstance(expression, ast.Subscript)
+                and isinstance(expression.value, ast.Name)
+                and expression.value.id in bindings
+                and isinstance(expression.slice, ast.Constant)
+                and expression.slice.value == "table"
+            ):
+                # ``build_table_result`` returns a wrapper containing the actual
+                # table artifact.  Generated code commonly stores that wrapper
+                # before appending ``wrapper["table"]``.  For lineage purposes
+                # the wrapper extraction and the helper call are the same table
+                # declaration, so retain the helper's data argument.
+                return resolve(bindings[expression.value.id])
             return expression
 
         events: list[tuple[int, int, ast.AST]] = []
@@ -1340,8 +1680,8 @@ class LineageIndexer:
         return ""
 
     @classmethod
-    def _table_data_sources(cls, tree: ast.AST) -> list[str]:
-        sources: list[str] = []
+    def _table_data_sources(cls, tree: ast.AST) -> list[dict[str, str]]:
+        sources: list[dict[str, str]] = []
         for expression in cls._table_artifact_expressions(tree):
             rows_expression = cls._table_rows_expression(expression)
             source = ""
@@ -1352,7 +1692,15 @@ class LineageIndexer:
             if not source:
                 loaded = _loaded_names(rows_expression) if rows_expression is not None else []
                 source = loaded[0] if loaded else ""
-            sources.append(source)
+            title = ""
+            if isinstance(expression, ast.Call):
+                title_node = next(
+                    (keyword.value for keyword in expression.keywords if keyword.arg == "title"),
+                    None,
+                )
+                if isinstance(title_node, ast.Constant) and isinstance(title_node.value, str):
+                    title = str(title_node.value)
+            sources.append({"source_frame": source, "title": title})
         return sources
 
     @classmethod
@@ -1861,7 +2209,7 @@ class LineageIndexer:
         *,
         column_aliases: dict[str, dict[str, str]],
         chart_sources: list[dict[str, Any]],
-        table_sources: list[str],
+        table_sources: list[dict[str, str]],
         table_metric_fields: list[set[str]],
     ) -> list[dict[str, Any]]:
         outputs: list[dict[str, Any]] = []
@@ -1943,13 +2291,32 @@ class LineageIndexer:
                     "lineage_fields": [source_field] if source_field else [field],
                 })
 
+        matched_table_contracts: set[int] = set()
         for table_index, table in enumerate(snapshot.tables):
             rows = table.get("rows") or []
             rows = [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
-            source_frame = table_sources[table_index] if len(table_sources) == len(snapshot.tables) else ""
+            actual_title = str(table.get("title") or "").strip()
+            contract_index = next(
+                (
+                    index for index, contract in enumerate(table_sources)
+                    if index not in matched_table_contracts
+                    and actual_title
+                    and str(contract.get("title") or "").strip() == actual_title
+                ),
+                -1,
+            )
+            if contract_index < 0 and len(table_sources) == len(snapshot.tables):
+                contract_index = table_index
+            if contract_index >= 0:
+                matched_table_contracts.add(contract_index)
+            source_frame = (
+                str(table_sources[contract_index].get("source_frame") or "")
+                if 0 <= contract_index < len(table_sources)
+                else ""
+            )
             structured_metric_fields = (
-                table_metric_fields[table_index]
-                if len(table_metric_fields) == len(snapshot.tables)
+                table_metric_fields[contract_index]
+                if 0 <= contract_index < len(table_metric_fields)
                 else set()
             )
             for column_index, column in enumerate(table.get("columns") or []):
@@ -1997,6 +2364,12 @@ class LineageIndexer:
                 expression = expression.transform(
                     lambda item: exp.Literal.string("?") if isinstance(item, exp.Literal) else item
                 )
+                if operation.get("semantic_kind") == "aggregation":
+                    expression = expression.transform(
+                        lambda item: exp.column("__measure__")
+                        if isinstance(item, exp.Column)
+                        else item
+                    )
                 source = expression.sql(pretty=False)
             except Exception:
                 source = re.sub(r"(['\"]).*?\1|\b\d+(?:\.\d+)?\b", "?", source)
@@ -2089,10 +2462,88 @@ class LineageIndexer:
         frame_positions: dict[str, list[dict[str, set[str]]]] = {}
         scalar_origins: dict[str, dict[str, set[str]]] = {}
         mapping_value_origins: dict[str, dict[str, set[str]]] = {}
+        mapping_field_origins: dict[str, dict[str, dict[str, set[str]]]] = {}
+        mapping_alias_sources: dict[str, str] = {}
+        for loop in (item for item in ast.walk(tree) if isinstance(item, ast.For)):
+            if not (
+                isinstance(loop.target, (ast.Tuple, ast.List))
+                and len(loop.target.elts) >= 2
+                and isinstance(loop.target.elts[1], ast.Name)
+                and isinstance(loop.iter, ast.Call)
+                and isinstance(loop.iter.func, ast.Attribute)
+                and loop.iter.func.attr == "items"
+                and isinstance(loop.iter.func.value, ast.Name)
+            ):
+                continue
+            mapping_alias_sources[loop.target.elts[1].id] = loop.iter.func.value.id
+        string_sequences: dict[str, list[str]] = {}
+        dynamic_subscript_fields: dict[str, list[str]] = {}
+        appended_record_dicts: dict[str, list[ast.Dict]] = {}
+        for assignment in (
+            item for item in ast.walk(tree)
+            if isinstance(item, (ast.Assign, ast.AnnAssign))
+        ):
+            value = getattr(assignment, "value", None)
+            targets = getattr(assignment, "targets", None) or [getattr(assignment, "target", None)]
+            names = [target.id for target in targets if isinstance(target, ast.Name)]
+            if (
+                len(names) == 1
+                and isinstance(value, (ast.List, ast.Tuple))
+                and all(
+                    isinstance(item, ast.Constant) and isinstance(item.value, str)
+                    for item in value.elts
+                )
+            ):
+                string_sequences[names[0]] = [str(item.value) for item in value.elts]
+        for loop in (item for item in ast.walk(tree) if isinstance(item, ast.For)):
+            if not isinstance(loop.target, (ast.Tuple, ast.List)):
+                continue
+            if not (
+                isinstance(loop.iter, ast.Call)
+                and isinstance(loop.iter.func, ast.Name)
+                and loop.iter.func.id == "zip"
+            ):
+                continue
+            target_names = [
+                item.id if isinstance(item, ast.Name) else ""
+                for item in loop.target.elts
+            ]
+            for index, iterator in enumerate(loop.iter.args):
+                if index >= len(target_names) or not target_names[index]:
+                    continue
+                if isinstance(iterator, ast.Name) and iterator.id in string_sequences:
+                    dynamic_subscript_fields[target_names[index]] = list(
+                        string_sequences[iterator.id]
+                    )
+        for call in (item for item in ast.walk(tree) if isinstance(item, ast.Call)):
+            if not (
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr == "append"
+                and isinstance(call.func.value, ast.Name)
+                and len(call.args) == 1
+                and isinstance(call.args[0], ast.Dict)
+            ):
+                continue
+            appended_record_dicts.setdefault(call.func.value.id, []).append(call.args[0])
         row_frames: list[tuple[str, str, int, int]] = []
+        enumeration_index_scopes: list[tuple[str, int, int]] = []
         for node in ast.walk(tree):
             if not isinstance(node, (ast.For, ast.comprehension)):
                 continue
+            if (
+                isinstance(node, ast.For)
+                and isinstance(node.iter, ast.Call)
+                and isinstance(node.iter.func, ast.Name)
+                and node.iter.func.id == "enumerate"
+                and isinstance(node.target, (ast.Tuple, ast.List))
+                and node.target.elts
+                and isinstance(node.target.elts[0], ast.Name)
+            ):
+                enumeration_index_scopes.append((
+                    node.target.elts[0].id,
+                    int(getattr(node, "lineno", 0) or 0),
+                    int(getattr(node, "end_lineno", getattr(node, "lineno", 0)) or 0),
+                ))
             iterator = node.iter
             row_iterator = next(
                 (
@@ -2101,11 +2552,14 @@ class LineageIndexer:
                     if isinstance(item, ast.Call)
                     and isinstance(item.func, ast.Attribute)
                     and item.func.attr in {"iterrows", "itertuples"}
-                    and isinstance(item.func.value, ast.Name)
                 ),
                 None,
             )
-            source_frame = row_iterator.func.value.id if row_iterator is not None else ""
+            source_frame = (
+                cls._expression_base_frame(row_iterator.func.value)
+                if row_iterator is not None
+                else ""
+            )
             if not source_frame:
                 continue
             targets = []
@@ -2126,16 +2580,18 @@ class LineageIndexer:
             if not (
                 isinstance(call.func, ast.Attribute)
                 and call.func.attr == "apply"
-                and isinstance(call.func.value, ast.Name)
                 and call.args
                 and isinstance(call.args[0], ast.Lambda)
             ):
+                continue
+            source_frame = cls._expression_base_frame(call.func.value)
+            if not source_frame:
                 continue
             lambda_node = call.args[0]
             start = int(getattr(lambda_node, "lineno", getattr(call, "lineno", 0)) or 0)
             end = int(getattr(lambda_node, "end_lineno", getattr(call, "end_lineno", start)) or start)
             for argument in lambda_node.args.args:
-                row_frames.append((argument.arg, call.func.value.id, start, end))
+                row_frames.append((argument.arg, source_frame, start, end))
 
         def row_source(name: str, line: int) -> str:
             matches = [
@@ -2144,6 +2600,12 @@ class LineageIndexer:
                 if alias == name and start <= line <= end
             ]
             return min(matches, default=(0, ""))[1]
+
+        def is_presentation_ordinal(names: set[str], line: int) -> bool:
+            return bool(names) and all(
+                any(alias == name and start <= line <= end for alias, start, end in enumeration_index_scopes)
+                for name in names
+            )
 
         def subscript_key(node: ast.Subscript) -> str:
             value = node.slice
@@ -2155,6 +2617,12 @@ class LineageIndexer:
             if node is None:
                 return empty_origin()
             origins: list[dict[str, set[str]]] = []
+            column_access_frame_names = {
+                item.value.id
+                for item in ast.walk(node)
+                if isinstance(item, ast.Subscript)
+                and isinstance(item.value, ast.Name)
+            }
             for item in ast.walk(node):
                 if (
                     isinstance(item, ast.Call)
@@ -2169,9 +2637,10 @@ class LineageIndexer:
                     isinstance(item, ast.Subscript)
                     and isinstance(item.value, ast.Attribute)
                     and item.value.attr in {"loc", "iloc"}
-                    and isinstance(item.value.value, ast.Name)
                 ):
-                    frame_name = item.value.value.id
+                    frame_name = cls._expression_base_frame(item.value.value)
+                    if not frame_name:
+                        continue
                     slice_items = (
                         list(item.slice.elts)
                         if isinstance(item.slice, (ast.Tuple, ast.List))
@@ -2188,11 +2657,26 @@ class LineageIndexer:
                         )
                         if origin:
                             origins.append(origin)
+                if isinstance(item, ast.Attribute) and isinstance(item.value, ast.Name):
+                    frame_name = row_source(
+                        item.value.id,
+                        int(getattr(item, "lineno", line) or line),
+                    )
+                    if frame_name:
+                        origin = (frame_columns.get(frame_name) or {}).get(item.attr)
+                        if origin:
+                            origins.append(origin)
                 if isinstance(item, ast.Subscript) and isinstance(item.value, ast.Name):
                     field = subscript_key(item)
-                    if not field:
-                        continue
                     frame_name = item.value.id
+                    mapping_source = mapping_alias_sources.get(frame_name, frame_name)
+                    if field:
+                        mapping_origin = (
+                            mapping_field_origins.get(mapping_source) or {}
+                        ).get(field)
+                        if mapping_origin:
+                            origins.append(mapping_origin)
+                            continue
                     frame_name = (
                         row_source(frame_name, line)
                         or row_source(
@@ -2201,10 +2685,32 @@ class LineageIndexer:
                         )
                         or frame_name
                     )
-                    origin = (frame_columns.get(frame_name) or {}).get(field)
-                    if origin:
-                        origins.append(origin)
+                    if field:
+                        origin = (frame_columns.get(frame_name) or {}).get(field)
+                        if origin:
+                            origins.append(origin)
+                        continue
+                    if isinstance(item.slice, (ast.List, ast.Tuple)):
+                        for field_node in item.slice.elts:
+                            if not (
+                                isinstance(field_node, ast.Constant)
+                                and isinstance(field_node.value, str)
+                            ):
+                                continue
+                            origin = (frame_columns.get(frame_name) or {}).get(
+                                str(field_node.value)
+                            )
+                            if origin:
+                                origins.append(origin)
+                        continue
+                    if isinstance(item.slice, ast.Name):
+                        for candidate_field in dynamic_subscript_fields.get(item.slice.id, []):
+                            origin = (frame_columns.get(frame_name) or {}).get(candidate_field)
+                            if origin:
+                                origins.append(origin)
                 elif isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load):
+                    if item.id in column_access_frame_names:
+                        continue
                     origin = scalar_origins.get(item.id)
                     if origin:
                         origins.append(origin)
@@ -2213,6 +2719,16 @@ class LineageIndexer:
         def frame_name_from_expression(node: ast.AST | None) -> str:
             if isinstance(node, ast.Name) and node.id in frame_columns:
                 return node.id
+            if isinstance(node, ast.IfExp):
+                branch_names = {
+                    name
+                    for name in (
+                        frame_name_from_expression(node.body),
+                        frame_name_from_expression(node.orelse),
+                    )
+                    if name
+                }
+                return next(iter(branch_names)) if len(branch_names) == 1 else ""
             if isinstance(node, ast.Subscript):
                 return frame_name_from_expression(node.value)
             if isinstance(node, ast.Attribute):
@@ -2299,25 +2815,41 @@ class LineageIndexer:
                     frame_positions[target] = [frame_columns[target][column] for column in columns]
                     continue
 
-                if (
-                    isinstance(value, ast.Call)
-                    and ((isinstance(value.func, ast.Name) and value.func.id == "DataFrame")
-                         or (isinstance(value.func, ast.Attribute) and value.func.attr == "DataFrame"))
-                    and value.args
-                    and (
-                        isinstance(value.args[0], ast.Dict)
-                        or (
-                            isinstance(value.args[0], (ast.List, ast.Tuple))
-                            and value.args[0].elts
-                            and all(isinstance(item, ast.Dict) for item in value.args[0].elts)
+                dataframe_value_call = next(
+                    (
+                        item for item in ast.walk(value)
+                        if isinstance(item, ast.Call)
+                        and (
+                            (isinstance(item.func, ast.Name) and item.func.id == "DataFrame")
+                            or (isinstance(item.func, ast.Attribute) and item.func.attr == "DataFrame")
                         )
-                    )
+                        and item.args
+                        and (
+                            isinstance(item.args[0], ast.Dict)
+                            or (
+                                isinstance(item.args[0], (ast.List, ast.Tuple))
+                                and item.args[0].elts
+                                and all(isinstance(record, ast.Dict) for record in item.args[0].elts)
+                            )
+                            or (
+                                isinstance(item.args[0], ast.Name)
+                                and bool(appended_record_dicts.get(item.args[0].id))
+                            )
+                        )
+                    ),
+                    None,
+                ) if value is not None else None
+                if (
+                    dataframe_value_call is not None
                 ):
+                    dataframe_argument = dataframe_value_call.args[0]
                     mapped: dict[str, dict[str, set[str]]] = {}
                     records = (
-                        [value.args[0]]
-                        if isinstance(value.args[0], ast.Dict)
-                        else list(value.args[0].elts)
+                        [dataframe_argument]
+                        if isinstance(dataframe_argument, ast.Dict)
+                        else list(appended_record_dicts.get(dataframe_argument.id) or [])
+                        if isinstance(dataframe_argument, ast.Name)
+                        else list(dataframe_argument.elts)
                     )
                     max_columns = max((len(record.keys) for record in records), default=0)
                     positions: list[dict[str, set[str]]] = []
@@ -2387,7 +2919,7 @@ class LineageIndexer:
                         and item.func.attr in {
                             "copy", "sort_values", "head", "tail", "nlargest", "nsmallest",
                             "dropna", "fillna", "reset_index", "rename", "groupby", "agg", "aggregate",
-                            "value_counts",
+                            "melt", "value_counts",
                         }
                         for item in ast.walk(value)
                     )
@@ -2409,6 +2941,76 @@ class LineageIndexer:
                     )
                 )
                 if is_frame_transform:
+                    melt_call = next(
+                        (
+                            item for item in ast.walk(value)
+                            if isinstance(item, ast.Call)
+                            and isinstance(item.func, ast.Attribute)
+                            and item.func.attr == "melt"
+                        ),
+                        None,
+                    )
+                    if melt_call is not None:
+                        def melt_string_values(keyword_name: str) -> list[str]:
+                            keyword_value = next(
+                                (
+                                    keyword.value for keyword in melt_call.keywords
+                                    if keyword.arg == keyword_name
+                                ),
+                                None,
+                            )
+                            if isinstance(keyword_value, ast.Constant) and isinstance(keyword_value.value, str):
+                                return [str(keyword_value.value)]
+                            if isinstance(keyword_value, (ast.List, ast.Tuple)):
+                                return [
+                                    str(item.value)
+                                    for item in keyword_value.elts
+                                    if isinstance(item, ast.Constant) and isinstance(item.value, str)
+                                ]
+                            return []
+
+                        def melt_string_value(keyword_name: str, default: str) -> str:
+                            values = melt_string_values(keyword_name)
+                            return values[0] if values else default
+
+                        source_columns = frame_columns.get(source_frame) or {}
+                        id_fields = melt_string_values("id_vars")
+                        value_fields = melt_string_values("value_vars") or [
+                            field for field in source_columns if field not in id_fields
+                        ]
+                        variable_field = melt_string_value("var_name", "variable")
+                        value_field = melt_string_value("value_name", "value")
+                        variable_origin = merge_origins(
+                            *(source_columns.get(field) for field in value_fields)
+                        )
+                        variable_origin["dimension_boundaries"].update(
+                            variable_origin.get("boundaries") or set()
+                        )
+                        value_origin = merge_origins(
+                            *(source_columns.get(field) for field in value_fields)
+                        )
+                        operation = operation_for(node)
+                        operation_id = str((operation or {}).get("operation_node_id") or "")
+                        if operation_id and value_origin["queries"]:
+                            value_origin["operations"].add(operation_id)
+                            variable_origin["operations"].add(operation_id)
+                        frame_columns[target] = {
+                            field: merge_origins(source_columns.get(field))
+                            for field in id_fields
+                            if field in source_columns
+                        }
+                        frame_columns[target][variable_field] = variable_origin
+                        frame_columns[target][value_field] = value_origin
+                        frame_positions[target] = [
+                            frame_columns[target][field]
+                            for field in frame_columns[target]
+                        ]
+                        if value_origin["queries"]:
+                            scalar_origins[target] = merge_origins(
+                                *(frame_columns[target].values())
+                            )
+                        continue
+
                     value_counts_call = next(
                         (
                             item for item in ast.walk(value)
@@ -2618,17 +3220,15 @@ class LineageIndexer:
                             frame_origin["operations"].add(operation_id)
                             frame_origin["boundaries"] = {operation_id}
                             if operation.get("semantic_kind") == "ranking":
-                                # A row-scope transform (sort/head/top-N) is the final
-                                # boundary of every displayed column, while each
-                                # column keeps its upstream aggregation/formula in
-                                # the operation chain. Treating both as competing
-                                # boundaries incorrectly makes formatted tables
-                                # look like unrelated calculations.
+                                # Sorting and Top-N constrain which rows are shown,
+                                # but they do not replace each column's metric
+                                # calculation boundary. Keep the row-scope operation
+                                # in the chain while preserving upstream aggregation
+                                # or formula boundaries per column.
                                 for column_origin in (frame_columns.get(target) or {}).values():
                                     if not column_origin.get("queries"):
                                         continue
                                     column_origin["operations"].add(operation_id)
-                                    column_origin["boundaries"] = {operation_id}
                     if frame_origin["queries"]:
                         scalar_origins[target] = frame_origin
                     continue
@@ -2648,6 +3248,18 @@ class LineageIndexer:
                     frame_name = target_node.value.id
                     field = subscript_key(target_node)
                     if not field:
+                        if isinstance(value, ast.Dict):
+                            for key_node, value_node in zip(value.keys, value.values):
+                                if not (
+                                    isinstance(key_node, ast.Constant)
+                                    and isinstance(key_node.value, str)
+                                ):
+                                    continue
+                                field_origin = expression_origin(value_node, line)
+                                if field_origin.get("queries"):
+                                    mapping_field_origins.setdefault(frame_name, {})[
+                                        str(key_node.value)
+                                    ] = field_origin
                         origin = expression_origin(value, line)
                         if origin.get("queries"):
                             mapping_value_origins[frame_name] = merge_origins(
@@ -2687,6 +3299,81 @@ class LineageIndexer:
                     frame_positions[frame_name] = old_positions
 
         enriched: list[dict[str, Any]] = []
+        operation_producers: dict[str, set[str]] = {}
+        for operation_id, operation in operation_by_id.items():
+            for target in operation.get("targets") or []:
+                target_name = str(target or "").strip()
+                if target_name:
+                    operation_producers.setdefault(target_name, set()).add(operation_id)
+
+        def local_calculation_ancestry(operation_id: str) -> set[str]:
+            pending = [operation_id]
+            visited: set[str] = set()
+            local: set[str] = set()
+            while pending:
+                current_id = pending.pop()
+                if current_id in visited:
+                    continue
+                visited.add(current_id)
+                current = operation_by_id.get(current_id) or {}
+                if (
+                    current.get("kind") not in {
+                        "query_load", "query_projection", "source_field",
+                        "validated_query", "output_expression",
+                    }
+                    and current.get("semantic_kind")
+                    in {"aggregation", "formula", "ranking", "projection"}
+                ):
+                    local.add(current_id)
+                for loaded_name in current.get("loads") or []:
+                    pending.extend(operation_producers.get(str(loaded_name), set()))
+            return local
+
+        def count_derived_measure(operation_id: str, seen: set[str] | None = None) -> bool:
+            seen = set(seen or ())
+            if operation_id in seen:
+                return True
+            seen.add(operation_id)
+            operation = operation_by_id.get(operation_id) or {}
+            source = str(operation.get("source") or "")
+            semantic_kind = str(operation.get("semantic_kind") or "")
+            called: set[str] = set()
+            parsed: ast.AST | None = None
+            try:
+                parsed = ast.parse(source)
+                called = _called_operation_names(parsed)
+            except SyntaxError:
+                parsed = None
+            if semantic_kind == "aggregation":
+                return bool(called.intersection({"len", "count", "size", "nunique"})) or bool(
+                    re.search(r"\bCOUNT\s*\(", source, re.IGNORECASE)
+                )
+            if semantic_kind != "formula" or parsed is None:
+                return False
+            # A remainder such as ``total - active - expired`` is still a
+            # category count. Ratios and weighted scores are different units
+            # and must not be folded into that count family.
+            if any(
+                isinstance(item, ast.BinOp)
+                and not isinstance(item.op, (ast.Add, ast.Sub))
+                for item in ast.walk(parsed)
+            ):
+                return False
+            parent_ids = {
+                parent_id
+                for loaded_name in operation.get("loads") or []
+                for parent_id in operation_producers.get(str(loaded_name), set())
+                if parent_id != operation_id
+                and (operation_by_id.get(parent_id) or {}).get("kind")
+                != "output_expression"
+                and int((operation_by_id.get(parent_id) or {}).get("line") or 0)
+                <= int(operation.get("line") or 0)
+            }
+            return bool(parent_ids) and all(
+                count_derived_measure(parent_id, seen)
+                for parent_id in parent_ids
+            )
+
         for raw_output in outputs:
             output = dict(raw_output)
             source_frame = str(output.get("source_frame") or "").strip()
@@ -2702,6 +3389,16 @@ class LineageIndexer:
                 try:
                     expression = ast.parse(str(output.get("field") or ""), mode="eval")
                     origin = expression_origin(expression, int(output.get("source_line") or 0))
+                    loaded_names = {
+                        item.id
+                        for item in ast.walk(expression)
+                        if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load)
+                    }
+                    if is_presentation_ordinal(
+                        loaded_names,
+                        int(output.get("source_line") or 0),
+                    ):
+                        output["presentation_ordinal"] = True
                     expression_source = str(output.get("field") or "").strip()
                     expression_operation = next(
                         (
@@ -2742,7 +3439,27 @@ class LineageIndexer:
                         origin.get("dimension_boundaries") or set()
                     )
                 )
-                output["ambiguous_calculation_boundary"] = len(families) > 1
+                shared_local_boundary = bool(boundary_ids) and bool(
+                    set.intersection(*(
+                        local_calculation_ancestry(item)
+                        for item in boundary_ids
+                    ))
+                )
+                shared_count_measure = bool(boundary_ids) and all(
+                    count_derived_measure(item)
+                    for item in boundary_ids
+                )
+                # Different formulas can still be one coherent parameterized
+                # metric when every branch descends from the same local
+                # calculation (for example a root-cause score whose formula
+                # varies by cause category).  Unrelated query projections such
+                # as amount/profit/count have no shared local boundary and stay
+                # deliberately ambiguous.
+                output["ambiguous_calculation_boundary"] = (
+                    len(families) > 1
+                    and not shared_local_boundary
+                    and not shared_count_measure
+                )
             enriched.append(output)
         return enriched
 
@@ -3188,12 +3905,22 @@ class LineageIndexer:
                         if token.get("numeric_suffix"):
                             pattern_parts.append(re.escape(str(token["numeric_suffix"])))
                     else:
-                        pattern_parts.append(fr"(?P<{slot_name}>[^\r\n]*?)")
+                        # The value may itself be a fully rendered report section.
+                        # Keep the slot non-greedy, but allow newlines so the complete
+                        # AST-owned template remains the source of positional truth.
+                        pattern_parts.append(fr"(?P<{slot_name}>[\s\S]*?)")
             if not slot_names or not any("literal" in token and str(token.get("literal") or "") for token in tokens):
                 continue
             pattern = "".join(pattern_parts)
             template_matches = list(re.finditer(pattern, report_region))
             for occurrence, match in enumerate(template_matches):
+                rendered_slot_bindings = {
+                    str(expression.get("expression") or ""): match.group(
+                        f"slot_{int(expression.get('slot_index') or 0)}"
+                    )
+                    for expression in template_expressions
+                    if f"slot_{int(expression.get('slot_index') or 0)}" in match.groupdict()
+                }
                 for expression in template_expressions:
                     slot_name = f"slot_{int(expression.get('slot_index') or 0)}"
                     if slot_name not in match.groupdict():
@@ -3222,6 +3949,7 @@ class LineageIndexer:
                         "rendered_context": report[max(0, start - 120):min(len(report), end + 120)],
                         "source_line": expression.get("line"),
                         "numeric_hint": bool(expression.get("numeric_hint")),
+                        "rendered_slot_bindings": rendered_slot_bindings,
                         "direct_operation_node_ids": [expression.get("operation_node_id")],
                     })
 
@@ -3294,6 +4022,15 @@ class LineageIndexer:
         ))
         if literal_fields:
             return literal_fields
+        attribute_fields = list(dict.fromkeys(
+            item.attr
+            for item in ast.walk(tree)
+            if isinstance(item, ast.Attribute)
+            and isinstance(item.value, ast.Name)
+            and str(item.attr or "").strip()
+        ))
+        if attribute_fields:
+            return attribute_fields
         called_names = {
             item.func.id
             for item in ast.walk(tree)
@@ -3372,10 +4109,6 @@ class PostAnalysisEvidenceCompiler:
                 if str(output.get("output_node_id") or "")
                 and not self._is_grouping_dimension_output(output, lineage_index)
                 and self._is_report_metric_output(output, lineage_index)
-                and (
-                    output.get("artifact_type") in {"chart", "table"}
-                    or bool(output.get("candidate_query_node_ids"))
-                )
             }
             structured_output_ids = {
                 str(output.get("output_node_id") or "")
@@ -3453,13 +4186,22 @@ class PostAnalysisEvidenceCompiler:
         output: dict[str, Any],
         lineage_index: dict[str, Any],
     ) -> bool:
-        if output.get("artifact_type") != "report" or output.get("numeric_hint"):
+        if output.get("presentation_ordinal"):
+            return False
+        if output.get("artifact_type") != "report":
+            return True
+        # Report output nodes only exist for numeric values located through an
+        # AST-owned render template. If lineage is incomplete, retain the slot
+        # as unresolved so compilation cannot report a false complete status.
+        if output.get("numeric_hint"):
             return True
         boundary_ids = {
             str(item)
             for item in output.get("boundary_operation_node_ids") or []
             if str(item)
         }
+        if not boundary_ids:
+            return True
         operations = [
             operation
             for operation in lineage_index.get("operation_nodes") or []
@@ -3477,6 +4219,11 @@ class PostAnalysisEvidenceCompiler:
     @staticmethod
     def _build_calculation_candidates(lineage_index: dict[str, Any]) -> dict[str, dict[str, Any]]:
         grouped: dict[str, dict[str, Any]] = {}
+        operation_by_id = {
+            str(item.get("operation_node_id") or ""): item
+            for item in lineage_index.get("operation_nodes") or []
+            if str(item.get("operation_node_id") or "")
+        }
         for output in lineage_index.get("output_nodes") or []:
             if output.get("ambiguous_calculation_boundary"):
                 continue
@@ -3498,6 +4245,16 @@ class PostAnalysisEvidenceCompiler:
                 continue
             if PostAnalysisEvidenceCompiler._is_grouping_dimension_output(output, lineage_index):
                 continue
+            parameter_bindings, metric_source_fields = (
+                PostAnalysisEvidenceCompiler._resolve_literal_parameter_bindings(
+                    output,
+                    boundaries=boundaries,
+                    operation_by_id=operation_by_id,
+                    literal_iteration_bindings=(
+                        lineage_index.get("literal_iteration_bindings") or []
+                    ),
+                )
+            )
             boundary = next(
                 (
                     item for item in lineage_index.get("operation_nodes") or []
@@ -3509,6 +4266,7 @@ class PostAnalysisEvidenceCompiler:
                 "boundaries": sorted(boundaries),
                 "queries": sorted(query_ids),
                 "field": str(output.get("field") or ""),
+                "parameter_bindings": parameter_bindings,
             }
             identity = _stable_json(identity_payload)
             calculation_id = f"calc_{_digest(identity, 20)}"
@@ -3519,6 +4277,8 @@ class PostAnalysisEvidenceCompiler:
                 "output_node_ids": [],
                 "operation_node_ids": [],
                 "query_node_ids": query_ids,
+                "parameter_bindings": parameter_bindings,
+                "metric_source_fields": metric_source_fields,
             })
             candidate["output_node_ids"].append(str(output.get("output_node_id") or ""))
             candidate["operation_node_ids"] = list(dict.fromkeys([
@@ -3526,6 +4286,68 @@ class PostAnalysisEvidenceCompiler:
                 *operation_ids,
             ]))
         return grouped
+
+    @staticmethod
+    def _resolve_literal_parameter_bindings(
+        output: dict[str, Any],
+        *,
+        boundaries: list[str],
+        operation_by_id: dict[str, dict[str, Any]],
+        literal_iteration_bindings: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], list[str]]:
+        dynamic_field_names: set[str] = set()
+        for operation_id in boundaries:
+            source = str((operation_by_id.get(operation_id) or {}).get("source") or "")
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                continue
+            dynamic_field_names.update(
+                item.slice.id
+                for item in ast.walk(tree)
+                if isinstance(item, ast.Subscript)
+                and isinstance(item.slice, ast.Name)
+            )
+        if not dynamic_field_names:
+            return {}, []
+
+        rendered_values = {
+            str(value).strip()
+            for value in (output.get("rendered_slot_bindings") or {}).values()
+            if str(value).strip()
+        }
+        if not rendered_values:
+            return {}, []
+
+        for group in literal_iteration_bindings:
+            rows = [item for item in group.get("rows") or [] if isinstance(item, dict)]
+            group_names = set().union(*(set(item) for item in rows)) if rows else set()
+            selector_names = sorted(dynamic_field_names.intersection(group_names))
+            if not selector_names:
+                continue
+            matched_rows = [
+                row
+                for row in rows
+                if any(
+                    str(value).strip() in rendered_values
+                    for name, value in row.items()
+                    if name not in selector_names and str(value).strip()
+                )
+            ]
+            if len(matched_rows) != 1:
+                continue
+            selected = matched_rows[0]
+            parameter_bindings = {
+                name: selected[name]
+                for name in sorted(selected)
+            }
+            metric_source_fields = [
+                str(selected[name]).strip()
+                for name in selector_names
+                if str(selected.get(name) or "").strip()
+            ]
+            return parameter_bindings, metric_source_fields
+        return {}, []
 
     @staticmethod
     def _planner_candidate_payloads(
@@ -3551,6 +4373,8 @@ class PostAnalysisEvidenceCompiler:
             payloads.append({
                 "calculation_id": calculation_id,
                 "calculation_kind": boundary.get("semantic_kind") or "",
+                "parameter_bindings": candidate.get("parameter_bindings") or {},
+                "metric_source_fields": candidate.get("metric_source_fields") or [],
                 "calculation_expressions": list(dict.fromkeys(
                     str(operation.get("source") or "").strip()
                     for operation in boundary_operations
@@ -3793,10 +4617,14 @@ class PostAnalysisEvidenceCompiler:
                 "queries": sorted(query_ids),
                 "operations": [operation_by_id[item]["source"] for item in sorted(operation_ids)],
                 "metric_fields": sorted(
-                    field
-                    for item in output_ids
-                    for field in output_metric_fields(output_by_id[item])
+                    candidate.get("metric_source_fields")
+                    or [
+                        field
+                        for item in output_ids
+                        for field in output_metric_fields(output_by_id[item])
+                    ]
                 ),
+                "parameter_bindings": candidate.get("parameter_bindings") or {},
             }
             signature = _digest(_stable_json(signature_payload), 24)
             if any(output_claims.get(item) not in (None, signature) for item in output_ids):
@@ -3805,9 +4633,12 @@ class PostAnalysisEvidenceCompiler:
             for output_id in output_ids:
                 output_claims[output_id] = signature
             metric_fields = list(dict.fromkeys(
-                field
-                for item in output_ids
-                for field in output_metric_fields(output_by_id[item])
+                candidate.get("metric_source_fields")
+                or [
+                    field
+                    for item in output_ids
+                    for field in output_metric_fields(output_by_id[item])
+                ]
             ))
             if signature not in definitions_by_signature:
                 boundary = operation_by_id.get(str(candidate.get("boundary_operation_node_id"))) or {}
@@ -3825,6 +4656,7 @@ class PostAnalysisEvidenceCompiler:
                         "metric_fields": metric_fields,
                         "calculation_signature": signature,
                         "operation_node_ids": operation_ids,
+                        "parameter_bindings": candidate.get("parameter_bindings") or {},
                     },
                     "transformations": list(dict.fromkeys(
                         self._describe_operation(operation_by_id[item])

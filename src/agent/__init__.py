@@ -287,6 +287,10 @@ def build_prompt_messages(
     current_system_messages: list[BaseMessage] = []
     if datasource_message is not None:
         current_system_messages.append(datasource_message)
+    current_system_messages.append(SystemMessage(
+        "本轮输出语言契约：除非用户明确指定另一种语言，最终分析报告、图表标题、表格标题与业务说明"
+        "必须沿用当前用户问题的主要自然语言；执行错误修复不得翻译或切换已经形成的报告语言。"
+    ))
     current_system_messages.extend(runtime_messages)
 
     mandatory_system_messages = [*base_system_messages, *current_system_messages]

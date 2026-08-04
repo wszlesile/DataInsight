@@ -2071,6 +2071,7 @@ def _build_analysis_recovery_instruction(
 
     lines.extend([
         '请基于上一版失败代码做最小必要修补，不要整段重写与当前错误无关的逻辑。',
+        '修复技术错误时必须保持当前用户问题的输出语言；不得翻译或切换上一版已经形成的报告、图表和表格语言。',
         '请直接修正完整 Python 代码并再次调用 execute_python。',
     ])
     if 'probe_feedback' in latest_error_types:

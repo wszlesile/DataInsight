@@ -1938,7 +1938,14 @@ def validate_business_context(
                     f"joinable relationship {relationship.relationship_id} lacks keys"
                 )
         if (
-            relationship.evidence_basis == "schema"
+            relationship.relationship_type in {
+                "same_entity",
+                "parent_child",
+                "event_of_entity",
+                "dimension_enrichment",
+                "bridge",
+            }
+            and relationship.evidence_basis == "schema"
             and relationship.joinability in {"joinable", "alignable"}
             and not _schema_declares_relationship(
                 declared_relationships,
@@ -2331,6 +2338,27 @@ class AnalysisPreparationWorkflow:
                 and not unresolved_join
             ):
                 lineage_status = "direct"
+            elif unresolved_join:
+                # A partially verified relationship graph must not invalidate the
+                # verified edges or the rest of Preparation. Keep the grounded
+                # facts, but make the affected question explicitly advisory until
+                # Runtime can avoid or resolve the remaining relationship.
+                lineage_status = "partial"
+                if not unresolved_by_id:
+                    affected_fact_id = next(
+                        iter(required_fact_ids or bound_fact_ids),
+                        "",
+                    )
+                    if affected_fact_id:
+                        unresolved_by_id[affected_fact_id] = (
+                            UnresolvedBusinessFactContract(
+                                fact_id=affected_fact_id,
+                                reason="回答该问题所需的数据源关系仍有部分未确认",
+                                business_impact=(
+                                    "相关来源暂不能全部可靠合并，综合判断需要保留范围说明"
+                                ),
+                            )
+                        )
             normalized_lineage.append(lineage.model_copy(update={
                 "fact_bindings": bindings,
                 "unresolved_business_facts": list(unresolved_by_id.values()),
@@ -2706,8 +2734,15 @@ class AnalysisPreparationWorkflow:
         removed_ids: set[str] = set()
         unresolved = list(candidate.unresolved_relationships)
         for relationship in candidate.relationships:
-            if relationship.relationship_type in {"comparable", "independent", "unknown"}:
+            if relationship.relationship_type in {"comparable", "independent"}:
                 normalized.append(relationship)
+                continue
+            if relationship.relationship_type == "unknown":
+                normalized.append(relationship.model_copy(update={
+                    "joinability": "unknown",
+                    "evidence_basis": "unresolved",
+                    "observation_id": "",
+                }))
                 continue
             valid_field_pairs = [
                 (left_field, right_field)
@@ -3042,7 +3077,8 @@ class AnalysisPreparationWorkflow:
                 candidate = _invoke_contract(
                     stage="business_context",
                     payload={
-                        **payload,
+                        "user_query": self.user_query,
+                        "datasource_selection": selection.model_dump(),
                         "resolution_phase": "finalize_after_probe",
                         "business_context_draft": candidate.model_dump(),
                         "probe_observations": current_observations,

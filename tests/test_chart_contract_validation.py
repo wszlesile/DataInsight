@@ -17,7 +17,9 @@ from agent.tools import (  # noqa: E402
     CURRENT_EXECUTION_INTENT,
     CURRENT_DATASOURCE_NUMERIC_FIELDS,
     StructuredResult,
+    _build_generated_code_error_context,
     _build_execution_namespace,
+    _canonicalize_used_datasource_ids,
     _extract_dataframe_reduction_clauses,
     _classify_execution_error,
     _inspect_preparation_relationship,
@@ -40,6 +42,41 @@ from utils.chart_document_utils import build_chart_result, normalize_chart_resul
 
 
 class ChartContractValidationTestCase(unittest.TestCase):
+
+    def test_syntax_error_feedback_contains_exact_generated_code_context(self) -> None:
+        retry = _validate_generated_code_contract(
+            'execution_intent = "analysis"\nreport = "用户期望的"过程波动"分类"\n'
+        )
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(retry.diagnostics["violated_contract"], "invalid_python_syntax")
+        context = retry.diagnostics["code_error_context"]
+        self.assertEqual(context["line_no"], 2)
+        self.assertIn('"过程波动"', context["error_line"])
+        self.assertIn("第 2 行", retry.message)
+
+    def test_query_snapshots_canonicalize_declared_datasource_ids(self) -> None:
+        result = StructuredResult(
+            analysis_report="收入分析。",
+            query_snapshots={
+                "revenue": {
+                    "implementation": {"sql": "SELECT SUM(amount) FROM dw.revenue"},
+                    "execution": {"status": "success"},
+                },
+            },
+        )
+
+        canonical = _canonicalize_used_datasource_ids(
+            result,
+            declared_datasource_ids=[12, 13],
+            selected_datasource_snapshot=[
+                {"datasource_id": 12, "datasource_identifier": "dw.revenue"},
+                {"datasource_id": 13, "datasource_identifier": "dw.product_detail"},
+            ],
+        )
+
+        self.assertEqual(canonical, [12])
 
     def test_valid_analysis_result_terminates_the_agent_graph(self) -> None:
         message = _tool_success_message(
@@ -90,6 +127,34 @@ result = request_retry(
 '''
 
         self.assertIsNone(_validate_generated_code_contract(code))
+
+    def test_partial_analysis_program_gets_state_boundary_repair_feedback(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"target_filters": []}
+sql = "SELECT status FROM contracts"
+validation = validate_query_constraints(
+    query_key="q_contracts",
+    query_constraints=query_constraints,
+    sql=sql,
+)
+data = load_data_with_sql(sql=sql)
+print("data loading complete; continue later")
+'''
+
+        retry = _validate_generated_code_contract(code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(retry.retry_type, "contract_error")
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "incomplete_analysis_program",
+        )
+        self.assertTrue(any(
+            "独立执行单元" in item
+            for item in retry.repair_instructions
+        ))
 
     def test_probe_accepts_observations_accumulated_with_list_append(self) -> None:
         code = '''
@@ -160,6 +225,17 @@ result = request_retry(
         self.assertEqual(
             _classify_execution_error(RuntimeError(error_message), error_message),
             "data_source_unavailable",
+        )
+
+    def test_oversized_query_result_has_a_specific_repair_type(self) -> None:
+        error_message = (
+            "Query result exceeds 10000 rows, please update query conditions "
+            "or set pagination"
+        )
+
+        self.assertEqual(
+            _classify_execution_error(RuntimeError(error_message), error_message),
+            "query_result_too_large",
         )
 
     def test_probe_feedback_adds_authoritative_outcome_summary(self) -> None:
@@ -659,6 +735,41 @@ charts = [build_chart_result(data=top_rows)]
         self.assertEqual(len(normalized), 2)
         self.assertEqual([item["title"] for item in normalized], ["Department amount", "Monthly amount"])
 
+    def test_duplicate_chart_error_identifies_chart_and_related_helper_call(self) -> None:
+        chart = build_chart_result(
+            chart_kind="bar",
+            data=[
+                {"quality_item": "purity", "product": "A", "value": 1.0},
+                {"quality_item": "purity", "product": "A", "value": 2.0},
+            ],
+            title="Quality deviation",
+            category_field="quality_item",
+            value_field="value",
+            series_field="product",
+        )
+
+        with self.assertRaisesRegex(ValueError, r"chart\[1\] title='Quality deviation'") as caught:
+            _normalize_chart_items([chart])
+
+        code = '''
+chart_data = detail.copy()
+chart_data["unique_batch"] = chart_data["batch_id"]
+chart = build_chart_result(
+    chart_kind="bar",
+    data=chart_data,
+    title="Quality deviation",
+    category_field="quality_item",
+    value_field="value",
+    series_field="product",
+)
+result = save_analysis_result(analysis_report=report, charts=[chart], tables=[])
+'''
+        context = _build_generated_code_error_context(code, caught.exception, "traceback")
+
+        related_code = "\n".join(item["code"] for item in context["related_context_lines"])
+        self.assertIn('chart_data["unique_batch"]', related_code)
+        self.assertIn('series_field="product"', related_code)
+
     def test_normalized_chart_retains_backend_field_mapping(self) -> None:
         chart = build_chart_result(
             chart_kind="bar",
@@ -736,6 +847,50 @@ charts = [build_chart_result(data=top_rows)]
         self.assertEqual(
             retry.diagnostics["violated_contract"],
             "repeated_numeric_display_unit",
+        )
+
+    def test_report_rejects_unrendered_generated_code_placeholders(self) -> None:
+        result = StructuredResult(
+            analysis_report=(
+                "## Summary\n"
+                "- Range: {start_date} to {end_date[:10]}\n"
+                "- Missing share: {100 - covered_pct:.1f}%"
+            ),
+            charts=[{"title": "Trend", "chart_document": {"series": []}}],
+            tables=[],
+        )
+        generated_code = """
+start_date = '2026-08-03'
+end_date = '2026-08-10'
+covered_pct = 25.0
+"""
+
+        retry = _validate_structured_result_contract(
+            result,
+            generated_code=generated_code,
+        )
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(retry.retry_type, "result_contract_error")
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "unrendered_report_placeholder",
+        )
+        self.assertEqual(len(retry.diagnostics["placeholders"]), 3)
+
+    def test_report_allows_literal_braces_not_bound_to_generated_variables(self) -> None:
+        result = StructuredResult(
+            analysis_report="## Summary\nThe set is {high, medium, low} and the formula uses {x}.",
+            charts=[{"title": "Trend", "chart_document": {"series": []}}],
+            tables=[],
+        )
+
+        self.assertIsNone(
+            _validate_structured_result_contract(
+                result,
+                generated_code="metric_value = 3",
+            )
         )
 
     def test_bar_chart_allows_null_gaps_when_other_points_are_renderable(self) -> None:
@@ -1123,6 +1278,22 @@ if validation is not None:
 else:
     data = load_data_with_sql("SELECT status, COUNT(*) AS contract_count FROM t GROUP BY status")
     values = data.set_index("status")["contract_count"].to_dict()
+    active_count = values.get("active", 0)
+    result = save_analysis_result(analysis_report=f"active={active_count}", charts=[], tables=[])
+'''
+
+        self.assertIsNone(_validate_generated_code_contract(code))
+
+    def test_generated_code_allows_zero_for_absent_fixed_value_counts_category(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"metric": "contract_count"}}
+validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT status FROM t")
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql("SELECT status FROM t")
+    values = data["status"].value_counts().to_dict()
     active_count = values.get("active", 0)
     result = save_analysis_result(analysis_report=f"active={active_count}", charts=[], tables=[])
 '''
@@ -1534,6 +1705,51 @@ status_dist = population_df["status"].value_counts().reset_index()
 
         self.assertIsNone(_validate_analysis_relationship_contract(context, code))
 
+    def test_analysis_allows_counts_of_rows_after_explicit_grouped_grain(self) -> None:
+        context = SimpleNamespace(active_datasource_snapshot={
+            "selected_datasource_snapshot": [
+                {"datasource_id": 11, "datasource_identifier": "dw.batches"},
+                {"datasource_id": 12, "datasource_identifier": "dw.samples"},
+            ],
+            "analysis_semantic_context": {
+                "relationships": [{
+                    "relationship_id": "batch_samples",
+                    "left_datasource_id": 11,
+                    "right_datasource_id": 12,
+                    "relationship_type": "event_of_entity",
+                    "joinability": "joinable",
+                    "cardinality": "one_to_many",
+                    "aggregation_safety": {
+                        "left_measure_after_join": {"status": "unsafe_repeated_by_join"},
+                        "right_measure_after_join": {"status": "safe"},
+                    },
+                }]
+            },
+        })
+        code = '''
+execution_intent = "analysis"
+query_constraints = {
+    "time_range": None,
+    "target_filters": [],
+    "aggregation": {"grain": "overall", "metric": "alarm_pattern"},
+}
+sql = """
+SELECT b.batch_id, s.parameter_name, s.alarm_flag
+FROM dw.batches b
+JOIN dw.samples s ON b.batch_id = s.batch_id
+"""
+data = load_data_with_sql(sql=sql)
+parameter_stats = data[data["alarm_flag"] == 1].groupby(
+    "parameter_name", as_index=False
+).agg(
+    alarm_count=("alarm_flag", "count"),
+    batch_count=("batch_id", "nunique"),
+)
+has_parameter_results = len(parameter_stats) > 0
+'''
+
+        self.assertIsNone(_validate_analysis_relationship_contract(context, code))
+
     def test_analysis_requires_runtime_normalization_for_numeric_text_relation(self) -> None:
         context = SimpleNamespace(active_datasource_snapshot={
             "selected_datasource_snapshot": [
@@ -1819,6 +2035,40 @@ details = load_data_with_sql("SELECT contract_id FROM dw.contract_details")
 has_license = contracts["license_id"].notna()
 license_coverage = has_license.sum()
 license_ratio = license_coverage / len(contracts)
+'''
+
+        self.assertIsNone(_validate_analysis_relationship_contract(context, code))
+
+    def test_analysis_does_not_infer_cross_source_coverage_from_with_variable_name(self) -> None:
+        context = SimpleNamespace(active_datasource_snapshot={
+            "selected_datasource_snapshot": [
+                {"datasource_id": 11, "datasource_identifier": "dw.batches"},
+                {"datasource_id": 12, "datasource_identifier": "dw.process_params"},
+            ],
+            "analysis_semantic_context": {
+                "relationships": [{
+                    "relationship_id": "batch_process_params",
+                    "left_datasource_id": 11,
+                    "right_datasource_id": 12,
+                    "left_fields": ["batch_id"],
+                    "right_fields": ["batch_id"],
+                    "relationship_type": "parent_child",
+                    "joinability": "joinable",
+                    "aggregation_safety": {"key_domain_coverage": {}},
+                }]
+            },
+        })
+        code = '''
+execution_intent = "analysis"
+batches = load_data_with_sql("SELECT batch_id FROM dw.batches")
+process_params = load_data_with_sql(
+    "SELECT batch_id, value, upper_control_limit, lower_control_limit FROM dw.process_params"
+)
+params_with_ucl = process_params[
+    process_params["upper_control_limit"].notna()
+    & process_params["lower_control_limit"].notna()
+]
+above_ucl = params_with_ucl[params_with_ucl["value"] > params_with_ucl["upper_control_limit"]]
 '''
 
         self.assertIsNone(_validate_analysis_relationship_contract(context, code))

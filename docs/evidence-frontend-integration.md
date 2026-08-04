@@ -236,25 +236,23 @@ Content-Type: application/json
 
 - `chart_index` 是当前轮次图表列表中的 0 基下标。
 - `value_field` 对应图表数据字段，通常来自 `chart_document.encoding.value_field` 或 `value_fields`。
-- 前端图表点击事件中，根据 ECharts 事件的 `encode.x`、`encode.y`、`seriesName` 或 `seriesIndex` 找到匹配 ref。
+- 前端先按当前产物的 `artifact_id` 或轮次级 `chart_index` 收敛候选 refs，不能跨图表仅按字段名匹配。
+- 字段匹配需要综合 ECharts 事件 `encode.x/encode.y`、系列自身 `series.encode`、`dataset.dimensions`、`seriesName` 和数据点名称；字段比较可忽略空白、下划线和中英文括号差异。
+- 如果当前图只有一个候选 ref，可直接使用；多候选字段仍无法区分时，才按 `seriesIndex` 选择对应 ref。
 - 找到 ref 后，使用 `ref.artifact_id` 和 `ref.evidence_id` 调用详情接口。
+- `selection.raw_value` 应优先按 `value_field` 从对象数据点读取，并兼容数组值和 `dataset.source`，不要把整段 ECharts `params.value` 原样当作当前指标值。
 
 当前前端参考逻辑：
 
 ```js
 const findChartEvidenceRef = (chart, chartIndex, params = {}) => {
   const refs = chart?.evidenceRefs?.chart_trace_refs || []
-  const encode = params.encode || {}
-  const valueFields = [
-    ...(Array.isArray(encode.y) ? encode.y : []),
-    ...(Array.isArray(encode.x) ? encode.x : []),
-    params.seriesName
-  ].map((item) => String(item || '').trim()).filter(Boolean)
-
-  return refs.find((ref) =>
-    Number(ref.chart_index || 0) === Number(chartIndex || 0)
-    && (!ref.value_field || valueFields.includes(ref.value_field))
-  )
+  const candidates = refs.every((ref) => String(ref.artifact_id) === String(chart.id))
+    ? refs
+    : refs.filter((ref) => Number(ref.chart_index || 0) === Number(chartIndex || 0))
+  const valueFields = collectEventAndSeriesFields(chart.chartSpec, params)
+  return candidates.find((ref) => semanticallyMatches(ref.value_field, valueFields, params.seriesName))
+    || (candidates.length === 1 ? candidates[0] : candidates[params.seriesIndex])
 }
 ```
 
@@ -307,7 +305,7 @@ const findTableEvidenceRef = (table, column) => {
 定位规则：
 
 - `start/end` 是最终 Markdown 源文本中的字符区间。
-- `text` 必须等于 `analysis_report.slice(start, end)`。
+- `text` 必须等于按 Unicode code point 切片后的对应文本。JavaScript 应先执行 `Array.from(analysis_report)`，再按 `start/end` 切片；不能直接使用 UTF-16 `String.slice`，否则 emoji 或扩展字符会使后续位置偏移。
 - 前端渲染 Markdown 前，先在 Markdown 源文本阶段把命中的字符范围包成轻量 HTML，如 `<span class="traceable-value">...</span>`，再交给 Markdown 渲染器。
 - 点击 span 后，从 `dataset` 中读取 `evidence_id/start/end`，再从 refs 中找到完整 ref。
 
@@ -316,6 +314,7 @@ const findTableEvidenceRef = (table, column) => {
 ```js
 const renderTraceableReport = (content, refs = []) => {
   const text = String(content || '')
+  const characters = Array.from(text)
   const normalizedRefs = refs
     .filter((ref) => ref && Number.isFinite(Number(ref.start)) && Number.isFinite(Number(ref.end)) && ref.evidence_id)
     .map((ref) => ({ ...ref, start: Number(ref.start), end: Number(ref.end) }))
@@ -325,12 +324,12 @@ const renderTraceableReport = (content, refs = []) => {
   let markdown = ''
   normalizedRefs.forEach((ref) => {
     if (ref.start < cursor) return
-    markdown += text.slice(cursor, ref.start)
-    const targetText = text.slice(ref.start, ref.end)
+    markdown += characters.slice(cursor, ref.start).join('')
+    const targetText = characters.slice(ref.start, ref.end).join('')
     markdown += `<span class="traceable-value" data-evidence-id="${ref.evidence_id}" data-start="${ref.start}" data-end="${ref.end}">${targetText}</span>`
     cursor = ref.end
   })
-  markdown += text.slice(cursor)
+  markdown += characters.slice(cursor).join('')
   return marked.parse(markdown)
 }
 ```

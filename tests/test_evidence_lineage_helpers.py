@@ -1,4 +1,5 @@
 import inspect
+import math
 import sys
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from agent.tools import (  # noqa: E402
     _begin_query_snapshot_execution,
     _build_execution_namespace,
     _check_time_range_constraint,
+    _extract_sql_projection_semantics,
     _validate_generated_code_contract,
     _resolve_requested_enum_values,
     build_markdown_table,
@@ -275,6 +277,28 @@ result = request_retry(
     assert _validate_generated_code_contract(code) is None
 
 
+def test_sql_projection_semantics_preserve_aggregate_boundaries_before_snapshot_clipping():
+    projections = _extract_sql_projection_semantics(
+        "SELECT product_id, AVG(alarm_count) AS avg_alarm_count "
+        "FROM events GROUP BY product_id"
+    )
+
+    assert projections == [
+        {
+            "alias": "product_id",
+            "semantic_kind": "projection",
+            "projection_role": "dimension",
+            "expression": "product_id",
+        },
+        {
+            "alias": "avg_alarm_count",
+            "semantic_kind": "aggregation",
+            "projection_role": "measure",
+            "expression": "AVG(alarm_count)",
+        },
+    ]
+
+
 def test_build_table_result_only_returns_display_artifact():
     result = build_table_result(
         title="区域完工率",
@@ -322,6 +346,32 @@ def test_build_table_result_accepts_records_data():
     )
 
     assert result["table"]["rows"] == [{"region": "华东", "completion_rate": 76.3}]
+
+
+def test_build_table_result_applies_display_precision_to_finite_decimal_values():
+    result = build_table_result(
+        title="Metrics",
+        rows=[{
+            "name": "A",
+            "amount": 12.3456,
+            "count": 7,
+            "active": True,
+            "missing": float("nan"),
+        }],
+        value_precision=2,
+    )
+
+    row = result["table"]["rows"][0]
+    assert row["amount"] == 12.35
+    assert row["count"] == 7
+    assert row["active"] is True
+    assert math.isnan(row["missing"])
+
+
+@pytest.mark.parametrize("value_precision", [-1, 11, 1.5, True])
+def test_build_table_result_rejects_invalid_display_precision(value_precision):
+    with pytest.raises(ValueError, match="value_precision"):
+        build_table_result(title="Metrics", rows=[], value_precision=value_precision)
 
 
 def test_save_analysis_result_merges_nested_table_presentation_metadata():

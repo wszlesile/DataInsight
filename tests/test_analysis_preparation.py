@@ -955,6 +955,65 @@ def test_direct_lineage_cannot_depend_on_unresolved_cross_source_relationship():
     )
 
 
+def test_unresolved_relationship_downgrades_only_the_affected_lineage():
+    context = _business_context()
+    direct_lineage = context.insight_lineage[0].model_copy(update={
+        "lineage_status": "direct",
+        "unresolved_business_facts": [],
+    })
+    candidate = context.model_copy(update={"insight_lineage": [direct_lineage]})
+
+    normalized = prep.AnalysisPreparationWorkflow._complete_derived_fact_lineage(
+        candidate,
+        _selection(),
+    )
+
+    lineage = normalized.insight_lineage[0]
+    assert lineage.lineage_status == "partial"
+    assert lineage.unresolved_business_facts
+    assert normalized.relationships == candidate.relationships
+    validate_business_context(
+        normalized,
+        compact_datasource_snapshot(_snapshot())["selected_datasource_snapshot"],
+        selection=_selection(),
+        intent=_intent(),
+    )
+
+
+def test_unknown_relationship_cannot_reintroduce_schema_join_evidence():
+    context = _business_context()
+    relationship = context.relationships[0].model_copy(update={
+        "relationship_type": "unknown",
+        "joinability": "alignable",
+        "evidence_basis": "schema",
+    })
+
+    normalized = prep.AnalysisPreparationWorkflow._normalize_unverified_schema_relationships(
+        context.model_copy(update={"relationships": [relationship]}),
+        compact_datasource_snapshot(_snapshot())["selected_datasource_snapshot"],
+    )
+
+    assert normalized.relationships[0].joinability == "unknown"
+    assert normalized.relationships[0].evidence_basis == "unresolved"
+
+
+def test_comparable_relationship_does_not_require_physical_join_metadata():
+    context = _business_context()
+    relationship = context.relationships[0].model_copy(update={
+        "relationship_type": "comparable",
+        "joinability": "alignable",
+        "evidence_basis": "schema",
+    })
+    candidate = context.model_copy(update={"relationships": [relationship]})
+
+    validate_business_context(
+        candidate,
+        compact_datasource_snapshot(_snapshot())["selected_datasource_snapshot"],
+        selection=_selection(),
+        intent=_intent(),
+    )
+
+
 def test_lineage_relationship_scope_drops_relationships_outside_question_sources():
     context = _business_context()
     lineage = context.insight_lineage[0].model_copy(update={
@@ -1873,6 +1932,9 @@ def test_business_context_finalizes_lineage_after_bounded_probe(monkeypatch):
 
     assert payloads[-1]["resolution_phase"] == "finalize_after_probe"
     assert len(payloads[-1]["probe_observations"]) == 2
+    assert "selected_datasources" not in payloads[-1]
+    assert "query_guidance" not in payloads[-1]
+    assert payloads[-1]["business_context_draft"]
     assert result.business_context.probe_requests == []
     assert result.business_context.relationships[0].joinability == "joinable"
     assert result.business_context.insight_lineage[0].lineage_status == "direct"
@@ -1921,7 +1983,7 @@ def test_local_file_time_coverage_schema_probe_has_its_own_pandas_runtime(monkey
     assert observation["facts"]["max_value"].startswith("2025-03-04")
 
 
-def test_business_context_semantic_rejection_is_repaired_in_stage(monkeypatch):
+def test_business_context_semantic_rejection_preserves_advisory_lineage(monkeypatch):
     invalid_schema_claim = _canonical_flow_context().model_copy(update={
         "relationships": [
             _canonical_flow_context().relationships[0].model_copy(update={
@@ -1947,9 +2009,13 @@ def test_business_context_semantic_rejection_is_repaired_in_stage(monkeypatch):
         conversation_context={},
     )
 
-    assert not result.business_context.relationships
-    assert result.business_context.unresolved_relationships
-    assert result.probe_observations == ()
+    assert len(result.business_context.relationships) == 1
+    relationship = result.business_context.relationships[0]
+    assert relationship.joinability == "unknown"
+    assert relationship.evidence_basis == "unresolved"
+    assert result.business_context.insight_lineage[0].lineage_status == "partial"
+    assert result.business_context.insight_lineage[0].unresolved_business_facts
+    assert result.probe_observations
 
 
 def test_single_datasource_skips_selection_but_builds_business_lineage(monkeypatch):

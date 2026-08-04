@@ -17,8 +17,10 @@ from agent.tools import (  # noqa: E402
     CURRENT_EXECUTION_INTENT,
     CURRENT_QUERY_SNAPSHOTS,
     _augment_repair_instructions,
+    _build_repair_instructions,
     _build_no_data_feedback,
     _classify_execution_error,
+    _extract_error_signature,
     _inspect_zero_population_aggregate,
     raise_no_data_error,
     load_data_with_sql,
@@ -105,6 +107,21 @@ class ExecutePythonNoDataRetryTestCase(unittest.TestCase):
 
         self.assertIn("MySQL 源查询", instructions[0])
         self.assertIn("CAST(expression AS SIGNED/DECIMAL)", instructions[0])
+
+    def test_oversized_query_repair_preserves_full_analysis_scope(self) -> None:
+        instructions = _build_repair_instructions("query_result_too_large")
+
+        self.assertTrue(any("总体统计口径不变" in item for item in instructions))
+        self.assertTrue(any("稳定排序键" in item and "LIMIT/OFFSET" in item for item in instructions))
+        self.assertTrue(any("无业务依据的 LIMIT" in item for item in instructions))
+
+    def test_oversized_query_has_a_stable_failure_memory_signature(self) -> None:
+        signature = _extract_error_signature(
+            "query_result_too_large",
+            "Query result exceeds 10000 rows",
+        )
+
+        self.assertEqual(signature["signature_type"], "query_result_too_large")
 
     def test_analysis_zero_population_aggregate_enters_no_data_flow(self) -> None:
         token = CURRENT_EXECUTION_INTENT.set("analysis")

@@ -924,10 +924,11 @@ const escapeHtml = (value) => String(value ?? '')
 
 const renderTraceableReport = (content, refs = []) => {
   const text = String(content || '')
+  const characters = Array.from(text)
   const normalizedRefs = (Array.isArray(refs) ? refs : [])
     .filter((ref) => ref && Number.isFinite(Number(ref.start)) && Number.isFinite(Number(ref.end)) && ref.evidence_id)
     .map((ref) => ({ ...ref, start: Number(ref.start), end: Number(ref.end) }))
-    .filter((ref) => ref.start >= 0 && ref.end > ref.start && ref.end <= text.length)
+    .filter((ref) => ref.start >= 0 && ref.end > ref.start && ref.end <= characters.length)
     .sort((left, right) => left.start - right.start)
 
   if (!normalizedRefs.length) return renderMarkdown(text)
@@ -936,12 +937,12 @@ const renderTraceableReport = (content, refs = []) => {
   let markdown = ''
   normalizedRefs.forEach((ref) => {
     if (ref.start < cursor) return
-    markdown += text.slice(cursor, ref.start)
-    const targetText = text.slice(ref.start, ref.end)
+    markdown += characters.slice(cursor, ref.start).join('')
+    const targetText = characters.slice(ref.start, ref.end).join('')
     markdown += `<span class="traceable-value" data-evidence-id="${escapeHtml(ref.evidence_id)}" data-start="${ref.start}" data-end="${ref.end}">${escapeHtml(targetText)}</span>`
     cursor = ref.end
   })
-  markdown += text.slice(cursor)
+  markdown += characters.slice(cursor).join('')
   return marked.parse(markdown)
 }
 const collectKey = (collectType, targetId) => `${collectType}:${targetId}`
@@ -1294,22 +1295,140 @@ const hasTableEvidenceRef = (table, column) => (
   getTableEvidenceRefs(table).some((ref) => getRefTableColumn(ref) === column.field || getRefTableColumn(ref) === column.title)
 )
 
+const isPlainObject = (value) => value && typeof value === 'object' && !Array.isArray(value)
+
+const chartDimensionName = (dimensions, value) => {
+  const index = Number(value)
+  if (!Number.isFinite(index) || index < 0 || index >= dimensions.length) {
+    return typeof value === 'string' ? value : ''
+  }
+  const dimension = dimensions[index]
+  if (typeof dimension === 'string' || typeof dimension === 'number') return String(dimension)
+  if (isPlainObject(dimension) && (dimension.name !== undefined || dimension.displayName !== undefined)) {
+    return String(dimension.name ?? dimension.displayName)
+  }
+  return typeof value === 'string' ? value : ''
+}
+
+const normalizeEncodedFields = (value, dimensions) => (
+  (Array.isArray(value) ? value : [])
+    .map((item) => (
+      typeof item === 'string' && Number.isNaN(Number(item))
+        ? item.trim()
+        : chartDimensionName(dimensions, item).trim()
+    ))
+    .filter(Boolean)
+)
+
+const chartDatasetDimensions = (chartSpec) => {
+  const dataset = chartSpec?.dataset
+  if (Array.isArray(dataset)) {
+    return isPlainObject(dataset[0]) && Array.isArray(dataset[0].dimensions) ? dataset[0].dimensions : []
+  }
+  return isPlainObject(dataset) && Array.isArray(dataset.dimensions) ? dataset.dimensions : []
+}
+
+const seriesEncodedFields = (chartSpec, seriesIndex) => {
+  const series = Array.isArray(chartSpec?.series) ? chartSpec.series[seriesIndex] : null
+  if (!isPlainObject(series) || !isPlainObject(series.encode)) return []
+  const dimensions = chartDatasetDimensions(chartSpec)
+  const fields = []
+  ;['x', 'y', 'value', 'tooltip'].forEach((key) => {
+    const encoded = series.encode[key]
+    if (typeof encoded === 'string') fields.push(encoded.trim())
+    else if (typeof encoded === 'number') {
+      const field = chartDimensionName(dimensions, encoded)
+      if (field) fields.push(field)
+    } else if (Array.isArray(encoded)) {
+      fields.push(...normalizeEncodedFields(encoded, dimensions))
+    }
+  })
+  return fields
+}
+
+const chartEventValueFields = (chartSpec, params = {}) => {
+  const dimensions = chartDatasetDimensions(chartSpec)
+  const encode = params.encode || {}
+  const eventFields = [
+    ...normalizeEncodedFields(encode.y, dimensions),
+    ...normalizeEncodedFields(encode.x, dimensions),
+    ...seriesEncodedFields(chartSpec, Number(params.seriesIndex ?? 0)),
+    String(params.seriesName ?? '').trim(),
+    String(params.name ?? '').trim()
+  ].filter(Boolean)
+  return Array.from(new Set(eventFields))
+}
+
+const chartRefsForInteraction = (refs, chartIndex, artifactId) => {
+  if (!refs.length) return []
+  const hasArtifactId = artifactId !== null && artifactId !== undefined && artifactId !== ''
+  if (
+    hasArtifactId
+    && refs.every((ref) => ref.artifact_id !== null && ref.artifact_id !== undefined && String(ref.artifact_id) === String(artifactId))
+  ) {
+    return refs
+  }
+  const indexed = refs.filter((ref) => Number(ref.chart_index ?? 0) === Number(chartIndex ?? 0))
+  if (indexed.length) return indexed
+  return hasArtifactId
+    ? refs.filter((ref) => ref.artifact_id !== null && ref.artifact_id !== undefined && String(ref.artifact_id) === String(artifactId))
+    : []
+}
+
+const normalizeEvidenceField = (value) => String(value || '')
+  .replace(/\s+/g, '')
+  .replace(/[()（）]/g, '')
+  .replace(/_/g, '')
+  .toLowerCase()
+
+const chartRefMatchesField = (ref, valueFields, seriesName) => {
+  const refField = getRefValueField(ref)
+  if (!refField || valueFields.includes(refField)) return true
+  const normalizedRef = normalizeEvidenceField(refField)
+  if (valueFields.some((field) => normalizeEvidenceField(field) === normalizedRef)) return true
+  const normalizedSeries = normalizeEvidenceField(seriesName)
+  return Boolean(
+    normalizedSeries
+    && (
+      normalizedSeries === normalizedRef
+      || normalizedSeries.includes(normalizedRef)
+      || normalizedRef.includes(normalizedSeries)
+    )
+  )
+}
+
 const findChartEvidenceRef = (chart, chartIndex, params = {}) => {
   const refs = chart?.evidenceRefs?.chart_trace_refs || []
-  const encode = params.encode || {}
-  const valueFields = [
-    ...(Array.isArray(encode.y) ? encode.y : []),
-    ...(Array.isArray(encode.x) ? encode.x : []),
-    params.seriesName
-  ].map((item) => String(item || '').trim()).filter(Boolean)
-  return refs.find((ref) => {
-    const refIndex = Number(ref.chart_index || 0)
-    const refField = getRefValueField(ref)
-    return refIndex === Number(chartIndex || 0) && (!refField || valueFields.includes(refField))
-  }) || refs.find((ref, refIndex) => {
-    const refChartIndex = Number(ref.chart_index || 0)
-    return refChartIndex === Number(chartIndex || 0) && refIndex === Number(params?.seriesIndex ?? -1)
-  }) || refs.find((ref) => Number(ref.chart_index || 0) === Number(chartIndex || 0))
+  const candidates = chartRefsForInteraction(refs, chartIndex, chart?.id)
+  if (!candidates.length) return null
+  const valueFields = chartEventValueFields(chart?.chartSpec, params)
+  const semanticMatch = candidates.find((ref) => chartRefMatchesField(ref, valueFields, params.seriesName))
+  if (semanticMatch) return semanticMatch
+  if (candidates.length === 1) return candidates[0]
+  const seriesIndex = Number(params?.seriesIndex ?? -1)
+  return seriesIndex >= 0 && seriesIndex < candidates.length ? candidates[seriesIndex] : null
+}
+
+const structuredChartValue = (value, field) => {
+  if (field && isPlainObject(value) && field in value) return value[field]
+  if (Array.isArray(value)) return field ? undefined : value.length > 1 ? value[value.length - 1] : value[0]
+  return undefined
+}
+
+const chartEventRawValue = (chartSpec, params, valueField) => {
+  const dataValue = structuredChartValue(params?.data, valueField)
+  if (dataValue !== undefined) return dataValue
+  if (Array.isArray(params?.value)) return params.value.length > 1 ? params.value[params.value.length - 1] : params.value[0]
+  if (params?.value !== null && params?.value !== undefined) return params.value
+  const dataIndex = Number(params?.dataIndex ?? -1)
+  if (!valueField || dataIndex < 0) return undefined
+  const dataset = chartSpec?.dataset
+  const source = isPlainObject(dataset) && Array.isArray(dataset.source)
+    ? dataset.source
+    : Array.isArray(dataset) && isPlainObject(dataset[0]) && Array.isArray(dataset[0].source)
+      ? dataset[0].source
+      : null
+  return source && dataIndex < source.length ? structuredChartValue(source[dataIndex], valueField) : undefined
 }
 
 const findTableEvidenceRef = (table, column) => {
@@ -1352,7 +1471,7 @@ const onChartEvidenceClick = (item, chart, chartIndex, params) => {
       data_index: Number(params?.dataIndex ?? -1),
       series_index: Number(params?.seriesIndex ?? -1),
       value_field: getRefValueField(ref),
-      raw_value: params?.value
+      raw_value: chartEventRawValue(chart?.chartSpec, params, getRefValueField(ref))
     }
   })
 }

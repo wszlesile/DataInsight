@@ -58,6 +58,8 @@
 
 ### D. 工具执行失败处理
 
+每次 `execute_python` 调用都是一个独立执行单元，不会继承上一次调用的 DataFrame、变量或中间结果。正式 `analysis` 必须在同一份代码中完成查询、计算、空数据判断、图表/表格、洞察报告和 `save_analysis_result(...)`；需要先观察真实值时，应明确生成 `probe` 并通过 `request_retry(...)` 返回观察结果，不能提交“本步先加载、下一步继续”的半成品 analysis。
+
 如果 `execute_python` 执行失败：
 
 - 如果工具返回了结构化错误反馈，要重点理解其中的 `error_type`、`error_message` 和 `repair_instructions`
@@ -142,6 +144,8 @@
 #### load_data_with_sql
 
 `load_data_with_sql(sql, params=None, numeric_columns=None, text_columns=None)` 返回 `pandas.DataFrame`。Loader 会根据当前数据源 Schema 自动恢复 SQL 直接投影的数值字段，并自动识别明确的 SQL 数值聚合别名；只有表达式派生列或 Schema 无法确定类型的结果列需要通过 `numeric_columns=[...]` 显式声明。用于等值比较的查询维度也必须与分析参数统一类型；合同号、设备号、产品编码等业务标识必须保留字符串，不能数值化。Schema 关系包含 `key_normalization=integral_numeric_text` 时，两侧关联键都通过 `text_columns=[...]` 保真加载，再对两列调用 `normalize_relationship_key(series)` 后关联；不要自行用 `str()`、`astype(str)` 或浮点转换实现该关系。
+
+单次 SQL 结果最多加载 10000 行。这是数据访问容量边界，不是分析范围边界：总体数量、分布、趋势和根因统计应优先在查询层完成过滤、JOIN 与分组聚合，再加载小结果；确实需要扫描全部明细时，使用稳定排序键配合 `LIMIT/OFFSET` 分页，并在每批内累计统计，不要把全部分页重新拼成超大 DataFrame。不能为了避开上限而无依据截断总体口径；TopN、有限明细或抽样本身就是目标时，才直接限制结果并按产物披露范围。
 
 关系查询中的时间分桶优先分别返回数值 year/month/day 字段，再在 pandas 中构造展示标签。不要使用 `||` 拼接时间标签：该运算符经过联邦关系查询时可能按布尔运算执行，导致所有周期塌缩；确需 SQL 拼接时使用数据源明确支持的 `CONCAT(...)`。
 
@@ -528,6 +532,7 @@ result = request_retry(
 - `tables` 中每一项都表示一个结构化表格结果
 - 结构化表格优先使用 `build_table_result(...)` 构造，不要只手写不一致的 `columns/rows`。
 - `build_table_result(...)` 会规范化表格标题、描述、列和行；将其返回值中的 `table` 放入 `tables`。
+- 完整签名为 `build_table_result(title, description='', columns=None, rows=None, data=None, value_precision=None)`；`data` 可传 DataFrame 或 records，不能与 `rows` 同时传入。`value_precision` 可选，取 0 到 10 的整数，仅控制有限小数值的展示精度。
 - 表格列的 `key` 必须对应真实结果字段，`label` 必须是用户可读的业务名称；不要把临时变量名、底层字段编码或 `Metric` 这类技术名直接作为表头。
 - 每个业务指标必须对应独立数值列；部门、月份等作为维度列。不要把“指标名称”放在行里、再让同一个月份/类别列混装金额、数量、比率等不同口径，否则该列没有唯一业务含义。
 - 图表也遵守同一边界：类别字段本身是“指标/metric”时，不要让多种业务指标共用“数值/value”列；把每个指标放入独立数值列，并使用多指标图表 helper。

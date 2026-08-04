@@ -369,15 +369,23 @@ def _normalize_title_legend_grid(option: dict[str, Any]) -> None:
     if _has_axis_data_zoom(option, "yAxis"):
         right_offset = max(right_offset, 54)
 
-    grid.setdefault("top", top_offset)
-    grid.setdefault("left", left_offset)
-    grid.setdefault("right", right_offset)
-    grid.setdefault("bottom", bottom_offset)
+    _ensure_minimum_numeric_offset(grid, "top", top_offset)
+    _ensure_minimum_numeric_offset(grid, "left", left_offset)
+    _ensure_minimum_numeric_offset(grid, "right", right_offset)
+    _ensure_minimum_numeric_offset(grid, "bottom", bottom_offset)
     grid.setdefault("containLabel", True)
 
     _assign_option_mapping(option, "title", title)
     _assign_option_mapping(option, "legend", legend)
     _assign_option_mapping(option, "grid", grid)
+
+
+def _ensure_minimum_numeric_offset(mapping: dict[str, Any], key: str, minimum: int) -> None:
+    current = mapping.get(key)
+    if isinstance(current, (int, float)) and not isinstance(current, bool):
+        mapping[key] = max(current, minimum)
+    elif current is None:
+        mapping[key] = minimum
 
 
 def _sync_pie_legend_data(option: dict[str, Any]) -> None:

@@ -13,6 +13,43 @@ from utils.chart_spec_utils import finalize_chart_spec
 
 
 class ChartSpecLayoutTestCase(unittest.TestCase):
+    def test_vertical_legend_reserves_space_outside_plot_grid(self) -> None:
+        legend_names = [f"Batch-{index:02d}" for index in range(10)]
+        raw_spec = {
+            "title": {"text": "Deviation by batch"},
+            "legend": {"data": legend_names},
+            "grid": {"left": 56, "right": 32, "top": 64, "bottom": 56},
+            "xAxis": {"type": "category", "data": ["purity", "water"]},
+            "yAxis": {"type": "value"},
+            "series": [
+                {"type": "bar", "name": name, "data": [index, None]}
+                for index, name in enumerate(legend_names)
+            ],
+        }
+
+        final_spec = finalize_chart_spec(raw_spec)
+
+        self.assertEqual(final_spec["legend"]["orient"], "vertical")
+        self.assertGreaterEqual(final_spec["grid"]["right"], 148)
+
+    def test_horizontal_legend_below_title_reserves_top_grid_space(self) -> None:
+        raw_spec = {
+            "title": {"text": "Revenue by region"},
+            "legend": {"data": ["East", "West"]},
+            "grid": {"left": 56, "right": 32, "top": 64, "bottom": 56},
+            "xAxis": {"type": "category", "data": ["Jan", "Feb"]},
+            "yAxis": {"type": "value"},
+            "series": [
+                {"type": "bar", "name": "East", "data": [1, 2]},
+                {"type": "bar", "name": "West", "data": [2, 3]},
+            ],
+        }
+
+        final_spec = finalize_chart_spec(raw_spec)
+
+        self.assertEqual(final_spec["legend"]["orient"], "horizontal")
+        self.assertGreaterEqual(final_spec["grid"]["top"], 96)
+
     def test_finalize_adds_x_axis_datazoom_and_hides_dense_labels(self) -> None:
         raw_spec = {
             "title": {"text": "Monthly Revenue by Channel"},
