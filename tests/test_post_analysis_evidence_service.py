@@ -183,6 +183,24 @@ def test_planner_payload_preserves_resolver_splits_for_one_calculation():
     assert canonical["unresolved_outputs"] == []
 
 
+def test_planner_payload_discards_llm_rewritten_metric_field_names():
+    canonical = PostAnalysisEvidenceCompiler._canonicalize_planner_payload({
+        "metrics": [{
+            "calculation_id": "calc_alarm_rate",
+            "output_node_ids": ["out_alarm_rate"],
+            "operation_node_ids": ["op_alarm_rate"],
+            "query_node_ids": ["q_alarm"],
+            "metric_source_fields": ["alarm_rate"],
+            "metric_key": "alarm_rate",
+            "business_name": "报警率",
+            "business_explanation": "统计报警记录占全部采样记录的比例。",
+        }],
+        "unresolved_outputs": [],
+    })
+
+    assert "metric_source_fields" not in canonical["metrics"][0]
+
+
 def test_resolver_requires_each_output_to_be_bound_or_explicitly_unresolved():
     candidates = {
         "calc_shared": {
@@ -207,6 +225,31 @@ def test_resolver_requires_each_output_to_be_bound_or_explicitly_unresolved():
     errors = PostAnalysisEvidenceCompiler._plan_reference_errors(plan, candidates)
 
     assert errors == ["missing output bindings: ['report_stopped']"]
+
+
+def test_resolver_cannot_drop_data_derived_detail_value_as_unresolved():
+    candidates = {
+        "calc_detail": {
+            "evidence_required": True,
+            "output_node_ids": ["report_test_value"],
+            "operation_node_ids": ["op_test_value"],
+            "query_node_ids": ["query_quality"],
+            "available_metric_fields": ["test_value"],
+        }
+    }
+    plan = EvidencePlan.model_validate({
+        "metrics": [],
+        "unresolved_outputs": [{
+            "output_node_id": "report_test_value",
+            "reason": "It is a row-level value rather than an aggregate.",
+        }],
+    })
+
+    errors = PostAnalysisEvidenceCompiler._plan_reference_errors(plan, candidates)
+
+    assert errors == [
+        "unresolved_outputs[0] is evidence_required: report_test_value"
+    ]
 
 
 def test_resolver_rejects_output_bound_to_an_unrelated_calculation():

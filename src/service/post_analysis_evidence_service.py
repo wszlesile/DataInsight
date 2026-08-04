@@ -29,10 +29,10 @@ query_catalog、operation_catalog 和 output_catalog 分别描述已执行查询
 
 规则：
 1. 每个 output_node_id 必须恰好出现在一个 metric.output_node_ids 或 unresolved_outputs 中，不得遗漏或重复。
-2. metric 中的 output_node_ids、operation_node_ids、query_node_ids 只能引用该 calculation_id 候选内的节点；metric_source_fields 只能使用候选中已提供的字段。
-3. 只选择该指标真正使用的查询、计算步骤和指标字段。不得虚构，也不得因为它们处于同一候选中就全部引用。
-4. 年份、编号、排名序号等非业务计算值放入 unresolved_outputs，reason 说明其不是指标。
-5. 当查询、计算和展示的关系无法从输入事实证明时，必须放入 unresolved_outputs，不得猜测。
+2. metric 中的 output_node_ids、operation_node_ids、query_node_ids 只能引用该 calculation_id 候选内的节点。
+3. 只选择该指标真正使用的查询和计算步骤。指标字段由本地编译器根据所选 output 的既有血缘恢复，不要输出 metric_source_fields，也不得改写字段名。
+4. calculation_candidate.evidence_required=true 表示该输出已经具备可证明的查询、计算和字段来源，必须绑定 Evidence；单条明细值也是数据事实，不能仅因它不是汇总指标而放入 unresolved_outputs。
+5. 只有年份、编号、排名序号等不属于数据计算结果的普通数字，或查询、计算和展示关系确实无法证明的输出，才能放入 unresolved_outputs。
 6. business_name 说明业务指标含义，business_explanation 简洁说明统计对象、范围和计算口径。
 7. value_type 只能是 number、integer、currency、percentage、duration、other。display_unit 使用面向用户的单位。
 8. 面向用户的文字不得出现 Runtime、Metric、Evidence、AST、API 等内部术语。
@@ -45,7 +45,6 @@ query_catalog、operation_catalog 和 output_catalog 分别描述已执行查询
     "output_node_ids": ["output_..."],
     "operation_node_ids": ["operation_..."],
     "query_node_ids": ["query_..."],
-    "metric_source_fields": ["实际指标字段"],
     "metric_key": "稳定英文语义名",
     "business_name": "业务指标名称",
     "business_explanation": "面向用户的统计口径说明",
@@ -4635,6 +4634,11 @@ class PostAnalysisEvidenceCompiler:
             candidates.append({
                 "calculation_id": candidate.get("calculation_id"),
                 "calculation_kind": candidate.get("calculation_kind"),
+                "evidence_required": bool(
+                    candidate.get("operation_node_ids")
+                    and candidate.get("query_node_ids")
+                    and candidate.get("available_metric_fields")
+                ),
                 "parameter_bindings": candidate.get("parameter_bindings") or {},
                 "metric_source_fields": candidate.get("metric_source_fields") or [],
                 "available_metric_fields": candidate.get("available_metric_fields") or [],
@@ -4889,7 +4893,9 @@ class PostAnalysisEvidenceCompiler:
                     if response_text:
                         messages.append(AIMessage(response_text))
                     messages.append(HumanMessage(
-                        "上一输出不符合证据解析契约。请确保每个 output_node_id 恰好被 metric 绑定一次或列入 unresolved_outputs，只修正 JSON 结构和引用："
+                        "上一轮输出不符合证据解析契约。请确保每个 output_node_id 恰好被 metric "
+                        "绑定一次或列入 unresolved_outputs；evidence_required=true 的输出必须绑定，"
+                        "不能因其属于明细值而标记 unresolved。只修正 JSON 结构和引用："
                         + str(exc)[:1200]
                     ))
                     continue
@@ -4902,6 +4908,17 @@ class PostAnalysisEvidenceCompiler:
         normalized = dict(payload)
         if not isinstance(normalized.get("metrics"), list):
             normalized["metrics"] = []
+        else:
+            normalized["metrics"] = [
+                {
+                    str(key): value
+                    for key, value in metric.items()
+                    if str(key) != "metric_source_fields"
+                }
+                if isinstance(metric, dict)
+                else metric
+                for metric in normalized["metrics"]
+            ]
         if not isinstance(normalized.get("unresolved_outputs"), list):
             normalized["unresolved_outputs"] = []
         return normalized
@@ -4989,6 +5006,13 @@ class PostAnalysisEvidenceCompiler:
             claimed_output_ids.update(selected_output_ids)
 
         unresolved_output_ids: set[str] = set()
+        required_output_ids = {
+            str(output_id)
+            for candidate in calculation_candidates.values()
+            if bool(candidate.get("evidence_required"))
+            for output_id in candidate.get("output_node_ids") or []
+            if str(output_id)
+        }
         for unresolved_index, unresolved in enumerate(plan.unresolved_outputs):
             output_id = str(unresolved.output_node_id or "").strip()
             if output_id not in expected_output_ids:
@@ -5000,6 +5024,10 @@ class PostAnalysisEvidenceCompiler:
                 errors.append(f"unresolved_outputs[{unresolved_index}].reason is empty")
             if output_id in unresolved_output_ids or output_id in claimed_output_ids:
                 errors.append(f"output is resolved more than once: {output_id}")
+            if output_id in required_output_ids:
+                errors.append(
+                    f"unresolved_outputs[{unresolved_index}] is evidence_required: {output_id}"
+                )
             unresolved_output_ids.add(output_id)
 
         missing_output_ids = expected_output_ids - claimed_output_ids - unresolved_output_ids
