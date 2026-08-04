@@ -69,6 +69,10 @@ def _semantic_plan(payload: dict) -> EvidencePlan:
     return EvidencePlan(metrics=[
         PlannedMetric(
             calculation_id=item["calculation_id"],
+            output_node_ids=item.get("output_node_ids") or [],
+            operation_node_ids=item.get("operation_node_ids") or [],
+            query_node_ids=item.get("query_node_ids") or [],
+            metric_source_fields=item.get("metric_source_fields") or [],
             metric_key=f"metric_{index}",
             business_name=f"Business metric {index}",
             business_explanation="Calculated from the confirmed query and calculation boundary.",
@@ -147,20 +151,22 @@ def test_unparseable_query_sql_does_not_abort_other_lineage_sources():
     )
 
 
-def test_planner_payload_collapses_duplicate_annotations_for_one_calculation():
+def test_planner_payload_preserves_resolver_splits_for_one_calculation():
     payload = {
         "metrics": [
-            {
-                "calculation_id": "calc_shared",
-                "metric_key": "contract_count",
+                {
+                    "calculation_id": "calc_shared",
+                    "output_node_ids": ["report_running"],
+                    "metric_key": "contract_count",
                 "business_name": "合同数量",
                 "business_explanation": "按合同实例去重统计。",
                 "value_type": "integer",
                 "display_unit": "",
             },
-            {
-                "calculation_id": "calc_shared",
-                "metric_key": "contract_count_in_chart",
+                {
+                    "calculation_id": "calc_shared",
+                    "output_node_ids": ["report_stopped"],
+                    "metric_key": "contract_count_in_chart",
                 "business_name": "合同数量（图表）",
                 "business_explanation": "",
                 "value_type": "integer",
@@ -171,10 +177,165 @@ def test_planner_payload_collapses_duplicate_annotations_for_one_calculation():
 
     canonical = PostAnalysisEvidenceCompiler._canonicalize_planner_payload(payload)
 
-    assert len(canonical["metrics"]) == 1
-    assert canonical["metrics"][0]["calculation_id"] == "calc_shared"
-    assert canonical["metrics"][0]["business_name"] == "合同数量"
-    assert canonical["metrics"][0]["display_unit"] == "个"
+    assert len(canonical["metrics"]) == 2
+    assert canonical["metrics"][0]["output_node_ids"] == ["report_running"]
+    assert canonical["metrics"][1]["output_node_ids"] == ["report_stopped"]
+    assert canonical["unresolved_outputs"] == []
+
+
+def test_resolver_requires_each_output_to_be_bound_or_explicitly_unresolved():
+    candidates = {
+        "calc_shared": {
+            "output_node_ids": ["report_running", "report_stopped"],
+            "operation_node_ids": ["op_count"],
+            "query_node_ids": ["query_devices"],
+        }
+    }
+    plan = EvidencePlan.model_validate({
+        "metrics": [{
+            "calculation_id": "calc_shared",
+            "output_node_ids": ["report_running"],
+            "operation_node_ids": ["op_count"],
+            "query_node_ids": ["query_devices"],
+            "metric_key": "running_count",
+            "business_name": "运行中设备数",
+            "business_explanation": "统计当前运行中的设备。",
+        }],
+        "unresolved_outputs": [],
+    })
+
+    errors = PostAnalysisEvidenceCompiler._plan_reference_errors(plan, candidates)
+
+    assert errors == ["missing output bindings: ['report_stopped']"]
+
+
+def test_resolver_rejects_output_bound_to_an_unrelated_calculation():
+    candidates = {
+        "calc_running": {
+            "output_node_ids": ["report_running"],
+            "operation_node_ids": ["op_running"],
+            "query_node_ids": ["query_devices"],
+        },
+        "calc_stopped": {
+            "output_node_ids": ["report_stopped"],
+            "operation_node_ids": ["op_stopped"],
+            "query_node_ids": ["query_devices"],
+        },
+    }
+    plan = EvidencePlan.model_validate({
+        "metrics": [{
+            "calculation_id": "calc_running",
+            "output_node_ids": ["report_stopped"],
+            "operation_node_ids": ["op_running"],
+            "query_node_ids": ["query_devices"],
+            "metric_key": "stopped_count",
+            "business_name": "停机设备数",
+            "business_explanation": "统计当前停机设备。",
+        }],
+        "unresolved_outputs": [{
+            "output_node_id": "report_running",
+            "reason": "当前事实无法证明指标语义。",
+        }],
+    })
+
+    errors = PostAnalysisEvidenceCompiler._plan_reference_errors(plan, candidates)
+
+    assert any("outside calculation candidate" in error for error in errors)
+
+
+def test_resolver_can_split_one_static_candidate_into_distinct_evidence_boundaries():
+    snapshot = _snapshot(code="", tables=[{"title": "Device status"}])
+    lineage_index = {
+        "operation_nodes": [
+            {
+                "operation_node_id": "op_running",
+                "kind": "aggregation",
+                "semantic_kind": "aggregation",
+                "source": "data['running_count'].sum()",
+                "line": 1,
+            },
+            {
+                "operation_node_id": "op_stopped",
+                "kind": "aggregation",
+                "semantic_kind": "aggregation",
+                "source": "data['stopped_count'].sum()",
+                "line": 2,
+            },
+        ],
+        "query_nodes": [{
+            "query_node_id": "query_devices",
+            "query_key": "query_devices",
+            "query_scope": {},
+        }],
+        "output_nodes": [
+            {
+                "output_node_id": "table_running",
+                "artifact_type": "table",
+                "artifact_index": 0,
+                "artifact_id": 0,
+                "field": "running_count",
+                "lineage_fields": ["running_count"],
+            },
+            {
+                "output_node_id": "table_stopped",
+                "artifact_type": "table",
+                "artifact_index": 0,
+                "artifact_id": 0,
+                "field": "stopped_count",
+                "lineage_fields": ["stopped_count"],
+            },
+        ],
+    }
+    candidates = {
+        "calc_shared": {
+            "calculation_id": "calc_shared",
+            "boundary_operation_node_id": "op_running",
+            "output_node_ids": ["table_running", "table_stopped"],
+            "operation_node_ids": ["op_running", "op_stopped"],
+            "query_node_ids": ["query_devices"],
+            "metric_source_fields": ["running_count", "stopped_count"],
+        }
+    }
+    plan = EvidencePlan.model_validate({
+        "metrics": [
+            {
+                "calculation_id": "calc_shared",
+                "output_node_ids": ["table_running"],
+                "operation_node_ids": ["op_running"],
+                "query_node_ids": ["query_devices"],
+                "metric_source_fields": ["running_count"],
+                "metric_key": "running_device_count",
+                "business_name": "运行中设备数",
+                "business_explanation": "汇总运行中设备数量。",
+                "value_type": "integer",
+                "display_unit": "台",
+            },
+            {
+                "calculation_id": "calc_shared",
+                "output_node_ids": ["table_stopped"],
+                "operation_node_ids": ["op_stopped"],
+                "query_node_ids": ["query_devices"],
+                "metric_source_fields": ["stopped_count"],
+                "metric_key": "stopped_device_count",
+                "business_name": "停机设备数",
+                "business_explanation": "汇总停机设备数量。",
+                "value_type": "integer",
+                "display_unit": "台",
+            },
+        ]
+    })
+
+    compiler = PostAnalysisEvidenceCompiler(planner=lambda _: plan)
+    errors = compiler._plan_reference_errors(plan, candidates)
+    bundle = compiler._compile_plan(snapshot, lineage_index, plan, candidates)
+
+    assert errors == []
+    assert len(bundle["evidence_definitions"]) == 2
+    refs = {item["column_key"]: item["evidence_key"] for item in bundle["table_trace_refs"]}
+    assert refs["running_count"] != refs["stopped_count"]
+    definitions = {item["evidence_key"]: item for item in bundle["evidence_definitions"]}
+    assert definitions[refs["running_count"]]["calculation"]["operation_node_ids"] == ["op_running"]
+    assert definitions[refs["stopped_count"]]["calculation"]["operation_node_ids"] == ["op_stopped"]
 
 
 def test_report_string_concatenation_preserves_numeric_expression_lineage():
@@ -313,11 +474,18 @@ result = save_analysis_result(analysis_report="Contract details.", charts=[], ta
 
     def plan(payload: dict) -> EvidencePlan:
         seen_payload.update(payload)
+        output_by_id = {
+            item["output_node_id"]: item for item in payload.get("output_catalog") or []
+        }
         metrics = []
         for item in payload["calculation_candidates"]:
-            output = item["outputs"][0]
+            output = output_by_id[item["output_node_ids"][0]]
             metrics.append(PlannedMetric(
                 calculation_id=item["calculation_id"],
+                output_node_ids=item.get("output_node_ids") or [],
+                operation_node_ids=item.get("operation_node_ids") or [],
+                query_node_ids=item.get("query_node_ids") or [],
+                metric_source_fields=item.get("metric_source_fields") or [],
                 metric_key="subscription_duration",
                 business_name="订阅周期",
                 business_explanation="展示合同记录中的订阅周期。",
@@ -338,7 +506,7 @@ result = save_analysis_result(analysis_report="Contract details.", charts=[], ta
         "display_unit": "天",
     }]
     assert bundle["diagnostics"]["structured_output_slot_count"] == 1
-    assert seen_payload["calculation_candidates"][0]["outputs"][0]["display_unit_hint"] == "天"
+    assert seen_payload == {}
 
 
 def test_unit_bearing_grouping_dimension_does_not_become_table_metric():
@@ -503,20 +671,24 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     refs = {item["text"]: item["evidence_key"] for item in bundle["report_trace_refs"]}
     assert refs["60.00"] != refs["-300.00"]
     assert refs["200.00"] != refs["500.00"]
-    outputs = [
-        output
-        for candidate in captured["calculation_candidates"]
-        for output in candidate["outputs"]
-    ]
+    outputs = captured["output_catalog"]
     amount_output = next(output for output in outputs if output["field"] == "amount_change / 10000")
-    assert "ten-thousand CNY" in amount_output["display_context"]["suffix"]
-    assert "decline is 60.00%" in amount_output["display_context"]["rendered_context"]
+    amount_context = amount_output["display_context_examples"][0]
+    assert "ten-thousand CNY" in amount_context["suffix"]
+    assert "decline is 60.00%" in amount_context["rendered_context"]
     amount_candidate = next(
         candidate
         for candidate in captured["calculation_candidates"]
-        if amount_output in candidate["outputs"]
+        if amount_output["output_node_id"] in candidate["output_node_ids"]
     )
-    assert any("amount_change" in expression for expression in amount_candidate["calculation_expressions"])
+    operation_by_id = {
+        operation["operation_node_id"]: operation
+        for operation in captured["operation_catalog"]
+    }
+    assert any(
+        "amount_change" in operation_by_id[operation_id]["expression"]
+        for operation_id in amount_candidate["operation_node_ids"]
+    )
 
 
 def test_multiline_report_template_allows_saved_outer_whitespace_normalization():
@@ -2494,7 +2666,41 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
         },
     )
 
-    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+    def resolver(payload: dict) -> EvidencePlan:
+        output_by_id = {
+            item["output_node_id"]: item for item in payload["output_catalog"]
+        }
+        operation_by_id = {
+            item["operation_node_id"]: item for item in payload["operation_catalog"]
+        }
+        metrics = []
+        for index, candidate in enumerate(payload["calculation_candidates"], start=1):
+            outputs = [output_by_id[item] for item in candidate["output_node_ids"]]
+            rendered = " ".join(
+                str(output.get("display_context_examples") or []) for output in outputs
+            )
+            output_fields = " ".join(str(output.get("field") or "") for output in outputs)
+            wants_grouped = "batches_with_evidence" in output_fields or (
+                "batches" in rendered and "total_occurrences" not in output_fields
+            )
+            selected_operations = [
+                operation_id
+                for operation_id in candidate["operation_node_ids"]
+                if ("groupby" in operation_by_id[operation_id]["expression"]) == wants_grouped
+            ] or candidate["operation_node_ids"]
+            metrics.append(PlannedMetric(
+                calculation_id=candidate["calculation_id"],
+                output_node_ids=candidate["output_node_ids"],
+                operation_node_ids=selected_operations,
+                query_node_ids=candidate["query_node_ids"],
+                metric_source_fields=candidate.get("metric_source_fields") or [],
+                metric_key=f"process_metric_{index}",
+                business_name=f"Process metric {index}",
+                business_explanation="Calculated from the confirmed process records.",
+            ))
+        return EvidencePlan(metrics=metrics)
+
+    bundle = PostAnalysisEvidenceCompiler(planner=resolver).compile(snapshot)
 
     assert bundle["status"] == "complete", bundle["diagnostics"]
     refs = sorted(bundle["report_trace_refs"], key=lambda item: item["start"])

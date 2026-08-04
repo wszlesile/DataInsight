@@ -22,36 +22,50 @@ from utils.llm_model_factory import create_data_insight_model, create_runtime_co
 
 
 EVIDENCE_PLANNER_PROMPT = """
-你是数据洞察结果的业务语义标注者。上游分析已经完成，查询、计算和产物均不可修改。
+你是数据洞察报告的证据关系解析专家。上游分析已经完成，查询、计算和报告均不可修改。图表和表格的结构化证据由本地编译器处理，当前输入只包含需要语义判断的报告数值位置。
 
-输入中的 calculation_candidates 已由本地编译器按真实查询与计算血缘确定。你不能选择、合并、拆分或重建计算关系，只需为每个候选补充用户可读的业务语义。
+query_catalog、operation_catalog 和 output_catalog 分别描述已执行查询、计算步骤和最终产物位置。calculation_candidates 通过 ID 引用这些可证明事实，每个候选拥有一个 calculation_id。
+请识别每个 output 表达的业务指标，并在同一 calculation_id 内将同一计算边界的 output_node_ids 绑定为一个 metric。同一 calculation_id 如果实际包含多个不同业务指标，必须拆成多个 metric。不同 calculation_id 即使业务名称相同，也不得放入同一 metric，因为它们尚未被证明为同一计算边界。
 
 规则：
-1. 每个 calculation_id 必须且只能输出一次，不得虚构或遗漏。
-2. business_name 应说明业务指标含义，business_explanation 应简洁说明统计对象、范围及计算口径。
-3. value_type 只能是 number、integer、currency、percentage、duration、other。
-4. display_unit 使用面向用户的展示单位；没有明确单位时为空字符串。
-5. 禁止出现 Runtime、Metric、Evidence、AST、API、operation_node_id、query_node_id 等内部术语。
-6. 不得输出 SQL、Python、计算结果或 Markdown。
+1. 每个 output_node_id 必须恰好出现在一个 metric.output_node_ids 或 unresolved_outputs 中，不得遗漏或重复。
+2. metric 中的 output_node_ids、operation_node_ids、query_node_ids 只能引用该 calculation_id 候选内的节点；metric_source_fields 只能使用候选中已提供的字段。
+3. 只选择该指标真正使用的查询、计算步骤和指标字段。不得虚构，也不得因为它们处于同一候选中就全部引用。
+4. 年份、编号、排名序号等非业务计算值放入 unresolved_outputs，reason 说明其不是指标。
+5. 当查询、计算和展示的关系无法从输入事实证明时，必须放入 unresolved_outputs，不得猜测。
+6. business_name 说明业务指标含义，business_explanation 简洁说明统计对象、范围和计算口径。
+7. value_type 只能是 number、integer、currency、percentage、duration、other。display_unit 使用面向用户的单位。
+8. 面向用户的文字不得出现 Runtime、Metric、Evidence、AST、API 等内部术语。
+9. 不得输出 SQL、Python、计算结果或 Markdown。
 
 只输出一个 JSON 对象：
 {
-  "metrics": [
-    {
-      "calculation_id": "calc_...",
-      "metric_key": "稳定英文语义名",
-      "business_name": "业务指标名称",
-      "business_explanation": "面向用户的统计口径说明",
-      "value_type": "number|integer|currency|percentage|duration|other",
-      "display_unit": "元/%/台/个/小时等，没有则为空"
-    }
-  ]
+  "metrics": [{
+    "calculation_id": "calc_...",
+    "output_node_ids": ["output_..."],
+    "operation_node_ids": ["operation_..."],
+    "query_node_ids": ["query_..."],
+    "metric_source_fields": ["实际指标字段"],
+    "metric_key": "稳定英文语义名",
+    "business_name": "业务指标名称",
+    "business_explanation": "面向用户的统计口径说明",
+    "value_type": "number|integer|currency|percentage|duration|other",
+    "display_unit": "元/%/台/个/小时等，没有则为空"
+  }],
+  "unresolved_outputs": [{
+    "output_node_id": "output_...",
+    "reason": "无法证明绑定关系的原因"
+  }]
 }
 """.strip()
 
 
 class PlannedMetric(BaseModel):
     calculation_id: str
+    output_node_ids: list[str] = Field(default_factory=list)
+    operation_node_ids: list[str] = Field(default_factory=list)
+    query_node_ids: list[str] = Field(default_factory=list)
+    metric_source_fields: list[str] = Field(default_factory=list)
     metric_key: str
     business_name: str
     business_explanation: str
@@ -59,8 +73,14 @@ class PlannedMetric(BaseModel):
     display_unit: str = ""
 
 
+class UnresolvedEvidenceOutput(BaseModel):
+    output_node_id: str
+    reason: str
+
+
 class EvidencePlan(BaseModel):
     metrics: list[PlannedMetric] = Field(default_factory=list)
+    unresolved_outputs: list[UnresolvedEvidenceOutput] = Field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -4062,6 +4082,7 @@ class PostAnalysisEvidenceCompiler:
         planner: Callable[[dict[str, Any]], EvidencePlan] | None = None,
     ) -> None:
         self._planner = planner or self._invoke_planner
+        self._resolver_id_maps: dict[str, dict[str, str]] = {}
 
     def compile(self, snapshot: AnalysisExecutionSnapshot) -> dict[str, Any]:
         lineage_index = LineageIndexer().build(snapshot)
@@ -4070,15 +4091,31 @@ class PostAnalysisEvidenceCompiler:
         calculation_candidates = self._build_calculation_candidates(lineage_index)
         if not calculation_candidates:
             return self._empty_bundle(snapshot, lineage_index, "insufficient_calculation_boundaries")
+        structured_plan = self._build_structured_evidence_plan(
+            calculation_candidates,
+            lineage_index,
+        )
+        report_candidates = self._filter_candidates_by_artifact_type(
+            calculation_candidates,
+            lineage_index,
+            "report",
+        )
         try:
-            plan = self._planner({
-                "user_query": snapshot.user_query,
-                "datasource_context": self._relevant_datasource_context(snapshot, lineage_index),
-                "calculation_candidates": self._planner_candidate_payloads(
-                    calculation_candidates,
-                    lineage_index,
-                ),
-            })
+            report_plan = (
+                self._restore_resolver_plan_ids(self._planner(
+                    self._planner_fact_payload(
+                        snapshot,
+                        lineage_index,
+                        report_candidates,
+                    )
+                ))
+                if report_candidates
+                else EvidencePlan()
+            )
+            plan = EvidencePlan(
+                metrics=[*report_plan.metrics, *structured_plan.metrics],
+                unresolved_outputs=report_plan.unresolved_outputs,
+            )
         except Exception as exc:
             logger.warning(
                 "post-analysis evidence planner unavailable: execution_id=%s error=%s",
@@ -4279,8 +4316,23 @@ class PostAnalysisEvidenceCompiler:
                 "query_node_ids": query_ids,
                 "parameter_bindings": parameter_bindings,
                 "metric_source_fields": metric_source_fields,
+                "available_metric_fields": [],
             })
             candidate["output_node_ids"].append(str(output.get("output_node_id") or ""))
+            candidate["available_metric_fields"] = list(dict.fromkeys([
+                *candidate.get("available_metric_fields", []),
+                *metric_source_fields,
+                *[
+                    str(field).strip()
+                    for field in output.get("lineage_fields") or []
+                    if str(field).strip()
+                ],
+                *(
+                    [str(output.get("field") or "").strip()]
+                    if str(output.get("field") or "").strip()
+                    else []
+                ),
+            ]))
             candidate["operation_node_ids"] = list(dict.fromkeys([
                 *candidate["operation_node_ids"],
                 *operation_ids,
@@ -4350,6 +4402,95 @@ class PostAnalysisEvidenceCompiler:
         return {}, []
 
     @staticmethod
+    def _filter_candidates_by_artifact_type(
+        candidates: dict[str, dict[str, Any]],
+        lineage_index: dict[str, Any],
+        artifact_type: str,
+    ) -> dict[str, dict[str, Any]]:
+        output_by_id = {
+            str(item.get("output_node_id") or ""): item
+            for item in lineage_index.get("output_nodes") or []
+        }
+        result: dict[str, dict[str, Any]] = {}
+        for calculation_id, candidate in candidates.items():
+            output_ids = [
+                str(output_id)
+                for output_id in candidate.get("output_node_ids") or []
+                if (output_by_id.get(str(output_id)) or {}).get("artifact_type") == artifact_type
+            ]
+            if output_ids:
+                result[calculation_id] = {**candidate, "output_node_ids": output_ids}
+        return result
+
+    @staticmethod
+    def _build_structured_evidence_plan(
+        candidates: dict[str, dict[str, Any]],
+        lineage_index: dict[str, Any],
+    ) -> EvidencePlan:
+        output_by_id = {
+            str(item.get("output_node_id") or ""): item
+            for item in lineage_index.get("output_nodes") or []
+        }
+        metrics: list[PlannedMetric] = []
+        for calculation_id, candidate in candidates.items():
+            output_ids = [
+                str(output_id)
+                for output_id in candidate.get("output_node_ids") or []
+                if (output_by_id.get(str(output_id)) or {}).get("artifact_type") in {"chart", "table"}
+            ]
+            if not output_ids:
+                continue
+            outputs = [output_by_id[output_id] for output_id in output_ids]
+            metric_fields = list(dict.fromkeys(
+                candidate.get("metric_source_fields")
+                or [
+                    str(field).strip()
+                    for output in outputs
+                    for field in (
+                        output.get("lineage_fields")
+                        or ([output.get("field")] if output.get("field") else [])
+                    )
+                    if str(field).strip()
+                ]
+            ))
+            label = next((
+                str(output.get("label") or output.get("field") or "").strip()
+                for output in outputs
+                if str(output.get("label") or output.get("field") or "").strip()
+            ), "数值指标")
+            unit = next((
+                str(output.get("display_unit_hint") or "").strip()
+                for output in outputs
+                if str(output.get("display_unit_hint") or "").strip()
+            ), "")
+            samples = [
+                value
+                for output in outputs
+                for value in output.get("sample_values") or []
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+            ]
+            value_type = "number"
+            if unit == "%":
+                value_type = "percentage"
+            elif unit in {"元", "万元", "亿元", "CNY", "RMB"}:
+                value_type = "currency"
+            elif samples and all(float(value).is_integer() for value in samples):
+                value_type = "integer"
+            metrics.append(PlannedMetric(
+                calculation_id=calculation_id,
+                output_node_ids=output_ids,
+                operation_node_ids=list(candidate.get("boundary_operation_node_ids") or []),
+                query_node_ids=list(candidate.get("query_node_ids") or []),
+                metric_source_fields=metric_fields,
+                metric_key=f"structured_{_digest(calculation_id, 12)}",
+                business_name=label,
+                business_explanation=f"按本轮确认的数据范围和计算口径统计{label}。",
+                value_type=value_type,
+                display_unit=unit,
+            ))
+        return EvidencePlan(metrics=metrics)
+
+    @staticmethod
     def _planner_candidate_payloads(
         candidates: dict[str, dict[str, Any]],
         lineage_index: dict[str, Any],
@@ -4375,6 +4516,29 @@ class PostAnalysisEvidenceCompiler:
                 "calculation_kind": boundary.get("semantic_kind") or "",
                 "parameter_bindings": candidate.get("parameter_bindings") or {},
                 "metric_source_fields": candidate.get("metric_source_fields") or [],
+                "available_metric_fields": candidate.get("available_metric_fields") or [],
+                "output_node_ids": [
+                    str(output_id) for output_id in candidate.get("output_node_ids") or []
+                    if str(output_id)
+                ],
+                "operation_node_ids": [
+                    str(operation_id)
+                    for operation_id in candidate.get("boundary_operation_node_ids") or []
+                    if str(operation_id)
+                ],
+                "query_node_ids": [
+                    str(query_id) for query_id in candidate.get("query_node_ids") or []
+                    if str(query_id)
+                ],
+                "operations": [
+                    {
+                        "operation_node_id": str(operation.get("operation_node_id") or ""),
+                        "kind": operation.get("semantic_kind") or operation.get("kind") or "",
+                        "expression": str(operation.get("source") or "").strip(),
+                    }
+                    for operation in boundary_operations
+                    if str(operation.get("operation_node_id") or "")
+                ],
                 "calculation_expressions": list(dict.fromkeys(
                     str(operation.get("source") or "").strip()
                     for operation in boundary_operations
@@ -4382,9 +4546,12 @@ class PostAnalysisEvidenceCompiler:
                 )),
                 "outputs": [
                     {
+                        "output_node_id": str(output.get("output_node_id") or ""),
                         "artifact_type": output.get("artifact_type"),
+                        "artifact_index": output.get("artifact_index"),
                         "label": output.get("label"),
                         "field": output.get("field"),
+                        "lineage_fields": output.get("lineage_fields") or [],
                         "sample_values": output.get("sample_values") or [],
                         "display_unit_hint": output.get("display_unit_hint") or "",
                         "display_context": {
@@ -4396,12 +4563,20 @@ class PostAnalysisEvidenceCompiler:
                     for output_id in candidate.get("output_node_ids") or []
                     for output in [output_by_id.get(str(output_id)) or {}]
                 ],
-                "query_scopes": [
-                    (query_by_id.get(str(query_id)) or {}).get("query_scope") or {}
-                    for query_id in candidate.get("query_node_ids") or []
-                ],
             })
         return payloads
+
+    @staticmethod
+    def _planner_query_catalog(lineage_index: dict[str, Any]) -> list[dict[str, Any]]:
+        """Expose each query scope once instead of duplicating it for every metric candidate."""
+        return [
+            {
+                "query_node_id": str(item.get("query_node_id") or ""),
+                "query_scope": item.get("query_scope") or {},
+            }
+            for item in lineage_index.get("query_nodes") or []
+            if str(item.get("query_node_id") or "")
+        ]
 
     @staticmethod
     def _relevant_datasource_context(
@@ -4436,6 +4611,242 @@ class PostAnalysisEvidenceCompiler:
                 "relevant_properties": relevant_properties,
             })
         return context
+
+    def _planner_fact_payload(
+        self,
+        snapshot: AnalysisExecutionSnapshot,
+        lineage_index: dict[str, Any],
+        calculation_candidates: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Build one normalized fact graph without repeating operations or outputs."""
+        expanded = self._planner_candidate_payloads(calculation_candidates, lineage_index)
+        operation_catalog: dict[str, dict[str, Any]] = {}
+        output_catalog: dict[str, dict[str, Any]] = {}
+        candidates: list[dict[str, Any]] = []
+        for candidate in expanded:
+            for operation in candidate.get("operations") or []:
+                operation_id = str(operation.get("operation_node_id") or "")
+                if operation_id:
+                    operation_catalog[operation_id] = operation
+            for output in candidate.get("outputs") or []:
+                output_id = str(output.get("output_node_id") or "")
+                if output_id:
+                    output_catalog[output_id] = output
+            candidates.append({
+                "calculation_id": candidate.get("calculation_id"),
+                "calculation_kind": candidate.get("calculation_kind"),
+                "parameter_bindings": candidate.get("parameter_bindings") or {},
+                "metric_source_fields": candidate.get("metric_source_fields") or [],
+                "available_metric_fields": candidate.get("available_metric_fields") or [],
+                "output_node_ids": candidate.get("output_node_ids") or [],
+                "operation_node_ids": candidate.get("operation_node_ids") or [],
+                "query_node_ids": candidate.get("query_node_ids") or [],
+            })
+        referenced_query_ids = {
+            str(query_id)
+            for candidate in candidates
+            for query_id in candidate.get("query_node_ids") or []
+            if str(query_id)
+        }
+        candidate_search_text = _stable_json(expanded)
+        relevant_datasources = []
+        for datasource in self._relevant_datasource_context(snapshot, lineage_index):
+            properties = datasource.get("relevant_properties")
+            filtered_properties = {
+                str(field): definition
+                for field, definition in (properties.items() if isinstance(properties, dict) else [])
+                if str(field) in candidate_search_text
+            }
+            if filtered_properties:
+                relevant_datasources.append({
+                    **datasource,
+                    "relevant_properties": filtered_properties,
+                })
+        payload = {
+            "user_query": snapshot.user_query,
+            "datasource_catalog": self._planner_datasource_catalog(
+                relevant_datasources
+            ),
+            "query_catalog": [
+                item for item in self._planner_query_catalog(lineage_index)
+                if str(item.get("query_node_id") or "") in referenced_query_ids
+            ],
+            "operation_catalog": list(operation_catalog.values()),
+            "output_catalog": list(output_catalog.values()),
+            "calculation_candidates": candidates,
+        }
+        return self._alias_planner_fact_payload(payload)
+
+    def _alias_planner_fact_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        def build_aliases(values: list[str], prefix: str) -> tuple[dict[str, str], dict[str, str]]:
+            forward = {
+                value: f"{prefix}{index}"
+                for index, value in enumerate(dict.fromkeys(values), start=1)
+                if value
+            }
+            return forward, {alias: value for value, alias in forward.items()}
+
+        query_forward, query_reverse = build_aliases([
+            str(item.get("query_node_id") or "")
+            for item in payload.get("query_catalog") or []
+        ], "q")
+        operation_forward, operation_reverse = build_aliases([
+            str(item.get("operation_node_id") or "")
+            for item in payload.get("operation_catalog") or []
+        ], "op")
+        calculation_forward, calculation_reverse = build_aliases([
+            str(item.get("calculation_id") or "")
+            for item in payload.get("calculation_candidates") or []
+        ], "calc")
+        calculation_by_output = {
+            str(output_id): str(candidate.get("calculation_id") or "")
+            for candidate in payload.get("calculation_candidates") or []
+            for output_id in candidate.get("output_node_ids") or []
+        }
+        output_groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+        for output in payload.get("output_catalog") or []:
+            output_id = str(output.get("output_node_id") or "")
+            key = (
+                calculation_by_output.get(output_id, ""),
+                str(output.get("field") or ""),
+                str(output.get("label") or ""),
+                str(output.get("display_unit_hint") or ""),
+            )
+            output_groups.setdefault(key, []).append(output)
+        output_forward: dict[str, str] = {}
+        output_reverse: dict[str, list[str]] = {}
+        aliased_output_catalog: list[dict[str, Any]] = []
+        for index, outputs in enumerate(output_groups.values(), start=1):
+            alias = f"out{index}"
+            internal_ids = [
+                str(output.get("output_node_id") or "") for output in outputs
+                if str(output.get("output_node_id") or "")
+            ]
+            for output_id in internal_ids:
+                output_forward[output_id] = alias
+            output_reverse[alias] = internal_ids
+            representative = dict(outputs[0])
+            contexts: list[dict[str, Any]] = []
+            for output in outputs:
+                context = output.get("display_context")
+                if isinstance(context, dict) and context not in contexts:
+                    contexts.append(context)
+            representative["output_node_id"] = alias
+            representative["occurrence_count"] = len(outputs)
+            representative["display_context_examples"] = contexts[:3]
+            representative.pop("display_context", None)
+            aliased_output_catalog.append(representative)
+        self._resolver_id_maps = {
+            "query": query_reverse,
+            "operation": operation_reverse,
+            "output": output_reverse,
+            "calculation": calculation_reverse,
+        }
+        return {
+            **payload,
+            "query_catalog": [
+                {**item, "query_node_id": query_forward.get(str(item.get("query_node_id") or ""), "")}
+                for item in payload.get("query_catalog") or []
+            ],
+            "operation_catalog": [
+                {
+                    **item,
+                    "operation_node_id": operation_forward.get(
+                        str(item.get("operation_node_id") or ""), ""
+                    ),
+                }
+                for item in payload.get("operation_catalog") or []
+            ],
+            "output_catalog": aliased_output_catalog,
+            "calculation_candidates": [
+                {
+                    **item,
+                    "calculation_id": calculation_forward.get(str(item.get("calculation_id") or ""), ""),
+                    "output_node_ids": [
+                        value for value in dict.fromkeys(
+                            output_forward.get(str(output_id), "")
+                            for output_id in item.get("output_node_ids") or []
+                        ) if value
+                    ],
+                    "operation_node_ids": [
+                        operation_forward.get(str(value), "")
+                        for value in item.get("operation_node_ids") or []
+                    ],
+                    "query_node_ids": [
+                        query_forward.get(str(value), "") for value in item.get("query_node_ids") or []
+                    ],
+                }
+                for item in payload.get("calculation_candidates") or []
+            ],
+        }
+
+    def _restore_resolver_plan_ids(self, plan: EvidencePlan) -> EvidencePlan:
+        maps = self._resolver_id_maps
+        if not maps:
+            return plan
+        return EvidencePlan(
+            metrics=[
+                PlannedMetric.model_validate({
+                    **metric.model_dump(),
+                    "calculation_id": maps.get("calculation", {}).get(
+                        str(metric.calculation_id), str(metric.calculation_id)
+                    ),
+                    "output_node_ids": [
+                        restored
+                        for value in metric.output_node_ids
+                        for restored in (
+                            maps.get("output", {}).get(str(value))
+                            or [str(value)]
+                        )
+                    ],
+                    "operation_node_ids": [
+                        maps.get("operation", {}).get(str(value), str(value))
+                        for value in metric.operation_node_ids
+                    ],
+                    "query_node_ids": [
+                        maps.get("query", {}).get(str(value), str(value))
+                        for value in metric.query_node_ids
+                    ],
+                })
+                for metric in plan.metrics
+            ],
+            unresolved_outputs=[
+                UnresolvedEvidenceOutput(output_node_id=restored, reason=item.reason)
+                for item in plan.unresolved_outputs
+                for restored in (
+                    maps.get("output", {}).get(str(item.output_node_id))
+                    or [str(item.output_node_id)]
+                )
+            ],
+        )
+
+    @staticmethod
+    def _planner_datasource_catalog(context: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        semantic_keys = {
+            "title", "display_name", "displayName", "description", "type", "format",
+            "unit", "enum", "semantic_type", "semanticType", "business_name", "businessName",
+        }
+        result: list[dict[str, Any]] = []
+        for datasource in context:
+            properties = datasource.get("relevant_properties")
+            fields: list[dict[str, Any]] = []
+            for field, definition in (properties.items() if isinstance(properties, dict) else []):
+                compact = {"field": str(field)}
+                if isinstance(definition, dict):
+                    compact.update({
+                        str(key): value
+                        for key, value in definition.items()
+                        if str(key) in semantic_keys
+                        and isinstance(value, (str, int, float, bool, list, tuple, type(None)))
+                    })
+                fields.append(compact)
+            result.append({
+                "datasource_id": datasource.get("datasource_id"),
+                "datasource_name": datasource.get("datasource_name") or "",
+                "datasource_identifier": datasource.get("datasource_identifier") or "",
+                "fields": fields,
+            })
+        return result
 
     def _invoke_planner(self, payload: dict[str, Any]) -> EvidencePlan:
         if not bool(getattr(Config, "POST_ANALYSIS_EVIDENCE_PLANNER_ENABLED", True)):
@@ -4478,7 +4889,7 @@ class PostAnalysisEvidenceCompiler:
                     if response_text:
                         messages.append(AIMessage(response_text))
                     messages.append(HumanMessage(
-                        "上一输出不符合 JSON 或候选标注契约。请为每个 calculation_id 恰好输出一次，只修正结构："
+                        "上一输出不符合证据解析契约。请确保每个 output_node_id 恰好被 metric 绑定一次或列入 unresolved_outputs，只修正 JSON 结构和引用："
                         + str(exc)[:1200]
                     ))
                     continue
@@ -4487,58 +4898,113 @@ class PostAnalysisEvidenceCompiler:
 
     @staticmethod
     def _canonicalize_planner_payload(payload: dict[str, Any]) -> dict[str, Any]:
-        """Collapse repeated annotations without changing calculation boundaries."""
-        metrics = payload.get("metrics")
-        if not isinstance(metrics, list):
-            return payload
-
-        canonical_metrics: list[Any] = []
-        metrics_by_calculation_id: dict[str, dict[str, Any]] = {}
-        for item in metrics:
-            if not isinstance(item, dict):
-                canonical_metrics.append(item)
-                continue
-            calculation_id = str(item.get("calculation_id") or "").strip()
-            if not calculation_id:
-                canonical_metrics.append(item)
-                continue
-            existing = metrics_by_calculation_id.get(calculation_id)
-            if existing is None:
-                copied = dict(item)
-                metrics_by_calculation_id[calculation_id] = copied
-                canonical_metrics.append(copied)
-                continue
-            for field in (
-                "metric_key",
-                "business_name",
-                "business_explanation",
-                "value_type",
-                "display_unit",
-            ):
-                if not str(existing.get(field) or "").strip() and str(item.get(field) or "").strip():
-                    existing[field] = item[field]
-
-        return {**payload, "metrics": canonical_metrics}
+        """Normalize optional resolver collections without changing its decisions."""
+        normalized = dict(payload)
+        if not isinstance(normalized.get("metrics"), list):
+            normalized["metrics"] = []
+        if not isinstance(normalized.get("unresolved_outputs"), list):
+            normalized["unresolved_outputs"] = []
+        return normalized
 
     @staticmethod
     def _plan_reference_errors(
         plan: EvidencePlan,
         calculation_candidates: dict[str, dict[str, Any]],
     ) -> list[str]:
-        expected_ids = set(calculation_candidates)
+        expected_output_ids = {
+            str(output_id)
+            for candidate in calculation_candidates.values()
+            for output_id in candidate.get("output_node_ids") or []
+            if str(output_id)
+        }
         errors: list[str] = []
-        claimed_ids: set[str] = set()
+        claimed_output_ids: set[str] = set()
         for metric_index, metric in enumerate(plan.metrics):
             calculation_id = str(metric.calculation_id or "").strip()
-            if calculation_id not in expected_ids:
+            candidate = calculation_candidates.get(calculation_id)
+            if candidate is None:
                 errors.append(f"metrics[{metric_index}].calculation_id is unknown: {calculation_id}")
                 continue
-            if calculation_id in claimed_ids:
-                errors.append(f"calculation_id is emitted more than once: {calculation_id}")
-            claimed_ids.add(calculation_id)
-        missing_ids = expected_ids - claimed_ids
-        if missing_ids:
-            errors.append(f"missing calculation candidates: {sorted(missing_ids)}")
+            allowed_output_ids = {
+                str(item) for item in candidate.get("output_node_ids") or [] if str(item)
+            }
+            selected_output_ids = [
+                str(item).strip() for item in metric.output_node_ids if str(item).strip()
+            ]
+            if not selected_output_ids:
+                errors.append(f"metrics[{metric_index}].output_node_ids is empty")
+                continue
+            unknown_output_ids = set(selected_output_ids) - allowed_output_ids
+            if unknown_output_ids:
+                errors.append(
+                    f"metrics[{metric_index}] references outputs outside calculation candidate: "
+                    f"{sorted(unknown_output_ids)}"
+                )
+            allowed_operation_ids = {
+                str(item) for item in candidate.get("operation_node_ids") or [] if str(item)
+            }
+            selected_operation_ids = {
+                str(item).strip() for item in metric.operation_node_ids if str(item).strip()
+            }
+            if not selected_operation_ids:
+                errors.append(f"metrics[{metric_index}].operation_node_ids is empty")
+            elif not selected_operation_ids.issubset(allowed_operation_ids):
+                errors.append(
+                    f"metrics[{metric_index}] references operations outside calculation candidate: "
+                    f"{sorted(selected_operation_ids - allowed_operation_ids)}"
+                )
+            allowed_query_ids = {
+                str(item) for item in candidate.get("query_node_ids") or [] if str(item)
+            }
+            selected_query_ids = {
+                str(item).strip() for item in metric.query_node_ids if str(item).strip()
+            }
+            if not selected_query_ids:
+                errors.append(f"metrics[{metric_index}].query_node_ids is empty")
+            elif not selected_query_ids.issubset(allowed_query_ids):
+                errors.append(
+                    f"metrics[{metric_index}] references queries outside calculation candidate: "
+                    f"{sorted(selected_query_ids - allowed_query_ids)}"
+                )
+            allowed_metric_fields = {
+                str(item).strip()
+                for item in (
+                    candidate.get("available_metric_fields")
+                    or candidate.get("metric_source_fields")
+                    or []
+                )
+                if str(item).strip()
+            }
+            selected_metric_fields = {
+                str(item).strip() for item in metric.metric_source_fields if str(item).strip()
+            }
+            if not selected_metric_fields.issubset(allowed_metric_fields):
+                errors.append(
+                    f"metrics[{metric_index}] references fields outside calculation candidate: "
+                    f"{sorted(selected_metric_fields - allowed_metric_fields)}"
+                )
+            duplicate_output_ids = set(selected_output_ids).intersection(claimed_output_ids)
+            if duplicate_output_ids:
+                errors.append(f"outputs are claimed more than once: {sorted(duplicate_output_ids)}")
+            claimed_output_ids.update(selected_output_ids)
+
+        unresolved_output_ids: set[str] = set()
+        for unresolved_index, unresolved in enumerate(plan.unresolved_outputs):
+            output_id = str(unresolved.output_node_id or "").strip()
+            if output_id not in expected_output_ids:
+                errors.append(
+                    f"unresolved_outputs[{unresolved_index}].output_node_id is unknown: {output_id}"
+                )
+                continue
+            if not str(unresolved.reason or "").strip():
+                errors.append(f"unresolved_outputs[{unresolved_index}].reason is empty")
+            if output_id in unresolved_output_ids or output_id in claimed_output_ids:
+                errors.append(f"output is resolved more than once: {output_id}")
+            unresolved_output_ids.add(output_id)
+
+        missing_output_ids = expected_output_ids - claimed_output_ids - unresolved_output_ids
+        if missing_output_ids:
+            errors.append(f"missing output bindings: {sorted(missing_output_ids)}")
         return errors
 
     @staticmethod
@@ -4546,11 +5012,26 @@ class PostAnalysisEvidenceCompiler:
         operation_ids: list[str],
         query_ids: list[str],
         operation_by_id: dict[str, dict[str, Any]],
+        *,
+        available_operation_ids: list[str] | None = None,
+        metric_fields: list[str] | None = None,
     ) -> list[str]:
         selected = set(operation_ids)
+        available = set(available_operation_ids or operation_by_id)
+        field_set = {str(field).strip() for field in metric_fields or [] if str(field).strip()}
         for operation_id, operation in operation_by_id.items():
+            if operation_id not in available:
+                continue
             if operation.get("kind") == "validated_query" and str(operation.get("query_node_id")) in query_ids:
                 selected.add(operation_id)
+                continue
+            if operation.get("kind") == "query_projection" and str(operation.get("query_node_id")) in query_ids:
+                targets = {
+                    str(target).strip() for target in operation.get("targets") or []
+                    if str(target).strip()
+                }
+                if targets.intersection(field_set):
+                    selected.add(operation_id)
         return sorted(
             selected,
             key=lambda item: (
@@ -4588,22 +5069,34 @@ class PostAnalysisEvidenceCompiler:
 
         for metric in plan.metrics:
             candidate = calculation_candidates.get(str(metric.calculation_id or "")) or {}
-            output_ids = list(dict.fromkeys(candidate.get("output_node_ids") or []))
+            output_ids = list(dict.fromkeys(
+                str(item).strip() for item in metric.output_node_ids if str(item).strip()
+            ))
             selected_outputs = [output_by_id[item] for item in output_ids if item in output_by_id]
             candidate_operation_ids = list(dict.fromkeys(
                 str(operation_id)
-                for operation_id in candidate.get("operation_node_ids") or []
+                for operation_id in metric.operation_node_ids
                 if str(operation_id) in operation_by_id
             ))
             query_ids = list(dict.fromkeys(
                 str(query_id)
-                for query_id in candidate.get("query_node_ids") or []
+                for query_id in metric.query_node_ids
                 if str(query_id) in query_by_id
+            ))
+            metric_fields = list(dict.fromkeys(
+                metric.metric_source_fields
+                or [
+                    field
+                    for item in output_ids
+                    for field in output_metric_fields(output_by_id[item])
+                ]
             ))
             operation_ids = self._expand_operation_ids(
                 candidate_operation_ids,
                 query_ids,
                 operation_by_id,
+                available_operation_ids=list(candidate.get("operation_node_ids") or []),
+                metric_fields=metric_fields,
             )
             if not output_ids or not operation_ids or not query_ids:
                 continue
@@ -4617,7 +5110,7 @@ class PostAnalysisEvidenceCompiler:
                 "queries": sorted(query_ids),
                 "operations": [operation_by_id[item]["source"] for item in sorted(operation_ids)],
                 "metric_fields": sorted(
-                    candidate.get("metric_source_fields")
+                    metric.metric_source_fields
                     or [
                         field
                         for item in output_ids
@@ -4632,14 +5125,6 @@ class PostAnalysisEvidenceCompiler:
             evidence_key = f"calc_{signature}"
             for output_id in output_ids:
                 output_claims[output_id] = signature
-            metric_fields = list(dict.fromkeys(
-                candidate.get("metric_source_fields")
-                or [
-                    field
-                    for item in output_ids
-                    for field in output_metric_fields(output_by_id[item])
-                ]
-            ))
             if signature not in definitions_by_signature:
                 boundary = operation_by_id.get(str(candidate.get("boundary_operation_node_id"))) or {}
                 definitions_by_signature[signature] = {
@@ -4723,6 +5208,13 @@ class PostAnalysisEvidenceCompiler:
                 "lineage_operation_count": len(lineage_index["operation_nodes"]),
                 "lineage_output_count": len(lineage_index["output_nodes"]),
                 "compiled_output_node_ids": sorted(output_claims),
+                "resolver_unresolved_outputs": [
+                    {
+                        "output_node_id": str(item.output_node_id or "").strip(),
+                        "reason": str(item.reason or "").strip(),
+                    }
+                    for item in plan.unresolved_outputs
+                ],
             },
         }
 
