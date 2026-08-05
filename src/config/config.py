@@ -154,6 +154,22 @@ class Config:
     DATASOURCE_SELECTION_SHORTLIST_TRIGGER_CHARS = int(
         os.environ.get('DATASOURCE_SELECTION_SHORTLIST_TRIGGER_CHARS', 24000)
     )
+    DATASOURCE_SELECTION_PROVIDER = os.environ.get(
+        'DATASOURCE_SELECTION_PROVIDER', 'local'
+    ).strip().lower()
+    SEMANTIC_BASE = os.environ.get(
+        'SEMANTIC_BASE', 'http://192.168.11.189:9622'
+    ).rstrip('/')
+    SEMANTIC_DATASOURCE_RETRIEVE_PATH = os.environ.get(
+        'SEMANTIC_DATASOURCE_RETRIEVE_PATH',
+        '/api/supos/data-insight/v1/retrieve',
+    )
+    SEMANTIC_DATASOURCE_TOP_K = int(
+        os.environ.get('SEMANTIC_DATASOURCE_TOP_K', 10)
+    )
+    SEMANTIC_REQUEST_TIMEOUT_SECONDS = float(
+        os.environ.get('SEMANTIC_REQUEST_TIMEOUT_SECONDS', 60)
+    )
 
     @classmethod
     def get(cls, key: str, default: Any = None) -> Any:

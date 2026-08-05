@@ -21,6 +21,11 @@ from pydantic import (
 )
 
 from config import Config
+from service.semantic_datasource_selection_service import (
+    DatasourceSelectionProviderRouter,
+    SemanticDatasourceSelectionError,
+    SemanticDatasourceSelectionService,
+)
 from utils import logger
 from utils.analysis_task_cancel import AnalysisTaskCancelled
 from utils.llm_model_factory import (
@@ -161,7 +166,15 @@ class BusinessFactCoverageContract(BaseModel):
     coverage_status: Literal["direct", "partial", "unresolved"]
     datasource_ids: list[int] = Field(default_factory=list)
     supporting_datasource_ids: list[int] = Field(default_factory=list)
-    derived_from_fact_ids: list[str] = Field(default_factory=list)
+    derived_from_fact_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Canonical fact IDs that provide the factual basis for this analytical "
+            "output. Use this for calculations and for synthesis such as comparison, "
+            "ranking, interpretation, recommendations, or evidence-gap assessment; "
+            "the final analytical output does not need to be stored as a datasource field."
+        ),
+    )
     coverage_reason: str = Field(min_length=1)
 
     @model_validator(mode="before")
@@ -1588,6 +1601,135 @@ def filter_datasource_snapshot(
     }
 
 
+def filter_relationship_hints(
+    relationship_hints: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    datasource_ids: list[int],
+) -> tuple[dict[str, Any], ...]:
+    allowed = {int(item) for item in datasource_ids if int(item or 0) > 0}
+    return tuple(
+        dict(item)
+        for item in relationship_hints
+        if isinstance(item, dict)
+        and int(item.get('source_datasource_id') or 0) in allowed
+        and int(item.get('target_datasource_id') or 0) in allowed
+    )
+
+
+def validate_semantic_relationship_hints(
+    relationship_hints: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    schemas: list[dict[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    """Keep provider-asserted relations whose endpoints match the current Schema."""
+    fields_by_id = {
+        int(item.get("datasource_id") or item.get("id") or 0): set(
+            (item.get("field_capabilities") or {}).get("queryable_fields")
+            or _schema_fields(item)
+        )
+        for item in schemas
+        if isinstance(item, dict)
+    }
+    validated: list[dict[str, Any]] = []
+    for hint in relationship_hints:
+        if (
+            not isinstance(hint, dict)
+            or hint.get("source") != "semantic_center"
+            or hint.get("verification_status") != "provider_asserted"
+        ):
+            continue
+        source_id = int(hint.get("source_datasource_id") or 0)
+        target_id = int(hint.get("target_datasource_id") or 0)
+        source_fields = [
+            str(item).strip()
+            for item in hint.get("source_fields") or []
+            if str(item).strip()
+        ]
+        target_fields = [
+            str(item).strip()
+            for item in hint.get("target_fields") or []
+            if str(item).strip()
+        ]
+        if (
+            source_id not in fields_by_id
+            or target_id not in fields_by_id
+            or not source_fields
+            or len(source_fields) != len(target_fields)
+            or any(field not in fields_by_id[source_id] for field in source_fields)
+            or any(field not in fields_by_id[target_id] for field in target_fields)
+        ):
+            continue
+        validated.append({
+            **dict(hint),
+            "source_datasource_id": source_id,
+            "target_datasource_id": target_id,
+            "source_fields": source_fields,
+            "target_fields": target_fields,
+        })
+    return tuple(validated)
+
+
+def enrich_snapshot_with_semantic_relationships(
+    snapshot: dict[str, Any],
+    relationship_hints: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Adapt provider ER facts into the existing datasource Schema contract."""
+    enriched = copy.deepcopy(snapshot)
+    rows = [
+        item
+        for item in enriched.get("selected_datasource_snapshot") or []
+        if isinstance(item, dict)
+    ]
+    validated = validate_semantic_relationship_hints(relationship_hints, rows)
+    rows_by_id = {
+        int(item.get("datasource_id") or item.get("id") or 0): item
+        for item in rows
+    }
+    for hint in validated:
+        source_id = int(hint["source_datasource_id"])
+        source = rows_by_id.get(source_id)
+        if source is None:
+            continue
+        metadata_schema = source.get("metadata_schema")
+        if not isinstance(metadata_schema, dict):
+            metadata_schema = {}
+            source["metadata_schema"] = metadata_schema
+        relationships = metadata_schema.get("relationships")
+        if not isinstance(relationships, list):
+            relationships = []
+            metadata_schema["relationships"] = relationships
+        candidate = {
+            "target_datasource_id": int(hint["target_datasource_id"]),
+            "source_fields": list(hint["source_fields"]),
+            "target_fields": list(hint["target_fields"]),
+            "description": str(hint.get("description") or "").strip(),
+            "source": "semantic_center",
+        }
+        signature = (
+            candidate["target_datasource_id"],
+            tuple(candidate["source_fields"]),
+            tuple(candidate["target_fields"]),
+        )
+        if any(
+            (
+                int(item.get("target_datasource_id") or 0),
+                tuple(_relationship_fields(
+                    item.get("source_fields")
+                    or item.get("left_fields")
+                    or item.get("local_fields")
+                )),
+                tuple(_relationship_fields(
+                    item.get("target_fields")
+                    or item.get("right_fields")
+                    or item.get("referenced_fields")
+                )),
+            ) == signature
+            for item in relationships
+            if isinstance(item, dict)
+        ):
+            continue
+        relationships.append(candidate)
+    return enriched
+
+
 def compact_datasource_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     """Add one canonical property view without removing source schema semantics."""
     rows: list[dict[str, Any]] = []
@@ -2331,6 +2473,19 @@ class AnalysisPreparationWorkflow:
                 for relationship_id in lineage.relationship_ids
                 for relationship in [relationship_by_id.get(relationship_id)]
             )
+            if not unresolved_join:
+                # A bound fact with a fully resolved relationship path is
+                # analysis-ready. Requiring aggregation, ranking, comparison or
+                # interpretation does not make the business fact unavailable;
+                # those are Runtime responsibilities. Preserve unresolved facts
+                # only when Preparation identified a concrete unsupported field
+                # binding or an actual missing lineage path.
+                unresolved_by_id = {
+                    fact_id: unresolved_fact
+                    for fact_id, unresolved_fact in unresolved_by_id.items()
+                    if fact_id not in bound_fact_ids
+                    or bool(unresolved_fact.unsupported_field_bindings)
+                }
             lineage_status = lineage.lineage_status
             if (
                 bound_fact_ids == required_fact_ids
@@ -2774,16 +2929,24 @@ class AnalysisPreparationWorkflow:
                 unresolved.append(
                     f"关系 {relationship.relationship_id} 已忽略两侧 Schema 不完整的候选键"
                 )
+            schema_declared = _schema_declares_relationship(
+                declared,
+                left_datasource_id=relationship.left_datasource_id,
+                right_datasource_id=relationship.right_datasource_id,
+                left_fields=relationship.left_fields,
+                right_fields=relationship.right_fields,
+            )
+            if schema_declared:
+                normalized.append(relationship.model_copy(update={
+                    "joinability": "joinable",
+                    "evidence_basis": "schema",
+                    "observation_id": "",
+                    "probe_facts": {},
+                }))
+                continue
             if (
                 relationship.evidence_basis == "schema"
                 and relationship.joinability in {"joinable", "alignable"}
-                and not _schema_declares_relationship(
-                    declared,
-                    left_datasource_id=relationship.left_datasource_id,
-                    right_datasource_id=relationship.right_datasource_id,
-                    left_fields=relationship.left_fields,
-                    right_fields=relationship.right_fields,
-                )
             ):
                 normalized.append(relationship.model_copy(update={
                     "joinability": "unknown",
@@ -2851,6 +3014,92 @@ class AnalysisPreparationWorkflow:
             ],
         )
         return {"intent": intent}
+
+    def semantic_selection(
+        self,
+        state: AnalysisPreparationState,
+    ) -> AnalysisPreparationState:
+        """Use semantic retrieval as a provider for canonical datasource selection."""
+        self._start_stage("semantic_selection")
+        intent = state["intent"]
+        try:
+            semantic_query = "\n".join(filter(None, [
+                intent.business_goal,
+                *intent.business_subjects,
+                *(item.business_question for item in intent.business_questions),
+                *(
+                    fact.business_fact
+                    for item in intent.business_questions
+                    for fact in item.required_business_facts
+                ),
+            ]))
+            semantic_result = SemanticDatasourceSelectionService().retrieve(
+                query=semantic_query,
+                authorization=str(self.execution_context.get("token") or ""),
+                namespace_id=int(self.execution_context.get("namespace_id") or 0),
+                database_conn_info=dict(
+                    self.execution_context.get("database_conn_info") or {}
+                ),
+            )
+            catalog = build_datasource_catalog(semantic_result.datasource_snapshot)
+            if not catalog:
+                raise SemanticDatasourceSelectionError(
+                    "semantic selection returned no usable datasource candidates"
+                )
+            relationship_hints = semantic_result.relationship_hints
+            discovery_catalog = build_datasource_discovery_catalog(
+                catalog,
+                search_text=semantic_query,
+            )
+            selection = _invoke_contract(
+                stage="semantic_selection",
+                payload={
+                    "intent_context": intent.model_dump(),
+                    "semantic_candidate_catalog": discovery_catalog,
+                    "relationship_hints": list(relationship_hints),
+                },
+                output_model=DatasourceSelectionContract,
+                runtime_config=self.runtime_config,
+                cancelled=self.cancelled,
+            )
+            selection = self._normalize_selection(selection, catalog, intent)
+            selected_snapshot = filter_datasource_snapshot(
+                semantic_result.datasource_snapshot,
+                selection.selected_datasource_ids,
+            )
+            selected_snapshot = enrich_snapshot_with_semantic_relationships(
+                selected_snapshot,
+                filter_relationship_hints(
+                    relationship_hints,
+                    selection.selected_datasource_ids,
+                ),
+            )
+            logger.info(
+                "semantic selection canonicalized candidate_count=%s selected_ids=%s relationships=%s",
+                len(catalog),
+                selection.selected_datasource_ids,
+                len(relationship_hints),
+            )
+            return {
+                "selection": selection,
+                "selected_snapshot": selected_snapshot,
+                "selected_schemas": (
+                    compact_datasource_snapshot(selected_snapshot)
+                    .get("selected_datasource_snapshot")
+                    or []
+                ),
+                "query_capabilities": infer_query_capabilities(selected_snapshot),
+            }
+        except AnalysisTaskCancelled:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "semantic datasource selection unavailable; using local selection "
+                "with the existing intent: %s",
+                exc,
+            )
+            return self.select_datasources(state)
+
 
     def select_datasources(
         self,
@@ -3175,21 +3424,41 @@ class AnalysisPreparationWorkflow:
             ),
         }
 
-    def compile(self):
+    def compile(self, *, provider: str = "local"):
         graph = StateGraph(AnalysisPreparationState)
-        graph.add_node("intent_analysis", self.intent_analysis)
-        graph.add_node("select_datasources", self.select_datasources)
         graph.add_node("business_context", self.business_context)
-        graph.add_edge(START, "intent_analysis")
-        graph.add_edge("intent_analysis", "select_datasources")
-        graph.add_edge("select_datasources", "business_context")
+        graph.add_node("intent_analysis", self.intent_analysis)
+        if provider == "semantic_center":
+            graph.add_node("semantic_selection", self.semantic_selection)
+            graph.add_edge(START, "intent_analysis")
+            graph.add_edge("intent_analysis", "semantic_selection")
+            graph.add_edge("semantic_selection", "business_context")
+        else:
+            graph.add_node("select_datasources", self.select_datasources)
+            graph.add_edge(START, "intent_analysis")
+            graph.add_edge("intent_analysis", "select_datasources")
+            graph.add_edge("select_datasources", "business_context")
         graph.add_edge("business_context", END)
         return graph.compile()
 
     def run(self) -> PreparationResult:
-        state = self.compile().invoke({
-            "catalog": build_datasource_catalog(self.datasource_snapshot),
-        })
+        provider = DatasourceSelectionProviderRouter.resolve()
+        try:
+            state = self.compile(provider=provider).invoke({
+                "catalog": build_datasource_catalog(self.datasource_snapshot),
+            })
+        except AnalysisTaskCancelled:
+            raise
+        except Exception as exc:
+            if provider != "semantic_center":
+                raise
+            logger.warning(
+                "semantic Preparation unavailable; falling back to local Preparation: %s",
+                exc,
+            )
+            state = self.compile(provider="local").invoke({
+                "catalog": build_datasource_catalog(self.datasource_snapshot),
+            })
         return PreparationResult(
             intent=state["intent"],
             selection=state["selection"],

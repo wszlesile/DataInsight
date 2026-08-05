@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 from calendar import monthrange
@@ -55,7 +56,6 @@ RETRY_LATEST_ERROR_LIMIT = 3
 RETRY_PATTERN_HINT_LIMIT = 5
 RETRY_ERROR_MAX_CHARS = 700
 RETRY_HINT_MAX_CHARS = 500
-RETRY_FAILED_CODE_MAX_CHARS = 5000
 RETRY_RECOVERY_INSTRUCTION_MAX_CHARS = 14000
 PROBE_NO_DATA_MEMORY_LIMIT = 3
 PROBE_NO_DATA_ERROR_TYPES = {'probe_feedback', 'no_data_found'}
@@ -690,6 +690,9 @@ def _prepare_analysis_context(
             execution_context={
                 "token": agent_request.auth_token or "",
                 "database_conn_info": dict(agent_request.database_conn_info or {}),
+                "namespace_id": int(runtime.conversation.insight_namespace_id or 0),
+                "conversation_id": int(runtime.conversation.id or 0),
+                "turn_id": int(runtime.turn.id or 0),
             },
             cancelled=lambda: _raise_if_analysis_task_cancelled(runtime),
             stage_callback=lambda stage: logger.info(
@@ -758,6 +761,28 @@ def _prepare_analysis_context(
             query_capabilities=infer_query_capabilities(source_snapshot),
             explicit_time_range=expected_time_range or None,
         )
+    source_ids = {
+        int(item.get('datasource_id') or item.get('id') or 0)
+        for item in source_snapshot.get('selected_datasource_snapshot') or []
+        if isinstance(item, dict)
+        and int(item.get('datasource_id') or item.get('id') or 0) > 0
+    }
+    prepared_rows = [
+        dict(item)
+        for item in result.selected_snapshot.get('selected_datasource_snapshot') or []
+        if isinstance(item, dict)
+    ]
+    prepared_ids = {
+        int(item.get('datasource_id') or item.get('id') or 0)
+        for item in prepared_rows
+        if int(item.get('datasource_id') or item.get('id') or 0) > 0
+    }
+    if prepared_ids - source_ids:
+        with session_scope(expire_on_commit=False) as session:
+            ConversationContextService(session).merge_turn_datasource_snapshot(
+                turn_id=int(runtime.turn.id or 0),
+                datasource_snapshot=prepared_rows,
+            )
     runtime.short_term_memory["preparation_result"] = result
     return result
 
@@ -1766,15 +1791,22 @@ def _build_failed_pattern_hints(executions: list[Any]) -> list[str]:
     return [_clip_retry_text(hint, RETRY_HINT_MAX_CHARS) for hint in hints[:RETRY_PATTERN_HINT_LIMIT]]
 
 
-def _get_latest_failed_generated_code(executions: list[Any]) -> str:
-    """返回最近一次失败执行的完整代码，用于引导模型做最小修补。"""
+def _get_latest_failed_repair_target(executions: list[Any]) -> dict[str, Any]:
+    """Return an immutable execution reference and bounded local repair context."""
     for execution in reversed(executions):
         if getattr(execution, 'execution_status', '') == 'success':
             continue
         generated_code = (getattr(execution, 'generated_code', '') or '').strip()
         if generated_code:
-            return _clip_retry_text(generated_code, RETRY_FAILED_CODE_MAX_CHARS)
-    return ''
+            payload = _extract_execution_payload(execution)
+            code_error_context = payload.get('code_error_context')
+            return {
+                'base_execution_id': int(getattr(execution, 'id', 0) or 0),
+                'source_sha256': hashlib.sha256(generated_code.encode('utf-8')).hexdigest(),
+                'line_count': len(generated_code.splitlines()),
+                'code_error_context': code_error_context if isinstance(code_error_context, dict) else {},
+            }
+    return {}
 
 
 def _extract_execution_payload(execution: Any) -> dict[str, Any]:
@@ -2001,7 +2033,7 @@ def _build_analysis_recovery_instruction(
     ][-3:]
     failed_pattern_hints = _build_failed_pattern_hints(executions)
     failure_summary = _build_failure_frequency_summary(executions)
-    latest_failed_code = _get_latest_failed_generated_code(executions)
+    latest_repair_target = _get_latest_failed_repair_target(executions)
     latest_probe_feedback_payload = next(
         (
             payload
@@ -2025,6 +2057,13 @@ def _build_analysis_recovery_instruction(
         '本轮已经进入数据分析执行阶段。',
         f'当前轮次累计执行了 {len(executions)} 次 Python 分析代码，但仍未成功生成完整分析产物。',
     ]
+    if latest_repair_target:
+        lines.extend([
+            '最近失败代码已完整保存在不可变执行记录中，不要根据截断预览重写整份分析。',
+            '局部技术错误应再次调用 execute_python：令 code=""，使用下面的 base_execution_id，'
+            '并按 code_error_context 的原始行号提交非重叠 patches；后端会合成完整代码并保留未修改范围。',
+            json.dumps(latest_repair_target, ensure_ascii=False),
+        ])
     explicit_time_range_guard = getattr(runtime, 'short_term_memory', {}).get('explicit_time_range_guard', {})
     if isinstance(explicit_time_range_guard, dict) and explicit_time_range_guard.get('active'):
         lines.extend([
@@ -2128,14 +2167,6 @@ def _build_analysis_recovery_instruction(
         '不要向用户解释工具错误，不要再次询问用户，也不要用自然语言提前结束本轮。',
         '只有成功生成完整的结构化图表结果和分析报告，这一轮分析才算完成。',
     ])
-
-    if latest_failed_code:
-        lines.extend([
-            '下面是本轮最近一次失败的完整代码，请以它为基础只做最小必要修补：',
-            '```python',
-            latest_failed_code,
-            '```',
-        ])
 
     if round_index >= MAX_ANALYSIS_AGENT_ROUNDS - 1:
         lines.append('这已经是本轮最后一次修复机会；如果仍无法完成，请让本轮以失败结束，而不是伪装成成功。')

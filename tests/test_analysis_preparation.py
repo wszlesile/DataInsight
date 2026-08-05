@@ -454,6 +454,39 @@ def test_derived_fact_can_depend_on_a_fact_from_another_business_question():
     assert share.supporting_datasource_ids == [12]
 
 
+def test_analytical_recommendation_inherits_its_factual_scope():
+    selection = DatasourceSelectionContract(
+        question_coverage=[
+            BusinessQuestionCoverageContract(
+                question_id="root_cause",
+                fact_coverage=[BusinessFactCoverageContract(
+                    fact_id="root_cause_evidence",
+                    coverage_status="direct",
+                    datasource_ids=[11, 12],
+                    coverage_reason="process and equipment observations",
+                )],
+                coverage_reason="root-cause evidence is available",
+            ),
+            BusinessQuestionCoverageContract(
+                question_id="evidence_gap",
+                fact_coverage=[BusinessFactCoverageContract(
+                    fact_id="confirmation_evidence_needed",
+                    coverage_status="direct",
+                    derived_from_fact_ids=["root_cause_evidence"],
+                    coverage_reason="assess confirmation gaps from observed evidence",
+                )],
+                coverage_reason="the recommendation is derived from observed evidence",
+            ),
+        ],
+        selection_reason="facts and their analytical synthesis",
+    )
+
+    recommendation = selection.question_coverage[1].fact_coverage[0]
+    assert recommendation.coverage_status == "direct"
+    assert recommendation.datasource_ids == [11, 12]
+    assert selection.selected_datasource_ids == [11, 12]
+
+
 def test_business_fact_binding_supports_derived_lineage_without_fake_fields():
     binding = BusinessFactBindingContract(
         fact_id="growth_rate",
@@ -557,6 +590,69 @@ def test_derived_fact_completion_promotes_fully_grounded_lineage_to_direct():
     assert {
         item.fact_id for item in completed.insight_lineage[0].fact_bindings
     } == {"measured_fact", "derived_advice"}
+
+
+def test_analysis_work_is_not_preserved_as_an_unresolved_business_fact():
+    selection = DatasourceSelectionContract(
+        question_coverage=[BusinessQuestionCoverageContract(
+            question_id="question_1",
+            fact_coverage=[BusinessFactCoverageContract(
+                fact_id="root_cause_priority",
+                coverage_status="direct",
+                datasource_ids=[11],
+                coverage_reason="event facts are available for analysis",
+            )],
+            coverage_reason="the selected event source covers the question",
+        )],
+        selection_reason="selected event source",
+    )
+    candidate = BusinessContextContract(insight_lineage=[InsightLineageContract(
+        question_id="question_1",
+        business_question="rank root-cause candidates",
+        lineage_status="partial",
+        datasource_ids=[11],
+        fact_bindings=[BusinessFactBindingContract(
+            fact_id="root_cause_priority",
+            datasource_id=11,
+            fields=["event_type", "event_count"],
+        )],
+        unresolved_business_facts=[UnresolvedBusinessFactContract(
+            fact_id="root_cause_priority",
+            reason="ranking requires analysis of the selected event facts",
+        )],
+        synthesis_path="compare the selected event facts and rank candidates",
+    )])
+
+    completed = prep.AnalysisPreparationWorkflow._complete_derived_fact_lineage(
+        candidate,
+        selection,
+    )
+
+    lineage = completed.insight_lineage[0]
+    assert lineage.lineage_status == "direct"
+    assert lineage.unresolved_business_facts == []
+
+
+def test_concrete_unsupported_field_binding_remains_unresolved():
+    candidate = _business_context().model_copy(update={
+        "relationships": [
+            _business_context().relationships[0].model_copy(update={
+                "joinability": "joinable",
+                "evidence_basis": "schema",
+            })
+        ],
+    })
+
+    completed = prep.AnalysisPreparationWorkflow._complete_derived_fact_lineage(
+        candidate,
+        _selection(),
+    )
+
+    lineage = completed.insight_lineage[0]
+    assert lineage.lineage_status == "partial"
+    assert [item.fact_id for item in lineage.unresolved_business_facts] == [
+        "question_1_fact_3"
+    ]
 
 
 def test_selection_contract_covers_questions_without_metrics_or_probe_plan():
@@ -1666,6 +1762,307 @@ def test_prepare_analysis_runs_advisory_flow_without_failure_route(monkeypatch):
     assert prompt_snapshot["selected_datasource_ids"] == [11, 12]
     assert "preparation_envelope" not in prompt_snapshot
     assert prompt_snapshot["analysis_semantic_context"]["relationships"] == []
+
+
+def test_semantic_selection_normalizes_to_canonical_preparation_state(monkeypatch):
+    from service.semantic_datasource_selection_service import (
+        SemanticDatasourceSelectionResult,
+    )
+
+    snapshot = _snapshot()
+    workflow = prep.AnalysisPreparationWorkflow(
+        user_query='分析合同情况',
+        context_mode='fresh_analysis',
+        expected_time_range={},
+        datasource_snapshot=snapshot,
+        conversation_context={},
+        runtime_config=None,
+        execution_context={
+            'token': 'Bearer test',
+            'namespace_id': 6,
+            'database_conn_info': {},
+        },
+        cancelled=None,
+        stage_callback=None,
+    )
+    semantic_result = SemanticDatasourceSelectionResult(
+        datasource_ids=(11, 12),
+        datasource_snapshot=snapshot,
+        relationship_hints=({
+            'source_datasource_id': 11,
+            'target_datasource_id': 12,
+            'source_fields': ['customer_id'],
+            'target_fields': ['id'],
+            'description': '合同关联客户',
+            'source': 'semantic_center',
+            'verification_status': 'provider_asserted',
+        },),
+    )
+    monkeypatch.setattr(prep.Config, 'DATASOURCE_SELECTION_PROVIDER', 'semantic_center')
+    monkeypatch.setattr(
+        prep.SemanticDatasourceSelectionService,
+        'retrieve',
+        lambda self, **kwargs: semantic_result,
+    )
+    captured = {}
+
+    def fake_invoke_contract(*, stage, payload, **kwargs):
+        captured['stage'] = stage
+        captured['payload'] = payload
+        return _selection()
+
+    monkeypatch.setattr(prep, '_invoke_contract', fake_invoke_contract)
+
+    result = workflow.semantic_selection({'intent': _intent()})
+
+    assert result['selection'].selected_datasource_ids == [11, 12]
+    selected_rows = result['selected_snapshot']['selected_datasource_snapshot']
+    relation = selected_rows[0]['metadata_schema']['relationships'][0]
+    assert relation['target_datasource_id'] == 12
+    assert relation['source_fields'] == ['customer_id']
+    assert relation['target_fields'] == ['id']
+    assert 'relationship_hints' not in result
+    assert captured['stage'] == 'semantic_selection'
+    assert 'semantic_candidate_catalog' in captured['payload']
+    assert captured['payload']['intent_context'] == _intent().model_dump()
+    assert 'user_query' not in captured['payload']
+    assert captured['payload']['relationship_hints'] == list(
+        semantic_result.relationship_hints
+    )
+
+
+def test_semantic_relationship_is_schema_checked_and_skips_relationship_probe(
+    monkeypatch,
+):
+    hints = ({
+        "source_datasource_id": 11,
+        "target_datasource_id": 12,
+        "source_fields": ["customer_id"],
+        "target_fields": ["id"],
+        "description": "合同通过客户标识关联客户",
+        "source": "semantic_center",
+        "verification_status": "provider_asserted",
+    },)
+    enriched = prep.enrich_snapshot_with_semantic_relationships(_snapshot(), hints)
+    schemas = compact_datasource_snapshot(enriched)[
+        "selected_datasource_snapshot"
+    ]
+    candidate = prep.AnalysisPreparationWorkflow._normalize_unverified_schema_relationships(
+        _business_context(), schemas
+    )
+    workflow = prep.AnalysisPreparationWorkflow(
+        user_query="分析合同情况",
+        context_mode="fresh_analysis",
+        expected_time_range={},
+        datasource_snapshot=_snapshot(),
+        conversation_context={},
+        runtime_config=None,
+        execution_context={},
+        cancelled=None,
+        stage_callback=None,
+    )
+    monkeypatch.setattr(
+        "agent.tools.execute_preparation_relationship_probe",
+        lambda **kwargs: pytest.fail("trusted semantic relationship must not be probed"),
+    )
+
+    resolved, observations = workflow._probe_relationship_candidates(
+        candidate=candidate,
+        schemas=schemas,
+        selection=_selection(),
+    )
+
+    assert observations == []
+    assert resolved.relationships[0].joinability == "joinable"
+    assert resolved.relationships[0].evidence_basis == "schema"
+
+
+def test_semantic_relationship_with_stale_field_is_not_trusted():
+    hints = ({
+        "source_datasource_id": 11,
+        "target_datasource_id": 12,
+        "source_fields": ["missing_customer_id"],
+        "target_fields": ["id"],
+        "source": "semantic_center",
+        "verification_status": "provider_asserted",
+    },)
+    schemas = compact_datasource_snapshot(_snapshot())[
+        "selected_datasource_snapshot"
+    ]
+
+    assert prep.validate_semantic_relationship_hints(hints, schemas) == ()
+
+
+def test_business_context_consumes_trusted_semantic_relationship_without_probe(
+    monkeypatch,
+):
+    snapshot = _snapshot()
+    selected_snapshot = prep.enrich_snapshot_with_semantic_relationships(
+        prep.filter_datasource_snapshot(snapshot, [11, 12]),
+        ({
+            "source_datasource_id": 11,
+            "target_datasource_id": 12,
+            "source_fields": ["customer_id"],
+            "target_fields": ["id"],
+            "description": "合同通过客户标识关联客户",
+            "source": "semantic_center",
+            "verification_status": "provider_asserted",
+        },),
+    )
+    schemas = compact_datasource_snapshot(selected_snapshot)[
+        "selected_datasource_snapshot"
+    ]
+    workflow = prep.AnalysisPreparationWorkflow(
+        user_query="分析合同情况",
+        context_mode="fresh_analysis",
+        expected_time_range={},
+        datasource_snapshot=snapshot,
+        conversation_context={},
+        runtime_config=None,
+        execution_context={},
+        cancelled=None,
+        stage_callback=None,
+    )
+    monkeypatch.setattr(
+        prep,
+        "_invoke_contract",
+        lambda **kwargs: _business_context(),
+    )
+    monkeypatch.setattr(
+        "agent.tools.execute_preparation_relationship_probe",
+        lambda **kwargs: pytest.fail("trusted semantic relationship must not be probed"),
+    )
+
+    result = workflow.business_context({
+        "intent": _intent(),
+        "selection": _selection(),
+        "selected_snapshot": selected_snapshot,
+        "selected_schemas": schemas,
+        "query_capabilities": ("sql",),
+    })
+
+    relationship = result["business_context"].relationships[0]
+    assert relationship.joinability == "joinable"
+    assert relationship.evidence_basis == "schema"
+    enriched_rows = result["selected_snapshot"]["selected_datasource_snapshot"]
+    schema_relationships = [
+        item
+        for row in enriched_rows
+        for item in (row.get("metadata_schema") or {}).get("relationships") or []
+        if item.get("relationship_id") == relationship.relationship_id
+    ]
+    assert schema_relationships
+    assert all(item["joinability"] == "joinable" for item in schema_relationships)
+
+
+def test_semantic_provider_reuses_canonical_intent_before_selection(monkeypatch):
+    snapshot = _snapshot()
+    workflow = prep.AnalysisPreparationWorkflow(
+        user_query='分析合同情况',
+        context_mode='fresh_analysis',
+        expected_time_range={},
+        datasource_snapshot=snapshot,
+        conversation_context={},
+        runtime_config=None,
+        execution_context={'token': 'Bearer test', 'namespace_id': 6},
+        cancelled=None,
+        stage_callback=None,
+    )
+    intent = _intent()
+    selection = _selection()
+    calls = []
+
+    monkeypatch.setattr(prep.Config, 'DATASOURCE_SELECTION_PROVIDER', 'semantic_center')
+
+    def intent_node(state):
+        calls.append('intent_analysis')
+        return {'intent': intent}
+
+    def semantic_node(state):
+        calls.append('semantic_selection')
+        assert state['intent'] is intent
+        return {
+            'selection': selection,
+            'selected_snapshot': snapshot,
+            'selected_schemas': prep.compact_datasource_snapshot(snapshot)[
+                'selected_datasource_snapshot'
+            ],
+            'query_capabilities': ('sql',),
+        }
+
+    def business_node(state):
+        calls.append('business_context')
+        return {
+            'business_context': workflow._fallback_business_context(selection),
+            'selected_snapshot': snapshot,
+        }
+
+    monkeypatch.setattr(workflow, 'intent_analysis', intent_node)
+    monkeypatch.setattr(workflow, 'semantic_selection', semantic_node)
+    monkeypatch.setattr(workflow, 'business_context', business_node)
+
+    result = workflow.run()
+
+    assert calls == ['intent_analysis', 'semantic_selection', 'business_context']
+    assert result.selection.selected_datasource_ids == [11, 12]
+
+
+def test_semantic_selection_failure_runs_complete_local_preparation(monkeypatch):
+    snapshot = _snapshot()
+    workflow = prep.AnalysisPreparationWorkflow(
+        user_query='分析合同情况',
+        context_mode='fresh_analysis',
+        expected_time_range={},
+        datasource_snapshot=snapshot,
+        conversation_context={},
+        runtime_config=None,
+        execution_context={'token': 'Bearer test', 'namespace_id': 6},
+        cancelled=None,
+        stage_callback=None,
+    )
+    monkeypatch.setattr(prep.Config, 'DATASOURCE_SELECTION_PROVIDER', 'semantic_center')
+
+    def fail_semantic(self, **kwargs):
+        raise prep.SemanticDatasourceSelectionError('gateway unavailable')
+
+    monkeypatch.setattr(
+        prep.SemanticDatasourceSelectionService,
+        'retrieve',
+        fail_semantic,
+    )
+    local_calls = []
+    intent = prep._canonicalize_intent_selection_facts(_intent())
+    selection = _canonical_flow_selection()
+
+    monkeypatch.setattr(
+        workflow,
+        'intent_analysis',
+        lambda state: local_calls.append('intent_analysis') or {'intent': intent},
+    )
+    monkeypatch.setattr(
+        workflow,
+        'select_datasources',
+        lambda state: local_calls.append('select_datasources') or {
+            'selection': selection,
+            'selected_snapshot': snapshot,
+            'selected_schemas': prep.compact_datasource_snapshot(snapshot)[
+                'selected_datasource_snapshot'
+            ],
+            'query_capabilities': ('sql',),
+        },
+    )
+    monkeypatch.setattr(
+        workflow,
+        'business_context',
+        lambda state: local_calls.append('business_context') or {
+            'business_context': workflow._fallback_business_context(selection),
+            'selected_snapshot': snapshot,
+        },
+    )
+    result = workflow.run()
+
+    assert local_calls == ['intent_analysis', 'select_datasources', 'business_context']
+    assert result.selection.selected_datasource_ids == [11, 12]
 
 
 def test_business_context_rejects_fabricated_probe_relationship():

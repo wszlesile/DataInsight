@@ -61,6 +61,7 @@
 - 逐个覆盖 Intent 的全部 `question_id` 和事实 `fact_id`。事实绑定必须落到已选 Schema 中真实存在的字段。
 - Selection 中 `datasource_ids` 表示事实/度量来源，`supporting_datasource_ids` 表示标签、分类、对象属性或桥接语义来源。两者都要进入相应问题的 lineage，并通过 fact binding 说明各自承担的字段语义。
 - 原始事实 binding 填写真实 `datasource_id` 和 `fields`。无法绑定的事实只放入 `unresolved_business_facts`，不要再输出空 `fact_binding`。比例、差值、同比等派生依赖已经由 Selection 的 `derived_from_fact_ids` 定稿，Business Context 不需要重复输出；编译器会把它们作为无物理数据源的逻辑节点内聚进 lineage。不得为派生事实虚构物理数据源或字段。
+- `unresolved_business_facts` 只表示已选 Schema、字段语义或必要关系无法承载该事实。若真实字段与关系已经具备，只是仍需正式分析执行聚合、比较、排序、归因判断或提出建议，该事实应保持 direct；这些分析工作不是 Preparation 的事实缺口。
 - `synthesis_path` 描述这些事实如何共同回答业务问题，不写 SQL、指标算法、图表形式、报告章节、结论或建议。
 - `reason` 是 Preparation 内部审计说明，不进入正式分析上下文。`unsupported_field_bindings` 结构化列出已经核验但不能承载该事实的真实字段，防止正式分析把它们当作代理口径；`business_reason` 说明业务语义不匹配，不写查询过程。
 - `business_impact` 只说明该缺口对用户问题的影响，必须使用业务语言，不写字段名、数据源标识、Probe、SQL 或内部协议名。三者职责不同，不能用技术诊断替代业务影响。

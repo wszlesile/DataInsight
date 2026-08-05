@@ -96,8 +96,8 @@ flowchart TD
     C -- "Probe/业务代码错误" --> B
     C -- "正式分析成功" --> D["冻结 AnalysisExecutionSnapshot"]
     D --> E["Lineage Indexer：代码与查询谱系索引"]
-    E --> F["Evidence Compiler：生成不可变计算候选"]
-    F --> G["Evidence Planner：仅补充业务名称与解释"]
+    E --> F["报告语义作用域：代码、查询、操作与报告槽位"]
+    F --> G["Evidence Planner：识别报告指标与计算关系"]
     G --> H{"本地验证"}
     H -- "可修复" --> F
     H -- "通过或保留验证子集" --> I["EvidenceAssemblyService 入库"]
@@ -154,19 +154,29 @@ flowchart TD
 - `sort_values`、`head/tail`、Top/Min/Max；
 - 图表 value field、表格 column、报告 f-string/format 动态值。
 
-不支持的自定义算法节点标记为 `unresolved`，不得降级为主题相似匹配。
+AST 不理解业务语义的赋值语句仍登记为静态代码节点，保留源码位置、目标变量和依赖变量。
+Evidence Planner 可以根据完整 Python 代码识别其业务含义；本地验证器只在该节点能够沿变量依赖
+到达本轮成功 QuerySnapshot 时接受绑定。无法建立静态事实路径的结果标记为 `unresolved`，不得
+降级为主题相似匹配。
 
-### 5.3 CalculationCandidate 与 EvidencePlan
+### 5.3 Report Semantic Scope 与 EvidencePlan
 
-Compiler 先按唯一计算边界和查询范围生成不可变 `calculation_id`。只有边界唯一、查询来源完整的产物位置才形成候选；存在多个可能边界时保持 unresolved，不做名称或数值猜测。
+图表和表格仍由 Compiler 按结构化字段确定性生成计算候选。报告采用不同边界：Compiler 先定位
+全部报告动态槽位，并提供本轮真实 query、静态代码操作目录和 AST 已恢复的 advisory hints；
+它不预先裁定报告里有哪些业务指标，也不因 AST 尚未恢复完整血缘而把槽位挡在 LLM 之外。
 
-Evidence Planner 是一个专注于“阅读已完成分析”的 LLM 调用，只为每个候选补充业务语义：
+Evidence Planner 是一个专注于“阅读已完成分析代码”的 LLM 调用。它以完整 Python 代码为主要
+事实，识别报告指标、重复展示、计算边界和所用 query/operation；不读取最终 Markdown 数值，
+也不根据数值相等关系猜测：
 
 ```json
 {
   "metrics": [
     {
-      "calculation_id": "calc_...",
+      "calculation_id": "report_semantic_scope",
+      "output_node_ids": ["out_..."],
+      "operation_node_ids": ["op_..."],
+      "query_node_ids": ["q_..."],
       "metric_key": "annual_contract_amount",
       "business_name": "年费合同金额",
       "value_type": "currency",
@@ -177,9 +187,10 @@ Evidence Planner 是一个专注于“阅读已完成分析”的 LLM 调用，�
 }
 ```
 
-Planner 不能选择、合并或拆分计算边界，也不能提交 SQL、代码、字符区间、Evidence ID 或
-计算结果。查询、计算、产物位置和 ref 均由本地 Compiler 生成。业务说明不得出现 Runtime、Metric、
-Report Program、字段 API 等内部术语。
+Planner 可以在报告语义作用域内选择、合并或拆分报告指标，但只能引用本地目录中的真实节点，
+不能提交 SQL、代码、字符区间、Evidence ID 或计算结果。本地验证器逐指标检查
+`output -> operation -> query` 可达性；越界操作被剔除，无法证明的槽位单独进入 unresolved，
+不会清空其他合法绑定。最终 calculation signature、Evidence ID 和 ref 均由 Compiler 生成。
 
 ### 5.4 EvidenceBundle
 
@@ -236,7 +247,7 @@ EvidenceDefinition 解释计算口径，不保存某个图表点或表格单元�
 本地强校验只检查可确定事实：
 
 1. code/result hash 与 execution 一致；
-2. 每个 `calculation_id` 由本地唯一边界生成，Planner 只能逐项补充语义且不得遗漏；
+2. 图表/表格 calculation 由本地唯一边界生成；报告指标由 Planner 识别，但只能引用真实节点；
 3. query 节点来自本次 `query_snapshots`；
 4. output node 确实到达对应产物位置；
 5. 一个 calculation signature 只生成一个 Evidence；
@@ -244,6 +255,13 @@ EvidenceDefinition 解释计算口径，不保存某个图表点或表格单元�
 7. ref 指向真实图表字段、表格列或报告字符区间；
 8. selector 与产物维度一致；
 9. 展示变换可以从执行事件或代码表达式验证。
+
+报告 Evidence 的职责主次固定为：LLM 主导语义发现，本地 AST 与 QuerySnapshot 主导事实验证、
+唯一签名和物化。Planner 的单项错误按指标隔离，不能推翻正式分析，也不能使其他报告 Evidence 丢失。
+
+LLM 只决定“哪些代码操作共同表达一个业务指标”，不重复猜测操作所属查询。最终 query refs 必须由
+所选操作的 QuerySnapshot 血缘闭包生成。参数化循环复用同一段计算代码时，唯一签名还必须包含计算
+表达式实际读取的循环参数和源字段；用于选择报告文案的展示标签不属于计算边界。
 
 以下内容不做刚性文本校验：报告章节数、段落数、最低字数、Markdown 中全部数字覆盖率。
 报告质量仍由统一 Agent 的角色和完整洞察语义保证。

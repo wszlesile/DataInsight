@@ -12,7 +12,8 @@
 2. 所有数据源先由 QuerySnapshot 的 loader 身份和 `execution.columns` 建立通用查询与字段血缘；关系 SQL 再使用 `sqlglot` 增强投影、聚合、筛选、分组和排序语义。DBAPI 参数占位符只在解析副本中规范化，不修改真实 SQL。
 3. Python 使用标准 AST 建立查询、DataFrame、列别名、聚合、公式、排序和产物字段之间的血缘。
 4. 只有一个产物位置能够证明唯一计算边界和完整查询来源时，才生成不可变 `CalculationCandidate`。
-5. Evidence Planner 只补充业务名称、业务解释、值类型和展示单位，不能选择、合并、拆分或重建计算关系。
+5. 图表和表格由本地结构化编译；报告 Evidence Planner 阅读成功 Python 代码，主导识别本地 AST
+   可能漏掉的指标与计算关系，本地再按 output、operation 和 QuerySnapshot 可达性逐项验真。
 6. Compiler 生成 EvidenceDefinition 和 refs，Assembly 按真实 artifact ID 持久化。
 
 ## 2. 查询事实
@@ -82,3 +83,22 @@
 - artifact ID 稳定定位
 - Planner 无效引用或调用失败时不猜测 Evidence
 - Evidence 编译失败不污染成功分析
+
+## 7. 2026-08-05 真实回归
+
+使用最近成功 execution 的冻结代码、QuerySnapshot 与 artifacts 做只读复编译，未更新正式分析结果：
+
+- `651`（多源质量根因分析）连续两轮均为 `complete`：43 个 EvidenceDefinition、3 个图表 refs、
+  14 个表格 refs、33 个报告 refs，50/50 个结构化与报告指标位置全部覆盖，无悬空引用。
+- `651` 中同一句内的“事件总次数”和“涉及批次数”稳定落到不同计算操作；循环中的过程报警、
+  温度报警、物料批次等字段按实际源字段和计算参数形成独立 Evidence，不再因复用循环代码误共享。
+- `629`、`591` 均为 `complete`，分别覆盖 25/25 个指标位置；`675` 为 `complete`，覆盖 45/45。
+  `675` 中同一 `len(device_types)` 在报告不同位置复用同一 Evidence，属于相同计算的合法复用。
+- `698` 初次暴露 Planner query 选择与操作血缘不一致。调整为由最终操作闭包 query refs 后，复编译
+  为 `complete`：25 个 EvidenceDefinition、2 个图表 refs、103 个报告 refs，105/105 全覆盖。
+- `671` 保持 `partial`：已覆盖 116 个报告 refs、7 个图表 refs、10 个表格 refs；8 个本地常量位置
+  没有 QuerySnapshot 事实，明确列为 unresolved，没有冒充查询证据。
+
+自动化回归覆盖参数化循环、故意合并不同报告指标、错误 query 选择、常量隔离、自定义 helper、
+图表/表格结构化引用及 Preparation/Runtime 相关契约。真实回归同时检查 Evidence key 存在性、
+query refs 有效性及不同已证明计算边界的误共享。

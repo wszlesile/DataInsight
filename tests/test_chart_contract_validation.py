@@ -30,7 +30,9 @@ from agent.tools import (  # noqa: E402
     _terminal_tool_success,
     _tool_success_message,
     _validate_analysis_relationship_contract,
+    _validate_analysis_scope_against_execution_history,
     _validate_generated_code_contract,
+    _validate_scope_preserving_technical_repair,
     _validate_structured_result_contract,
     load_data_with_sql,
     probe_data_with_sql,
@@ -192,6 +194,31 @@ result = request_retry(
 
         self.assertIsNone(_validate_generated_code_contract(code))
 
+    def test_probe_accepts_observations_from_a_static_outcome_manifest_loop(self) -> None:
+        code = '''
+execution_intent = "probe"
+first = probe_data_with_sql(sql="SELECT status, COUNT(*) AS cnt FROM a GROUP BY status")
+second = probe_data_with_sql(sql="SELECT kind, COUNT(*) AS cnt FROM b GROUP BY kind")
+observations = []
+for name, outcome in [("status", first), ("kind", second)]:
+    observation = {
+        "name": name,
+        "status": outcome["status"],
+        "row_count": outcome["row_count"],
+    }
+    if outcome["status"] == "success" and outcome["row_count"] > 0:
+        frame = outcome["data"]
+        observation["values"] = frame.head(5).to_dict(orient="records")
+    observations.append(observation)
+result = request_retry(
+    retry_type="probe_feedback",
+    message="observed candidate queries",
+    diagnostics={"query_observations": observations},
+)
+'''
+
+        self.assertIsNone(_validate_generated_code_contract(code))
+
     def test_probe_sql_wrapper_returns_structured_query_error(self) -> None:
         token = CURRENT_EXECUTION_INTENT.set("probe")
         try:
@@ -284,6 +311,172 @@ result = request_retry(
             "probe_data_with_sql" in item
             for item in retry.repair_instructions
         ))
+
+    def test_analysis_broad_sql_exception_is_static_and_does_not_authorize_scope_loss(self) -> None:
+        retry = _validate_generated_code_contract('''
+execution_intent = "analysis"
+try:
+    frame = load_data_with_sql(sql="SELECT * FROM equipment")
+except Exception:
+    frame = None
+result = save_analysis_result(analysis_report="report", charts=[], tables=[])
+''')
+
+        self.assertIsNotNone(retry)
+        self.assertEqual(retry.diagnostics["violated_contract"], "sql_load_error_handling")
+        self.assertEqual(retry.diagnostics["failure_phase"], "static_contract_validation")
+        self.assertFalse(retry.diagnostics["queries_executed"])
+        self.assertFalse(retry.diagnostics["scope_change_authorized"])
+        self.assertTrue(any(
+            "保留当前的全部数据源" in item
+            for item in retry.repair_instructions
+        ))
+
+    def test_technical_repair_rejects_silent_datasource_scope_regression(self) -> None:
+        retry = _validate_scope_preserving_technical_repair(
+            previous_used_datasource_ids=[67, 68, 149],
+            current_used_datasource_ids=[67],
+            previous_failure_payload={
+                "retry_type": "contract_error",
+                "diagnostics": {
+                    "violated_contract": "sql_load_error_handling",
+                    "scope_change_authorized": False,
+                },
+            },
+        )
+
+        self.assertIsNotNone(retry)
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "analysis_scope_regression_after_technical_repair",
+        )
+        self.assertEqual(retry.diagnostics["missing_datasource_ids"], [68, 149])
+
+    def test_technical_repair_accepts_preserved_datasource_scope(self) -> None:
+        retry = _validate_scope_preserving_technical_repair(
+            previous_used_datasource_ids=[67, 68, 149],
+            current_used_datasource_ids=[67, 68, 149],
+            previous_failure_payload={
+                "retry_type": "contract_error",
+                "diagnostics": {
+                    "violated_contract": "sql_load_error_handling",
+                    "scope_change_authorized": False,
+                },
+            },
+        )
+
+        self.assertIsNone(retry)
+
+    def test_probe_between_analysis_attempts_does_not_erase_repair_scope_anchor(self) -> None:
+        history = [
+            SimpleNamespace(
+                generated_code='execution_intent = "probe"\nresult = request_retry(...)',
+                result_payload_json=json.dumps({"error_type": "probe_feedback"}),
+                used_datasource_ids_json='[62]',
+            ),
+            SimpleNamespace(
+                generated_code='execution_intent = "analysis"\nresult = save_analysis_result(...)',
+                result_payload_json=json.dumps({"error_type": "schema_or_column_mismatch"}),
+                used_datasource_ids_json='[61, 62, 64, 66, 79, 179]',
+            ),
+        ]
+
+        retry = _validate_analysis_scope_against_execution_history(
+            previous_executions=history,
+            current_used_datasource_ids=[61, 62],
+            current_code='execution_intent = "analysis"\nresult = save_analysis_result(...)',
+        )
+
+        self.assertIsNotNone(retry)
+        self.assertEqual(retry.diagnostics["missing_datasource_ids"], [64, 66, 79, 179])
+
+    def test_probe_scope_is_allowed_to_be_narrower_than_failed_analysis(self) -> None:
+        retry = _validate_analysis_scope_against_execution_history(
+            previous_executions=[SimpleNamespace(
+                generated_code='execution_intent = "analysis"',
+                result_payload_json=json.dumps({"error_type": "runtime_error"}),
+                used_datasource_ids_json='[61, 62, 64]',
+            )],
+            current_used_datasource_ids=[62],
+            current_code='execution_intent = "probe"\nresult = request_retry(...)',
+        )
+
+        self.assertIsNone(retry)
+
+    def test_scope_anchor_ignores_declared_sources_absent_from_failed_code(self) -> None:
+        history = [SimpleNamespace(
+            generated_code='''execution_intent = "analysis"
+frame = load_data_with_sql(sql="SELECT * FROM warehouse.fact_quality")
+result = save_analysis_result(...)
+''',
+            result_payload_json=json.dumps({"error_type": "schema_or_column_mismatch"}),
+            used_datasource_ids_json='[61, 62, 63]',
+        )]
+        snapshot = [
+            {"datasource_id": 61, "datasource_identifier": "warehouse.fact_quality"},
+            {"datasource_id": 62, "datasource_identifier": "warehouse.dim_product"},
+            {"datasource_id": 63, "datasource_identifier": "warehouse.dim_customer"},
+        ]
+
+        retry = _validate_analysis_scope_against_execution_history(
+            previous_executions=history,
+            current_used_datasource_ids=[61],
+            current_code='execution_intent = "analysis"\nresult = save_analysis_result(...)',
+            selected_datasource_snapshot=snapshot,
+        )
+
+        self.assertIsNone(retry)
+
+    def test_scope_anchor_still_protects_sources_referenced_by_failed_code(self) -> None:
+        history = [SimpleNamespace(
+            generated_code='''execution_intent = "analysis"
+facts = load_data_with_sql(sql="SELECT * FROM warehouse.fact_quality")
+products = load_data_with_sql(sql="SELECT * FROM warehouse.dim_product")
+result = save_analysis_result(...)
+''',
+            result_payload_json=json.dumps({"error_type": "schema_or_column_mismatch"}),
+            used_datasource_ids_json='[61, 62, 63]',
+        )]
+        snapshot = [
+            {"datasource_id": 61, "datasource_identifier": "warehouse.fact_quality"},
+            {"datasource_id": 62, "datasource_identifier": "warehouse.dim_product"},
+            {"datasource_id": 63, "datasource_identifier": "warehouse.dim_customer"},
+        ]
+
+        retry = _validate_analysis_scope_against_execution_history(
+            previous_executions=history,
+            current_used_datasource_ids=[61],
+            current_code='execution_intent = "analysis"\nresult = save_analysis_result(...)',
+            selected_datasource_snapshot=snapshot,
+        )
+
+        self.assertIsNotNone(retry)
+        self.assertEqual(retry.diagnostics["missing_datasource_ids"], [62])
+
+    def test_query_size_repair_cannot_drop_an_unrelated_datasource(self) -> None:
+        retry = _validate_scope_preserving_technical_repair(
+            previous_used_datasource_ids=[62, 76, 77, 79],
+            current_used_datasource_ids=[62, 76, 77],
+            previous_failure_payload={
+                "error_type": "query_result_too_large",
+                "diagnostics": {},
+            },
+        )
+
+        self.assertIsNotNone(retry)
+        self.assertEqual(retry.diagnostics["missing_datasource_ids"], [79])
+
+    def test_result_contract_repair_may_correct_overdeclared_datasource_ids(self) -> None:
+        retry = _validate_scope_preserving_technical_repair(
+            previous_used_datasource_ids=[62, 76, 77, 79],
+            current_used_datasource_ids=[62, 76, 77],
+            previous_failure_payload={
+                "retry_type": "result_contract_error",
+                "diagnostics": {"declared_but_unread_datasource_ids": [79]},
+            },
+        )
+
+        self.assertIsNone(retry)
 
     def test_sql_projection_restores_schema_field_casing(self) -> None:
         raw = pd.DataFrame([{

@@ -57,7 +57,7 @@ TOOL_ERROR_CODE_CONTEXT_MAX_CHARS = int(os.environ.get('TOOL_ERROR_CODE_CONTEXT_
 PROBE_NO_DATA_RETRY_LIMIT = max(int(os.environ.get('PROBE_NO_DATA_RETRY_LIMIT', '3') or 3), 1)
 PROBE_NO_DATA_RETRY_TYPES = {'probe_feedback', 'no_data_found'}
 GENERATED_CODE_FILENAME = '<generated_analysis_code>'
-GENERATED_CODE_CONTEXT_RADIUS = 2
+GENERATED_CODE_CONTEXT_RADIUS = 8
 FRONTEND_TOOL_RETRY_MESSAGE = '分析代码规范需要调整，正在反馈给大模型重新生成。'
 FRONTEND_TOOL_ERROR_MESSAGE = '分析代码逻辑需要调整，正在反馈给大模型重新生成。'
 FRONTEND_TOOL_TIMEOUT_MESSAGE = '分析代码执行时间较长，正在反馈给大模型优化后重试。'
@@ -4095,16 +4095,23 @@ def _validate_sql_load_error_handling_contract(tree: ast.AST) -> RetryResult | N
             ):
                 return request_retry(
                     retry_type="contract_error",
-                    message="SQL 加载异常是阻断性错误。load_data_with_sql(...) 执行失败时必须立即反馈明确的 SQL 错误并停止当前分析流程，要求修正 SQL 后重试。",
+                    message=(
+                        "当前代码在执行前因 SQL 加载异常处理契约被拒绝；"
+                        "尚未执行任何查询，因此不能据此判定某个数据源无数据或不可用。"
+                    ),
                     diagnostics={
                         'violated_contract': 'sql_load_error_handling',
                         'try_line_no': getattr(node, 'lineno', None),
                         'except_line_no': getattr(handler, 'lineno', None),
+                        'failure_phase': 'static_contract_validation',
+                        'queries_executed': False,
+                        'scope_change_authorized': False,
+                        'recommended_next_execution_intent': execution_intent or 'analysis',
                     },
                     repair_instructions=[
-                        "不得将 SQL 加载异常降级为无数据、空数据、部分失败、可跳过数据源或普通查询失败。",
-                        "不得通过宽泛 except、仅记录日志、返回默认结果、保存部分成功报告等方式掩盖异常并继续分析。",
-                        "必须直接 raise 原异常，或立即把 request_retry(...) 的返回值赋给 result 并结束当前尝试；只有 load_data_with_sql(...) 成功返回且 DataFrame 为空时，才可以判断为无数据。",
+                        "这是技术实现错误，不是数据源可用性结论；必须保留当前的全部数据源、查询路径、计算范围和分析产物。",
+                        "只修正包裹 load_data_with_sql(...) 的宽泛 try/except：删除默认空结果降级，让原异常直接向上反馈。",
+                        "不要删除或跳过任何数据源，也不要把完整分析改成部分报告；只有后续真实执行返回的结构化诊断才能改变可用路径范围。",
                     ],
                 )
             return request_retry(
@@ -4509,6 +4516,16 @@ def _validate_probe_observation_contract(
     changed = True
     while changed:
         changed = False
+        for loop in (
+            item for item in ast.walk(tree)
+            if isinstance(item, (ast.For, ast.AsyncFor))
+        ):
+            if not loaded_names(loop.iter).intersection(tainted_names):
+                continue
+            new_targets = target_names(loop.target) - tainted_names
+            if new_targets:
+                tainted_names.update(new_targets)
+                changed = True
         for node in assignments:
             value = getattr(node, "value", None)
             if value is None:
@@ -5200,20 +5217,44 @@ def save_analysis_result(
     )
 
 
+class SourceCodePatch(BaseModel):
+    """A line-addressed edit against one immutable failed execution."""
+
+    start_line: int = Field(description="被替换区间的起始行号（1-based，包含）。")
+    end_line: int = Field(description="被替换区间的结束行号（1-based，包含）。")
+    replacement: str = Field(description="替换该行区间的完整 Python 源码。")
+
+
 class ExePythonCodeInput(BaseModel):
     code: str = Field(
+        default='',
         description=(
             "一份独立、完整、可执行的 Python 代码。execution_intent='analysis' 时必须在同一次调用内完成"
             "查询、计算、图表/表格、报告并以 result = save_analysis_result(...) 收口；"
             "execution_intent='probe' 时必须以 result = request_retry(...) 返回结构化探测反馈。"
-            "不同 execute_python 调用之间不会保留 DataFrame、变量或中间状态。"
+            "不同 execute_python 调用之间不会保留 DataFrame、变量或中间状态。首次生成或整体调整时填写；"
+            "对上一执行中的局部技术错误做修复时，改用 base_execution_id + patches，避免重写整份代码。"
         )
     )
-    title: str = Field(description="本次代码执行任务的简短标题")
-    description: str = Field(description="本次代码执行任务的详细说明")
+    title: str = Field(default='', description="本次代码执行任务的简短标题；省略时使用默认任务标题。")
+    description: str = Field(default='', description="本次代码执行任务的简要说明；局部修复时可以省略。")
     used_datasource_ids: list[int] = Field(
         default_factory=list,
         description="本次代码实际读取或查询的数据源 datasource_id 列表。analysis 和 probe 都必须先根据当前问题、历史上下文和数据源语义判断相关数据源后准确填写，只能从当前选中的候选数据源 ID 中选择，不要把所有候选数据源都填入。最终 analysis_report、charts、tables 中声称已分析、已覆盖或展示状态的数据源必须与这里声明的实际访问范围一致。",
+    )
+    base_execution_id: int = Field(
+        default=0,
+        description=(
+            "局部修复所基于的失败 execution_id。只修复错误定位附近代码时填写，并让 code 保持为空；"
+            "后端会从该不可变执行记录恢复完整代码和原 used_datasource_ids。"
+        ),
+    )
+    patches: list[SourceCodePatch] = Field(
+        default_factory=list,
+        description=(
+            "针对 base_execution_id 完整源码的非重叠行区间替换。只提交错误所需的最小修改；"
+            "后端按行号合成完整代码，未覆盖区域保持原样。"
+        ),
     )
 
 
@@ -5890,6 +5931,34 @@ def _datasource_relation_tokens(item: dict[str, Any]) -> set[str]:
     return tokens
 
 
+def _statically_referenced_datasource_ids(
+    code: str,
+    *,
+    selected_datasource_snapshot: list[dict[str, Any]] | None,
+) -> set[int]:
+    """Map physical datasource identifiers mentioned by generated code to IDs."""
+
+    normalized_code = str(code or '').lower()
+    if not normalized_code or not selected_datasource_snapshot:
+        return set()
+    referenced_ids: set[int] = set()
+    for item in selected_datasource_snapshot:
+        try:
+            datasource_id = int(item.get('datasource_id') or item.get('id') or 0)
+        except (TypeError, ValueError):
+            continue
+        if datasource_id <= 0:
+            continue
+        tokens = sorted(_datasource_relation_tokens(item), key=len, reverse=True)
+        if any(
+            re.search(rf'(?<![\w]){re.escape(token)}(?![\w])', normalized_code)
+            for token in tokens
+            if token
+        ):
+            referenced_ids.add(datasource_id)
+    return referenced_ids
+
+
 def _find_untracked_datasource_accesses(
     exec_result: StructuredResult,
     *,
@@ -6537,6 +6606,96 @@ def _build_analysis_logic_signature(code: str) -> str:
     if not normalized_code:
         return ''
     return hashlib.sha256(normalized_code.encode('utf-8')).hexdigest()
+
+
+def _apply_source_code_patches(code: str, patches: list[SourceCodePatch]) -> str:
+    """Apply non-overlapping line edits to an immutable source snapshot."""
+    source_lines = str(code or '').splitlines()
+    if not source_lines:
+        raise ValueError('base_execution_id 对应的执行记录没有可修复代码。')
+    if not patches:
+        raise ValueError('使用 base_execution_id 修复时必须提供至少一个 patches 行区间替换。')
+
+    normalized = sorted(patches, key=lambda item: (item.start_line, item.end_line))
+    previous_end = 0
+    for patch in normalized:
+        if patch.start_line < 1 or patch.end_line < patch.start_line:
+            raise ValueError('patches 行号必须满足 1 <= start_line <= end_line。')
+        if patch.end_line > len(source_lines):
+            raise ValueError(
+                f'patches 行号超出失败代码范围：end_line={patch.end_line}, line_count={len(source_lines)}。'
+            )
+        if patch.start_line <= previous_end:
+            raise ValueError('patches 不能包含重叠的源码行区间。')
+        previous_end = patch.end_line
+
+    for patch in reversed(normalized):
+        source_lines[patch.start_line - 1:patch.end_line] = patch.replacement.splitlines()
+
+    rendered = '\n'.join(source_lines)
+    if str(code or '').endswith(('\n', '\r')):
+        rendered += '\n'
+    return rendered
+
+
+def _resolve_execute_python_source(
+    *,
+    conversation_id: int,
+    turn_id: int,
+    code: str,
+    used_datasource_ids: list[int] | None,
+    base_execution_id: int,
+    patches: list[SourceCodePatch] | None,
+) -> tuple[str, list[int], int, str]:
+    """Resolve a full execution source, optionally by patching one failed execution."""
+    normalized_code = str(code or '')
+    normalized_ids = _normalize_used_datasource_ids(used_datasource_ids)
+    base_execution_id = int(base_execution_id or 0)
+    normalized_patches = [
+        item if isinstance(item, SourceCodePatch) else SourceCodePatch.model_validate(item)
+        for item in (patches or [])
+    ]
+
+    if base_execution_id <= 0:
+        if normalized_patches:
+            raise ValueError('提供 patches 时必须同时提供 base_execution_id。')
+        if not normalized_code.strip():
+            raise ValueError('首次执行必须提供完整 code。')
+        return normalized_code, normalized_ids, 0, 'llm_generated'
+    if normalized_code.strip():
+        raise ValueError('局部修复只能提交 base_execution_id + patches，不能同时提交完整 code。')
+
+    from config.database import SessionLocal
+    from model import InsightNsExecution
+
+    session = SessionLocal()
+    try:
+        base_execution = session.query(InsightNsExecution).filter(
+            InsightNsExecution.id == base_execution_id,
+            InsightNsExecution.conversation_id == int(conversation_id or 0),
+            InsightNsExecution.turn_id == int(turn_id or 0),
+            InsightNsExecution.is_deleted == 0,
+        ).first()
+        if base_execution is None:
+            raise ValueError('base_execution_id 不属于当前会话轮次或执行记录不存在。')
+        if str(base_execution.execution_status or '') == 'success':
+            raise ValueError('不能以已成功执行的代码作为错误修复基线。')
+        try:
+            base_ids = _normalize_used_datasource_ids(json.loads(base_execution.used_datasource_ids_json or '[]'))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            base_ids = []
+        if normalized_ids and normalized_ids != base_ids:
+            raise ValueError(
+                '局部技术修复不能改变 base_execution_id 的 used_datasource_ids；'
+                '省略该参数或原样传入上一版范围。'
+            )
+        resolved_code = _apply_source_code_patches(
+            str(base_execution.generated_code or ''),
+            normalized_patches,
+        )
+        return resolved_code, base_ids, base_execution_id, 'llm_patch_repair'
+    finally:
+        session.close()
 
 
 def _create_execution_record(
@@ -7895,6 +8054,175 @@ def _build_turn_failure_memory(turn_id: int, current_execution_id: int) -> dict[
         session.close()
 
 
+def _validate_scope_preserving_technical_repair(
+    *,
+    previous_used_datasource_ids: list[int],
+    current_used_datasource_ids: list[int],
+    previous_failure_payload: dict[str, Any] | None,
+) -> RetryResult | None:
+    """A static implementation rejection cannot authorize silent analysis-scope loss."""
+    failure_payload = dict(previous_failure_payload or {})
+    diagnostics = failure_payload.get('diagnostics')
+    diagnostics = dict(diagnostics) if isinstance(diagnostics, dict) else {}
+    if not _failure_requires_scope_preservation(failure_payload):
+        return None
+
+    previous_ids = _normalize_used_datasource_ids(previous_used_datasource_ids)
+    current_ids = _normalize_used_datasource_ids(current_used_datasource_ids)
+    missing_ids = [item for item in previous_ids if item not in set(current_ids)]
+    if not missing_ids:
+        return None
+
+    return request_retry(
+        retry_type='contract_error',
+        message=(
+            '技术契约修复静默缩减了上一版已声明的多数据源分析范围。'
+            '上一版的错误只证明具体实现需要修正，没有结构化观测支持删除这些数据源。'
+        ),
+        diagnostics={
+            'violated_contract': 'analysis_scope_regression_after_technical_repair',
+            'previous_used_datasource_ids': previous_ids,
+            'current_used_datasource_ids': current_ids,
+            'missing_datasource_ids': missing_ids,
+            'scope_change_authorized': False,
+            'previous_failure_phase': diagnostics.get('failure_phase') or 'execution',
+            'previous_retry_type': failure_payload.get('retry_type'),
+            'previous_error_type': failure_payload.get('error_type'),
+        },
+        repair_instructions=[
+            '恢复 missing_datasource_ids 中的查询路径及其下游计算、图表、表格和报告表达。',
+            '只修正上一版报错的查询语法、聚合下推、Runtime API 或异常处理实现，不要借技术修复改写业务分析范围。',
+            '如果恢复后的真实查询执行失败，再根据该次具体错误或结构化 Probe 观测调整可用路径。',
+        ],
+    )
+
+
+def _failure_requires_scope_preservation(
+    previous_failure_payload: dict[str, Any] | None,
+) -> bool:
+    failure_payload = dict(previous_failure_payload or {})
+    diagnostics = failure_payload.get('diagnostics')
+    diagnostics = dict(diagnostics) if isinstance(diagnostics, dict) else {}
+    scope_preserving_retry_types = {
+        'missing_query_constraints',
+        'invalid_query_constraints',
+        'query_constraint_violation',
+        'chart_contract_error',
+        'missing_structured_artifact',
+        'missing_report',
+        'incomplete_result',
+    }
+    scope_preserving_error_types = {
+        'syntax_error',
+        'missing_dependency',
+        'schema_or_column_mismatch',
+        'undefined_name',
+        'data_type_or_time_mismatch',
+        'query_result_too_large',
+        'runtime_error',
+        'library_api_signature_mismatch',
+        'chart_contract_error',
+    }
+    return (
+        diagnostics.get('violated_contract') == 'sql_load_error_handling'
+        or failure_payload.get('retry_type') in scope_preserving_retry_types
+        or failure_payload.get('error_type') in scope_preserving_error_types
+    )
+
+
+def _validate_analysis_scope_against_execution_history(
+    *,
+    previous_executions: list[Any],
+    current_used_datasource_ids: list[int],
+    current_code: str,
+    selected_datasource_snapshot: list[dict[str, Any]] | None = None,
+) -> RetryResult | None:
+    """Keep the last failed analysis as repair anchor across intervening Probe calls."""
+    try:
+        current_tree = ast.parse(current_code or '')
+    except SyntaxError:
+        return None
+    if _extract_static_string_assignment(current_tree, 'execution_intent') != 'analysis':
+        return None
+
+    for previous in previous_executions:
+        try:
+            previous_tree = ast.parse(getattr(previous, 'generated_code', '') or '')
+        except SyntaxError:
+            previous_tree = None
+        if (
+            previous_tree is None
+            or _extract_static_string_assignment(previous_tree, 'execution_intent') != 'analysis'
+        ):
+            continue
+        try:
+            payload = json.loads(getattr(previous, 'result_payload_json', '') or '{}')
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or not _failure_requires_scope_preservation(payload):
+            continue
+        try:
+            previous_used_ids = json.loads(
+                getattr(previous, 'used_datasource_ids_json', '') or '[]'
+            )
+        except (TypeError, ValueError):
+            previous_used_ids = []
+        referenced_ids = _statically_referenced_datasource_ids(
+            getattr(previous, 'generated_code', '') or '',
+            selected_datasource_snapshot=selected_datasource_snapshot,
+        )
+        if referenced_ids:
+            previous_used_ids = [
+                datasource_id
+                for datasource_id in _normalize_used_datasource_ids(previous_used_ids)
+                if datasource_id in referenced_ids
+            ]
+        return _validate_scope_preserving_technical_repair(
+            previous_used_datasource_ids=_normalize_used_datasource_ids(previous_used_ids),
+            current_used_datasource_ids=current_used_datasource_ids,
+            previous_failure_payload=payload,
+        )
+    return None
+
+
+def _validate_technical_repair_scope_from_history(
+    *,
+    turn_id: int,
+    current_execution_id: int,
+    current_used_datasource_ids: list[int],
+    current_code: str,
+    selected_datasource_snapshot: list[dict[str, Any]] | None = None,
+) -> RetryResult | None:
+    if turn_id <= 0 or current_execution_id <= 0:
+        return None
+
+    from config.database import SessionLocal
+    from model import InsightNsExecution, InsightNsTurn
+
+    session = SessionLocal()
+    try:
+        turn = session.query(InsightNsTurn).filter(InsightNsTurn.id == turn_id).first()
+        previous_query = session.query(InsightNsExecution).filter(
+            InsightNsExecution.turn_id == turn_id,
+            InsightNsExecution.id < current_execution_id,
+            InsightNsExecution.is_deleted == 0,
+            InsightNsExecution.execution_status != 'success',
+        )
+        if turn is not None and turn.started_at is not None:
+            previous_query = previous_query.filter(InsightNsExecution.created_at >= turn.started_at)
+        previous_executions = previous_query.order_by(
+            InsightNsExecution.id.desc()
+        ).limit(20).all()
+        return _validate_analysis_scope_against_execution_history(
+            previous_executions=previous_executions,
+            current_used_datasource_ids=current_used_datasource_ids,
+            current_code=current_code,
+            selected_datasource_snapshot=selected_datasource_snapshot,
+        )
+    finally:
+        session.close()
+
+
 def _turn_has_prior_time_range_guard_signal(turn_id: int, current_execution_id: int) -> bool:
     """Whether this turn already hit no-data/probe feedback before the current execution."""
     if turn_id <= 0:
@@ -8184,6 +8512,7 @@ def _augment_repair_instructions(
 def _tool_error_message(
     *,
     tool_call_id: str,
+    execution_id: int = 0,
     error_type: str,
     error_message: str,
     repair_instructions: list[str],
@@ -8223,6 +8552,7 @@ def _tool_error_message(
     payload = {
         'tool': 'execute_python',
         'status': 'failed',
+        'execution_id': int(execution_id or 0),
         'error_type': error_type,
         'error_message': clipped_error_message,
         'error_message_truncated': clipped_error_message != (error_message or ''),
@@ -8248,6 +8578,17 @@ def _tool_error_message(
         ),
         'previous_failure_count': len(previous_failure_messages or []),
     }
+    if execution_id > 0 and current_failed_code:
+        payload['repair_target'] = {
+            'base_execution_id': int(execution_id),
+            'source_sha256': _build_analysis_logic_signature(current_failed_code),
+            'line_count': len(str(current_failed_code).splitlines()),
+            'mode': 'line_patch',
+            'usage': (
+                '局部技术错误优先再次调用 execute_python，令 code 为空，并提交 '
+                'base_execution_id 与非重叠 patches；后端会保留未修改的完整分析代码和数据源范围。'
+            ),
+        }
     if feedback_kind:
         payload['feedback_kind'] = feedback_kind
     if retry_reason_code:
@@ -8493,15 +8834,18 @@ def run_generated_code_locally(
     description=(
         "执行一份独立闭环的 Python 洞察分析或探测代码。analysis 必须在本次调用内生成完整产物并保存；"
         "probe 必须返回结构化探测反馈；调用之间不共享运行时变量。"
+        "局部技术错误可用失败反馈中的 base_execution_id 和行级 patches 修复，后端会保留其余完整代码。"
     ),
     args_schema=ExePythonCodeInput,
 )
 def execute_python(
     runtime: ToolRuntime[CustomContext],
-    code: str,
+    code: str = '',
     title: str = '',
     description: str = "",
     used_datasource_ids: list[int] | None = None,
+    base_execution_id: int = 0,
+    patches: list[SourceCodePatch] | None = None,
 ) -> Optional[ToolMessage | Command]:
     """
     执行模型生成的 Python 分析代码。
@@ -8513,16 +8857,38 @@ def execute_python(
     emit = _get_stream_emitter()
     start_time = time.time()
     _raise_if_runtime_task_cancelled(runtime.context)
-    normalized_used_datasource_ids = _normalize_used_datasource_ids(used_datasource_ids)
+    conversation_id = int(getattr(runtime.context, 'conversation_id', 0) or 0)
+    turn_id = int(getattr(runtime.context, 'turn_id', 0) or 0)
+    try:
+        code, normalized_used_datasource_ids, parent_execution_id, execution_source = _resolve_execute_python_source(
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            code=code,
+            used_datasource_ids=used_datasource_ids,
+            base_execution_id=base_execution_id,
+            patches=patches,
+        )
+    except (TypeError, ValueError) as exc:
+        return _tool_error_message(
+            tool_call_id=runtime.tool_call_id,
+            error_type='contract_error',
+            error_message=str(exc),
+            repair_instructions=[
+                '首次执行请提交完整 code；局部修复请提交 code=""、失败的 base_execution_id 和非重叠 patches。',
+                'patches 的 start_line/end_line 必须引用错误反馈 code_error_context 中的原始行号。',
+            ],
+        )
     execution_id = _create_execution_record(
-        conversation_id=int(getattr(runtime.context, 'conversation_id', 0) or 0),
-        turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+        conversation_id=conversation_id,
+        turn_id=turn_id,
         tool_call_id=getattr(runtime, 'tool_call_id', '') or '',
         code=code,
         title=title,
         description=description,
         used_datasource_ids=normalized_used_datasource_ids,
         analysis_task_id=getattr(runtime.context, 'analysis_task_id', None),
+        parent_execution_id=parent_execution_id or None,
+        execution_source=execution_source,
     )
     _raise_if_runtime_task_cancelled(runtime.context, execution_id=execution_id, start_time=start_time)
     execution_log_context = {
@@ -8565,6 +8931,13 @@ def execute_python(
     if contract_retry is None:
         contract_retry = _validate_generated_code_contract(code)
     if contract_retry is None:
+        contract_retry = _validate_technical_repair_scope_from_history(
+            turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+            current_execution_id=execution_id,
+            current_used_datasource_ids=normalized_used_datasource_ids,
+            current_code=code,
+        )
+    if contract_retry is None:
         contract_retry = _validate_analysis_relationship_contract(
             runtime.context,
             code,
@@ -8603,6 +8976,7 @@ def execute_python(
         )
         return _tool_error_message(
             tool_call_id=runtime.tool_call_id,
+            execution_id=execution_id,
             error_type=contract_retry.retry_type,
             error_message=contract_retry.message,
             repair_instructions=retry_repair_instructions,
@@ -8695,6 +9069,7 @@ def execute_python(
         )
         return _tool_error_message(
             tool_call_id=runtime.tool_call_id,
+            execution_id=execution_id,
             error_type=error_type,
             error_message=error_message,
             repair_instructions=repair_instructions,
@@ -8741,6 +9116,7 @@ def execute_python(
         )
         return _tool_error_message(
             tool_call_id=runtime.tool_call_id,
+            execution_id=execution_id,
             error_type=error_type,
             error_message=error_message,
             repair_instructions=repair_instructions,
@@ -8781,6 +9157,7 @@ def execute_python(
         )
         return _tool_error_message(
             tool_call_id=runtime.tool_call_id,
+            execution_id=execution_id,
             error_type=error_type,
             error_message=error_message,
             repair_instructions=repair_instructions,
@@ -8849,6 +9226,7 @@ def execute_python(
         )
         return _tool_error_message(
             tool_call_id=runtime.tool_call_id,
+            execution_id=execution_id,
             error_type=error_type,
             error_message=error_message,
             repair_instructions=repair_instructions,
@@ -8932,6 +9310,7 @@ def execute_python(
         )
         return _tool_error_message(
             tool_call_id=runtime.tool_call_id,
+            execution_id=execution_id,
             error_type=exec_result.retry_type,
             error_message=exec_result.message,
             repair_instructions=retry_repair_instructions,
@@ -8962,6 +9341,53 @@ def execute_python(
                     canonical_used_datasource_ids,
                 )
             normalized_used_datasource_ids = canonical_used_datasource_ids
+        scope_retry = _validate_technical_repair_scope_from_history(
+            turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+            current_execution_id=execution_id,
+            current_used_datasource_ids=normalized_used_datasource_ids,
+            current_code=code,
+            selected_datasource_snapshot=selected_datasource_snapshot,
+        )
+        if scope_retry is not None:
+            failure_memory = _build_turn_failure_memory(
+                turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+                current_execution_id=execution_id,
+            )
+            _update_execution_record(
+                execution_id,
+                execution_status='failed',
+                analysis_report=exec_result.analysis_report,
+                result_payload_json=scope_retry.model_dump_json(),
+                stdout_text=stdout_text,
+                stderr_text=stderr_text,
+                execution_seconds=execution_seconds,
+                error_message=scope_retry.message,
+                used_datasource_ids=normalized_used_datasource_ids,
+            )
+            emit(
+                'status',
+                stage='tool_retry',
+                level='warning',
+                tool='execute_python',
+                message=FRONTEND_TOOL_RETRY_MESSAGE,
+            )
+            return _tool_error_message(
+                tool_call_id=runtime.tool_call_id,
+                execution_id=execution_id,
+                error_type=scope_retry.retry_type,
+                error_message=scope_retry.message,
+                repair_instructions=scope_retry.repair_instructions,
+                error_signature=_build_retry_error_signature(scope_retry),
+                feedback_kind='retryable_feedback',
+                retry_reason_code=scope_retry.retry_type,
+                diagnostics=scope_retry.diagnostics,
+                analysis_report=exec_result.analysis_report,
+                current_failed_code=code,
+                previous_failure_messages=failure_memory.get('previous_failure_messages', []),
+                previous_failure_hints=failure_memory.get('previous_failure_hints', []),
+                stdout_text=stdout_text,
+                stderr_text=stderr_text,
+            )
         contract_retry = _validate_structured_result_contract(
             exec_result,
             generated_code=code,
@@ -8994,6 +9420,7 @@ def execute_python(
             )
             return _tool_error_message(
                 tool_call_id=runtime.tool_call_id,
+                execution_id=execution_id,
                 error_type=contract_retry.retry_type,
                 error_message=contract_retry.message,
                 repair_instructions=contract_retry.repair_instructions or _build_repair_instructions(contract_retry.retry_type),
@@ -9061,6 +9488,7 @@ def execute_python(
     )
     return _tool_error_message(
         tool_call_id=runtime.tool_call_id,
+        execution_id=execution_id,
         error_type='result_contract_error',
         error_message='生成的代码未按模板产出 result',
         repair_instructions=_build_repair_instructions('result_contract_error'),

@@ -502,6 +502,119 @@ class InsightNsRelDatasourceService:
             },
         }
 
+    def materialize_semantic_uns_node_ids(
+        self,
+        *,
+        uns_node_ids: list[str],
+        authorization: str,
+        lake_rds_database_name: str = '',
+        ts_query_source: str = '',
+    ) -> dict[str, int]:
+        """Materialize semantic-center node IDs without changing user selections."""
+        normalized_node_ids = list(dict.fromkeys(
+            str(item or '').strip() for item in uns_node_ids if str(item or '').strip()
+        ))
+        if not normalized_node_ids:
+            raise ValueError('semantic selection returned no UNS node IDs')
+        if not authorization:
+            raise ValueError('semantic UNS materialization requires authorization')
+
+        rows = self.session.query(InsightDatasource).filter(
+            InsightDatasource.datasource_type == 'table',
+            InsightDatasource.is_deleted == 0,
+            InsightDatasource.uns_node_id.in_(normalized_node_ids),
+        ).all()
+        datasource_by_node_id = {
+            str(datasource.uns_node_id or '').strip(): datasource
+            for datasource in rows
+            if str(datasource.uns_node_id or '').strip()
+        }
+        missing_node_ids = [
+            node_id
+            for node_id in normalized_node_ids
+            if node_id not in datasource_by_node_id
+        ]
+        if missing_node_ids:
+            release_clean_session_connection(self.session)
+            detail_results = self._fetch_uns_details_in_parallel(
+                missing_node_ids,
+                authorization,
+            )
+            failed = [item for item in detail_results if not item.get('success')]
+            if failed:
+                raise ValueError(self._build_uns_failure_message(
+                    [
+                        {
+                            'id': item.get('id', ''),
+                            'message': item.get('message', 'UNS detail lookup failed'),
+                        }
+                        for item in failed
+                    ],
+                    'semantic UNS materialization failed',
+                ))
+            details: list[dict[str, Any]] = []
+            for item in detail_results:
+                requested_node_id = str(item.get('id') or '').strip()
+                detail = dict(item['detail'])
+                returned_node_id = str(detail.get('id') or '').strip()
+                if returned_node_id and returned_node_id != requested_node_id:
+                    raise ValueError(
+                        'UNS instance response node ID mismatch: '
+                        f'{requested_node_id} -> {returned_node_id}'
+                    )
+                detail['id'] = requested_node_id
+                details.append(detail)
+            data_types = {
+                str(detail.get('id') or '').strip(): self._normalize_uns_data_type(detail)
+                for detail in details
+            }
+            lake_required_types = UNS_TABLE_DATA_TYPES - {UNS_PROTOCOL_TABLE_DATA_TYPE}
+            if any(item in lake_required_types for item in data_types.values()) \
+                    and not lake_rds_database_name:
+                raise ValueError('LakeRDS database name is unavailable')
+            time_series_types = {UNS_TIME_SERIES_DATA_TYPE, UNS_CALCULATED_TABLE_DATA_TYPE}
+            normalized_ts_query_source = normalize_ts_query_source(ts_query_source)
+            if any(item in time_series_types for item in data_types.values()) \
+                    and not normalized_ts_query_source:
+                raise ValueError('time-series query source is unavailable')
+
+            reference_detail_by_id, reference_failures = (
+                self._fetch_reference_uns_details_for_import(details, authorization)
+            )
+            if reference_failures:
+                raise ValueError(self._build_uns_failure_message(
+                    reference_failures,
+                    'semantic UNS reference materialization failed',
+                ))
+            for detail in details:
+                datasource = self._upsert_uns_table_datasource(
+                    detail=detail,
+                    lake_rds_database_name=lake_rds_database_name,
+                    uns_data_type=self._normalize_uns_data_type(detail),
+                    ts_query_source=normalized_ts_query_source,
+                    reference_detail_by_id=reference_detail_by_id,
+                )
+                self._bind_datasource(
+                    insight_namespace_id=SHARED_UNS_NAMESPACE_ID,
+                    insight_conversation_id=DEFAULT_CONVERSATION_ID,
+                    datasource_id=datasource.id,
+                    bind_source=BIND_SOURCE_SYSTEM_DEFAULT,
+                )
+                datasource_by_node_id[str(detail.get('id') or '').strip()] = datasource
+
+        missing = [
+            node_id
+            for node_id in normalized_node_ids
+            if node_id not in datasource_by_node_id
+        ]
+        if missing:
+            raise ValueError(f'UNS node IDs could not be materialized: {missing}')
+        self.session.commit()
+        return {
+            node_id: int(datasource_by_node_id[node_id].id)
+            for node_id in normalized_node_ids
+        }
+
     def _build_uns_failure_message(
         self,
         failed_rows: list[dict[str, Any]],

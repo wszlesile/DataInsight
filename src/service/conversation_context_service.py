@@ -1040,6 +1040,76 @@ class ConversationContextService:
         }
         return [payload_map[datasource_id] for datasource_id in normalized_ids if datasource_id in payload_map]
 
+    def build_datasource_snapshot_by_ids(
+        self,
+        *,
+        namespace_id: int,
+        datasource_ids: list[int],
+    ) -> list[dict[str, Any]]:
+        """Build a turn-scoped snapshot for namespace or shared UNS datasources."""
+        normalized_ids = list(dict.fromkeys(
+            datasource_id
+            for datasource_id in (to_int(item, 0) for item in datasource_ids or [])
+            if datasource_id > 0
+        ))
+        if not normalized_ids:
+            return []
+        rows = self.session.query(InsightDatasource).filter(
+            InsightDatasource.id.in_(normalized_ids),
+            InsightDatasource.insight_namespace_id.in_([0, int(namespace_id)]),
+            InsightDatasource.is_deleted == 0,
+        ).all()
+        payload_map = {
+            item['datasource_id']: item
+            for item in (self._build_datasource_snapshot_item(row) for row in rows)
+        }
+        return [
+            payload_map[datasource_id]
+            for datasource_id in normalized_ids
+            if datasource_id in payload_map
+        ]
+
+    def merge_turn_datasource_snapshot(
+        self,
+        *,
+        turn_id: int,
+        datasource_snapshot: list[dict[str, Any]],
+    ) -> None:
+        """Persist newly materialized sources in the immutable current-turn scope."""
+        turn = self.session.query(InsightNsTurn).filter(
+            InsightNsTurn.id == int(turn_id),
+            InsightNsTurn.is_deleted == 0,
+        ).first()
+        if turn is None:
+            raise ValueError('analysis turn does not exist')
+        rows = [
+            dict(item)
+            for item in safe_json_loads(turn.selected_datasource_snapshot_json, [])
+            if isinstance(item, dict)
+        ]
+        rows_by_id = {
+            to_int(item.get('datasource_id') or item.get('id'), 0): item
+            for item in rows
+            if to_int(item.get('datasource_id') or item.get('id'), 0) > 0
+        }
+        ordered_ids = list(rows_by_id)
+        for item in datasource_snapshot:
+            if not isinstance(item, dict):
+                continue
+            datasource_id = to_int(
+                item.get('datasource_id') or item.get('id'), 0
+            )
+            if datasource_id <= 0:
+                continue
+            if datasource_id not in rows_by_id:
+                ordered_ids.append(datasource_id)
+            rows_by_id[datasource_id] = dict(item)
+        turn.selected_datasource_ids_json = dump_json(ordered_ids)
+        turn.selected_datasource_snapshot_json = dump_json([
+            rows_by_id[datasource_id] for datasource_id in ordered_ids
+        ])
+        self.session.commit()
+
     def _ensure_conversation_resource_bindings(self, conversation: InsightNsConversation) -> None:
         """
         根据当前空间下的默认关系，回填会话级资源关系。
