@@ -55,11 +55,16 @@ Evidence 编译器没有洞察规划权。它只能回答：
 
 找不到可验证链路时，不得猜测或绑定一个主题相近的 Evidence。
 
-### 3.3 不扫描 Markdown 数字反推指标
+### 3.3 最终报告扫描只发现位置，不反推指标
 
-系统不使用正则或数值相等关系扫描 Markdown，再猜测某个数字属于哪个指标。
-报告绑定由“代码表达式锚点 + 最终文本精确片段”共同定位。文本只用于确认最终字符
-区间，不用于决定计算语义。
+系统以高召回方式扫描最终 Markdown 的潜在数值位置，保证 AST 未覆盖的新语法、动态
+文本和紧邻中文量词的数值不会静默遗漏。扫描结果只是包含 `report_candidate_id`、
+`start/end` 和 `text` 的候选，不能直接创建 Evidence，也不能通过数值相等、字段名相似
+或主题相似猜测指标。
+
+年份、日期、Markdown 列表序号、比较阈值、公式系数和业务编码等展示数字由确定性语法
+规则排除。候选的计算语义仍必须由代码表达式、AST/dataflow、LLM 结构化声明和
+QuerySnapshot 联合确定；最终文本只提供真实位置和必要的局部展示上下文。
 
 ### 3.4 一个计算签名对应一个 Evidence
 
@@ -95,13 +100,17 @@ flowchart TD
     B --> C["execute_python：Probe 或正式分析"]
     C -- "Probe/业务代码错误" --> B
     C -- "正式分析成功" --> D["冻结 AnalysisExecutionSnapshot"]
-    D --> E["Lineage Indexer：代码与查询谱系索引"]
-    E --> F["报告语义作用域：代码、查询、操作与报告槽位"]
-    F --> G["Evidence Planner：识别报告指标与计算关系"]
-    G --> H{"本地验证"}
-    H -- "可修复" --> F
-    H -- "通过或保留验证子集" --> I["EvidenceAssemblyService 入库"]
-    I --> J["报告、图表、表格与 Evidence 展示"]
+    D --> E["Lineage Indexer：代码、查询与结构化产物谱系"]
+    E --> S["图表/表格：按数值字段与业务数值列确定性编译"]
+    E --> F["报告位置发现：AST 槽位 + 最终 Markdown 高召回候选"]
+    F --> G["本地 verified 绑定"]
+    G --> H["Evidence Planner：仅补充未覆盖候选"]
+    H --> I{"verified / attested / contradicted 验真"}
+    I -- "可修复且未决严格减少" --> H
+    I -- "通过或隔离未决位置" --> J["计算签名、Evidence 与 refs"]
+    S --> J
+    J --> K["EvidenceAssemblyService 入库"]
+    K --> L["报告、图表、表格与 Evidence 展示"]
 ```
 
 统一 Agent 的 ReAct 上下文只处理 Probe、业务计算和产物修复。Evidence Planner 使用
@@ -161,22 +170,26 @@ Evidence Planner 可以根据完整 Python 代码识别其业务含义；本地�
 
 ### 5.3 Report Semantic Scope 与 EvidencePlan
 
-图表和表格仍由 Compiler 按结构化字段确定性生成计算候选。报告采用不同边界：Compiler 先定位
-全部报告动态槽位，并提供本轮真实 query、静态代码操作目录和 AST 已恢复的 advisory hints；
-它不预先裁定报告里有哪些业务指标，也不因 AST 尚未恢复完整血缘而把槽位挡在 LLM 之外。
+图表和表格仍由 Compiler 按结构化字段确定性生成计算候选。报告采用“位置高召回、AST
+主导绑定、LLM 语义补漏”边界：Compiler 先用本轮真实 query、静态代码操作目录、报告
+语法锚点和 AST 血缘绑定所有已证明的报告数值；同时扫描最终 Markdown，补齐 AST 未定位
+到的潜在数值位置。Planner 只处理本地尚未覆盖或语义边界仍需判断的候选。语法锚点和
+渲染候选都是待验真的位置目录，不是要求 Planner 全量重判的指标结论。
 
-Evidence Planner 是一个专注于“阅读已完成分析代码”的 LLM 调用。它以完整 Python 代码为主要
-事实，识别报告指标、重复展示、计算边界和所用 query/operation；不读取最终 Markdown 数值，
-也不根据数值相等关系猜测：
+Evidence Planner 是一个专注于“阅读已完成分析代码并补足语义缺口”的 LLM 调用。它以完整
+Python 代码为主要事实，并接收尚未解决的候选 ID、局部展示上下文、源码锚点、operation
+目录和成功 QuerySnapshot 字段目录。它识别 AST 未能稳定恢复的报告指标、重复展示、计算
+边界和所用 operation，但不能根据候选数值相等关系猜测绑定，也不接收完整图表或表格数据集。
+Planner 优先引用本地提供的稳定语法锚点；当本地锚点目录漏掉合法报告表达式时，可以提交
+源码行与表达式作为补发现锚点，由本地重新解析和验真：
 
 ```json
 {
   "metrics": [
     {
       "calculation_id": "report_semantic_scope",
-      "output_node_ids": ["out_..."],
+      "source_anchors": [{"anchor_id": "expr_...", "line": 120, "expression": "total_amount"}],
       "operation_node_ids": ["op_..."],
-      "query_node_ids": ["q_..."],
       "metric_key": "annual_contract_amount",
       "business_name": "年费合同金额",
       "value_type": "currency",
@@ -187,10 +200,13 @@ Evidence Planner 是一个专注于“阅读已完成分析代码”的 LLM 调�
 }
 ```
 
-Planner 可以在报告语义作用域内选择、合并或拆分报告指标，但只能引用本地目录中的真实节点，
-不能提交 SQL、代码、字符区间、Evidence ID 或计算结果。本地验证器逐指标检查
-`output -> operation -> query` 可达性；越界操作被剔除，无法证明的槽位单独进入 unresolved，
-不会清空其他合法绑定。最终 calculation signature、Evidence ID 和 ref 均由 Compiler 生成。
+Planner 可以在报告语义作用域内选择、合并或拆分补漏指标。AST 已证明的报告数值不依赖
+Planner 覆盖；Planner 对补漏槽位的遗漏或未知 unresolved 不会推翻本地已证明绑定。Planner
+不能提交 SQL、字符区间、Evidence ID 或计算结果。本地验证器先将补发现锚点解析为真实 AST
+节点，再逐指标检查 `source anchor -> operation -> query` 可达性；最终 query refs 由所选
+operation 的 QuerySnapshot 闭包确定。越界操作被剔除，无法证明的槽位单独进入 unresolved，
+不会清空其他合法绑定。最终 output node、calculation signature、Evidence ID 和 ref 均由
+Compiler 生成。
 
 ### 5.4 EvidenceBundle
 
@@ -222,9 +238,10 @@ Evidence。
 ### 6.3 报告
 
 Compiler 从 Python AST 提取动态字符串的结构模板、源码表达式、格式化槽位和邻接静态
-文本，再与最终 Markdown 做整段模板匹配，精确定位 `start/end`。最终文本只确认某个
-已知代码槽位渲染到了哪里，不参与发现指标或决定计算边界。动态精度、预格式化百分比
-和同一模板内多个数值槽位均按各自表达式回溯。
+文本，再与最终 Markdown 做整段模板匹配，精确定位 `start/end`。对 AST 模板未定位的
+数值，最终报告扫描器以高召回方式补充位置候选，包括 `共81批`、`温度2次` 等紧邻中文
+文本的表达。扫描不决定指标语义；候选只有在本地血缘证明或 LLM 声明通过验真后才能生成 ref。
+动态精度、预格式化百分比和同一模板内多个数值槽位均按各自表达式回溯。
 
 如果同一文本出现多次，必须由源码锚点、邻接静态文本和出现顺序共同消歧。无法唯一
 定位时不生成 ref，不能依靠数值相等绑定。
@@ -247,7 +264,8 @@ EvidenceDefinition 解释计算口径，不保存某个图表点或表格单元�
 本地强校验只检查可确定事实：
 
 1. code/result hash 与 execution 一致；
-2. 图表/表格 calculation 由本地唯一边界生成；报告指标由 Planner 识别，但只能引用真实节点；
+2. 图表/表格 calculation 由本地唯一边界生成；报告数值优先由 AST 与 QuerySnapshot 绑定，
+   Planner 只补充无法由 AST 独立覆盖的真实节点；
 3. query 节点来自本次 `query_snapshots`；
 4. output node 确实到达对应产物位置；
 5. 一个 calculation signature 只生成一个 Evidence；
@@ -256,8 +274,9 @@ EvidenceDefinition 解释计算口径，不保存某个图表点或表格单元�
 8. selector 与产物维度一致；
 9. 展示变换可以从执行事件或代码表达式验证。
 
-报告 Evidence 的职责主次固定为：LLM 主导语义发现，本地 AST 与 QuerySnapshot 主导事实验证、
-唯一签名和物化。Planner 的单项错误按指标隔离，不能推翻正式分析，也不能使其他报告 Evidence 丢失。
+报告 Evidence 的职责主次固定为：AST 与 QuerySnapshot 主导可证明事实绑定、唯一签名和物化；
+LLM 只做语义补漏。Planner 的单项错误按指标隔离，不能推翻正式分析，也不能使本地已证明的
+报告 Evidence 丢失。
 
 LLM 只决定“哪些代码操作共同表达一个业务指标”，不重复猜测操作所属查询。最终 query refs 必须由
 所选操作的 QuerySnapshot 血缘闭包生成。参数化循环复用同一段计算代码时，唯一签名还必须包含计算
@@ -302,15 +321,19 @@ LLM 只决定“哪些代码操作共同表达一个业务指标”，不重复�
 
 1. 实现 Python AST 和 SQL AST 索引。
 2. 建立查询、变量、列、操作和输出节点关系。
-3. 增加报告 render event 的透明采集，不改变最终字符串。
+3. 建立 AST 报告槽位定位和最终 Markdown 高召回候选扫描，不侵入正式报告构造。
 4. 用手写代码夹具验证常见计算签名和 grouped selector。
 
 ### 阶段三：Evidence Planner 与 Compiler
 
 1. 定义严格 JSON schema 和专用 Prompt。
-2. Compiler 先生成不可变计算候选，Planner 只做业务命名和解释。
-3. Compiler 生成 signature、EvidenceDefinition 和三类 refs。
-4. 实现一次 Evidence 专用结构化修复；保留验证子集，不回流正式 Agent。
+2. 图表和表格由 Compiler 直接生成不可变计算候选；报告先由 AST 与 QuerySnapshot 绑定
+   可证明位置，Planner 只处理仍未解决的源码锚点和最终产物候选。
+3. Compiler 验证报告源码锚点、operation 与 QuerySnapshot 闭包，物化 report output，再生成
+   signature、EvidenceDefinition 和三类 refs。
+4. 当 AST 未预建 report output 时，最终产物扫描仍必须形成候选并调用 Planner；Planner 可以
+   引用候选 ID，也可以提交可本地解析的补发现锚点。
+5. 实现一次 Evidence 专用 JSON 结构修复；业务绑定错误按指标隔离，不回流正式 Agent。
 
 ### 阶段四：旁路真实回归
 
@@ -341,5 +364,22 @@ LLM 只决定“哪些代码操作共同表达一个业务指标”，不重复�
 - 本地重执行、刷新、追问、无数据和取消流程不回退；
 - 总耗时增加可测且可接受，Evidence 超时不阻塞分析结果展示。
 
-若 Lineage Indexer 无法覆盖常见生成代码，或必须依赖 Markdown 数字猜测才能达到覆盖率，
+若 Lineage Indexer 无法覆盖常见生成代码，或必须依赖 Markdown 数值相等关系猜测计算语义，
 则停止切换并补足编译能力，不能用 Prompt 禁止项约束统一 Agent 的洞察表达。
+## 2026-08-07 补充：报告候选与三级可信边界
+
+本节记录高召回候选和三级可信边界的实现细节。当前实现将“发现位置”和“判断计算语义”严格分开：
+
+1. 最终报告扫描器以高召回方式枚举数值位置，只负责生成 `report_candidate_id + start/end + text`，不据此创建 Evidence。
+2. 年月日、章节序号、Markdown 有序列表编号、比较阈值、公式系数和业务编码中的数字由
+   确定性的展示语法规则排除；中文文本与量词相邻的数值必须保留为候选。
+3. AST 与 QuerySnapshot 优先完成 `output -> operation -> query` 的本地证明。
+4. 仅将尚未证明的候选交给 LLM。LLM 必须返回结构化 `metric / non_metric / unresolved` 决策；metric 同时声明候选 ID、成功查询 ID、真实字段、计算语义和置信度。
+5. Compiler 最终按以下三级边界处理：
+   - `verified`：本地能够完整证明产物、计算和成功 QuerySnapshot 的闭包。
+   - `attested`：候选位置、查询和字段均为真实事实，LLM 高置信声明计算边界，但本地 AST/dataflow 能力无法证明具体语法写法。
+   - `contradicted`：查询或字段不存在，候选越界，或 LLM 声明与本地已经证明的事实冲突；必须拒绝。
+
+源码行号和表达式定位是本地验真的辅助信息，不再是唯一准入条件。这样避免“LLM 正确识别了新语法，却因本地解析器同样不支持该语法而被拒绝”的循环依赖；同时，LLM 不能覆盖 QuerySnapshot、字段存在性和已证明血缘等确定事实。
+
+`calculation_signature` 包含查询范围、字段、运算边界、参数绑定及 `lineage_verification`。不同计算边界不会因为名称相似而合并；同一 grouped 指标仍按列/series 形成一个 Evidence，而不是按点或单元格复制。

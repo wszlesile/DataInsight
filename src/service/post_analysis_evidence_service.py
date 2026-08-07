@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import json
 import math
@@ -22,20 +23,20 @@ from utils.llm_model_factory import create_data_insight_model, create_runtime_co
 
 
 EVIDENCE_PLANNER_PROMPT = """
-你是数据洞察报告的证据关系解析专家。上游分析已经完成，查询、计算和报告均不可修改。图表和表格的结构化证据由本地编译器处理，当前输入只包含需要语义判断的报告代码位置。
+你是数据洞察报告的证据关系补漏专家。上游分析已经成功完成，查询、计算和报告均不可修改。图表和表格以及大部分报告数值已经由本地完成；当前只处理输入目录中仍未解决的报告位置。
 
-analysis_code 是本轮已成功执行的完整 Python 源码。请先阅读源码中的查询、计算以及 analysis_report 构造逻辑，理解每个报告槽位表达的业务指标；不要根据最终 Markdown 的数值或数值相等关系猜测绑定。
-query_catalog、operation_catalog 和 output_catalog 分别描述已执行查询范围、可引用代码步骤和报告模板槽位。calculation_candidates 中的 report_semantic_scope 是报告语义识别范围，不是本地预先裁定的指标清单；local_lineage_hints 只是 AST 已恢复出的参考线索，可能不完整，不能限制你的判断。
-请以 analysis_code 为主要事实识别每个 output 表达的业务指标，将同一计算边界的 output_node_ids 绑定为一个 metric，并选择真实参与该指标的最小 operation/query 集合。即使 local_lineage_hints 没有某个 output，也要从代码中补识别；不同查询、字段或计算公式不得仅因业务名称相似而合并。
+analysis_code_with_lines 是带行号的完整成功 Python 源码，是定位计算边界的主要事实。report_candidate_catalog 与 source_anchor_catalog 是本次唯一待分类范围。阅读完整代码只是为了理解这些位置如何计算，不要重新枚举目录以外、已经由本地处理过的报告表达式，也不要读取或猜测最终 Markdown 数值。
+
+source_anchor_catalog 是代码中动态字符串表达式的纯语法索引，包含报告、图表描述和其他字符串；它不是报告指标候选。你可以引用其中的 anchor_id，也可以在目录漏掉合法表达式时提交准确的 source_line 与 expression。operation_catalog 是可验证的代码语句目录，不是候选清单。query_catalog 只描述本轮成功数据访问范围；最终查询关系由本地根据所选 operation 的依赖闭包确定。
 
 规则：
-1. 每个 output_node_id 必须恰好出现在一个 metric.output_node_ids 或 unresolved_outputs 中，不得遗漏或重复。
-2. metric 中的 output_node_ids、operation_node_ids、query_node_ids 只能引用该 calculation_id 候选内的节点；所选 operation 还必须出现在对应 output 的 output_operation_ids 中，这是本地静态依赖能够验证的代码路径。
-3. 只选择该指标真正使用的查询和计算步骤。指标字段由本地编译器根据所选 output 的既有血缘恢复，不要输出 metric_source_fields，也不得改写字段名。
+1. 每个 metric 必须引用输入中的 source_anchors 或 report_candidate_ids。目录已有 anchor 时使用 anchor_id；渲染候选使用 report_candidate_ids，并通过 operation_node_ids 或 calculation_source_refs 声明其最小计算边界。不得提交目录之外的表达式作为待分类位置。
+2. operation_node_ids 只选择真实参与该指标的最小计算语句集合。不要为了“看起来完整”选择整个分析流程。
+3. 同一源码表达式只能属于一个 metric；同一计算边界的重复报告表达可以归入同一个 metric。不同查询、字段、公式或参数绑定不得仅因名称相似而合并。
 4. 单条明细值也是数据事实，不能仅因它不是汇总指标而放入 unresolved_outputs。代码通过 idxmax/idxmin、sort/head、rank 等先选择目标行再读取该行指标时，排名选择和被选指标共同构成一个复合计算。
-5. operation_catalog 是可验证的代码事实目录，不是一个指标的候选边界。不得因为候选范围较宽就选择仅仅名称相似的步骤；代码不能证明时必须 unresolved。
-6. 你的核心职责是补全本地 AST 可能遗漏的报告证据关系，而不是复述 local_lineage_hints。对于 hint 完整的指标也要按代码复核；对于 hint 缺失的指标要主动沿变量赋值、计算和查询调用识别。
-7. 只有年份、编号、排名序号等不属于数据计算结果的普通数字，或查询、计算和展示关系确实无法证明的输出，才能放入 unresolved_outputs。
+5. 输入目录中的每一项必须且只能归入 metric、non_metric 对应字段或 unresolved_outputs 之一；不要处理目录以外的源码表达式。
+6. 年份、编号、排名序号、展示标签等不属于数据计算结果的报告表达式放入 non_metric_source_anchors；代码关系无法确认时放入 unresolved_outputs，不得猜测。
+7. 不要输出 SQL、Python 代码、字符区间、Evidence ID、最终数值或 metric_source_fields。
 8. business_name 说明业务指标含义，business_explanation 简洁说明统计对象、范围和计算口径。
 9. value_type 只能是 number、integer、currency、percentage、duration、other。display_unit 使用面向用户的单位。
 10. 面向用户的文字不得出现 Runtime、Metric、Evidence、AST、API 等内部术语，也不得复述 SQL、Python、计算结果或 Markdown。
@@ -43,10 +44,14 @@ query_catalog、operation_catalog 和 output_catalog 分别描述已执行查询
 只输出一个 JSON 对象：
 {
   "metrics": [{
-    "calculation_id": "calc_...",
-    "output_node_ids": ["output_..."],
+    "calculation_id": "report_semantic_scope",
+    "source_anchors": [{"anchor_id": "a1", "source_line": 0, "expression": ""}],
     "operation_node_ids": ["operation_..."],
-    "query_node_ids": ["query_..."],
+    "calculation_source_refs": [{"source_line": 120, "expression": "len(active_rows)"}],
+    "claimed_query_node_ids": ["q1"],
+    "claimed_metric_fields": ["status"],
+    "attestation_confidence": "high",
+    "parameter_bindings": {"loop_variable": "literal value when one source slot is reused"},
     "metric_key": "稳定英文语义名",
     "business_name": "业务指标名称",
     "business_explanation": "面向用户的统计口径说明",
@@ -54,17 +59,83 @@ query_catalog、operation_catalog 和 output_catalog 分别描述已执行查询
     "display_unit": "元/%/台/个/小时等，没有则为空"
   }],
   "unresolved_outputs": [{
-    "output_node_id": "output_...",
+    "source_anchor": {"anchor_id": "a2", "source_line": 0, "expression": ""},
     "reason": "无法证明绑定关系的原因"
-  }]
+  }],
+  "non_metric_source_anchors": [{"anchor_id": "a3", "source_line": 0, "expression": ""}]
 }
-""".strip()
+""".strip() + """
+
+Additional posthoc report-candidate rules:
+11. report_candidate_catalog contains every rendered numeric span not already
+   located by an AST report template. It is a high-recall candidate set, not a
+   metric list. Classify every candidate exactly once: include its id in a
+   metric.report_candidate_ids when it is a data result, put it in
+   non_metric_report_candidate_ids for dates/ordinals/static labels, or add an
+   unresolved_outputs item with output_node_id when no executed calculation can
+   be proven.
+12. A metric may use source_anchors, report_candidate_ids, or both. For a
+    report candidate select the smallest operation set that produced the shown
+    business value. Do not invent an operation merely because its value could
+    look similar.
+13. operation_node_ids may reference catalogued operations. When the exact
+    calculation is visible in analysis_code_with_lines but absent from
+    operation_catalog, use calculation_source_refs with the exact source_line
+    and the smallest complete Python expression or assignment. This is a
+    locator claim only: local AST and QuerySnapshot verification decides whether
+    it can become Evidence. Do not use a surrounding report-format expression
+    when a distinct calculation expression exists.
+14. When calculation_selection_mode is source_locator, operation_catalog is
+    intentionally empty. Use calculation_source_refs for every metric rather
+    than inventing operation IDs.
+15. source_line_hints are local text-retrieval hints for a rendered candidate,
+    not calculation proof. Inspect those lines and nearby variable definitions,
+    then return the exact calculation expression that produced that candidate.
+16. For every source-locator metric also return claimed_query_node_ids using
+    ids from query_catalog, claimed_metric_fields using real projected fields,
+    and attestation_confidence. Use high only when the candidate, source
+    expression, query and field boundary are all certain. Local verification may
+    accept a high-confidence claim when dynamic Python dataflow is beyond local
+    capability, but it will reject nonexistent or contradictory references.
+17. text_examples identifies the exact unresolved numeric span, not every number
+    in the surrounding line. Other numbers in that sentence may already be
+    locally resolved. Bind only the expression producing text_examples. For a
+    joined loop or repeated template, use the yielded value expression and put
+    the dimension value that selects this occurrence in parameter_bindings;
+    do not bind the whole paragraph or summary object.
+
+The JSON object may include report_candidate_ids and calculation_source_refs on
+each metric and a top-level non_metric_report_candidate_ids array.
+"""
+
+
+class ReportSourceAnchorRef(BaseModel):
+    anchor_id: str = ""
+    source_line: int = 0
+    expression: str = ""
+
+
+class CalculationSourceRef(BaseModel):
+    """Planner-located calculation syntax that still requires local proof."""
+
+    source_line: int
+    expression: str
 
 
 class PlannedMetric(BaseModel):
     calculation_id: str
+    source_anchors: list[ReportSourceAnchorRef] = Field(default_factory=list)
+    # Posthoc candidates are spans discovered from the rendered report rather
+    # than from an AST render template. They are only accepted after an LLM
+    # claim is reconciled with an executed calculation/query path.
+    report_candidate_ids: list[str] = Field(default_factory=list)
     output_node_ids: list[str] = Field(default_factory=list)
     operation_node_ids: list[str] = Field(default_factory=list)
+    calculation_source_refs: list[CalculationSourceRef] = Field(default_factory=list)
+    claimed_query_node_ids: list[str] = Field(default_factory=list)
+    claimed_metric_fields: list[str] = Field(default_factory=list)
+    attestation_confidence: Literal["high", "medium", "low"] = "medium"
+    lineage_verification: Literal["verified", "attested"] = "verified"
     query_node_ids: list[str] = Field(default_factory=list)
     metric_source_fields: list[str] = Field(default_factory=list)
     parameter_bindings: dict[str, Any] = Field(default_factory=dict)
@@ -76,13 +147,16 @@ class PlannedMetric(BaseModel):
 
 
 class UnresolvedEvidenceOutput(BaseModel):
-    output_node_id: str
+    output_node_id: str = ""
+    source_anchor: ReportSourceAnchorRef | None = None
     reason: str
 
 
 class EvidencePlan(BaseModel):
     metrics: list[PlannedMetric] = Field(default_factory=list)
     unresolved_outputs: list[UnresolvedEvidenceOutput] = Field(default_factory=list)
+    non_metric_source_anchors: list[ReportSourceAnchorRef] = Field(default_factory=list)
+    non_metric_report_candidate_ids: list[str] = Field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -226,6 +300,19 @@ def _is_numeric_display_text(value: Any) -> bool:
     return number.is_finite()
 
 
+def _is_markdown_ordinal_slot(prefix: Any, suffix: Any) -> bool:
+    """Return whether a dynamic string slot only renders a list ordinal."""
+    line_prefix = str(prefix or "").rsplit("\n", 1)[-1]
+    line_suffix = str(suffix or "").split("\n", 1)[0]
+    return bool(
+        re.fullmatch(
+            r"\s*(?:(?:#{1,6}|[-+*])\s+)?(?:\*\*)?",
+            line_prefix,
+        )
+        and re.match(r"(?:[.)、]|）)(?=\s|\*\*)", line_suffix)
+    )
+
+
 _STRUCTURED_NUMERIC_DISPLAY_PATTERN = re.compile(
     r"^\s*(?P<prefix>[￥¥$€£])?\s*"
     r"(?P<open>\()?\s*(?P<number>[+-]?\d[\d,]*(?:\.\d+)?)\s*"
@@ -317,6 +404,10 @@ class LineageIndexer:
             query_snapshots=query_snapshots,
             operations=operations,
         )
+        outputs = self._attach_report_markdown_table_origins(
+            outputs,
+            code=snapshot.generated_code,
+        )
         outputs = self._attach_output_lineage(outputs, operations)
         queries = [
             {
@@ -332,6 +423,9 @@ class LineageIndexer:
             "query_nodes": queries,
             "operation_nodes": operations,
             "output_nodes": outputs,
+            "report_source_anchors": self._source_expression_catalog(
+                snapshot.generated_code
+            ),
             "literal_iteration_bindings": self._literal_iteration_bindings(
                 snapshot.generated_code
             ),
@@ -339,6 +433,66 @@ class LineageIndexer:
                 snapshot.generated_code
             ),
         }
+
+    @classmethod
+    def _source_expression_catalog(cls, code: str) -> list[dict[str, Any]]:
+        """Index dynamic string expressions without deciding report ownership.
+
+        This is a syntax catalog for the planner and verifier, not a list of
+        report metrics. Expressions from chart descriptions, diagnostics, and
+        other strings are intentionally present so semantic ownership remains
+        the planner's responsibility.
+        """
+        try:
+            tree = ast.parse(code or "")
+        except SyntaxError:
+            return []
+        formatted_numeric_names = cls._formatted_numeric_names(tree)
+        templates: list[ast.JoinedStr] = []
+        templates.extend(
+            item for item in ast.walk(tree) if isinstance(item, ast.JoinedStr)
+        )
+        for item in ast.walk(tree):
+            if isinstance(item, ast.Call):
+                template = cls._format_call_template(item)
+                if template is not None:
+                    templates.append(template)
+            elif isinstance(item, ast.BinOp) and isinstance(item.op, ast.Add):
+                template = cls._concatenated_string_template(item)
+                if template is not None:
+                    templates.append(template)
+
+        anchors: dict[str, dict[str, Any]] = {}
+        for template in templates:
+            for expression in cls._joined_string_expressions(
+                template,
+                code,
+                formatted_numeric_names=formatted_numeric_names,
+            ):
+                anchor_id = str(expression.get("expression_id") or "")
+                if not anchor_id:
+                    continue
+                anchors.setdefault(anchor_id, {
+                    "anchor_id": anchor_id,
+                    "source_line": int(expression.get("line") or 0),
+                    "expression": str(expression.get("expression") or ""),
+                    "loads": list(expression.get("loads") or []),
+                    "display_prefix": str(expression.get("prefix") or ""),
+                    "display_suffix": str(expression.get("suffix") or ""),
+                    "numeric_hint": bool(expression.get("numeric_hint")),
+                    "numeric_suffix": str(expression.get("numeric_suffix") or ""),
+                    "presentation_ordinal": bool(
+                        expression.get("presentation_ordinal")
+                    ),
+                    "expression_metadata": expression,
+                })
+        return sorted(
+            anchors.values(),
+            key=lambda item: (
+                int(item.get("source_line") or 0),
+                str(item.get("anchor_id") or ""),
+            ),
+        )
 
     @staticmethod
     def _report_construction_issues(code: str) -> list[dict[str, Any]]:
@@ -685,17 +839,19 @@ class LineageIndexer:
             tree,
             code,
         )
-        joined_strings_in_report_concatenations: set[int] = set()
+        joined_strings_in_report_expressions: set[int] = set()
         synthetic_concatenation_joined_strings: set[int] = set()
         for node in ast.walk(tree):
             if not isinstance(node, (ast.Assign, ast.AnnAssign)):
                 continue
             value = getattr(node, "value", None)
-            if "analysis_report" not in _target_names(node) or not isinstance(value, ast.BinOp):
+            if "analysis_report" not in _target_names(node) or value is None:
                 continue
-            joined_strings_in_report_concatenations.update(
+            joined_strings_in_report_expressions.update(
                 id(item) for item in ast.walk(value) if isinstance(item, ast.JoinedStr)
             )
+            if not isinstance(value, ast.BinOp):
+                continue
             template = self._concatenated_string_template(value)
             contains_joined_builder = any(
                 isinstance(item, ast.Call)
@@ -787,7 +943,7 @@ class LineageIndexer:
                     )
                     if metadata:
                         expression.update(metadata)
-                    if id(node) in joined_strings_in_report_concatenations:
+                    if id(node) in joined_strings_in_report_expressions:
                         expression["report_declared"] = True
                 report_expressions.extend(expressions)
         operations.extend(self._container_iteration_operations(tree, code))
@@ -835,6 +991,7 @@ class LineageIndexer:
     ) -> list[dict[str, Any]]:
         """Connect values yielded by mapping.items() to writes into that mapping."""
         writes_by_container: dict[str, list[str]] = {}
+        aliases_to_member_targets: dict[str, list[str]] = {}
         for node in ast.walk(tree):
             if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                 continue
@@ -851,32 +1008,56 @@ class LineageIndexer:
                 ):
                     continue
                 writes_by_container.setdefault(item.value.id, []).append(ast.unparse(item))
-
-        operations: list[dict[str, Any]] = []
-        for node in ast.walk(tree):
-            if not (
-                isinstance(node, ast.For)
-                and isinstance(node.target, (ast.Tuple, ast.List))
-                and len(node.target.elts) >= 2
-                and isinstance(node.iter, ast.Call)
-                and isinstance(node.iter.func, ast.Attribute)
-                and node.iter.func.attr == "items"
-                and isinstance(node.iter.func.value, ast.Name)
+            if (
+                len(targets) == 1
+                and isinstance(targets[0], ast.Name)
+                and isinstance(getattr(node, "value", None), ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr == "get"
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.args
+                and isinstance(node.value.args[0], ast.Constant)
+                and isinstance(node.value.args[0].value, str)
             ):
-                continue
-            container_name = node.iter.func.value.id
-            value_target = node.target.elts[1]
+                aliases_to_member_targets[targets[0].id] = [
+                    f"{node.value.func.value.id}[{node.value.args[0].value!r}]"
+                ]
+
+        def items_container(expression: ast.AST) -> str:
+            calls = [
+                item for item in ast.walk(expression)
+                if isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Attribute)
+                and item.func.attr == "items"
+                and isinstance(item.func.value, ast.Name)
+            ]
+            return calls[0].func.value.id if len(calls) == 1 else ""
+
+        def append_iteration(
+            *,
+            target: ast.AST,
+            iterator: ast.AST,
+            line: int,
+        ) -> None:
+            if not isinstance(target, (ast.Tuple, ast.List)) or len(target.elts) < 2:
+                return
+            value_target = target.elts[1]
             if not isinstance(value_target, ast.Name):
-                continue
-            source_targets = list(dict.fromkeys(writes_by_container.get(container_name) or []))
+                return
+            container_name = items_container(iterator)
+            if not container_name:
+                return
+            source_targets = list(dict.fromkeys(
+                aliases_to_member_targets.get(container_name)
+                or writes_by_container.get(container_name)
+                or []
+            ))
             if not source_targets:
-                continue
-            source = ast.get_source_segment(code, node.iter) or ast.unparse(node.iter)
+                return
+            source = ast.get_source_segment(code, iterator) or ast.unparse(iterator)
             operations.append({
-                "operation_node_id": (
-                    f"op_container_iter_{getattr(node, 'lineno', 0)}_{_digest(source, 8)}"
-                ),
-                "line": getattr(node, "lineno", 0),
+                "operation_node_id": f"op_container_iter_{line}_{_digest(source, 8)}",
+                "line": line,
                 "kind": "container_iteration",
                 "semantic_kind": "presentation",
                 "query_node_id": "",
@@ -884,6 +1065,45 @@ class LineageIndexer:
                 "loads": source_targets,
                 "source": source[:1200],
             })
+
+        def append_dataframe_iteration(node: ast.For) -> None:
+            if not (
+                isinstance(node.target, (ast.Tuple, ast.List))
+                and len(node.target.elts) >= 2
+                and isinstance(node.target.elts[1], ast.Name)
+                and isinstance(node.iter, ast.Call)
+                and isinstance(node.iter.func, ast.Attribute)
+                and node.iter.func.attr in {"iterrows", "itertuples"}
+                and isinstance(node.iter.func.value, ast.Name)
+            ):
+                return
+            frame_name = node.iter.func.value.id
+            source = ast.get_source_segment(code, node.iter) or ast.unparse(node.iter)
+            operations.append({
+                "operation_node_id": (
+                    f"op_frame_iter_{getattr(node, 'lineno', 0)}_{_digest(source, 8)}"
+                ),
+                "line": getattr(node, "lineno", 0),
+                "kind": "container_iteration",
+                "semantic_kind": "presentation",
+                "query_node_id": "",
+                "targets": [node.target.elts[1].id],
+                "loads": [frame_name],
+                "source": source[:1200],
+            })
+
+        operations: list[dict[str, Any]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.For):
+                append_iteration(target=node.target, iterator=node.iter, line=int(node.lineno or 0))
+                append_dataframe_iteration(node)
+            elif isinstance(node, (ast.ListComp, ast.GeneratorExp, ast.SetComp)):
+                for generator in node.generators:
+                    append_iteration(
+                        target=generator.target,
+                        iterator=generator.iter,
+                        line=int(getattr(node, "lineno", 0) or 0),
+                    )
         return operations
 
     @classmethod
@@ -953,9 +1173,11 @@ class LineageIndexer:
                     joined_builders_by_name.setdefault(name, set()).update(joined_builders)
             if not (set(_target_names(node)) & report_value_names):
                 continue
-            if isinstance(value, ast.JoinedStr):
-                direct_templates.append(value)
-            elif isinstance(value, ast.Call):
+            direct_templates.extend(
+                item for item in ast.walk(value)
+                if isinstance(item, ast.JoinedStr)
+            )
+            if isinstance(value, ast.Call):
                 synthetic = cls._format_call_template(value)
                 if synthetic is not None:
                     direct_synthetic_templates.append(synthetic)
@@ -1075,6 +1297,20 @@ class LineageIndexer:
             template = value if isinstance(value, ast.JoinedStr) else (
                 cls._format_call_template(value) if isinstance(value, ast.Call) else None
             )
+            # Named detail fragments are frequently produced by joining a list
+            # comprehension, for example ``"、".join(f"{name} {count}次" ...)``.
+            # When that name is inserted into a report template, its element
+            # f-string is part of the report construction graph as well.
+            if (
+                template is None
+                and isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "join"
+                and value.args
+                and isinstance(value.args[0], (ast.ListComp, ast.GeneratorExp, ast.SetComp))
+                and isinstance(value.args[0].elt, ast.JoinedStr)
+            ):
+                template = value.args[0].elt
             if not isinstance(template, ast.JoinedStr):
                 continue
             for name in _target_names(assignment):
@@ -1134,10 +1370,17 @@ class LineageIndexer:
                 continue
             targets = [name for name in _target_names(node) if name in report_builders]
             value = getattr(node, "value", None)
-            if len(targets) != 1 or not isinstance(value, (ast.List, ast.Tuple)):
+            if len(targets) != 1:
                 continue
-            for item in value.elts:
-                add_entry(targets[0], item)
+            if isinstance(value, (ast.List, ast.Tuple)):
+                for item in value.elts:
+                    add_entry(targets[0], item)
+            elif isinstance(value, ast.ListComp):
+                # A report builder often receives repeated rows through a list
+                # comprehension and is later included via ``extend``. Treat its
+                # element template as report-owned so every rendered row can be
+                # located by the same AST calculation boundary.
+                add_entry(targets[0], value.elt)
 
         for call in (item for item in ast.walk(tree) if isinstance(item, ast.Call)):
             if not (
@@ -2260,6 +2503,10 @@ class LineageIndexer:
                 "slot_index": slot_index,
                 "numeric_hint": bool(slot_token.get("numeric_hint")),
                 "numeric_suffix": str(slot_token.get("numeric_suffix") or ""),
+                "presentation_ordinal": _is_markdown_ordinal_slot(
+                    prefix_text,
+                    suffix_text,
+                ),
             })
             slot_index += 1
         return expressions
@@ -2450,9 +2697,30 @@ class LineageIndexer:
                     "lineage_fields": [source_field] if source_field else [key],
                 })
 
-        for output in self._locate_report_outputs(snapshot.analysis_report, report_expressions):
+        ast_report_outputs = self._locate_report_outputs(
+            snapshot.analysis_report,
+            report_expressions,
+        )
+        reserved_report_spans = {
+            (int(output.get("start") or 0), int(output.get("end") or 0))
+            for output in ast_report_outputs
+            if int(output.get("end") or 0) > int(output.get("start") or 0)
+        }
+        for output in ast_report_outputs:
             if self._is_known_dimension_output(output, snapshot.selected_datasource_snapshot):
                 continue
+            output["artifact_id"] = snapshot.report_artifact_id
+            outputs.append(output)
+        occupied_report_spans = reserved_report_spans.union({
+            (int(output.get("start") or 0), int(output.get("end") or 0))
+            for output in outputs
+            if output.get("artifact_type") == "report"
+            and int(output.get("end") or 0) > int(output.get("start") or 0)
+        })
+        for output in self._locate_report_numeric_candidates(
+            snapshot.analysis_report,
+            occupied=occupied_report_spans,
+        ):
             output["artifact_id"] = snapshot.report_artifact_id
             outputs.append(output)
         return outputs
@@ -3062,6 +3330,93 @@ class LineageIndexer:
                     frame_positions[target] = merged_positions
                     continue
 
+                groupby_multi_agg_call = next(
+                    (
+                        item for item in ast.walk(value)
+                        if isinstance(item, ast.Call)
+                        and isinstance(item.func, ast.Attribute)
+                        and item.func.attr in {"agg", "aggregate"}
+                        and item.args
+                        and isinstance(item.args[0], (ast.List, ast.Tuple))
+                    ),
+                    None,
+                ) if value is not None else None
+                groupby_call_for_multi_agg = next(
+                    (
+                        item for item in ast.walk(value)
+                        if isinstance(item, ast.Call)
+                        and isinstance(item.func, ast.Attribute)
+                        and item.func.attr == "groupby"
+                    ),
+                    None,
+                ) if groupby_multi_agg_call is not None else None
+                if groupby_multi_agg_call is not None and groupby_call_for_multi_agg is not None:
+                    source_frame = frame_name_from_expression(groupby_call_for_multi_agg.func.value)
+                    source_columns = frame_columns.get(source_frame) or {}
+                    group_fields: list[str] = []
+                    for argument in groupby_call_for_multi_agg.args:
+                        if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                            group_fields.append(str(argument.value))
+                        elif isinstance(argument, (ast.List, ast.Tuple)):
+                            group_fields.extend(
+                                str(item.value)
+                                for item in argument.elts
+                                if isinstance(item, ast.Constant)
+                                and isinstance(item.value, str)
+                            )
+                    measure_fields = list(dict.fromkeys(
+                        subscript_key(item)
+                        for item in ast.walk(value)
+                        if isinstance(item, ast.Subscript)
+                        and item.value is groupby_call_for_multi_agg
+                        and subscript_key(item)
+                    ))
+                    aggregate_specs = [
+                        str(item.value)
+                        for item in groupby_multi_agg_call.args[0].elts
+                        if isinstance(item, ast.Constant)
+                        and isinstance(item.value, str)
+                    ]
+                    if source_frame and aggregate_specs:
+                        operation = operation_for(node)
+                        operation_id = str((operation or {}).get("operation_node_id") or "")
+                        dimension_origins = [
+                            merge_origins(source_columns.get(field))
+                            for field in group_fields
+                        ]
+                        for dimension_origin in dimension_origins:
+                            dimension_origin["dimension_boundaries"].update(
+                                dimension_origin.get("boundaries") or set()
+                            )
+                        measure_origin = merge_origins(
+                            *(
+                                source_columns.get(field)
+                                for field in measure_fields
+                            ),
+                            *(source_columns.values() if not measure_fields else []),
+                        )
+                        if measure_origin["queries"] and operation_id:
+                            measure_origin["operations"].add(operation_id)
+                            measure_origin["boundaries"] = {operation_id}
+                        frame_columns[target] = {
+                            field: dimension_origins[index]
+                            for index, field in enumerate(group_fields)
+                        }
+                        for aggregate_name in aggregate_specs:
+                            frame_columns[target][aggregate_name] = merge_origins(measure_origin)
+                        frame_positions[target] = [
+                            *dimension_origins,
+                            *(
+                                merge_origins(measure_origin)
+                                for _ in aggregate_specs
+                            ),
+                        ]
+                        if measure_origin["queries"]:
+                            scalar_origins[target] = merge_origins(
+                                *(frame_columns[target].values())
+                            )
+                        continue
+
                 source_frame = frame_name_from_expression(value)
                 has_positional_scalar_access = any(
                     isinstance(item, ast.Subscript)
@@ -3346,6 +3701,33 @@ class LineageIndexer:
                                     *(frame_columns[target][field] for field in aggregate_fields),
                                     *named_aggregate_origins.values(),
                                 ] or [aggregate_origin]
+                                if not aggregate_fields and not named_aggregate_origins:
+                                    aggregate_call = next(
+                                        (
+                                            item for item in ast.walk(value)
+                                            if isinstance(item, ast.Call)
+                                            and isinstance(item.func, ast.Attribute)
+                                            and item.func.attr in {"agg", "aggregate"}
+                                        ),
+                                        None,
+                                    )
+                                    aggregate_specs: list[str] = []
+                                    if (
+                                        aggregate_call is not None
+                                        and aggregate_call.args
+                                        and isinstance(aggregate_call.args[0], (ast.List, ast.Tuple))
+                                    ):
+                                        aggregate_specs = [
+                                            str(item.value)
+                                            for item in aggregate_call.args[0].elts
+                                            if isinstance(item, ast.Constant)
+                                            and isinstance(item.value, str)
+                                        ]
+                                    if aggregate_specs:
+                                        metric_positions = [
+                                            merge_origins(aggregate_origin)
+                                            for _ in aggregate_specs
+                                        ]
                                 frame_positions[target] = [
                                     *dimension_origins,
                                     *metric_positions,
@@ -3764,6 +4146,86 @@ class LineageIndexer:
                 return False
         return True
 
+    @staticmethod
+    def _attach_report_markdown_table_origins(
+        outputs: list[dict[str, Any]],
+        *,
+        code: str,
+    ) -> list[dict[str, Any]]:
+        """Recover structured column origins for Markdown tables in reports.
+
+        `build_markdown_table(frame, columns=[...])` already carries a stable
+        report-table schema.  Reusing it keeps Markdown table evidence at the
+        column boundary and avoids asking the semantic planner to infer one
+        metric for every rendered cell.
+        """
+        try:
+            tree = ast.parse(code or "")
+        except SyntaxError:
+            return outputs
+
+        contracts: list[dict[str, Any]] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function_name = ""
+            if isinstance(node.func, ast.Name):
+                function_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                function_name = node.func.attr
+            if function_name != "build_markdown_table" or not node.args:
+                continue
+            try:
+                source_frame = ast.unparse(node.args[0]).strip()
+            except Exception:
+                source_frame = ""
+            columns_node = next(
+                (keyword.value for keyword in node.keywords if keyword.arg == "columns"),
+                None,
+            )
+            columns: dict[str, str] = {}
+            if isinstance(columns_node, (ast.List, ast.Tuple)):
+                for item in columns_node.elts:
+                    if not isinstance(item, ast.Dict):
+                        continue
+                    values: dict[str, str] = {}
+                    for key, value in zip(item.keys, item.values):
+                        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                            continue
+                        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                            values[key.value] = value.value
+                    label = str(values.get("label") or values.get("key") or "").strip()
+                    field = str(values.get("key") or "").strip()
+                    if label and field:
+                        columns[label] = field
+            if columns:
+                contracts.append({"source_frame": source_frame, "columns": columns})
+
+        if not contracts:
+            return outputs
+        for output in outputs:
+            if not output.get("posthoc_report_candidate"):
+                continue
+            group_id = str(output.get("report_candidate_group_id") or "")
+            match = re.fullmatch(r"report_table_(\d+)_column_\d+", group_id)
+            if match is None:
+                continue
+            table_index = int(match.group(1))
+            if table_index >= len(contracts):
+                continue
+            contract = contracts[table_index]
+            label = str(output.get("label") or "").strip()
+            field = str(contract["columns"].get(label) or "").strip()
+            if not field:
+                continue
+            output.update({
+                "field": field,
+                "lineage_fields": [field],
+                "source_frame": str(contract.get("source_frame") or ""),
+                "markdown_table_column_origin": True,
+            })
+        return outputs
+
     @classmethod
     def _attach_output_lineage(
         cls,
@@ -4140,6 +4602,8 @@ class LineageIndexer:
         normalized_target = str(target or "").strip()
         if normalized_target == field:
             return True
+        if "[" in field and normalized_target == field.split("[", 1)[0]:
+            return True
         return normalized_target.endswith(f"[{field!r}]") or normalized_target.endswith(f'["{field}"]')
 
     @staticmethod
@@ -4221,6 +4685,7 @@ class LineageIndexer:
                     occupied.add((start, end))
                     outputs.append({
                         "output_node_id": f"out_report_{expression['expression_id']}_{occurrence}",
+                        "source_anchor_id": str(expression.get("expression_id") or ""),
                         "artifact_type": "report",
                         "artifact_index": 0,
                         "field": str(expression.get("expression") or ""),
@@ -4233,6 +4698,9 @@ class LineageIndexer:
                         "text": text,
                         "display_prefix": str(expression.get("prefix") or ""),
                         "display_suffix": str(expression.get("suffix") or ""),
+                        "presentation_ordinal": bool(
+                            expression.get("presentation_ordinal")
+                        ),
                         "rendered_context": report[max(0, start - 120):min(len(report), end + 120)],
                         "source_line": expression.get("line"),
                         "numeric_hint": bool(expression.get("numeric_hint")),
@@ -4275,6 +4743,7 @@ class LineageIndexer:
                     occupied.add((start, end))
                     outputs.append({
                         "output_node_id": f"out_report_{expression['expression_id']}_local_{occurrence}",
+                        "source_anchor_id": str(expression.get("expression_id") or ""),
                         "artifact_type": "report",
                         "artifact_index": 0,
                         "field": str(expression.get("expression") or ""),
@@ -4287,11 +4756,196 @@ class LineageIndexer:
                         "text": text,
                         "display_prefix": prefix,
                         "display_suffix": suffix,
+                        "presentation_ordinal": bool(
+                            expression.get("presentation_ordinal")
+                        ),
                         "rendered_context": report[max(0, start - 120):min(len(report), end + 120)],
                         "source_line": expression.get("line"),
                         "numeric_hint": True,
                         "direct_operation_node_ids": [expression.get("operation_node_id")],
                     })
+        return outputs
+
+    @staticmethod
+    def _locate_report_numeric_candidates(
+        report: str,
+        *,
+        occupied: set[tuple[int, int]],
+    ) -> list[dict[str, Any]]:
+        """Enumerate numeric report spans that AST template matching did not locate.
+
+        This is intentionally a recall-oriented artifact scan.  It does not
+        declare that a token is a metric and it does not infer a calculation
+        boundary.  Those decisions remain with the semantic planner and the
+        local code/query reconciliation step.
+        """
+        token_pattern = re.compile(
+            r"(?:(?<![A-Za-z0-9_.\-%])[-+]|(?<![A-Za-z0-9_.]))"
+            r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][-+]?\d+)?"
+        )
+        outputs: list[dict[str, Any]] = []
+        in_fence = False
+        line_start = 0
+        heading = ""
+        table_index = -1
+        in_markdown_table = False
+        table_headers: list[str] = []
+
+        def presentation_literal_flags(
+            line_text: str,
+            *,
+            token_start: int,
+            token_end: int,
+        ) -> tuple[bool, bool, bool, bool, bool]:
+            """Classify rendered display literals without inferring a metric.
+
+            The artifact scan intentionally starts broad, but calendar values and
+            comparison cutoffs are presentation grammar, not observed facts. This
+            uses only local Markdown/natural-language syntax around the rendered
+            token; it never relies on a business field name or a concrete value.
+            """
+            temporal_patterns = (
+                r"\d{4}年(?:\d{1,2}月(?:\d{1,2}日)?)?",
+                r"\d{4}-\d{1,2}(?:-\d{1,2})?",
+                r"\d{1,2}月(?:\d{1,2}日)?",
+            )
+            temporal = any(
+                match.start() <= token_start and token_end <= match.end()
+                for pattern in temporal_patterns
+                for match in re.finditer(pattern, line_text)
+            )
+            prefix = line_text[max(0, token_start - 24):token_start]
+            suffix = line_text[token_end:min(len(line_text), token_end + 24)]
+            comparison_threshold = bool(
+                re.search(
+                    r"(?:高于|低于|超过|不少于|不低于|至多|至少|大于|小于|>=|<=|>|<|≥|≤)\s*(?:\*\*)?\s*$",
+                    prefix,
+                )
+                and re.match(r"\s*(?:%|％|倍|元|个|件|台|项|次|天|月|年|\*\*)", suffix)
+            )
+            ordinal_patterns = (
+                r"^\s*#{1,6}\s+(?:第\s*)?\d+(?:\.\d+)*[.、]?",
+                r"^\s*\*\*(?:第\s*)?\d+(?:\.\d+)*[.、]?(?=\s|\*\*)",
+                r"^\s*第\s*\d+(?:\.\d+)*[章节项]",
+                r"^\s*(?:[-+*]\s+)?(?:\*\*)?\d+(?:\.\d+)*(?:[.)、]|）)(?=\s|\*\*)",
+            )
+            ordinal = any(
+                match.start() <= token_start and token_end <= match.end()
+                for pattern in ordinal_patterns
+                for match in re.finditer(pattern, line_text)
+            )
+            formula_coefficient = bool(
+                re.search(r"(?:[×*/xX]\s*|\bcoef(?:ficient)?\s*=\s*)$", prefix)
+                or re.match(r"\s*[×*/xX+]", suffix)
+            )
+            identifier_start = token_start
+            identifier_end = token_end
+            while identifier_start > 0 and re.match(
+                r"[A-Za-z0-9_-]", line_text[identifier_start - 1]
+            ):
+                identifier_start -= 1
+            while identifier_end < len(line_text) and re.match(
+                r"[A-Za-z0-9_-]", line_text[identifier_end]
+            ):
+                identifier_end += 1
+            identifier_token = line_text[identifier_start:identifier_end]
+            business_identifier = bool(
+                (identifier_start < token_start or identifier_end > token_end)
+                and re.search(r"[A-Za-z]", identifier_token)
+                and re.search(r"\d", identifier_token)
+            )
+            return (
+                temporal,
+                comparison_threshold,
+                ordinal,
+                formula_coefficient,
+                business_identifier,
+            )
+
+        for line_number, line in enumerate(report.splitlines(keepends=True), start=1):
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                in_fence = not in_fence
+                line_start += len(line)
+                continue
+            if not in_fence and stripped.startswith("#"):
+                heading = stripped.lstrip("#").strip()
+            if not in_fence:
+                is_markdown_table_row = (
+                    stripped.startswith("|") and stripped.count("|") >= 2
+                )
+                if is_markdown_table_row and not in_markdown_table:
+                    table_index += 1
+                    table_headers = []
+                in_markdown_table = is_markdown_table_row
+                if is_markdown_table_row and not table_headers:
+                    table_headers = [
+                        cell.strip()
+                        for cell in stripped.strip("|").split("|")
+                    ]
+                for match in token_pattern.finditer(line):
+                    start = line_start + match.start()
+                    end = line_start + match.end()
+                    if any(start < occupied_end and end > occupied_start for occupied_start, occupied_end in occupied):
+                        continue
+                    text = report[start:end]
+                    if not _is_numeric_display_text(text):
+                        continue
+                    temporal_literal = bool(re.match(
+                        r"^\d{4}年(?:\d{1,2}月(?:\d{1,2}日)?)?",
+                        line[match.start():],
+                    ))
+                    (
+                        temporal_literal,
+                        comparison_threshold,
+                        presentation_ordinal,
+                        presentation_formula_coefficient,
+                        presentation_business_identifier,
+                    ) = presentation_literal_flags(
+                        line,
+                        token_start=match.start(),
+                        token_end=match.end(),
+                    )
+                    occupied.add((start, end))
+                    pipe_before_match = line[:match.start()].count("|")
+                    table_column_index = max(0, pipe_before_match - 1)
+                    candidate_group_id = (
+                        f"report_table_{table_index}_column_{table_column_index}"
+                        if is_markdown_table_row
+                        else f"report_span_{start}_{end}"
+                    )
+                    table_column_label = (
+                        table_headers[table_column_index]
+                        if table_column_index < len(table_headers)
+                        else ""
+                    )
+                    outputs.append({
+                        "output_node_id": f"out_report_candidate_{start}_{end}",
+                        "artifact_type": "report",
+                        "artifact_index": 0,
+                        "field": "",
+                        "label": table_column_label or heading,
+                        "lineage_fields": [],
+                        "start": start,
+                        "end": end,
+                        "text": text,
+                        "numeric_hint": True,
+                        "presentation_temporal_literal": temporal_literal,
+                        "presentation_comparison_threshold": comparison_threshold,
+                        "presentation_ordinal": presentation_ordinal,
+                        "presentation_formula_coefficient": presentation_formula_coefficient,
+                        "presentation_business_identifier": presentation_business_identifier,
+                        "posthoc_report_candidate": True,
+                        "report_candidate_group_id": candidate_group_id,
+                        "report_line": line_number,
+                        "rendered_context": report[max(0, start - 120):min(len(report), end + 120)],
+                        "display_context": {
+                            "heading": heading,
+                            "column_label": table_column_label,
+                            "line": stripped[:320],
+                        },
+                    })
+            line_start += len(line)
         return outputs
 
     @staticmethod
@@ -4335,10 +4989,12 @@ class LineageIndexer:
     def _query_scope(snapshot: Any) -> dict[str, Any]:
         value = snapshot if isinstance(snapshot, dict) else {}
         implementation = value.get("implementation") if isinstance(value.get("implementation"), dict) else {}
+        execution = value.get("execution") if isinstance(value.get("execution"), dict) else {}
         return {
             "query_constraints": value.get("query_constraints") or {},
             "aggregation_hints": implementation.get("aggregation_hints") or [],
             "implementation": implementation,
+            "execution_columns": execution.get("columns") or [],
         }
 
 
@@ -4348,12 +5004,16 @@ class PostAnalysisEvidenceCompiler:
         *,
         planner: Callable[[dict[str, Any]], EvidencePlan] | None = None,
     ) -> None:
+        self._uses_default_planner = planner is None
         self._planner = planner or self._invoke_planner
         self._resolver_id_maps: dict[str, dict[str, str]] = {}
 
     def compile(self, snapshot: AnalysisExecutionSnapshot) -> dict[str, Any]:
         lineage_index = LineageIndexer().build(snapshot)
-        if not lineage_index["query_nodes"] or not lineage_index["output_nodes"]:
+        if not lineage_index["query_nodes"] or not (
+            lineage_index["output_nodes"]
+            or lineage_index.get("report_source_anchors")
+        ):
             return self._empty_bundle(snapshot, lineage_index, "insufficient_lineage")
         calculation_candidates = self._build_calculation_candidates(lineage_index)
         report_semantic_candidates = self._build_report_semantic_candidates(
@@ -4372,37 +5032,140 @@ class PostAnalysisEvidenceCompiler:
             lineage_index,
             {"chart", "table"},
         )
-        report_candidates = self._filter_candidates_by_artifact_type(
-            report_semantic_candidates,
+        # A report-wide semantic scope is valid even when the local output
+        # parser found no slots. The planner must still inspect the successful
+        # code; local materialization may then isolate an unproven discovery.
+        report_candidates = report_semantic_candidates
+        verified_report_plan = self._build_verified_report_completion_plan(
+            EvidencePlan(),
+            calculation_candidates,
             lineage_index,
-            "report",
         )
+        verified_report_output_ids = {
+            str(output_id)
+            for metric in verified_report_plan.metrics
+            for output_id in metric.output_node_ids
+            if str(output_id)
+        }
         planner_error = ""
         try:
-            report_plan = (
-                self._restore_resolver_plan_ids(self._planner(
-                    self._planner_fact_payload(
-                        snapshot,
-                        lineage_index,
-                        report_candidates,
-                    )
-                ))
-                if report_candidates
+            planner_payload = self._planner_fact_payload(
+                snapshot,
+                lineage_index,
+                report_candidates,
+                recovery_only=self._uses_default_planner,
+            ) if report_candidates else {}
+            planner_required = bool(
+                planner_payload.get("report_candidate_catalog")
+                or planner_payload.get("source_anchor_catalog")
+            ) or (bool(report_candidates) and not self._uses_default_planner)
+            raw_report_plan = (
+                self._restore_resolver_plan_ids(self._planner(planner_payload))
+                if planner_required
                 else EvidencePlan()
             )
-            report_plan = self._sanitize_semantic_plan(
-                report_plan,
-                report_candidates,
+            base_lineage_index = copy.deepcopy(lineage_index)
+            base_report_candidates = copy.deepcopy(report_candidates)
+
+            def finalize_report_plan(
+                raw_plan: EvidencePlan,
+                attempt_lineage: dict[str, Any],
+                attempt_candidates: dict[str, dict[str, Any]],
+            ) -> EvidencePlan:
+                finalized = self._materialize_report_discovery_plan(
+                    snapshot,
+                    attempt_lineage,
+                    raw_plan,
+                    attempt_candidates,
+                )
+                finalized = self._sanitize_semantic_plan(finalized, attempt_candidates)
+                finalized = self._isolate_duplicate_report_output_claims(
+                    finalized,
+                    attempt_candidates,
+                )
+                finalized = self._normalize_unresolved_report_outputs(finalized)
+                return self._filter_plan_claims(
+                    finalized,
+                    excluded_output_ids=verified_report_output_ids,
+                    allowed_output_ids={
+                        str(output_id)
+                        for candidate in attempt_candidates.values()
+                        for output_id in candidate.get("output_node_ids") or []
+                        if str(output_id)
+                    },
+                )
+
+            first_lineage = copy.deepcopy(base_lineage_index)
+            first_candidates = copy.deepcopy(base_report_candidates)
+            report_plan = finalize_report_plan(
+                raw_report_plan,
+                first_lineage,
+                first_candidates,
             )
+            chosen_lineage = first_lineage
+            chosen_candidates = first_candidates
+            repairable_unresolved = [
+                item
+                for item in report_plan.unresolved_outputs
+                if any(
+                    token in str(item.reason or "")
+                    for token in (
+                        "unknown query fields",
+                        "source locator",
+                        "did not classify",
+                    )
+                )
+            ]
+            if self._uses_default_planner and planner_required and repairable_unresolved:
+                repair_payload = copy.deepcopy(planner_payload)
+                repair_payload["repair_feedback"] = {
+                    "instruction": (
+                        "Repair only the unresolved candidates below. Re-check the successful "
+                        "query columns and the actual Python calculation before choosing query "
+                        "IDs and metric fields. Do not change already resolved candidates."
+                    ),
+                    "unresolved": [
+                        {
+                            "output_node_id": item.output_node_id,
+                            "reason": item.reason,
+                        }
+                        for item in repairable_unresolved
+                    ],
+                }
+                repaired_raw_plan = self._restore_resolver_plan_ids(
+                    self._planner(repair_payload)
+                )
+                repaired_lineage = copy.deepcopy(base_lineage_index)
+                repaired_candidates = copy.deepcopy(base_report_candidates)
+                repaired_plan = finalize_report_plan(
+                    repaired_raw_plan,
+                    repaired_lineage,
+                    repaired_candidates,
+                )
+                if len(repaired_plan.unresolved_outputs) < len(report_plan.unresolved_outputs):
+                    report_plan = repaired_plan
+                    chosen_lineage = repaired_lineage
+                    chosen_candidates = repaired_candidates
+            lineage_index = chosen_lineage
+            report_candidates = chosen_candidates
+            all_candidates.update(report_candidates)
             report_reference_errors = self._plan_reference_errors(
                 report_plan,
-                report_candidates,
+                all_candidates,
+                require_complete=False,
             )
             if report_reference_errors:
                 raise ValueError("; ".join(report_reference_errors[:20]))
             plan = EvidencePlan(
-                metrics=[*report_plan.metrics, *structured_plan.metrics],
+                metrics=[
+                    *verified_report_plan.metrics,
+                    *report_plan.metrics,
+                    *structured_plan.metrics,
+                ],
                 unresolved_outputs=report_plan.unresolved_outputs,
+                non_metric_report_candidate_ids=(
+                    report_plan.non_metric_report_candidate_ids
+                ),
             )
         except Exception as exc:
             logger.warning(
@@ -4415,11 +5178,18 @@ class PostAnalysisEvidenceCompiler:
             # Report semantics require the planner, but chart/table artifacts
             # already have deterministic column-level lineage. Isolate a report
             # planner failure instead of discarding those verified boundaries.
-            plan = structured_plan
+            plan = EvidencePlan(
+                metrics=[*verified_report_plan.metrics, *structured_plan.metrics],
+                unresolved_outputs=[],
+            )
         validation_candidates = (
-            structured_candidates if planner_error else all_candidates
+            calculation_candidates if planner_error else all_candidates
         )
-        reference_errors = self._plan_reference_errors(plan, validation_candidates)
+        reference_errors = self._plan_reference_errors(
+            plan,
+            validation_candidates,
+            require_complete=False,
+        )
         if reference_errors:
             return self._empty_bundle(
                 snapshot,
@@ -4429,12 +5199,18 @@ class PostAnalysisEvidenceCompiler:
             )
         try:
             compiled = self._compile_plan(snapshot, lineage_index, plan, all_candidates)
-            candidate_output_ids = {
+            selected_semantic_output_ids = {
                 str(output_id)
-                for candidate in all_candidates.values()
-                for output_id in candidate.get("output_node_ids") or []
+                for metric in plan.metrics
+                for output_id in metric.output_node_ids
                 if str(output_id)
             }
+            candidate_output_ids = {
+                str(output_id)
+                for candidate in calculation_candidates.values()
+                for output_id in candidate.get("output_node_ids") or []
+                if str(output_id)
+            }.union(selected_semantic_output_ids)
             metric_output_ids = {
                 str(output.get("output_node_id") or "")
                 for output in lineage_index.get("output_nodes") or []
@@ -4450,8 +5226,22 @@ class PostAnalysisEvidenceCompiler:
                 and not self._is_grouping_dimension_output(output, lineage_index)
             }
             compiled_output_ids = set(compiled.get("diagnostics", {}).pop("compiled_output_node_ids", []))
-            unresolved_output_ids = sorted(metric_output_ids - candidate_output_ids)
-            missing_compiled_output_ids = sorted(candidate_output_ids - compiled_output_ids)
+            non_metric_candidate_ids = {
+                str(output_id)
+                for output_id in plan.non_metric_report_candidate_ids
+                if str(output_id)
+            }
+            unresolved_output_ids = sorted(
+                metric_output_ids - candidate_output_ids - non_metric_candidate_ids
+            )
+            plan_unresolved_output_ids = {
+                str(item.output_node_id or "")
+                for item in plan.unresolved_outputs
+                if str(item.output_node_id or "")
+            }
+            missing_compiled_output_ids = sorted(
+                candidate_output_ids - compiled_output_ids - plan_unresolved_output_ids
+            )
             unresolved_structured_output_ids = sorted(
                 structured_output_ids - candidate_output_ids
             )
@@ -4495,6 +5285,657 @@ class PostAnalysisEvidenceCompiler:
             return self._empty_bundle(snapshot, lineage_index, "compile_failed", str(exc))
 
     @staticmethod
+    def _normalized_source_expression(expression: str) -> str:
+        source = str(expression or "").strip()
+        if not source:
+            return ""
+        try:
+            return ast.dump(ast.parse(source, mode="eval").body, include_attributes=False)
+        except SyntaxError:
+            return re.sub(r"\s+", "", source)
+
+    @staticmethod
+    def _resolve_calculation_source_refs(
+        code: str,
+        lineage_index: dict[str, Any],
+        references: list[CalculationSourceRef],
+    ) -> tuple[list[str], list[str]]:
+        """Resolve planner source locators into locally verifiable operations.
+
+        A locator may point at syntax the regular operation index did not choose
+        as a calculation boundary, such as an inline expression in a report
+        f-string. The source location must identify exactly one AST node. The
+        resulting synthetic operation still has to reach a successful query via
+        the normal dependency graph before it can be materialized.
+        """
+        if not references:
+            return [], []
+        try:
+            tree = ast.parse(code or "")
+        except SyntaxError as exc:
+            return [], [f"analysis code cannot be parsed: {exc}"]
+
+        operations = lineage_index.setdefault("operation_nodes", [])
+        operation_by_id = {
+            str(item.get("operation_node_id") or ""): item
+            for item in operations
+            if str(item.get("operation_node_id") or "")
+        }
+
+        def source_identity(value: str) -> str:
+            return re.sub(r"\s+", "", str(value or "").strip())
+
+        resolved: list[str] = []
+        errors: list[str] = []
+        for reference in references:
+            line = int(reference.source_line or 0)
+            expression = str(reference.expression or "").strip()
+            if line <= 0 or not expression:
+                errors.append("calculation source locator requires source_line and expression")
+                continue
+            wanted = source_identity(expression)
+            matches: list[ast.AST] = []
+            assignment_target_match = re.match(
+                r"^([A-Za-z_]\w*)\s*=",
+                expression,
+            )
+            assignment_target = (
+                assignment_target_match.group(1)
+                if assignment_target_match is not None
+                else ""
+            )
+            for node in ast.walk(tree):
+                node_start = int(getattr(node, "lineno", 0) or 0)
+                node_end = int(getattr(node, "end_lineno", node_start) or node_start)
+                if not (node_start - 2 <= line <= node_end + 2):
+                    continue
+                if not isinstance(node, (
+                    ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr,
+                    ast.Call, ast.BinOp, ast.UnaryOp, ast.Compare, ast.Subscript,
+                    ast.Attribute, ast.Name,
+                )):
+                    continue
+                if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+                    continue
+                source = ast.get_source_segment(code, node) or ""
+                if source_identity(source) == wanted:
+                    matches.append(node)
+                    continue
+                if (
+                    assignment_target
+                    and isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+                    and assignment_target in _target_names(node)
+                ):
+                    matches.append(node)
+            unique_locations = {
+                (
+                    int(getattr(node, "lineno", 0) or 0),
+                    int(getattr(node, "col_offset", 0) or 0),
+                    int(getattr(node, "end_lineno", 0) or 0),
+                    int(getattr(node, "end_col_offset", 0) or 0),
+                ): node
+                for node in matches
+            }
+            if len(unique_locations) != 1:
+                errors.append(
+                    f"calculation source locator is not unique: line={line} expression={expression[:160]}"
+                )
+                continue
+            node = next(iter(unique_locations.values()))
+            source = ast.get_source_segment(code, node) or expression
+            existing = next((
+                operation_id
+                for operation_id, operation in operation_by_id.items()
+                if int(operation.get("line") or 0) == int(getattr(node, "lineno", line) or line)
+                and source_identity(str(operation.get("source") or "")) == source_identity(source)
+            ), "")
+            if existing:
+                resolved.append(existing)
+                continue
+
+            resolved_line = int(getattr(node, "lineno", line) or line)
+            operation_id = f"op_recovered_{resolved_line}_{_digest(source, 10)}"
+            operation = {
+                "operation_node_id": operation_id,
+                "line": resolved_line,
+                "kind": "calculation",
+                "semantic_kind": (
+                    LineageIndexer._operation_semantic_kind(node)
+                    if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+                    else "formula"
+                ),
+                "query_node_id": "",
+                "targets": _target_names(node),
+                "loads": _loaded_names(node),
+                "source": source[:1200],
+                "planner_recovered": True,
+            }
+            if not operation["loads"]:
+                errors.append(
+                    f"calculation source locator has no data dependency: line={line} expression={expression[:160]}"
+                )
+                continue
+            operations.append(operation)
+            operation_by_id[operation_id] = operation
+            resolved.append(operation_id)
+        return list(dict.fromkeys(resolved)), errors
+
+    def _materialize_report_discovery_plan(
+        self,
+        snapshot: AnalysisExecutionSnapshot,
+        lineage_index: dict[str, Any],
+        plan: EvidencePlan,
+        report_candidates: dict[str, dict[str, Any]],
+    ) -> EvidencePlan:
+        """Resolve planner anchors and rendered candidates into report output nodes.
+
+        The planner discovers semantics from code.  This method is deliberately
+        authoritative only about syntax and executed dataflow: it maps source
+        anchors to rendered report slots, verifies selected operations, and
+        derives query references from successful QuerySnapshot dependencies.
+        """
+        candidate = report_candidates.get("report_semantic_scope")
+        if not candidate:
+            return plan
+        source_catalog = {
+            str(item.get("anchor_id") or ""): item
+            for item in lineage_index.get("report_source_anchors") or []
+            if str(item.get("anchor_id") or "")
+        }
+        anchors_by_location: dict[tuple[int, str], dict[str, Any]] = {}
+        for anchor in source_catalog.values():
+            anchors_by_location[(
+                int(anchor.get("source_line") or 0),
+                self._normalized_source_expression(str(anchor.get("expression") or "")),
+            )] = anchor
+
+        output_by_id = {
+            str(item.get("output_node_id") or ""): item
+            for item in lineage_index.get("output_nodes") or []
+            if str(item.get("output_node_id") or "")
+        }
+        outputs_by_anchor: dict[str, list[str]] = {}
+        report_candidate_members: dict[str, list[str]] = {}
+        for output_id, output in output_by_id.items():
+            if output.get("artifact_type") != "report":
+                continue
+            if output.get("posthoc_report_candidate"):
+                candidate_id = str(output.get("report_candidate_group_id") or output_id)
+                report_candidate_members.setdefault(candidate_id, []).append(output_id)
+            anchor_id = str(output.get("source_anchor_id") or "")
+            if anchor_id:
+                outputs_by_anchor.setdefault(anchor_id, []).append(output_id)
+
+        operation_by_id = {
+            str(item.get("operation_node_id") or ""): item
+            for item in lineage_index.get("operation_nodes") or []
+            if str(item.get("operation_node_id") or "")
+        }
+        producers: dict[str, list[str]] = {}
+        for operation_id, operation in operation_by_id.items():
+            for target in operation.get("targets") or []:
+                target_name = str(target or "").strip()
+                if target_name:
+                    producers.setdefault(target_name, []).append(operation_id)
+        successful_query_ids = {
+            str(item.get("query_node_id") or "")
+            for item in lineage_index.get("query_nodes") or []
+            if str(item.get("query_node_id") or "")
+        }
+
+        def resolve_anchor(reference: ReportSourceAnchorRef) -> dict[str, Any] | None:
+            anchor_id = str(reference.anchor_id or "")
+            if anchor_id and anchor_id in source_catalog:
+                return source_catalog[anchor_id]
+            key = (
+                int(reference.source_line or 0),
+                self._normalized_source_expression(reference.expression),
+            )
+            return anchors_by_location.get(key)
+
+        resolved_metrics: list[PlannedMetric] = []
+        unresolved: list[UnresolvedEvidenceOutput] = []
+        non_metric_anchor_ids: set[str] = {
+            str(anchor.anchor_id or "")
+            for anchor in plan.non_metric_source_anchors
+            if str(anchor.anchor_id or "")
+        }
+        non_metric_candidate_ids = {
+            output_id
+            for item in plan.non_metric_report_candidate_ids
+            for output_id in report_candidate_members.get(str(item), [])
+        }
+        report_candidate_labels = {
+            candidate_id: str(
+                (output_by_id.get(output_ids[0]) or {}).get("label") or ""
+            )
+            for candidate_id, output_ids in report_candidate_members.items()
+            if output_ids
+        }
+
+        def normalized_label(value: str) -> str:
+            return re.sub(r"[^\w\u4e00-\u9fff]+", "", str(value or "").lower())
+
+        candidate_owners: dict[str, list[int]] = {}
+        for metric_index, metric in enumerate(plan.metrics):
+            for candidate_id in metric.report_candidate_ids:
+                if str(candidate_id) in report_candidate_members:
+                    candidate_owners.setdefault(str(candidate_id), []).append(metric_index)
+        allowed_candidate_owners: dict[str, int | None] = {}
+        unresolved_duplicate_candidate_outputs: list[UnresolvedEvidenceOutput] = []
+        for candidate_id, owners in candidate_owners.items():
+            if len(owners) == 1:
+                allowed_candidate_owners[candidate_id] = owners[0]
+                continue
+            label = normalized_label(report_candidate_labels.get(candidate_id, ""))
+            scores = {
+                owner: int(bool(label) and (
+                    label in normalized_label(plan.metrics[owner].business_name)
+                    or normalized_label(plan.metrics[owner].business_name) in label
+                    or label in normalized_label(plan.metrics[owner].metric_key)
+                    or normalized_label(plan.metrics[owner].metric_key) in label
+                ))
+                for owner in owners
+            }
+            best_score = max(scores.values())
+            winners = [owner for owner, score in scores.items() if score == best_score]
+            if best_score and len(winners) == 1:
+                allowed_candidate_owners[candidate_id] = winners[0]
+                continue
+            allowed_candidate_owners[candidate_id] = None
+            unresolved_duplicate_candidate_outputs.extend(
+                UnresolvedEvidenceOutput(
+                    output_node_id=output_id,
+                    reason="Multiple semantic claims could not be reduced to one report candidate boundary.",
+                )
+                for output_id in report_candidate_members[candidate_id]
+            )
+        for item in plan.unresolved_outputs:
+            if item.source_anchor is None:
+                unresolved.append(item)
+                continue
+            anchor = resolve_anchor(item.source_anchor)
+            if anchor is None:
+                unresolved.append(item)
+                continue
+            anchor_id = str(anchor.get("anchor_id") or "")
+            output_ids = outputs_by_anchor.get(anchor_id) or []
+            if not output_ids:
+                unresolved.append(item)
+                continue
+            unresolved.extend(
+                UnresolvedEvidenceOutput(
+                    output_node_id=output_id,
+                    source_anchor=item.source_anchor,
+                    reason=item.reason,
+                )
+                for output_id in output_ids
+            )
+
+        for metric_index, metric in enumerate(plan.metrics):
+            resolved_anchors = [
+                anchor
+                for reference in metric.source_anchors
+                if (anchor := resolve_anchor(reference)) is not None
+            ]
+            anchor_output_ids = [
+                output_id
+                for anchor in resolved_anchors
+                for output_id in outputs_by_anchor.get(str(anchor.get("anchor_id") or ""), [])
+                if (
+                    not metric.parameter_bindings
+                    or (
+                        (candidate.get("local_lineage_hints") or {})
+                        .get(output_id, {})
+                        .get("parameter_bindings", {})
+                        == metric.parameter_bindings
+                    )
+                )
+            ]
+            selected_candidate_output_ids = [
+                output_id
+                for candidate_id in metric.report_candidate_ids
+                if allowed_candidate_owners.get(str(candidate_id)) == metric_index
+                for output_id in report_candidate_members.get(str(candidate_id), [])
+            ]
+            output_ids = list(dict.fromkeys([
+                *anchor_output_ids,
+                *selected_candidate_output_ids,
+            ]))
+            recovered_operations, source_ref_errors = self._resolve_calculation_source_refs(
+                snapshot.generated_code,
+                lineage_index,
+                metric.calculation_source_refs,
+            )
+            if recovered_operations:
+                operation_by_id.update({
+                    str(item.get("operation_node_id") or ""): item
+                    for item in lineage_index.get("operation_nodes") or []
+                    if str(item.get("operation_node_id") or "")
+                })
+                producers.clear()
+                for operation_id, operation in operation_by_id.items():
+                    for target in operation.get("targets") or []:
+                        target_name = str(target or "").strip()
+                        if target_name:
+                            producers.setdefault(target_name, []).append(operation_id)
+            selected_operations = list(dict.fromkeys(
+                str(operation_id)
+                for operation_id in [
+                    *metric.operation_node_ids,
+                    *recovered_operations,
+                ]
+                if str(operation_id) in operation_by_id
+            ))
+            query_ids = list(dict.fromkeys(
+                query_id
+                for operation_id in selected_operations
+                for query_id in LineageIndexer._query_dependencies(
+                    [operation_id], operation_by_id, producers
+                )
+                if query_id in successful_query_ids
+            ))
+            verification = "verified"
+            claimed_query_ids = list(dict.fromkeys(
+                str(query_id)
+                for query_id in metric.claimed_query_node_ids
+                if str(query_id)
+            ))
+            output_verified_query_ids = {
+                str(query_id)
+                for output_id in output_ids
+                for query_id in (output_by_id.get(output_id) or {}).get(
+                    "candidate_query_node_ids"
+                ) or []
+                if str(query_id)
+            }
+            if (
+                output_verified_query_ids
+                and claimed_query_ids
+                and not output_verified_query_ids.issubset(set(claimed_query_ids))
+            ):
+                source_ref_errors.append(
+                    "LLM query claim contradicts locally verified query dependencies."
+                )
+            elif (
+                query_ids
+                and claimed_query_ids
+                and not set(query_ids).issubset(set(claimed_query_ids))
+            ):
+                source_ref_errors.append(
+                    "Planner source locator does not support the declared query boundary."
+                )
+            requires_attestation = bool(
+                metric.report_candidate_ids
+                and claimed_query_ids
+                and (
+                    metric.claimed_metric_fields
+                    or not query_ids
+                    or source_ref_errors
+                    or set(query_ids) != set(claimed_query_ids)
+                )
+            )
+            if requires_attestation:
+                unknown_queries = set(claimed_query_ids) - successful_query_ids
+                def query_fields(query_id: str) -> set[str]:
+                    fields: set[str] = set()
+                    query_snapshot = snapshot.query_snapshots.get(query_id)
+                    query_snapshot = query_snapshot if isinstance(query_snapshot, dict) else {}
+                    execution = (
+                        query_snapshot.get("execution")
+                        if isinstance(query_snapshot.get("execution"), dict)
+                        else {}
+                    )
+                    fields.update(
+                        str(field)
+                        for field in execution.get("columns") or []
+                        if str(field)
+                    )
+                    implementation = (
+                        query_snapshot.get("implementation")
+                        if isinstance(query_snapshot.get("implementation"), dict)
+                        else {}
+                    )
+                    for projection in implementation.get("projection_semantics") or []:
+                        if not isinstance(projection, dict):
+                            continue
+                        projection_fields = projection.get("source_fields") or []
+                        if not isinstance(projection_fields, list):
+                            projection_fields = [projection_fields]
+                        fields.update(
+                            str(field)
+                            for field in [projection.get("alias"), *projection_fields]
+                            if str(field)
+                        )
+                    fields.update(
+                        str(target)
+                        for operation in operation_by_id.values()
+                        if str(operation.get("query_node_id") or "") == query_id
+                        for target in operation.get("targets") or []
+                        if str(target)
+                    )
+                    return fields
+
+                query_fields_by_id = {
+                    query_id: query_fields(query_id)
+                    for query_id in successful_query_ids
+                }
+                claimed_fields = list(dict.fromkeys(
+                    str(field).strip()
+                    for field in metric.claimed_metric_fields
+                    if str(field).strip()
+                ))
+                known_fields = {
+                    field
+                    for query_id in claimed_query_ids
+                    for field in query_fields_by_id.get(query_id, set())
+                }
+                unknown_fields = set(claimed_fields) - known_fields
+                if unknown_fields and claimed_fields:
+                    compatible_queries = [
+                        query_id
+                        for query_id, fields in query_fields_by_id.items()
+                        if set(claimed_fields).issubset(fields)
+                    ]
+                    if len(compatible_queries) == 1:
+                        claimed_query_ids = compatible_queries
+                        unknown_queries = set()
+                        unknown_fields = set()
+                if metric.attestation_confidence != "high":
+                    source_ref_errors.append(
+                        "LLM attestation requires high confidence when local dataflow is unavailable."
+                    )
+                elif not claimed_query_ids or unknown_queries:
+                    source_ref_errors.append(
+                        "LLM attestation references no successful query or an unknown query."
+                    )
+                elif unknown_fields:
+                    source_ref_errors.append(
+                        f"LLM attestation references unknown query fields: {sorted(unknown_fields)}"
+                    )
+                else:
+                    source_identity = _stable_json([
+                        item.model_dump() for item in metric.calculation_source_refs
+                    ] or [{"report_candidate_ids": metric.report_candidate_ids}])
+                    attested_operations: list[str] = []
+                    for query_id in claimed_query_ids:
+                        operation_id = (
+                            f"op_attested_{_digest(source_identity + ':' + query_id, 14)}"
+                        )
+                        operation = {
+                            "operation_node_id": operation_id,
+                            "line": min(
+                                (
+                                    int(item.source_line or 0)
+                                    for item in metric.calculation_source_refs
+                                ),
+                                default=0,
+                            ),
+                            "kind": "calculation",
+                            "semantic_kind": "formula",
+                            "query_node_id": query_id,
+                            "targets": claimed_fields,
+                            "loads": [],
+                            "source": source_identity[:1200],
+                            "planner_attested": True,
+                        }
+                        lineage_index.setdefault("operation_nodes", []).append(operation)
+                        operation_by_id[operation_id] = operation
+                        attested_operations.append(operation_id)
+                    selected_operations = attested_operations
+                    query_ids = claimed_query_ids
+                    verification = "attested"
+                    # Source locators help local verification when supported, but
+                    # a locator capability miss must not veto an otherwise
+                    # consistent structured attestation. Query/field conflicts
+                    # above remain authoritative contradictions.
+                    source_ref_errors = [
+                        error
+                        for error in source_ref_errors
+                        if "contradicts locally verified" in error
+                    ]
+            if verification == "verified" and query_ids:
+                compatible_output_ids: list[str] = []
+                selected_query_set = set(query_ids)
+                for output_id in output_ids:
+                    output = output_by_id.get(output_id) or {}
+                    output_query_ids = {
+                        str(query_id)
+                        for query_id in output.get("candidate_query_node_ids") or []
+                        if str(query_id)
+                    }
+                    output_operation_ids = {
+                        str(operation_id)
+                        for operation_id in output.get("candidate_operation_node_ids") or []
+                        if str(operation_id)
+                    }
+                    if (
+                        (output_query_ids and output_query_ids & selected_query_set)
+                        or (
+                            not output_operation_ids
+                            and not output_query_ids
+                        )
+                    ):
+                        compatible_output_ids.append(output_id)
+                        continue
+                    unresolved.append(UnresolvedEvidenceOutput(
+                        output_node_id=output_id,
+                        reason=(
+                            "Report output is locally proven outside the selected calculation "
+                            "and query boundary."
+                        ),
+                    ))
+                output_ids = compatible_output_ids
+            if source_ref_errors or not output_ids or not selected_operations or not query_ids:
+                reason = (
+                    "; ".join(source_ref_errors)
+                    if source_ref_errors
+                    else "Planner source anchor cannot be proven to reach a report output and successful query."
+                )
+                failed_output_ids: set[str] = set()
+                for anchor in resolved_anchors:
+                    anchor_id = str(anchor.get("anchor_id") or "")
+                    anchor_output_ids = outputs_by_anchor.get(anchor_id, [])
+                    if not anchor_output_ids:
+                        unresolved.append(UnresolvedEvidenceOutput(
+                            source_anchor=ReportSourceAnchorRef(
+                                anchor_id=anchor_id,
+                                source_line=int(anchor.get("source_line") or 0),
+                                expression=str(anchor.get("expression") or ""),
+                            ),
+                            reason=reason,
+                        ))
+                    for output_id in anchor_output_ids:
+                        failed_output_ids.add(output_id)
+                        unresolved.append(UnresolvedEvidenceOutput(
+                            output_node_id=output_id,
+                            reason=reason,
+                        ))
+                for output_id in selected_candidate_output_ids:
+                    if output_id in failed_output_ids:
+                        continue
+                    unresolved.append(UnresolvedEvidenceOutput(
+                        output_node_id=output_id,
+                        reason=reason,
+                    ))
+                continue
+            for operation_id in selected_operations:
+                candidate.setdefault("operation_node_ids", []).append(operation_id)
+                candidate.setdefault("boundary_operation_node_ids", []).append(operation_id)
+                candidate.setdefault("operation_query_ids", {})[operation_id] = list(query_ids)
+                candidate.setdefault("operation_semantic_kinds", {})[operation_id] = str(
+                    (operation_by_id.get(operation_id) or {}).get("semantic_kind") or ""
+                )
+            for output_id in output_ids:
+                candidate.setdefault("output_operation_ids", {}).setdefault(output_id, []).extend(
+                    selected_operations
+                )
+            candidate["operation_node_ids"] = list(dict.fromkeys(candidate["operation_node_ids"]))
+            candidate["boundary_operation_node_ids"] = list(dict.fromkeys(
+                candidate["boundary_operation_node_ids"]
+            ))
+            for output_id in output_ids:
+                candidate["output_operation_ids"][output_id] = list(dict.fromkeys(
+                    candidate["output_operation_ids"][output_id]
+                ))
+            resolved_metrics.append(PlannedMetric.model_validate({
+                **metric.model_dump(),
+                "calculation_id": "report_semantic_scope",
+                "output_node_ids": output_ids,
+                "operation_node_ids": selected_operations,
+                "query_node_ids": query_ids,
+                "metric_source_fields": (
+                    list(metric.claimed_metric_fields)
+                    if verification == "attested"
+                    else metric.metric_source_fields
+                ),
+                "lineage_verification": verification,
+            }))
+
+        report_outputs = [
+            output
+            for output in output_by_id.values()
+            if output.get("artifact_type") == "report"
+            and self._is_report_metric_output(output, lineage_index)
+        ]
+        unresolved_output_ids = {
+            str(item.output_node_id or "") for item in unresolved if item.output_node_id
+        }
+        unresolved.extend(unresolved_duplicate_candidate_outputs)
+        unresolved_output_ids.update(
+            str(item.output_node_id or "")
+            for item in unresolved_duplicate_candidate_outputs
+            if item.output_node_id
+        )
+        planned_output_ids = {
+            output_id
+            for metric in resolved_metrics
+            for output_id in metric.output_node_ids
+        }
+        for output in report_outputs:
+            output_id = str(output.get("output_node_id") or "")
+            anchor_id = str(output.get("source_anchor_id") or "")
+            if (
+                not output_id
+                or output_id in planned_output_ids
+                or output_id in unresolved_output_ids
+                or anchor_id in non_metric_anchor_ids
+                or output_id in non_metric_candidate_ids
+            ):
+                continue
+            unresolved.append(UnresolvedEvidenceOutput(
+                output_node_id=output_id,
+                reason="Planner did not classify this verified report source anchor.",
+            ))
+
+        return EvidencePlan(
+            metrics=resolved_metrics,
+            unresolved_outputs=unresolved,
+            non_metric_source_anchors=plan.non_metric_source_anchors,
+            non_metric_report_candidate_ids=sorted(non_metric_candidate_ids),
+        )
+
+    @staticmethod
     def _is_grouping_dimension_output(
         output: dict[str, Any],
         lineage_index: dict[str, Any],
@@ -4524,7 +5965,13 @@ class PostAnalysisEvidenceCompiler:
         output: dict[str, Any],
         lineage_index: dict[str, Any],
     ) -> bool:
-        if output.get("presentation_ordinal"):
+        if (
+            output.get("presentation_ordinal")
+            or output.get("presentation_temporal_literal")
+            or output.get("presentation_comparison_threshold")
+            or output.get("presentation_formula_coefficient")
+            or output.get("presentation_business_identifier")
+        ):
             return False
         if output.get("artifact_type") != "report":
             return True
@@ -4738,6 +6185,11 @@ class PostAnalysisEvidenceCompiler:
                 lineage_index,
             )
         ]
+        source_anchors = [
+            anchor
+            for anchor in lineage_index.get("report_source_anchors") or []
+            if str(anchor.get("anchor_id") or "")
+        ]
         operation_ids = list(selectable_operations)
         query_ids = list(dict.fromkeys(
             query_id
@@ -4745,7 +6197,7 @@ class PostAnalysisEvidenceCompiler:
             for query_id in query_ids_by_operation.get(operation_id) or []
             if str(query_id)
         ))
-        if not report_outputs or not operation_ids or not query_ids:
+        if not source_anchors or not operation_ids or not query_ids:
             return {}
 
         report_output_by_id = {
@@ -4789,11 +6241,13 @@ class PostAnalysisEvidenceCompiler:
         output_operation_ids = {
             str(output.get("output_node_id") or ""): [
                 operation_id
-                for operation_id in dict.fromkeys([
-                    *(output.get("candidate_operation_node_ids") or []),
-                    *(output.get("boundary_operation_node_ids") or []),
-                    *(output.get("direct_operation_node_ids") or []),
-                ])
+                for operation_id in dict.fromkeys(
+                    operation_ids if output.get("posthoc_report_candidate") else [
+                        *(output.get("candidate_operation_node_ids") or []),
+                        *(output.get("boundary_operation_node_ids") or []),
+                        *(output.get("direct_operation_node_ids") or []),
+                    ]
+                )
                 if operation_id in selectable_operations
             ]
             for output in report_outputs
@@ -4820,6 +6274,7 @@ class PostAnalysisEvidenceCompiler:
             "ambiguous_input": False,
             "recovery_candidate": True,
             "semantic_scope": True,
+            "source_anchors": source_anchors,
             "local_lineage_hints": local_hints,
             "output_operation_ids": output_operation_ids,
             "operation_query_ids": {
@@ -4944,6 +6399,154 @@ class PostAnalysisEvidenceCompiler:
             if output_ids:
                 result[calculation_id] = {**candidate, "output_node_ids": output_ids}
         return result
+
+    @staticmethod
+    def _build_verified_report_completion_plan(
+        report_plan: EvidencePlan,
+        candidates: dict[str, dict[str, Any]],
+        lineage_index: dict[str, Any],
+    ) -> EvidencePlan:
+        """Fill planner omissions only when local lineage is already proven.
+
+        The report planner owns semantic discovery. This completion step does
+        not infer new metrics from text; it only prevents a verified report
+        output from losing evidence because the planner omitted an anchor that
+        AST + QuerySnapshot already proved reachable.
+        """
+        output_by_id = {
+            str(item.get("output_node_id") or ""): item
+            for item in lineage_index.get("output_nodes") or []
+            if str(item.get("output_node_id") or "")
+        }
+        claimed = {
+            str(output_id)
+            for metric in report_plan.metrics
+            for output_id in metric.output_node_ids
+            if str(output_id)
+        }
+        unresolved = {
+            str(item.output_node_id or "")
+            for item in report_plan.unresolved_outputs
+            if str(item.output_node_id or "")
+        }
+        metrics: list[PlannedMetric] = []
+        for calculation_id, candidate in candidates.items():
+            output_ids = [
+                str(output_id)
+                for output_id in candidate.get("output_node_ids") or []
+                if (output := output_by_id.get(str(output_id)))
+                and output.get("artifact_type") == "report"
+                and str(output_id) not in claimed
+                and str(output_id) not in unresolved
+                and output.get("boundary_operation_node_ids")
+                and output.get("candidate_query_node_ids")
+                and output.get("candidate_operation_node_ids")
+                and PostAnalysisEvidenceCompiler._is_report_metric_output(
+                    output,
+                    lineage_index,
+                )
+                and not PostAnalysisEvidenceCompiler._is_grouping_dimension_output(
+                    output,
+                    lineage_index,
+                )
+            ]
+            if not output_ids:
+                continue
+            outputs = [output_by_id[output_id] for output_id in output_ids]
+            source_anchors = [
+                ReportSourceAnchorRef(anchor_id=anchor_id)
+                for anchor_id in list(dict.fromkeys(
+                    str(output.get("source_anchor_id") or "")
+                    for output in outputs
+                    if str(output.get("source_anchor_id") or "")
+                ))
+            ]
+            metric_fields = list(dict.fromkeys(
+                candidate.get("metric_source_fields")
+                or [
+                    str(field).strip()
+                    for output in outputs
+                    for field in output.get("lineage_fields") or []
+                    if str(field).strip()
+                ]
+            ))
+            labels = [
+                str(output.get("label") or output.get("field") or "").strip()
+                for output in outputs
+                if str(output.get("label") or output.get("field") or "").strip()
+            ]
+            metrics.append(PlannedMetric(
+                calculation_id=str(calculation_id),
+                output_node_ids=output_ids,
+                source_anchors=source_anchors,
+                operation_node_ids=[
+                    str(item)
+                    for item in candidate.get("operation_node_ids") or []
+                    if str(item)
+                ],
+                query_node_ids=[
+                    str(item)
+                    for item in candidate.get("query_node_ids") or []
+                    if str(item)
+                ],
+                metric_source_fields=metric_fields,
+                parameter_bindings=(
+                    candidate.get("parameter_bindings")
+                    if isinstance(candidate.get("parameter_bindings"), dict)
+                    else {}
+                ),
+                metric_key=f"verified_report_{_digest(str(calculation_id), 12)}",
+                business_name=labels[0] if labels else "报告数值",
+                business_explanation="由已执行代码中的报告输出、计算操作和查询快照本地验证补全。",
+                value_type="number",
+                display_unit=str(outputs[0].get("display_unit_hint") or ""),
+            ))
+        return EvidencePlan(metrics=metrics)
+
+    @staticmethod
+    def _filter_plan_claims(
+        plan: EvidencePlan,
+        *,
+        excluded_output_ids: set[str],
+        allowed_output_ids: set[str] | None = None,
+    ) -> EvidencePlan:
+        if not excluded_output_ids and allowed_output_ids is None:
+            return plan
+        metrics: list[PlannedMetric] = []
+        for metric in plan.metrics:
+            output_ids = [
+                str(output_id)
+                for output_id in metric.output_node_ids
+                if (
+                    str(output_id)
+                    and str(output_id) not in excluded_output_ids
+                    and (
+                        allowed_output_ids is None
+                        or str(output_id) in allowed_output_ids
+                    )
+                )
+            ]
+            if not output_ids:
+                continue
+            metrics.append(metric.model_copy(update={"output_node_ids": output_ids}))
+        unresolved_outputs = [
+            item
+            for item in plan.unresolved_outputs
+            if (
+                str(item.output_node_id or "") not in excluded_output_ids
+                and (
+                    not item.output_node_id
+                    or allowed_output_ids is None
+                    or str(item.output_node_id) in allowed_output_ids
+                )
+            )
+        ]
+        return EvidencePlan(
+            metrics=metrics,
+            unresolved_outputs=unresolved_outputs,
+            non_metric_source_anchors=plan.non_metric_source_anchors,
+            non_metric_report_candidate_ids=plan.non_metric_report_candidate_ids,
+        )
 
     @staticmethod
     def _build_structured_evidence_plan(
@@ -5087,6 +6690,7 @@ class PostAnalysisEvidenceCompiler:
                 "outputs": [
                     {
                         "output_node_id": str(output.get("output_node_id") or ""),
+                        "source_anchor_id": str(output.get("source_anchor_id") or ""),
                         "artifact_type": output.get("artifact_type"),
                         "artifact_index": output.get("artifact_index"),
                         "label": output.get("label"),
@@ -5122,6 +6726,11 @@ class PostAnalysisEvidenceCompiler:
             )
             catalog.append({
                 "query_node_id": query_node_id,
+                "columns": list(dict.fromkeys(
+                    str(field)
+                    for field in scope.get("execution_columns") or []
+                    if str(field)
+                )),
                 "query_constraints": scope.get("query_constraints") or {},
                 "aggregation_hints": scope.get("aggregation_hints") or [],
                 "data_access": {
@@ -5147,8 +6756,10 @@ class PostAnalysisEvidenceCompiler:
     def _relevant_datasource_context(
         snapshot: AnalysisExecutionSnapshot,
         lineage_index: dict[str, Any],
+        *,
+        search_text: str = "",
     ) -> list[dict[str, Any]]:
-        search_text = "\n".join(
+        search_text = search_text or "\n".join(
             [
                 str(item.get("field") or "")
                 for item in lineage_index.get("output_nodes") or []
@@ -5177,11 +6788,123 @@ class PostAnalysisEvidenceCompiler:
             })
         return context
 
+    @staticmethod
+    def _report_candidate_catalog(
+        lineage_index: dict[str, Any],
+        *,
+        excluded_output_ids: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Group rendered report candidates by their Evidence binding boundary.
+
+        Prose values remain single-span candidates. Markdown table values are
+        grouped by table column so the semantic planner classifies one metric
+        boundary rather than every cell in a repeated data grid.
+        """
+        groups: dict[str, list[dict[str, Any]]] = {}
+        excluded_output_ids = excluded_output_ids or set()
+        for output in lineage_index.get("output_nodes") or []:
+            if output.get("artifact_type") != "report" or not output.get("posthoc_report_candidate"):
+                continue
+            if not PostAnalysisEvidenceCompiler._is_report_metric_output(
+                output,
+                lineage_index,
+            ):
+                continue
+            output_id = str(output.get("output_node_id") or "")
+            if not output_id or output_id in excluded_output_ids:
+                continue
+            group_id = str(output.get("report_candidate_group_id") or output_id)
+            groups.setdefault(group_id, []).append(output)
+        catalog: list[dict[str, Any]] = []
+        for group_id, outputs in groups.items():
+            representative = outputs[0]
+            context = representative.get("display_context") or {}
+            catalog.append({
+                "candidate_id": group_id,
+                "text_examples": list(dict.fromkeys(
+                    str(output.get("text") or "") for output in outputs
+                    if str(output.get("text") or "")
+                ))[:3],
+                "heading": str(context.get("heading") or representative.get("label") or ""),
+                "column_label": str(context.get("column_label") or representative.get("label") or ""),
+                "line": str(context.get("line") or ""),
+                "occurrence_count": len(outputs),
+                "kind": "markdown_table_column" if len(outputs) > 1 else "report_span",
+            })
+        return catalog
+
+    @staticmethod
+    def _attach_candidate_source_line_hints(
+        catalog: list[dict[str, Any]],
+        code: str,
+    ) -> list[dict[str, Any]]:
+        """Locate report-construction lines by shared static text only."""
+        try:
+            tree = ast.parse(code or "")
+        except SyntaxError:
+            return catalog
+
+        def normalized(value: str) -> str:
+            return re.sub(r"[^\w\u4e00-\u9fff]+", "", str(value or "").lower())
+
+        static_fragments: list[tuple[int, str, str]] = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+            ):
+                continue
+            text = str(node.value or "").strip()
+            compact = normalized(text)
+            if len(compact) < 4:
+                continue
+            static_fragments.append((int(getattr(node, "lineno", 0) or 0), text, compact))
+
+        enriched: list[dict[str, Any]] = []
+        for candidate in catalog:
+            candidate_text = normalized(" ".join([
+                str(candidate.get("heading") or ""),
+                str(candidate.get("column_label") or ""),
+                str(candidate.get("line") or ""),
+            ]))
+            matches = sorted(
+                (
+                    (len(compact), line, text)
+                    for line, text, compact in static_fragments
+                    if line > 0 and compact in candidate_text
+                ),
+                reverse=True,
+            )
+            hints: list[dict[str, Any]] = []
+            seen_lines: set[int] = set()
+            for _, line, text in matches:
+                if line in seen_lines:
+                    continue
+                seen_lines.add(line)
+                hints.append({"line": line, "matched_text": text[:160]})
+                if len(hints) >= 6:
+                    break
+            enriched.append({
+                **candidate,
+                "source_line_hints": sorted(hints, key=lambda item: int(item["line"])),
+                "nearby_source_range": (
+                    [
+                        max(1, min(int(item["line"]) for item in hints) - 4),
+                        max(int(item["line"]) for item in hints) + 4,
+                    ]
+                    if hints
+                    else []
+                ),
+            })
+        return enriched
+
     def _planner_fact_payload(
         self,
         snapshot: AnalysisExecutionSnapshot,
         lineage_index: dict[str, Any],
         calculation_candidates: dict[str, dict[str, Any]],
+        *,
+        recovery_only: bool = False,
     ) -> dict[str, Any]:
         """Build one normalized fact graph without repeating operations or outputs."""
         expanded = self._planner_candidate_payloads(calculation_candidates, lineage_index)
@@ -5236,35 +6959,178 @@ class PostAnalysisEvidenceCompiler:
             for query_id in candidate.get("query_node_ids") or []
             if str(query_id)
         }
-        candidate_search_text = _stable_json(expanded)
-        relevant_datasources = []
-        for datasource in self._relevant_datasource_context(snapshot, lineage_index):
-            properties = datasource.get("relevant_properties")
-            filtered_properties = {
-                str(field): definition
-                for field, definition in (properties.items() if isinstance(properties, dict) else [])
-                if str(field) in candidate_search_text
+        report_outputs_by_anchor: dict[str, list[dict[str, Any]]] = {}
+        for output in lineage_index.get("output_nodes") or []:
+            if output.get("artifact_type") != "report":
+                continue
+            anchor_id = str(output.get("source_anchor_id") or "")
+            if anchor_id:
+                report_outputs_by_anchor.setdefault(anchor_id, []).append(output)
+
+        locally_verified_report_output_ids = {
+            str(output_id)
+            for candidate in calculation_candidates.values()
+            for output_id in (candidate.get("local_lineage_hints") or {})
+            if str(output_id)
+        }
+        # The planner is a semantic recovery step, not a second classifier for
+        # every already-proven report slot. Keep only rendered numeric outputs
+        # that the local lineage graph could not bind to a calculation boundary.
+        discovery_report_anchor_ids = {
+            str(output.get("source_anchor_id") or "")
+            for output in lineage_index.get("output_nodes") or []
+            if output.get("artifact_type") == "report"
+            and self._is_report_metric_output(output, lineage_index)
+            and str(output.get("output_node_id") or "")
+            not in locally_verified_report_output_ids
+            and str(output.get("source_anchor_id") or "")
+        }
+        report_candidate_catalog = self._attach_candidate_source_line_hints(
+            self._report_candidate_catalog(
+                lineage_index,
+                excluded_output_ids=locally_verified_report_output_ids,
+            ),
+            snapshot.generated_code,
+        )
+        source_anchor_catalog = [
+            {
+                **{
+                    key: value
+                    for key, value in anchor.items()
+                    if key in {
+                        "anchor_id", "source_line", "expression", "loads",
+                        "display_prefix", "display_suffix", "numeric_hint",
+                        "numeric_suffix",
+                    }
+                },
+                "verified_report_output": bool(
+                    report_outputs_by_anchor.get(str(anchor.get("anchor_id") or ""))
+                ),
+                "query_reachable": any(
+                    output.get("candidate_query_node_ids")
+                    for output in report_outputs_by_anchor.get(
+                        str(anchor.get("anchor_id") or ""), []
+                    )
+                ),
+                "dimension_origin": bool(
+                    report_outputs_by_anchor.get(str(anchor.get("anchor_id") or ""))
+                ) and all(
+                    self._is_grouping_dimension_output(output, lineage_index)
+                    for output in report_outputs_by_anchor.get(
+                        str(anchor.get("anchor_id") or ""), []
+                    )
+                ),
             }
-            if filtered_properties:
-                relevant_datasources.append({
-                    **datasource,
-                    "relevant_properties": filtered_properties,
-                })
+            for anchor in lineage_index.get("report_source_anchors") or []
+            if (
+                not recovery_only
+                or str(anchor.get("anchor_id") or "") in discovery_report_anchor_ids
+            )
+        ]
+        discovery_search_text = _stable_json({
+            "user_query": snapshot.user_query,
+            "report_candidates": report_candidate_catalog,
+            "source_anchors": source_anchor_catalog,
+        })
+        relevant_datasources = self._relevant_datasource_context(
+            snapshot,
+            lineage_index,
+            search_text=(discovery_search_text if recovery_only else ""),
+        )
+        query_catalog = [
+            item for item in self._planner_query_catalog(lineage_index)
+            if str(item.get("query_node_id") or "") in referenced_query_ids
+        ]
+        if recovery_only:
+            query_catalog = [
+                {
+                    "query_node_id": item.get("query_node_id"),
+                    "data_access": item.get("data_access") or {},
+                    "columns": item.get("columns") or [],
+                    "projection_semantics": [
+                        projection
+                        for projection in item.get("projection_semantics") or []
+                        if any(
+                            str(value) and str(value) in discovery_search_text
+                            for value in (
+                                [projection.get("alias")]
+                                + (
+                                    list(projection.get("source_fields") or [])
+                                    if isinstance(projection.get("source_fields"), list)
+                                    else [projection.get("source_fields")]
+                                )
+                            )
+                        )
+                    ],
+                }
+                for item in query_catalog
+            ]
         payload = {
             "user_query": snapshot.user_query,
-            "analysis_code": snapshot.generated_code,
+            "analysis_code_with_lines": self._line_numbered_code(snapshot.generated_code),
+            "report_candidate_catalog": report_candidate_catalog,
+            "source_anchor_catalog": source_anchor_catalog,
             "datasource_catalog": self._planner_datasource_catalog(
                 relevant_datasources
             ),
-            "query_catalog": [
-                item for item in self._planner_query_catalog(lineage_index)
-                if str(item.get("query_node_id") or "") in referenced_query_ids
-            ],
-            "operation_catalog": list(operation_catalog.values()),
+            "query_catalog": query_catalog,
+            "operation_catalog": (
+                [] if recovery_only else list(operation_catalog.values())
+            ),
+            "calculation_selection_mode": (
+                "source_locator" if recovery_only else "operation_or_source_locator"
+            ),
             "output_catalog": list(output_catalog.values()),
             "calculation_candidates": candidates,
         }
-        return self._alias_planner_fact_payload(payload)
+        return self._discovery_planner_payload(self._alias_planner_fact_payload(payload))
+
+    @staticmethod
+    def _discovery_planner_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        """Remove local report answers while retaining independently verifiable facts."""
+        hints_by_anchor: dict[str, list[dict[str, Any]]] = {}
+        outputs = {
+            str(item.get("output_node_id") or ""): item
+            for item in payload.get("output_catalog") or []
+        }
+        for candidate in payload.get("calculation_candidates") or []:
+            if not candidate.get("semantic_scope"):
+                continue
+            local_hints = candidate.get("local_lineage_hints") or {}
+            for output_id, hint in local_hints.items():
+                output = outputs.get(str(output_id)) or {}
+                for anchor_id in output.get("source_anchor_ids") or []:
+                    hints_by_anchor.setdefault(str(anchor_id), []).append({
+                        "operation_node_ids": list(hint.get("operation_node_ids") or []),
+                        "parameter_bindings": dict(hint.get("parameter_bindings") or {}),
+                        "lineage_fields": list(hint.get("output_lineage_fields") or []),
+                    })
+        return {
+            key: value
+            for key, value in {
+                **payload,
+                "source_anchor_catalog": [
+                    {
+                        **anchor,
+                        "verification_hints": list({
+                            _stable_json(hint): hint
+                            for hint in hints_by_anchor.get(
+                                str(anchor.get("anchor_id") or ""), []
+                            )
+                        }.values()),
+                    }
+                    for anchor in payload.get("source_anchor_catalog") or []
+                ],
+            }.items()
+            if key not in {"output_catalog", "calculation_candidates"}
+        }
+
+    @staticmethod
+    def _line_numbered_code(code: str) -> str:
+        return "\n".join(
+            f"{index:04d}: {line}"
+            for index, line in enumerate(str(code or "").splitlines(), start=1)
+        )
 
     def _alias_planner_fact_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         def build_aliases(values: list[str], prefix: str) -> tuple[dict[str, str], dict[str, str]]:
@@ -5287,6 +7153,14 @@ class PostAnalysisEvidenceCompiler:
             str(item.get("calculation_id") or "")
             for item in payload.get("calculation_candidates") or []
         ], "calc")
+        anchor_forward, anchor_reverse = build_aliases([
+            str(item.get("anchor_id") or "")
+            for item in payload.get("source_anchor_catalog") or []
+        ], "a")
+        report_candidate_forward, report_candidate_reverse = build_aliases([
+            str(item.get("candidate_id") or "")
+            for item in payload.get("report_candidate_catalog") or []
+        ], "rc")
         calculation_by_output = {
             str(output_id): str(candidate.get("calculation_id") or "")
             for candidate in payload.get("calculation_candidates") or []
@@ -5327,6 +7201,14 @@ class PostAnalysisEvidenceCompiler:
                 if isinstance(context, dict) and context not in contexts:
                     contexts.append(context)
             representative["output_node_id"] = alias
+            source_anchor_ids = list(dict.fromkeys(
+                anchor_forward.get(source_anchor_id, source_anchor_id)
+                for output in outputs
+                for source_anchor_id in [str(output.get("source_anchor_id") or "")]
+                if source_anchor_id
+            ))
+            representative["source_anchor_ids"] = source_anchor_ids
+            representative.pop("source_anchor_id", None)
             representative["occurrence_count"] = len(outputs)
             representative["display_context_examples"] = contexts[:3]
             representative.pop("display_context", None)
@@ -5336,9 +7218,31 @@ class PostAnalysisEvidenceCompiler:
             "operation": operation_reverse,
             "output": output_reverse,
             "calculation": calculation_reverse,
+            "anchor": anchor_reverse,
+            "report_candidate": report_candidate_reverse,
         }
         return {
             **payload,
+            "report_candidate_catalog": [
+                {
+                    **item,
+                    "candidate_id": report_candidate_forward.get(
+                        str(item.get("candidate_id") or ""),
+                        str(item.get("candidate_id") or ""),
+                    ),
+                }
+                for item in payload.get("report_candidate_catalog") or []
+            ],
+            "source_anchor_catalog": [
+                {
+                    **item,
+                    "anchor_id": anchor_forward.get(
+                        str(item.get("anchor_id") or ""),
+                        str(item.get("anchor_id") or ""),
+                    ),
+                }
+                for item in payload.get("source_anchor_catalog") or []
+            ],
             "query_catalog": [
                 {**item, "query_node_id": query_forward.get(str(item.get("query_node_id") or ""), "")}
                 for item in payload.get("query_catalog") or []
@@ -5437,44 +7341,220 @@ class PostAnalysisEvidenceCompiler:
             ],
         }
 
+    def _normalize_typed_resolver_aliases(self, plan: EvidencePlan) -> EvidencePlan:
+        """Repair only cross-field alias placement before alias validation.
+
+        The planner receives typed short IDs: ``a*`` for source expressions and
+        ``rc*`` for rendered report candidates. It can occasionally put a valid
+        ID in the other field. Keep aliases intact for the following validation
+        pass, while moving them to their declared type.
+        """
+        maps = self._resolver_id_maps
+        if not maps:
+            return plan
+        candidate_aliases = set(maps.get("report_candidate", {}))
+        anchor_aliases = set(maps.get("anchor", {}))
+
+        def normalize_metric(metric: PlannedMetric) -> PlannedMetric:
+            anchors: list[ReportSourceAnchorRef] = []
+            candidates: list[str] = []
+            for anchor in metric.source_anchors:
+                alias = str(anchor.anchor_id or "")
+                if alias in candidate_aliases:
+                    candidates.append(alias)
+                elif not anchor_aliases and metric.report_candidate_ids:
+                    # Candidate-only discovery has no source-anchor catalog.
+                    # A model may still emit placeholder ``a*`` values; they do
+                    # not carry additional proof and must not invalidate the
+                    # independently addressable rendered candidate.
+                    continue
+                else:
+                    anchors.append(anchor)
+            for candidate in metric.report_candidate_ids:
+                alias = str(candidate or "")
+                if alias in anchor_aliases:
+                    anchors.append(ReportSourceAnchorRef(anchor_id=alias))
+                else:
+                    candidates.append(alias)
+            return PlannedMetric.model_validate({
+                **metric.model_dump(),
+                "source_anchors": anchors,
+                "report_candidate_ids": list(dict.fromkeys(candidates)),
+            })
+
+        non_metric_anchors: list[ReportSourceAnchorRef] = []
+        non_metric_candidates: list[str] = []
+        for anchor in plan.non_metric_source_anchors:
+            alias = str(anchor.anchor_id or "")
+            if alias in candidate_aliases:
+                non_metric_candidates.append(alias)
+            else:
+                non_metric_anchors.append(anchor)
+        for candidate in plan.non_metric_report_candidate_ids:
+            alias = str(candidate or "")
+            if alias in anchor_aliases:
+                non_metric_anchors.append(ReportSourceAnchorRef(anchor_id=alias))
+            else:
+                non_metric_candidates.append(alias)
+        unresolved_outputs: list[UnresolvedEvidenceOutput] = []
+        for item in plan.unresolved_outputs:
+            output_id = str(item.output_node_id or "").strip()
+            anchor = item.source_anchor
+            anchor_alias = str(anchor.anchor_id or "").strip() if anchor is not None else ""
+            if anchor_alias in candidate_aliases:
+                unresolved_outputs.append(UnresolvedEvidenceOutput(
+                    output_node_id=anchor_alias,
+                    reason=item.reason,
+                ))
+                continue
+            if output_id in anchor_aliases:
+                unresolved_outputs.append(UnresolvedEvidenceOutput(
+                    source_anchor=ReportSourceAnchorRef(anchor_id=output_id),
+                    reason=item.reason,
+                ))
+                continue
+            if not output_id and anchor is not None and not (
+                anchor_alias
+                or int(anchor.source_line or 0) > 0
+                and str(anchor.expression or "").strip()
+            ):
+                # A shape-only unresolved item classifies no source fact. Drop
+                # it here; completeness validation still reports every omitted
+                # anchor/candidate instead of treating the empty object as proof.
+                continue
+            if output_id or anchor is not None:
+                unresolved_outputs.append(item)
+        return EvidencePlan(
+            metrics=[normalize_metric(metric) for metric in plan.metrics],
+            unresolved_outputs=unresolved_outputs,
+            non_metric_source_anchors=non_metric_anchors,
+            non_metric_report_candidate_ids=list(dict.fromkeys(non_metric_candidates)),
+        )
+
     def _restore_resolver_plan_ids(self, plan: EvidencePlan) -> EvidencePlan:
         maps = self._resolver_id_maps
         if not maps:
             return plan
-        return EvidencePlan(
-            metrics=[
-                PlannedMetric.model_validate({
-                    **metric.model_dump(),
-                    "calculation_id": maps.get("calculation", {}).get(
-                        str(metric.calculation_id), str(metric.calculation_id)
-                    ),
-                    "output_node_ids": [
-                        restored
-                        for value in metric.output_node_ids
-                        for restored in (
-                            maps.get("output", {}).get(str(value))
-                            or [str(value)]
-                        )
-                    ],
-                    "operation_node_ids": [
-                        maps.get("operation", {}).get(str(value), str(value))
-                        for value in metric.operation_node_ids
-                    ],
-                    "query_node_ids": [
-                        maps.get("query", {}).get(str(value), str(value))
-                        for value in metric.query_node_ids
-                    ],
+
+        def unique_items(items: list[Any], key: Callable[[Any], str]) -> list[Any]:
+            result: list[Any] = []
+            seen: set[str] = set()
+            for item in items:
+                item_key = key(item)
+                if item_key in seen:
+                    continue
+                seen.add(item_key)
+                result.append(item)
+            return result
+
+        def restore_metric(metric: PlannedMetric) -> PlannedMetric:
+            restored_anchors: list[dict[str, Any]] = []
+            restored_candidates: list[str] = []
+            for anchor in metric.source_anchors:
+                raw_id = str(anchor.anchor_id or "")
+                # Resolver aliases are typed. If the planner places a rendered
+                # candidate alias in the anchor field, preserve the semantic
+                # claim by moving it to the matching typed field instead of
+                # treating a recoverable JSON-shape error as planner failure.
+                candidate_id = maps.get("report_candidate", {}).get(raw_id)
+                if candidate_id:
+                    restored_candidates.append(candidate_id)
+                    continue
+                restored_anchors.append({
+                    **anchor.model_dump(),
+                    "anchor_id": maps.get("anchor", {}).get(raw_id, raw_id),
                 })
-                for metric in plan.metrics
-            ],
+            for value in metric.report_candidate_ids:
+                raw_id = str(value or "")
+                anchor_id = maps.get("anchor", {}).get(raw_id)
+                if anchor_id:
+                    restored_anchors.append({"anchor_id": anchor_id})
+                    continue
+                restored_candidates.append(
+                    maps.get("report_candidate", {}).get(raw_id, raw_id)
+                )
+            return PlannedMetric.model_validate({
+                **metric.model_dump(),
+                "calculation_id": maps.get("calculation", {}).get(
+                    str(metric.calculation_id), str(metric.calculation_id)
+                ),
+                "output_node_ids": [
+                    restored
+                    for value in metric.output_node_ids
+                    for restored in (
+                        maps.get("output", {}).get(str(value))
+                        or [str(value)]
+                    )
+                ],
+                "operation_node_ids": [
+                    maps.get("operation", {}).get(str(value), str(value))
+                    for value in metric.operation_node_ids
+                ],
+                "query_node_ids": [
+                    maps.get("query", {}).get(str(value), str(value))
+                    for value in metric.query_node_ids
+                ],
+                "claimed_query_node_ids": [
+                    maps.get("query", {}).get(str(value), str(value))
+                    for value in metric.claimed_query_node_ids
+                ],
+                "source_anchors": unique_items(
+                    restored_anchors,
+                    _stable_json,
+                ),
+                "report_candidate_ids": list(dict.fromkeys(restored_candidates)),
+            })
+
+        non_metric_anchors: list[ReportSourceAnchorRef] = []
+        non_metric_candidates: list[str] = []
+        for anchor in plan.non_metric_source_anchors:
+            raw_id = str(anchor.anchor_id or "")
+            candidate_id = maps.get("report_candidate", {}).get(raw_id)
+            if candidate_id:
+                non_metric_candidates.append(candidate_id)
+            else:
+                non_metric_anchors.append(ReportSourceAnchorRef.model_validate({
+                    **anchor.model_dump(),
+                    "anchor_id": maps.get("anchor", {}).get(raw_id, raw_id),
+                }))
+        for value in plan.non_metric_report_candidate_ids:
+            raw_id = str(value or "")
+            anchor_id = maps.get("anchor", {}).get(raw_id)
+            if anchor_id:
+                non_metric_anchors.append(ReportSourceAnchorRef(anchor_id=anchor_id))
+            else:
+                non_metric_candidates.append(
+                    maps.get("report_candidate", {}).get(raw_id, raw_id)
+                )
+        return EvidencePlan(
+            metrics=[restore_metric(metric) for metric in plan.metrics],
             unresolved_outputs=[
-                UnresolvedEvidenceOutput(output_node_id=restored, reason=item.reason)
+                UnresolvedEvidenceOutput(
+                    output_node_id=restored,
+                    source_anchor=(
+                        ReportSourceAnchorRef.model_validate({
+                            **item.source_anchor.model_dump(),
+                            "anchor_id": maps.get("anchor", {}).get(
+                                str(item.source_anchor.anchor_id),
+                                str(item.source_anchor.anchor_id),
+                            ),
+                        })
+                        if item.source_anchor is not None
+                        else None
+                    ),
+                    reason=item.reason,
+                )
                 for item in plan.unresolved_outputs
                 for restored in (
                     maps.get("output", {}).get(str(item.output_node_id))
-                    or [str(item.output_node_id)]
+                    or ([str(item.output_node_id)] if str(item.output_node_id) else [""])
                 )
             ],
+            non_metric_source_anchors=unique_items(
+                non_metric_anchors,
+                lambda item: str(item.anchor_id or ""),
+            ),
+            non_metric_report_candidate_ids=list(dict.fromkeys(non_metric_candidates)),
         )
 
     @staticmethod
@@ -5512,10 +7592,7 @@ class PostAnalysisEvidenceCompiler:
         model = create_data_insight_model(runtime_config)
         if runtime_config.adapter == "openai":
             model = model.bind(response_format={"type": "json_object"})
-        messages: list[Any] = [
-            SystemMessage(EVIDENCE_PLANNER_PROMPT),
-            HumanMessage(_stable_json(payload)),
-        ]
+        messages = self._planner_messages(payload)
         last_error: Exception | None = None
         for attempt in range(2):
             response_text = ""
@@ -5540,14 +7617,44 @@ class PostAnalysisEvidenceCompiler:
                     raw_planner_payload = _extract_json_object(response_text)
                 planner_payload = self._canonicalize_planner_payload(raw_planner_payload)
                 plan = EvidencePlan.model_validate(planner_payload)
-                candidates = {
-                    str(item.get("calculation_id")): item
-                    for item in payload.get("calculation_candidates") or []
-                    if str(item.get("calculation_id") or "")
-                }
-                plan = self._sanitize_semantic_plan(plan, candidates)
-                reference_errors = self._plan_reference_errors(plan, candidates)
+                # Normalize typed resolver aliases before validating references.
+                # The model may correctly choose a rendered candidate but place
+                # its ``rc*`` alias in the source-anchor field (or vice versa).
+                # This is a recoverable response-shape mismatch, not missing
+                # evidence semantics.
+                plan = self._normalize_typed_resolver_aliases(plan)
+                # Discovery payloads deliberately omit the internal output
+                # catalog. A metric without an anchor or a rendered candidate
+                # therefore has no posthoc report position and must not make
+                # the entire planner result fail validation.
+                if "report_candidate_catalog" in payload:
+                    plan = EvidencePlan(
+                        metrics=[
+                            metric.model_copy(update={"output_node_ids": []})
+                            for metric in plan.metrics
+                            if metric.source_anchors or metric.report_candidate_ids
+                        ],
+                        unresolved_outputs=plan.unresolved_outputs,
+                        non_metric_source_anchors=plan.non_metric_source_anchors,
+                        non_metric_report_candidate_ids=(
+                            plan.non_metric_report_candidate_ids
+                        ),
+                    )
+                reference_errors = self._discovery_plan_reference_errors(plan, payload)
                 if reference_errors:
+                    completeness_only = all(
+                        str(error).startswith((
+                            "verified report source anchors are unclassified:",
+                            "rendered report candidates are unclassified:",
+                        ))
+                        for error in reference_errors
+                    )
+                    if attempt == 1 and completeness_only:
+                        # One focused retry is enough. Remaining candidate
+                        # omissions become isolated unresolved positions during
+                        # local materialization; they must not erase verified
+                        # report, chart, or table evidence.
+                        return plan
                     raise ValueError("; ".join(reference_errors[:20]))
                 return plan
             except (ValidationError, ValueError, json.JSONDecodeError) as exc:
@@ -5556,14 +7663,177 @@ class PostAnalysisEvidenceCompiler:
                     if response_text:
                         messages.append(AIMessage(response_text))
                     messages.append(HumanMessage(
-                        "上一轮输出不符合证据解析契约。请确保每个 output_node_id 恰好被 metric "
-                        "绑定一次或列入 unresolved_outputs；evidence_required=true 的输出必须绑定，"
-                        "不能因其属于明细值而标记 unresolved。只修正 JSON 结构和引用："
+                        "上一轮输出不符合报告证据发现契约。请确保源码锚点引用存在，"
+                        "同一源码锚点只分类一次，metric 至少包含一个源码锚点或报告候选，"
+                        "并引用目录中的真实计算操作，或用 calculation_source_refs 精确定位源码计算表达式。"
+                        "只修正 JSON 结构和源码/操作引用："
                         + str(exc)[:1200]
                     ))
                     continue
                 raise
         raise RuntimeError(f"Evidence Planner failed: {last_error}")
+
+    @staticmethod
+    def _planner_messages(payload: dict[str, Any]) -> list[Any]:
+        """Keep the recovery task salient without duplicating source code."""
+        code = str(payload.get("analysis_code_with_lines") or "")
+        task_facts = {
+            key: value
+            for key, value in payload.items()
+            if key != "analysis_code_with_lines"
+        }
+        candidate_ids = [
+            str(item.get("candidate_id") or "")
+            for item in payload.get("report_candidate_catalog") or []
+            if str(item.get("candidate_id") or "")
+        ]
+        anchor_ids = [
+            str(item.get("anchor_id") or "")
+            for item in payload.get("source_anchor_catalog") or []
+            if str(item.get("anchor_id") or "")
+        ]
+        return [
+            SystemMessage(EVIDENCE_PLANNER_PROMPT),
+            HumanMessage(
+                "以下 JSON 是本次唯一待处理目录及验真辅助事实。目录外表达式已经处理，"
+                "不得重新枚举：\n"
+                + json.dumps(
+                    task_facts,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                )
+            ),
+            HumanMessage(
+                "以下是只读的完整成功 Python 源码。仅用它定位上述目录项的最小计算边界：\n"
+                + code
+            ),
+            HumanMessage(
+                "现在只输出 JSON，并逐项分类这些待处理 ID："
+                f"report_candidate_ids={candidate_ids}, source_anchor_ids={anchor_ids}。"
+                "每个 ID 必须恰好出现一次；目录外源码表达式不要输出。"
+            ),
+        ]
+
+    @staticmethod
+    def _discovery_plan_reference_errors(
+        plan: EvidencePlan,
+        payload: dict[str, Any],
+    ) -> list[str]:
+        valid_anchor_ids = {
+            str(item.get("anchor_id") or "")
+            for item in payload.get("source_anchor_catalog") or []
+            if str(item.get("anchor_id") or "")
+        }
+        valid_operation_ids = {
+            str(item.get("operation_node_id") or "")
+            for item in payload.get("operation_catalog") or []
+            if str(item.get("operation_node_id") or "")
+        }
+        valid_report_candidate_ids = {
+            str(item.get("candidate_id") or "")
+            for item in payload.get("report_candidate_catalog") or []
+            if str(item.get("candidate_id") or "")
+        }
+        errors: list[str] = []
+        classified: dict[str, str] = {}
+
+        def validate_anchor(
+            anchor: ReportSourceAnchorRef,
+            owner: str,
+            binding_key: str = "",
+        ) -> None:
+            anchor_id = str(anchor.anchor_id or "")
+            identity = anchor_id or (
+                f"line:{int(anchor.source_line or 0)}:"
+                f"{PostAnalysisEvidenceCompiler._normalized_source_expression(anchor.expression)}"
+            )
+            if anchor_id:
+                if anchor_id not in valid_anchor_ids:
+                    errors.append(f"unknown source anchor: {anchor_id}")
+            elif not int(anchor.source_line or 0) or not str(anchor.expression or "").strip():
+                errors.append(f"{owner} contains an anchor without id or source location")
+            if identity:
+                identity = f"{identity}|{binding_key}" if binding_key else identity
+                previous = classified.get(identity)
+                if not previous:
+                    classified[identity] = owner
+
+        for index, metric in enumerate(plan.metrics):
+            owner = f"metric[{index}]"
+            if not metric.source_anchors and not metric.report_candidate_ids:
+                errors.append(f"{owner} has no source anchors or report candidates")
+            if not metric.operation_node_ids and not metric.calculation_source_refs:
+                errors.append(f"{owner} has no calculation operation or source locator")
+            binding_key = _stable_json(metric.parameter_bindings or {})
+            for anchor in metric.source_anchors:
+                validate_anchor(anchor, owner, binding_key)
+            for candidate_id in metric.report_candidate_ids:
+                candidate_id = str(candidate_id)
+                if candidate_id not in valid_report_candidate_ids:
+                    errors.append(f"{owner} references unknown report candidate: {candidate_id}")
+                previous = classified.get(f"candidate:{candidate_id}")
+                if not previous:
+                    classified[f"candidate:{candidate_id}"] = owner
+            for operation_id in metric.operation_node_ids:
+                if str(operation_id) not in valid_operation_ids:
+                    errors.append(f"{owner} references unknown operation: {operation_id}")
+            for query_id in metric.claimed_query_node_ids:
+                if str(query_id) not in {
+                    str(item.get("query_node_id") or "")
+                    for item in payload.get("query_catalog") or []
+                }:
+                    errors.append(f"{owner} references unknown claimed query: {query_id}")
+            for source_ref in metric.calculation_source_refs:
+                if int(source_ref.source_line or 0) <= 0 or not str(source_ref.expression or "").strip():
+                    errors.append(f"{owner} contains an invalid calculation source locator")
+        for index, anchor in enumerate(plan.non_metric_source_anchors):
+            validate_anchor(anchor, f"non_metric[{index}]")
+        for index, item in enumerate(plan.unresolved_outputs):
+            output_id = str(item.output_node_id or "")
+            if output_id:
+                if output_id not in valid_report_candidate_ids:
+                    errors.append(f"unresolved[{index}] references unknown report candidate: {output_id}")
+                else:
+                    classified.setdefault(f"candidate:{output_id}", f"unresolved[{index}]")
+            if item.source_anchor is not None:
+                validate_anchor(item.source_anchor, f"unresolved[{index}]")
+        for candidate_id in plan.non_metric_report_candidate_ids:
+            candidate_id = str(candidate_id)
+            if candidate_id not in valid_report_candidate_ids:
+                errors.append(f"non_metric references unknown report candidate: {candidate_id}")
+                continue
+            previous = classified.get(f"candidate:{candidate_id}")
+            if not previous:
+                classified[f"candidate:{candidate_id}"] = "non_metric"
+        required_report_anchor_ids = {
+            str(item.get("anchor_id") or "")
+            for item in payload.get("source_anchor_catalog") or []
+            if item.get("verified_report_output")
+            and str(item.get("anchor_id") or "")
+        }
+        classified_anchor_ids = {
+            identity.split("|", 1)[0]
+            for identity in classified
+            if not identity.startswith("line:")
+        }
+        missing_anchor_ids = required_report_anchor_ids - classified_anchor_ids
+        if missing_anchor_ids:
+            errors.append(
+                "verified report source anchors are unclassified: "
+                f"{sorted(missing_anchor_ids)}"
+            )
+        missing_candidate_ids = valid_report_candidate_ids - {
+            identity.removeprefix("candidate:")
+            for identity in classified
+            if identity.startswith("candidate:")
+        }
+        if missing_candidate_ids:
+            errors.append(
+                "rendered report candidates are unclassified: "
+                f"{sorted(missing_candidate_ids)}"
+            )
+        return errors
 
     @staticmethod
     def _repair_planner_json(model: Any, response_text: str, error: Exception) -> str:
@@ -5601,15 +7871,124 @@ class PostAnalysisEvidenceCompiler:
                 {
                     str(key): value
                     for key, value in metric.items()
-                    if str(key) not in {"metric_source_fields", "parameter_bindings"}
+                    if str(key) != "metric_source_fields"
                 }
                 if isinstance(metric, dict)
                 else metric
                 for metric in normalized["metrics"]
+                if not isinstance(metric, dict)
+                or metric.get("source_anchors")
+                or metric.get("report_candidate_ids")
+                or metric.get("output_node_ids")
             ]
         if not isinstance(normalized.get("unresolved_outputs"), list):
             normalized["unresolved_outputs"] = []
         return normalized
+
+    @staticmethod
+    def _normalize_unresolved_report_outputs(plan: EvidencePlan) -> EvidencePlan:
+        claimed_output_ids = {
+            str(output_id)
+            for metric in plan.metrics
+            for output_id in metric.output_node_ids
+            if str(output_id)
+        }
+        seen: set[tuple[str, str, int, str]] = set()
+        unresolved: list[UnresolvedEvidenceOutput] = []
+        for item in plan.unresolved_outputs:
+            output_id = str(item.output_node_id or "")
+            if output_id and output_id in claimed_output_ids:
+                continue
+            anchor = item.source_anchor
+            identity = (
+                output_id,
+                str(anchor.anchor_id or "") if anchor is not None else "",
+                int(anchor.source_line or 0) if anchor is not None else 0,
+                str(anchor.expression or "") if anchor is not None else "",
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            unresolved.append(item)
+        return EvidencePlan(
+            metrics=plan.metrics,
+            unresolved_outputs=unresolved,
+            non_metric_source_anchors=plan.non_metric_source_anchors,
+            non_metric_report_candidate_ids=plan.non_metric_report_candidate_ids,
+        )
+
+    @staticmethod
+    def _isolate_duplicate_report_output_claims(
+        plan: EvidencePlan,
+        calculation_candidates: dict[str, dict[str, Any]],
+    ) -> EvidencePlan:
+        """Keep one locally best-proven owner or isolate only the conflicting slot."""
+        claims: dict[str, list[int]] = {}
+        for metric_index, metric in enumerate(plan.metrics):
+            for output_id in metric.output_node_ids:
+                claims.setdefault(str(output_id), []).append(metric_index)
+        duplicates = {
+            output_id: owners
+            for output_id, owners in claims.items()
+            if output_id and len(owners) > 1
+        }
+        if not duplicates:
+            return plan
+
+        remove_by_metric: dict[int, set[str]] = {}
+        unresolved = list(plan.unresolved_outputs)
+        for output_id, owners in duplicates.items():
+            hint = next((
+                (candidate.get("local_lineage_hints") or {}).get(output_id)
+                for candidate in calculation_candidates.values()
+                if (candidate.get("local_lineage_hints") or {}).get(output_id)
+            ), {}) or {}
+            hint_operations = set(hint.get("operation_node_ids") or [])
+            hint_bindings = dict(hint.get("parameter_bindings") or {})
+            scores: dict[int, tuple[int, int, int]] = {}
+            for owner in owners:
+                metric = plan.metrics[owner]
+                metric_operations = set(metric.operation_node_ids)
+                binding_match = int(
+                    bool(hint_bindings)
+                    and dict(metric.parameter_bindings or {}) == hint_bindings
+                )
+                exact_operations = int(
+                    bool(hint_operations)
+                    and metric_operations == hint_operations
+                )
+                operation_overlap = len(metric_operations.intersection(hint_operations))
+                scores[owner] = (binding_match, exact_operations, operation_overlap)
+            best_score = max(scores.values())
+            winners = [owner for owner, score in scores.items() if score == best_score]
+            keep_owner = winners[0] if len(winners) == 1 and best_score > (0, 0, 0) else None
+            for owner in owners:
+                if owner != keep_owner:
+                    remove_by_metric.setdefault(owner, set()).add(output_id)
+            if keep_owner is None:
+                unresolved.append(UnresolvedEvidenceOutput(
+                    output_node_id=output_id,
+                    reason="Multiple semantic claims could not be reduced to one proven calculation boundary.",
+                ))
+
+        metrics: list[PlannedMetric] = []
+        for metric_index, metric in enumerate(plan.metrics):
+            retained_outputs = [
+                output_id for output_id in metric.output_node_ids
+                if output_id not in remove_by_metric.get(metric_index, set())
+            ]
+            if not retained_outputs:
+                continue
+            metrics.append(PlannedMetric.model_validate({
+                **metric.model_dump(),
+                "output_node_ids": retained_outputs,
+            }))
+        return EvidencePlan(
+            metrics=metrics,
+            unresolved_outputs=unresolved,
+            non_metric_source_anchors=plan.non_metric_source_anchors,
+            non_metric_report_candidate_ids=plan.non_metric_report_candidate_ids,
+        )
 
     @staticmethod
     def _sanitize_semantic_plan(
@@ -5780,12 +8159,18 @@ class PostAnalysisEvidenceCompiler:
                     reason="代码路径无法证明该报告数值来自所选查询。",
                 ))
                 unresolved_ids.add(output_id)
-        return EvidencePlan(metrics=metrics, unresolved_outputs=unresolved)
+        return EvidencePlan(
+            metrics=metrics,
+            unresolved_outputs=unresolved,
+            non_metric_report_candidate_ids=plan.non_metric_report_candidate_ids,
+        )
 
     @staticmethod
     def _plan_reference_errors(
         plan: EvidencePlan,
         calculation_candidates: dict[str, dict[str, Any]],
+        *,
+        require_complete: bool = True,
     ) -> list[str]:
         expected_output_ids = {
             str(output_id)
@@ -5945,7 +8330,13 @@ class PostAnalysisEvidenceCompiler:
         }
         for unresolved_index, unresolved in enumerate(plan.unresolved_outputs):
             output_id = str(unresolved.output_node_id or "").strip()
+            if not output_id and unresolved.source_anchor is not None:
+                if not str(unresolved.reason or "").strip():
+                    errors.append(f"unresolved_outputs[{unresolved_index}].reason is empty")
+                continue
             if output_id not in expected_output_ids:
+                if not require_complete:
+                    continue
                 errors.append(
                     f"unresolved_outputs[{unresolved_index}].output_node_id is unknown: {output_id}"
                 )
@@ -5960,9 +8351,10 @@ class PostAnalysisEvidenceCompiler:
                 )
             unresolved_output_ids.add(output_id)
 
-        missing_output_ids = expected_output_ids - claimed_output_ids - unresolved_output_ids
-        if missing_output_ids:
-            errors.append(f"missing output bindings: {sorted(missing_output_ids)}")
+        if require_complete:
+            missing_output_ids = expected_output_ids - claimed_output_ids - unresolved_output_ids
+            if missing_output_ids:
+                errors.append(f"missing output bindings: {sorted(missing_output_ids)}")
         return errors
 
     @staticmethod
@@ -6117,6 +8509,7 @@ class PostAnalysisEvidenceCompiler:
                 "queries": sorted(query_ids),
                 "operations": [operation_by_id[item]["source"] for item in sorted(operation_ids)],
                 "metric_fields": sorted(metric_fields),
+                "lineage_verification": metric.lineage_verification,
                 "parameter_bindings": (
                     metric.parameter_bindings
                     or candidate.get("parameter_bindings")
@@ -6145,6 +8538,7 @@ class PostAnalysisEvidenceCompiler:
                         "metric_fields": metric_fields,
                         "calculation_signature": signature,
                         "operation_node_ids": operation_ids,
+                        "lineage_verification": metric.lineage_verification,
                         "parameter_bindings": (
                             metric.parameter_bindings
                             or candidate.get("parameter_bindings")
@@ -6219,6 +8613,11 @@ class PostAnalysisEvidenceCompiler:
                 "resolver_unresolved_outputs": [
                     {
                         "output_node_id": str(item.output_node_id or "").strip(),
+                        "source_anchor": (
+                            item.source_anchor.model_dump()
+                            if item.source_anchor is not None
+                            else None
+                        ),
                         "reason": str(item.reason or "").strip(),
                     }
                     for item in plan.unresolved_outputs
@@ -6273,7 +8672,10 @@ class PostAnalysisEvidenceCompiler:
         error: str = "",
     ) -> dict[str, Any]:
         return {
-            "status": "partial" if lineage_index.get("output_nodes") else "failed",
+            "status": "partial" if (
+                lineage_index.get("output_nodes")
+                or lineage_index.get("report_source_anchors")
+            ) else "failed",
             "evidence_definitions": [],
             "chart_trace_refs": [],
             "table_trace_refs": [],
