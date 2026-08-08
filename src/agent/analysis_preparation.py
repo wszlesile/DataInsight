@@ -2176,7 +2176,6 @@ def validate_business_context(
             raise ValueError(
                 f"lineage {lineage.question_id} references an unavailable relationship"
             )
-        binding_datasource_ids: set[int] = set()
         bound_fact_ids: set[str] = set()
         binding_keys: set[tuple[str, int]] = set()
         for binding in lineage.fact_bindings:
@@ -2187,8 +2186,6 @@ def validate_business_context(
                 )
             binding_keys.add(binding_key)
             bound_fact_ids.add(binding.fact_id)
-            if binding.datasource_id > 0:
-                binding_datasource_ids.add(binding.datasource_id)
             if (
                 binding.datasource_id > 0
                 and binding.datasource_id not in lineage_datasource_ids
@@ -2237,22 +2234,6 @@ def validate_business_context(
         if bound_fact_ids | unresolved_fact_ids != required_fact_ids:
             raise ValueError(
                 f"lineage {lineage.question_id} must account for every required fact ID"
-            )
-        relationship_datasource_ids = {
-            datasource_id
-            for relationship_id in lineage.relationship_ids
-            for relationship in [relationships_by_id.get(relationship_id)]
-            if relationship is not None
-            for datasource_id in (
-                relationship.left_datasource_id,
-                relationship.right_datasource_id,
-            )
-        }
-        if lineage_datasource_ids and not lineage_datasource_ids.issubset(
-            binding_datasource_ids | relationship_datasource_ids
-        ):
-            raise ValueError(
-                f"lineage {lineage.question_id} does not bind facts for every datasource"
             )
         if lineage.lineage_status == "direct" and (
             not lineage_datasource_ids
@@ -2756,6 +2737,23 @@ class AnalysisPreparationWorkflow:
                 }
                 for item in candidate.probe_requests
             ]
+
+    @staticmethod
+    def _has_consumable_probe_observations(
+        observations: list[dict[str, Any]],
+    ) -> bool:
+        """Return whether Probe produced facts that require semantic finalization.
+
+        Unavailable or incomplete observations only preserve uncertainty. Sending
+        them through another LLM pass cannot add facts and needlessly duplicates
+        the most expensive Business Context step.
+        """
+        return any(
+            isinstance(observation, dict)
+            and observation.get("status") == "verified"
+            and bool(observation.get("complete"))
+            for observation in observations
+        )
 
     @staticmethod
     def _remove_relationship_resolved_schema_probes(
@@ -3322,7 +3320,7 @@ class AnalysisPreparationWorkflow:
             ]
             probe_observations.extend(current_observations)
             probe_draft = candidate
-            if current_observations:
+            if self._has_consumable_probe_observations(current_observations):
                 candidate = _invoke_contract(
                     stage="business_context",
                     payload={

@@ -973,6 +973,30 @@ def test_business_context_reference_validation_accepts_real_schema_fields():
     )
 
 
+def test_business_context_allows_auxiliary_selected_source_without_fact_binding():
+    context = _business_context()
+    lineage = context.insight_lineage[0].model_copy(update={
+        "lineage_status": "direct",
+        "relationship_ids": [],
+        "fact_bindings": [
+            BusinessFactBindingContract(
+                fact_id=f"question_1_fact_{index}",
+                datasource_id=11,
+                fields=["amount"],
+            )
+            for index in range(1, 4)
+        ],
+        "unresolved_business_facts": [],
+    })
+
+    validate_business_context(
+        context.model_copy(update={"insight_lineage": [lineage]}),
+        compact_datasource_snapshot(_snapshot())["selected_datasource_snapshot"],
+        selection=_selection(),
+        intent=_intent(),
+    )
+
+
 def test_business_context_reference_validation_rejects_unknown_fields():
     context = _business_context()
     broken = context.model_copy(update={
@@ -2335,6 +2359,28 @@ def test_business_context_finalizes_lineage_after_bounded_probe(monkeypatch):
     assert result.business_context.probe_requests == []
     assert result.business_context.relationships[0].joinability == "joinable"
     assert result.business_context.insight_lineage[0].lineage_status == "direct"
+
+
+def test_business_context_only_refinalizes_consumable_probe_observations():
+    workflow = prep.AnalysisPreparationWorkflow
+
+    assert not workflow._has_consumable_probe_observations([])
+    assert not workflow._has_consumable_probe_observations([{
+        "observation_id": "probe:contract_customer",
+        "status": "unavailable",
+        "complete": False,
+    }])
+    assert not workflow._has_consumable_probe_observations([{
+        "observation_id": "probe:contract_customer",
+        "status": "verified",
+        "complete": False,
+    }])
+    assert workflow._has_consumable_probe_observations([{
+        "observation_id": "probe:contract_customer",
+        "status": "verified",
+        "complete": True,
+        "facts": {"join_supported": True},
+    }])
 
 
 def test_business_context_normalizes_status_and_ignores_top_level_annotations():

@@ -324,20 +324,21 @@ def get_datasource_message(
 
     semantic_context = snapshot.get("analysis_semantic_context")
     payload: dict[str, Any] = {}
-    payload["datasources"] = datasource_items
     selected_ids = [
         to_int(item, 0)
         for item in snapshot.get('selected_datasource_ids', [])
         if to_int(item, 0) > 0
     ]
+    if isinstance(semantic_context, dict) and semantic_context:
+        # Put the semantic handoff before the large Schema payload.  The runtime
+        # still owns queries, metrics and narrative, but it must first see every
+        # user-requested business question that the Schema is meant to answer.
+        payload["analysis_semantic_context"] = semantic_context
     if selected_ids:
         payload["selected_datasource_ids"] = selected_ids
     if namespace_id_int > 0:
         payload["namespace_id"] = namespace_id_int
-    if isinstance(semantic_context, dict) and semantic_context:
-        # Close the large Schema payload with the business purpose it serves.
-        # This keeps the handoff salient without duplicating or strengthening it.
-        payload["analysis_semantic_context"] = semantic_context
+    payload["datasources"] = datasource_items
 
     instruction_lines = [
         "当前洞察空间可用的数据源信息：",
@@ -354,6 +355,9 @@ def get_datasource_message(
         )
         instruction_lines.append(
             "- `analysis_semantic_context` 说明业务目标和 Business Context 定稿后的洞察业务血缘。它不是 SQL、指标、图表或报告模板；查询、计算和洞察表达仍由正式分析根据真实数据自主完成。"
+        )
+        instruction_lines.append(
+            "- 开始编写代码前，先逐项阅读 `analysis_semantic_context.business_questions`。它们共同构成用户要回答的业务范围：可以基于真实数据选择不同计算和表达方式，但不能把其中某一问题的便捷子集静默替换成全部问题。"
         )
         instruction_lines.append(
             "- `analysis_semantic_context.analytical_facets` 是选源时识别的开放式洞察方向，用于保持完整业务意图。它不规定报告章节或结论；正式分析应根据 Schema 和实际查询结果选择有数据支撑、对回答问题有价值的方向，并对无法支持但会影响判断的重要缺口作业务化说明。"

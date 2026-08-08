@@ -208,6 +208,25 @@ operation 的 QuerySnapshot 闭包确定。越界操作被剔除，无法证明�
 不会清空其他合法绑定。最终 output node、calculation signature、Evidence ID 和 ref 均由
 Compiler 生成。
 
+### 5.3.1 结构化产物的语义补漏边界
+
+图表和表格的可点击位置始终由产物结构确定：图表按数值字段，表格按业务数值列，
+不由 LLM 扫描数据点或单元格。计算血缘采用两级解析：
+
+1. 本地 AST/dataflow 编译器优先解析字段到 Python 计算、QuerySnapshot 的完整路径；
+2. 仅当某个已确定的结构化数值槽位无法形成唯一计算边界时，调用一次独立的
+   Structured Evidence Resolver；
+3. Resolver 只接收 unresolved 槽位目录、成功 Python 代码和精简查询字段目录，
+   不接收完整图表/表格数据，也不能增加或修改分析产物；
+4. Resolver 返回 `output_node_id`、精确源码位置、查询声明和真实字段声明；
+5. 本地重新解析源码位置，并用 QuerySnapshot、变量依赖图和查询可达字段验真。
+   不存在的查询、字段或相互矛盾的声明进入 `unresolved`，不能生成 Evidence；
+6. 通过验真的恢复结果仍由本地生成 calculation signature、EvidenceDefinition 和 ref。
+
+因此，结构化产物不依赖 LLM 决定“哪里可以点击”，同时也不会因为本地尚未覆盖某种
+等价 Python 写法而永久漏掉 Evidence。确定性快路径不触发额外 LLM 调用，只有真实的
+本地解析缺口才进入补漏路径。
+
 ### 5.4 EvidenceBundle
 
 Compiler 将通过验证的 Plan 编译为现有前端可消费的结构：

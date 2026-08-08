@@ -759,18 +759,6 @@ class InsightNsConversationService:
         return mapping.get(key, str(value or '聚合'))
 
     @staticmethod
-    def _business_formula_text(evidence: dict[str, Any], calculation: dict[str, Any]) -> str:
-        metric_name = str(evidence.get('metric_name') or '').strip()
-        metric_fields = " ".join(str(item) for item in calculation.get('metric_fields') or [])
-        formula = str(calculation.get('formula') or '').strip()
-        combined = f"{metric_name} {metric_fields} {formula}"
-        if '毛利率' in combined and not all(part in formula for part in ('毛利', '销售收入')):
-            return "毛利率 = 毛利 / 销售收入 × 100%"
-        if ('利润率' in combined or '收益率' in combined) and '/' not in formula:
-            return f"{metric_name} = 利润 / 收入 × 100%"
-        return ''
-
-    @staticmethod
     def _friendly_metric(value: Any) -> str:
         mapping = {
             'count': '命中记录数',
@@ -1162,14 +1150,11 @@ class InsightNsConversationService:
     ) -> str:
         method = InsightNsConversationService._describe_calculation_method(calculation, derivation).rstrip('。')
         detail = InsightNsConversationService._describe_calculation(calculation, derivation, transformations).rstrip('。')
-        business_formula = InsightNsConversationService._business_formula_text(evidence, calculation)
         value = selected_context.get('display_value') or selected_context.get('raw_value')
         metric_name = evidence.get('metric_name') or '当前指标'
         parts = []
         if detail and detail not in method and not InsightNsConversationService._looks_like_query_scope_text(derivation.get('description')):
             parts.append(detail)
-        if business_formula:
-            parts.append(f"业务公式：{business_formula}")
         if method:
             parts.append(method)
         if value is not None:
@@ -1268,9 +1253,6 @@ class InsightNsConversationService:
         value = selected_context.get('display_value') or selected_context.get('raw_value')
         if value is not None:
             items.append({"label": "当前值", "value": value})
-        business_formula = InsightNsConversationService._business_formula_text(evidence, calculation)
-        if business_formula:
-            items.append({"label": "业务公式", "value": business_formula})
         if calculation.get('formula'):
             items.append({"label": "计算公式", "value": calculation.get('formula')})
         items.extend(InsightNsConversationService._calculation_items(

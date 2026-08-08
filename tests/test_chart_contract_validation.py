@@ -453,6 +453,40 @@ result = save_analysis_result(...)
         self.assertIsNotNone(retry)
         self.assertEqual(retry.diagnostics["missing_datasource_ids"], [62])
 
+    def test_scope_anchor_skips_rejected_attempt_without_data_access(self) -> None:
+        history = [
+            SimpleNamespace(
+                generated_code='''execution_intent = "analysis"
+query_constraints = {}
+result = save_analysis_result(...)
+''',
+                result_payload_json=json.dumps({"retry_type": "missing_query_constraints"}),
+                used_datasource_ids_json='[61, 62, 63]',
+            ),
+            SimpleNamespace(
+                generated_code='''execution_intent = "analysis"
+frame = load_data_with_sql(sql="SELECT * FROM warehouse.fact_quality")
+result = save_analysis_result(...)
+''',
+                result_payload_json=json.dumps({"error_type": "query_result_too_large"}),
+                used_datasource_ids_json='[61, 62, 63]',
+            ),
+        ]
+        snapshot = [
+            {"datasource_id": 61, "datasource_identifier": "warehouse.fact_quality"},
+            {"datasource_id": 62, "datasource_identifier": "warehouse.dim_product"},
+            {"datasource_id": 63, "datasource_identifier": "warehouse.dim_customer"},
+        ]
+
+        retry = _validate_analysis_scope_against_execution_history(
+            previous_executions=history,
+            current_used_datasource_ids=[61],
+            current_code='execution_intent = "analysis"\nresult = save_analysis_result(...)',
+            selected_datasource_snapshot=snapshot,
+        )
+
+        self.assertIsNone(retry)
+
     def test_query_size_repair_cannot_drop_an_unrelated_datasource(self) -> None:
         retry = _validate_scope_preserving_technical_repair(
             previous_used_datasource_ids=[62, 76, 77, 79],
@@ -1056,6 +1090,10 @@ result = save_analysis_result(analysis_report=report, charts=[chart], tables=[])
 start_date = '2026-08-03'
 end_date = '2026-08-10'
 covered_pct = 25.0
+report_sections = [
+    "- Range: {start_date} to {end_date[:10]}",
+    "- Missing share: {100 - covered_pct:.1f}%",
+]
 """
 
         retry = _validate_structured_result_contract(
@@ -1071,6 +1109,79 @@ covered_pct = 25.0
             "unrendered_report_placeholder",
         )
         self.assertEqual(len(retry.diagnostics["placeholders"]), 3)
+        self.assertEqual(retry.code_error_context["line_no"], 6)
+        self.assertIn("{start_date}", retry.code_error_context["error_line"])
+
+    def test_code_rejects_literal_unfinished_report_before_execution(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"grain": "overall"}}
+validation = validate_query_constraints(query_constraints=query_constraints)
+result = save_analysis_result(analysis_report="placeholder", charts=[], tables=[])
+'''
+
+        retry = _validate_generated_code_contract(code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(retry.retry_type, "missing_report")
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "unfinished_report_sentinel",
+        )
+        self.assertEqual(retry.code_error_context["line_no"], 5)
+
+    def test_result_rejects_dynamically_produced_unfinished_report(self) -> None:
+        result = StructuredResult(
+            analysis_report="## TODO",
+            charts=[],
+            tables=[],
+        )
+
+        retry = _validate_structured_result_contract(result)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(retry.retry_type, "missing_report")
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "unfinished_report_sentinel",
+        )
+
+    def test_result_allows_short_but_complete_report(self) -> None:
+        result = StructuredResult(
+            analysis_report="当前共有 3 份有效合同。",
+            charts=[],
+            tables=[{
+                "title": "合同概览",
+                "columns": [{"key": "status", "label": "状态"}, {"key": "count", "label": "数量"}],
+                "data": [{"status": "有效", "count": 3}],
+            }],
+        )
+
+        self.assertIsNone(_validate_structured_result_contract(result))
+
+    def test_result_rejects_empty_structured_artifact_after_analysis(self) -> None:
+        result = StructuredResult(
+            analysis_report="统计完成。",
+            charts=[],
+            tables=[{
+                "title": "统计结果",
+                "description": "汇总结果",
+                "columns": [{"key": "count", "label": "数量"}],
+                "rows": [],
+            }],
+        )
+
+        retry = _validate_structured_result_contract(result)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(retry.retry_type, "result_contract_error")
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "empty_structured_artifact",
+        )
 
     def test_report_allows_literal_braces_not_bound_to_generated_variables(self) -> None:
         result = StructuredResult(
@@ -1085,6 +1196,60 @@ covered_pct = 25.0
                 generated_code="metric_value = 3",
             )
         )
+
+    def test_code_rejects_unproven_first_value_used_as_grouped_table_dimension(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"grain": "product"}}
+validation = validate_query_constraints(query_constraints=query_constraints)
+summary = merged.groupby("product_code", as_index=False).agg(
+    company_name=("company_name", "first"),
+    revenue=("revenue", "sum"),
+)
+columns = [
+    {"key": "product_code", "label": "Product"},
+    {"key": "company_name", "label": "Company"},
+    {"key": "revenue", "label": "Revenue"},
+]
+tables = [build_table_result(data=summary, columns=columns)]
+result = save_analysis_result(analysis_report="report", tables=tables)
+'''
+
+        retry = _validate_generated_code_contract(code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "grouped_visible_dimension_functional_dependency",
+        )
+        self.assertEqual(retry.diagnostics["group_fields"], ["product_code"])
+        self.assertEqual(
+            retry.diagnostics["risky_dimensions"][0]["output_field"],
+            "company_name",
+        )
+        self.assertTrue(retry.code_error_context["line_no"])
+
+    def test_code_allows_first_value_when_dimension_is_part_of_grouping_grain(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"grain": "company_product"}}
+validation = validate_query_constraints(query_constraints=query_constraints)
+summary = merged.groupby(["company_name", "product_code"], as_index=False).agg(
+    revenue=("revenue", "sum"),
+)
+columns = [
+    {"key": "company_name", "label": "Company"},
+    {"key": "product_code", "label": "Product"},
+    {"key": "revenue", "label": "Revenue"},
+]
+tables = [build_table_result(data=summary, columns=columns)]
+result = save_analysis_result(analysis_report="report", tables=tables)
+'''
+
+        retry = _validate_generated_code_contract(code)
+
+        self.assertIsNone(retry)
 
     def test_bar_chart_allows_null_gaps_when_other_points_are_renderable(self) -> None:
         result = StructuredResult(
@@ -1526,6 +1691,22 @@ else:
     data = load_data_with_sql("SELECT status, COUNT(*) AS contract_count FROM t GROUP BY status")
     peak_row = data.loc[data["contract_count"].idxmax()]
     analysis_report = f"合同状态以 {peak_row['status']} 为主，共 {peak_row['contract_count']} 个。"
+    result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+
+        self.assertIsNone(_validate_generated_code_contract(code))
+
+    def test_generated_code_allows_sorted_positional_extrema_row_in_report(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"metric": "contract_count"}}
+validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT status, COUNT(*) AS contract_count FROM t GROUP BY status")
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql("SELECT status, COUNT(*) AS contract_count FROM t GROUP BY status")
+    data = data.sort_values("contract_count", ascending=False).reset_index(drop=True)
+    analysis_report = f"合同状态以 {data.iloc[0]['status']} 为主，共 {data.iloc[0]['contract_count']} 个。"
     result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
 '''
 

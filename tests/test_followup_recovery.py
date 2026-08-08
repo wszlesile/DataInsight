@@ -11,8 +11,10 @@ if str(SRC_ROOT) not in sys.path:
 
 from agent.context_engineering_runtime import classify_analysis_context_mode  # noqa: E402
 from agent.invoker import (  # noqa: E402
+    _build_failed_pattern_hints,
     _build_history_requirement_recovery_instruction,
     _build_possible_datasource_selection_hints,
+    _build_structured_execution_feedback,
 )
 from service.conversation_context_service import ConversationRunContext  # noqa: E402
 
@@ -60,6 +62,40 @@ class FollowupRecoveryTestCase(unittest.TestCase):
             classify_analysis_context_mode("你看看我前面对话的需求。我不想再重复一遍"),
             "followup",
         )
+
+    def test_schema_field_error_is_extracted_before_long_sql_is_clipped(self) -> None:
+        execution = SimpleNamespace(
+            execution_status="failed",
+            error_message=(
+                "IO Error: " + "SELECT a, b, c FROM long_source " * 80
+                + "Column 'fault_event_count' cannot be resolved."
+            ),
+        )
+
+        hints = _build_failed_pattern_hints([execution])
+
+        self.assertEqual(len(hints), 1)
+        self.assertIn("`fault_event_count`", hints[0])
+        self.assertIn("重建", hints[0])
+        self.assertIn('execution_intent="probe"', hints[0])
+
+    def test_structured_tool_feedback_preserves_diagnostics_and_repair_instructions(self) -> None:
+        execution = SimpleNamespace(
+            execution_status="failed",
+            error_message="generic retry text",
+            result_payload_json='''{
+                "retry_type": "query_constraint_violation",
+                "message": "relationship cannot be joined",
+                "diagnostics": {"relationship_id": "r18", "joinability": "not_joinable"},
+                "repair_instructions": ["analyze separately"]
+            }''',
+        )
+
+        feedback = _build_structured_execution_feedback([execution])
+
+        self.assertEqual(feedback[0]["retry_type"], "query_constraint_violation")
+        self.assertEqual(feedback[0]["diagnostics"]["relationship_id"], "r18")
+        self.assertEqual(feedback[0]["repair_instructions"], ["analyze separately"])
 
     def test_history_recovery_instruction_restores_analysis_and_correction(self) -> None:
         rows = [

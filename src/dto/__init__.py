@@ -38,6 +38,7 @@ class DatabaseConnInfo:
     password: str = ''
     lake_rds_database_name: str = ''
     ts_query_source: str = ''
+    authorization_token: str = ''
 
     def is_ready(self) -> bool:
         """是否已经拿到完整可用的数据库连接信息。"""

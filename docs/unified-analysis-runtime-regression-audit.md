@@ -7,6 +7,63 @@
 - Treat a successful terminal status as insufficient when correctness, expressiveness, evidence completeness, or runtime performance is below the acceptance standard.
 - Do not introduce conversation-specific rules. Final remediation must address shared contract or capability gaps.
 
+## 2026-08-07 Serial Regression / Conversation 44 / Turn 64
+
+Question: `分析一下今年3月份的各个产品的成本以及对应的利润`
+
+Selection provider: `local`.
+
+### Preparation
+
+- Intent and Selection each completed in one attempt, in about `3.2s` and `3.4s` respectively.
+- Selection chose local-file datasources `182` and `183`, covering monthly product profit and production cost.
+- Business Context used a relationship draft plus Probe-backed confirmation. The two model calls took about `10.3s` and `6.8s`; the final relationship correctly used company, workshop, line, product, and month as the one-to-one alignment grain.
+- No Preparation contract retry occurred. The two-call relationship confirmation remains a performance observation for comparison with later conversations.
+
+### Formal analysis
+
+- The first run before remediation needed five Python executions. A report placeholder contract error lacked generated-code line context, so subsequent repairs rewrote the full program and introduced a syntax error.
+- The same run grouped by product code while exposing `first(company_name)` as a visible table dimension. This collapsed multiple companies and attached the first company label to cross-company totals.
+- Retry feedback now carries a bounded `code_error_context` for unrendered report expressions, allowing the existing immutable execution plus line-patch protocol to repair the exact source location.
+- Static analysis now rejects `first/last` values exposed as grouped chart/table dimensions unless the source dimension is part of the grouping grain. The check follows the AST grouping and artifact fields; it does not depend on product/company vocabulary.
+- After remediation, the rerun completed with one Python execution in about `76s` end to end and explicitly kept the result at product-code grain without presenting a false company label.
+- A separate non-blocking semantic observation remains: row-level percentage fields were averaged at product grain while the overall percentage was recomputed from aggregate numerator and denominator. Per user direction, this is recorded for later contract design and was not addressed by adding a Prompt rule.
+
+### Evidence
+
+- The initial structural check reported `complete`, but deep validation found two correctness defects that the status alone did not expose. A row alias such as `top_product = product.iloc[0]` had lost column-level lineage and broadened some profit metrics to both source queries; the Evidence detail service also guessed a margin formula from the metric name even when the executed calculation was a difference.
+- Row selection now preserves per-column query lineage, and the presentation service no longer invents formulas from metric names. Units are carried only from explicit artifact labels or immediate report display tokens, without field-name inference.
+- Post-analysis Evidence was recompiled and persisted as `complete`: `25` definitions, `5` chart refs, `9` table refs, and `16` report refs. All `14` structured numeric slots and all `30` compiled metric outputs were bound; unresolved and missing sets were empty.
+- Deep resolve validation exercised all `58` clickable report, table-row, and chart-point locations. All `58` returned an available current value matching the artifact, no unrelated query boundary remained on the checked profit metrics, and the margin-gap detail contained no invented formula.
+- The formal-analysis percentage aggregation observation remains visible and unchanged. Evidence records the executed calculation; it does not silently repair that upstream business-semantic choice.
+
+## 2026-08-07 Serial Regression / Conversation 45 / Turn 65
+
+Question: `分析一下设备信息`
+
+Selection provider: `local`.
+
+### Preparation
+
+- Intent completed in about `2.3s`; Selection retained datasource `180`; Business Context completed in about `2.8s` with a direct single-source lineage and no relationship fabrication.
+- Preparation completed without contract retry or fallback. For this single-source question, the stage flow was proportionate and stable.
+
+### Formal analysis
+
+- Runtime generated and executed one `9,364`-character Python program successfully. Python execution took `18.2s`; the full turn completed in about one minute.
+- The report covered equipment scale, type and status structure, manufacturer distribution, installation years, power concentration, and operational suggestions. It retained materially more analytical content than a metric-description report.
+- Two narrative-quality observations prevent an unconditional content pass. Comparing only the first and last sparse installation years was described as continuous equipment-scale growth, and a location with only one device was still presented as a maintenance-resource concentration. Both calculations are real, but the business judgments are stronger than their supporting distributions.
+- These observations are recorded for cross-sample report-reasoning review. No field-specific Prompt prohibition or report-text validator was added.
+
+### Evidence
+
+- Initial deep inspection found that `groupby(...)[single_measure].sum()` recognized the selected measure but still assigned the whole source-frame origin to the aggregate. Consequently, `top_power_share` named every equipment field as an input despite using only rated power.
+- Grouped single-measure lineage now carries the selected source column through aggregation, row ranking, and the final formula. Whole-frame lineage remains only as a fallback when no measure can be identified.
+- Recompiled Evidence is `complete`: `26` definitions, `5` chart refs, `6` table refs, and `27` report refs. `top_power_share` now has only `额定功率(kW)` as its metric field.
+- Deep resolve validation exercised `103` report, table-row, and chart-point locations. All `103` returned an available current value matching the rendered artifact, and no name-derived business formula was present.
+
+Assessment: Preparation and Evidence pass. Runtime passes execution stability and artifact completeness, but the report remains conditional on the recorded interpretation-quality observations.
+
 ## Conversation 20 / Turn 40
 
 Question: `上半年签约套数有多少，年度达成率多少`
@@ -233,3 +290,73 @@ SQL 聚合查询在没有明细行时仍可能返回一行，例如 `COUNT(*) = 
 - `aggregation_safety.key_domain_coverage` 明确主体覆盖率分子必须是主体键与辅助键集合的交集去重数，不能把辅助表孤立键或一对多明细行计入主体覆盖。
 - 最终复验得到合同实例 `143`、未到期 `142`、已到期 `1`、客户 `8`、合同编号 `55`、授权记录 `198`；报告包含状态、订阅周期、到期压力、客户集中度及事实支持建议。Evidence 编译为 `complete`（definitions=17、chart_refs=4、report_refs=19）。
 - 该轮仍发生一次无数据后的混合 Probe/analysis 尝试。`no_data_found` 反馈现增加结构化 `recommended_next_execution_intent=probe`，明确下一版生成独立 Probe，禁止同一代码先探测再正式分析。
+
+## Provider A/B: Conversation 43 / Turn 63
+
+Question: OOS / near-limit batch process alarms, target deviation alignment, suspicious parameter combinations, drift classification, and process-window recommendations.
+
+### Before repair-protocol remediation
+
+- Semantic Selection run: `488s`, 23 selected datasources, 5 actually used, 6 Python executions. Evidence was partial (`definitions=15`) with 20 unresolved report outputs and one unresolved chart output.
+- Local Selection run: `469s`, 22 selected datasources, 5 actually used, 6 Python executions. Evidence was complete (`definitions=33`), but the report still contained contradictory findings.
+- Both providers generated a query exceeding the 10,000-row loader boundary.
+- Both repair chains produced broken Python by inserting a patch inside a triple-quoted SQL string or a dictionary body.
+- Both final reports overclaimed or contradicted their own displayed values. Provider choice therefore did not explain the shared Runtime failures.
+- Local Preparation was not faster than Semantic Preparation. Semantic API latency is only one component; shortlist/Selection breadth and repeated Business Context calls dominate many runs.
+
+### Deterministic protocol defects found
+
+- Every tool failure advertised `minimal_patch_required=true`, including missing structural contracts and query redesign. The model was therefore pushed toward line patches even when the repair required a complete-query or complete-program rewrite.
+- Patch application only checked line ranges and overlap. It did not require complete Python statement boundaries and did not parse the merged source before creating an execution record.
+- Query-size feedback localized the `load_data_with_sql(...)` call but omitted the complete SQL assignment that had to be redesigned.
+- Scope preservation used declared `used_datasource_ids` when the failed code's actual datasource references could not be resolved. A rejected attempt with no data access could become a false scope anchor for every later repair.
+
+### Remediation
+
+- A line patch is now offered only for locally repairable error classes with an AST-proven complete statement range. Structural contract errors and query-size redesign require complete-code repair.
+- `SourceCodePatch` must replace a complete AST statement or block. The merged source is parsed before an execution record is created; partial string/dictionary patches and syntactically invalid results are rejected without consuming an execution.
+- Query-size error context includes the complete referenced query assignment as structured source location.
+- Scope preservation receives the selected datasource Schema on both pre-execution and successful-result paths. It protects statically referenced datasource facts, skips rejected attempts with declarations but no data access, and continues searching backward for the nearest real implementation anchor.
+- Focused Runtime, chart-contract, no-data, Evidence, and context tests pass (`291` tests for the first remediation set; `112` focused repair/contract tests after the scope-anchor follow-up).
+
+### Invalid environment sample
+
+- One local rerun used `PROFILE=local`, which initializes the 226 FedQuery connection with fixed local credentials. All six paths returned `missing permission user key`; the resulting unavailable-data report is correct for that runtime observation but is not a valid analysis-quality sample.
+- Provider comparison reruns must use the platform-initialized FedQuery connection and the same datasource environment before report or Evidence results are compared.
+
+### Valid-environment local rerun after repair remediation
+
+- Task `277` used `PROFILE=prod` and the platform-initialized FedQuery connection. Preparation selected six datasources and completed without contract retry.
+- Preparation itself took about 154 seconds: Intent 11.4s, shortlist 6.8s, Selection 25.4s, and two Business Context LLM calls totaling 95.4s plus bounded Probe work.
+- Every relationship Probe observation was incomplete, so the second Business Context finalization could not add a verified fact and still returned all seven relationships as `unknown/unresolved`.
+- Formal Runtime did not create a Python execution. Its first model request was terminated by the platform LLM gateway after about 121 seconds with HTTP 504. This sample therefore cannot be used to assess report or Evidence quality.
+- Business Context now only performs the post-Probe LLM finalization when at least one observation is both `verified` and `complete`. Unavailable or incomplete observations preserve uncertainty directly and no longer trigger an expensive duplicate request.
+- Provider A/B remains a serial acceptance requirement: each Semantic Selection conversation must also be rerun through Local Selection against the same environment, question, and Runtime revision; Preparation latency/coverage, Runtime executions, report quality, and Evidence coverage/value resolution are compared independently.
+
+### Provider comparison after Preparation finalization optimization
+
+- Local task `278` completed in 156 seconds. Preparation used one Business Context LLM call instead of two; Intent, shortlist, Selection, and Business Context LLM time totaled about 84 seconds. Runtime then completed one Probe execution and one formal execution without code repair.
+- The resulting report is not an acceptance sample: all six Probe paths failed because the platform returned the container-only FedQuery host `platform-base-fedquery`, which a local subprocess cannot resolve. Formal analysis correctly avoided fabricated findings, but no data-backed report or Evidence was produced.
+- Semantic task `279` was stopped after Preparation because the same FedQuery environment would make Runtime invalid. Its provider retrieval plus canonical selection took about 16 seconds and selected `[64, 66, 72, 76, 77, 248]`; Local selected `[61, 62, 76, 77, 79, 80]` in about 20 seconds.
+- Semantic Selection was faster but materially weaker for this question. Business Context marked questions 1, 2, 3, and 5 partial because the selected set lacked a confirmed OOS/near-limit batch fact, batch-level test-value/target-value alignment, and a confirmed process-parameter-to-test-item path. Local Selection included direct OOS root-cause and quality-result sources.
+- The 226 platform was rebuilt during regression: auth and FedQuery container IDs changed, and the deployed toolkit backend is restarting because its configured database does not exist. PG/JDBC authorization is now propagated as a per-execution user credential: every new FedQuery connection executes `SET supos_authorization TO 'Bearer <jwt-token>'` before any business query, and the execution subprocess owns its pool so credentials cannot leak across users. The supplied opaque HTTP Bearer token remains valid for gateway APIs but FedQuery rejects it as `invalid authorization token`; Runtime and Evidence acceptance therefore remain blocked until a current-user JWT accepted by FedQuery is available.
+- The failure was isolated at the credential-type boundary. The supplied 20-character token succeeds against `current-user/sessionInfo`, but FedQuery logs reject the same `SET supos_authorization` value as `token contains an invalid number of segments`. A three-segment kernel service-account JWT reaches the next validation step but is rejected as `invalid jwt user key claim`. FedQuery therefore requires a base-auth user JWT containing the user-key claim, not an opaque open-API token and not a service-account JWT. SQL credentials, database selection, `SET` syntax, and business queries are not the cause.
+- FedQuery performs this credential validation internally before any permission-service request. A packet capture around a rejected `SET` showed no FedQuery traffic to base-auth or kernel. The deployed binary exposes `ValidateAuthorizationUserWithPublicKey`, `UserKeyFromJWTClaims`, `UserNameFromJWTClaims`, and ticket-claim validation; after identity extraction, its SQL permission plan maps referenced UNS objects and invokes `unsPermissionClient.check/checkBatch`. Therefore an opaque token cannot currently benefit from base-auth's successful `sessionInfo` introspection: FedQuery rejects it before that boundary. Supporting opaque credentials requires a platform-side FedQuery or gateway change that resolves the ticket to a trusted user identity/JWT, not an application-side token rewrite.
+
+### User JWT verification and focused Evidence regression
+
+- A gateway-issued current-user JWT was captured in memory from the platform's own authenticated `sessionInfo` request and accepted by FedQuery's `SET supos_authorization` protocol. No token was persisted in source, environment files, logs, or this document.
+- The JWT identity maps to the same current platform user as the opaque API token. FedQuery then reached object authorization and the platform denied `uns_rds`; this confirms the application-side credential propagation is valid and isolates the remaining relational regression blocker to platform user permission rather than token format, SQL connection, or datasource conversion.
+- Relationship-backed conversations must not be accepted using this identity: their Runtime queries correctly return `UNS permission denied`. Full reruns remain pending a current-user JWT whose account can read `uns_rds`.
+- Windows regression must run from a real Python module guarded by `if __name__ == '__main__'`. Running the workflow from `python -` breaks child-process bootstrap and produces false Business Context or Runtime failures. The regression runner is temporary and outside the repository.
+- Conversation 44 (local CSV, Local Selection) completed in 92.9 seconds. Preparation and formal Runtime passed on their first attempts; Runtime used one execution. Post-analysis Evidence initially marked the report's `top_n` display limit as a metric. The compiler now classifies queryless values sourced only from `analysis_parameters` and safe presentation conversions as presentation controls, not business metrics. Recompilation is complete with 24 Evidence definitions, 3 chart refs, 7 table refs, and 17 report refs.
+- Conversation 45 (local Excel, Local Selection) completed in 53.9 seconds. Preparation and formal Runtime passed on their first attempts; Evidence is complete with 20 definitions, 4 chart refs, 2 table refs, and 19 report refs.
+- Existing successful executions for conversations 46, 47, and 48 were recompiled independently of Preparation and Runtime. All three are complete: conversation 46 has 41 definitions / 4 chart refs / 7 table refs / 47 report refs; conversation 47 has 37 / 3 / 0 / 109 (its tables are embedded in Markdown rather than separate table artifacts); conversation 48 has 46 / 3 / 14 / 35.
+- Structured-artifact coverage was checked against the actual persisted artifacts. Every chart metric field and every business numeric table column in these samples has an Evidence ref. Compiler diagnostics report no unresolved output, no missing structured slot, and equal candidate/compiled output counts.
+
+### Gateway timeout and structured Evidence recovery follow-up
+
+- The 226 platform HTTP 504 was traced to two live Kong services whose upstream connect/read/write timeouts were still 60 seconds. Host and container resources were healthy, and the model gateway completed the same requests after roughly 67-97 seconds. Both live service timeouts were updated to 180 seconds without deleting or restarting resources. The setting must also be made durable in platform deployment configuration because a gateway recreation had restored the 60-second value.
+- Conversation 43 completed after the timeout correction. A report Evidence attestation initially remained partial because derived fields such as `abnormal_alarm_rate` were query-reachable through Python operations but absent from the verifier's direct query-column set. Query field verification now follows the operation dependency graph. Recompilation is complete with 25 definitions, 6 chart refs, 10 table refs, and 13 report refs; all 29 metric outputs are compiled.
+- Conversation 47 exposed a structured lineage shape built through repeated `list.append({...})` calls followed by `DataFrame(list)`. Artifact positions were correctly known, but two percentage slots had no unique local calculation boundary. Container record writes are now represented as parameterized field operations, and recompilation is complete with all 6 structured slots bound.
+- Structured Evidence no longer ends at a local AST ambiguity. Deterministic compilation remains the default; only unresolved chart/table numeric slots are sent to a compact LLM resolver with successful code and query catalogs. Its source/query/field claims are materialized and verified locally before candidates, signatures, Evidence, or refs are created. A real default-model recovery test completed one deliberately ambiguous table slot without exposing artifact values to the resolver.

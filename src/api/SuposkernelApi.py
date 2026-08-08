@@ -204,7 +204,7 @@ class SuposKernelApi:
     def _initialize_database_conn_info(self, token: str) -> None:
         conn_info = DatabaseConnInfo()
         if Config.PROFILE == 'local':
-            conn_info.host = '192.168.12.69'
+            conn_info.host = '192.168.18.226'
             conn_info.port = '31432'
             conn_info.user = 'fedquery'
             conn_info.password = 'fedquery'
@@ -330,6 +330,28 @@ class SuposKernelApi:
             database=database_conn_info.lake_rds_database_name,
             port=int(database_conn_info.port),
         )
+        authorization = str(
+            database_conn_info.authorization_token or ''
+        ).strip()
+        if authorization:
+            if not authorization.lower().startswith('bearer '):
+                authorization = f'Bearer {authorization}'
+            cursor = None
+            try:
+                cursor = dbapi_connection.cursor()
+                cursor.execute(
+                    'SET supos_authorization TO %s',
+                    (authorization,),
+                )
+                # QueuePool rolls back connections on return. Commit the
+                # session-level authorization so pool reuse cannot erase it.
+                dbapi_connection.commit()
+            except Exception:
+                dbapi_connection.close()
+                raise
+            finally:
+                if cursor is not None:
+                    cursor.close()
         self._register_time_text_casts(dbapi_connection)
         return dbapi_connection
 

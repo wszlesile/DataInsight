@@ -352,6 +352,13 @@ def _build_generated_code_error_context(
                     for current_line_no in range(related_start, related_end + 1)
                 ]
 
+    statement_ranges = _source_statement_patch_ranges(code, line_no)
+    if line_no and any(
+        marker in str(error or '').lower()
+        for marker in ('query result exceeds', 'rows, please update query conditions')
+    ):
+        statement_ranges = _extend_query_dependency_ranges(code, line_no, statement_ranges)
+
     return {
         'filename': GENERATED_CODE_FILENAME,
         'line_no': line_no,
@@ -359,8 +366,110 @@ def _build_generated_code_error_context(
         'error_line': error_line,
         'context_lines': context_lines,
         'related_context_lines': related_context_lines,
+        'suggested_patch_ranges': statement_ranges,
         'traceback_excerpt': _clip_retry_context_text(traceback_text, TOOL_ERROR_CODE_CONTEXT_MAX_CHARS),
     }
+
+
+def _source_statement_patch_ranges(
+    code: str,
+    line_no: int | None,
+) -> list[dict[str, Any]]:
+    """Return the smallest complete Python statement containing an error line."""
+    if not line_no:
+        return []
+    try:
+        tree = ast.parse(code or '')
+    except SyntaxError:
+        return []
+    source_lines = str(code or '').splitlines()
+    candidates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.stmt)
+        and int(getattr(node, 'lineno', 0) or 0) <= line_no
+        <= int(getattr(node, 'end_lineno', 0) or 0)
+    ]
+    if not candidates:
+        return []
+    node = min(
+        candidates,
+        key=lambda item: (
+            int(getattr(item, 'end_lineno', line_no) or line_no)
+            - int(getattr(item, 'lineno', line_no) or line_no),
+            -int(getattr(item, 'lineno', 0) or 0),
+        ),
+    )
+    start_line = int(getattr(node, 'lineno', line_no) or line_no)
+    end_line = int(getattr(node, 'end_lineno', line_no) or line_no)
+    return [{
+        'start_line': start_line,
+        'end_line': end_line,
+        'kind': type(node).__name__,
+        'source': '\n'.join(source_lines[start_line - 1:end_line]),
+        'role': 'failing_statement',
+    }]
+
+
+def _extend_query_dependency_ranges(
+    code: str,
+    line_no: int,
+    ranges: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add the complete query assignment used by a failing load statement."""
+    try:
+        tree = ast.parse(code or '')
+    except SyntaxError:
+        return ranges
+    source_lines = str(code or '').splitlines()
+    containing = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.stmt)
+        and int(getattr(node, 'lineno', 0) or 0) <= line_no
+        <= int(getattr(node, 'end_lineno', 0) or 0)
+    ]
+    if not containing:
+        return ranges
+    failing_statement = min(
+        containing,
+        key=lambda item: int(getattr(item, 'end_lineno', line_no) or line_no)
+        - int(getattr(item, 'lineno', line_no) or line_no),
+    )
+    referenced_names = {
+        node.id
+        for node in ast.walk(failing_statement)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+    assignments: list[tuple[int, ast.stmt, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        if int(getattr(node, 'lineno', 0) or 0) >= line_no:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        names = {
+            item.id
+            for target in targets
+            for item in ast.walk(target)
+            if isinstance(item, ast.Name)
+        }
+        for name in names & referenced_names:
+            assignments.append((int(getattr(node, 'lineno', 0) or 0), node, name))
+    if not assignments:
+        return ranges
+    _, node, name = max(assignments, key=lambda item: item[0])
+    start_line = int(getattr(node, 'lineno', 0) or 0)
+    end_line = int(getattr(node, 'end_lineno', start_line) or start_line)
+    dependency = {
+        'start_line': start_line,
+        'end_line': end_line,
+        'kind': type(node).__name__,
+        'source': '\n'.join(source_lines[start_line - 1:end_line]),
+        'role': 'query_definition',
+        'name': name,
+    }
+    return [dependency, *ranges]
 
 
 def _format_error_message_with_code_location(
@@ -2421,6 +2530,10 @@ class RetryResult(BaseModel):
     diagnostics: dict[str, Any] = Field(default_factory=dict, description="Structured diagnostic facts.")
     repair_instructions: list[str] = Field(default_factory=list, description="Targeted next-step instructions.")
     analysis_report: str = Field(default="", description="Optional diagnostic report; not a final answer.")
+    code_error_context: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Bounded generated-code location for a local repair.",
+    )
 
 
 class NoDataFoundError(Exception):
@@ -2493,6 +2606,7 @@ def request_retry(
     diagnostics: Optional[dict[str, Any]] = None,
     repair_instructions: Optional[list[str]] = None,
     analysis_report: str = "",
+    code_error_context: Optional[dict[str, Any]] = None,
 ) -> RetryResult:
     """Return structured retry feedback from generated probe code."""
     allowed_types = {
@@ -2570,6 +2684,7 @@ def request_retry(
         diagnostics=normalized_diagnostics,
         repair_instructions=normalized_instructions,
         analysis_report=str(analysis_report or "").strip(),
+        code_error_context=_copy_jsonable(code_error_context or {}, {}),
     )
 
 
@@ -2805,6 +2920,111 @@ def _validate_report_extrema_selection_contract(
         "最高", "最低", "最多", "最少", "峰值", "高峰", "为主", "主导",
         "highest", "lowest", "largest", "smallest", "peak", "dominant", "most ",
     )
+    def sorted_frame_orders() -> dict[str, set[tuple[str, bool]]]:
+        """Collect explicit DataFrame sort orders assigned back to a frame."""
+        orders: dict[str, set[tuple[str, bool]]] = {}
+        for assignment in ast.walk(tree):
+            if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = (
+                assignment.targets
+                if isinstance(assignment, ast.Assign)
+                else [assignment.target]
+            )
+            target_names = {
+                target.id for target in targets if isinstance(target, ast.Name)
+            }
+            if not target_names:
+                continue
+            for call in ast.walk(assignment.value):
+                if not (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "sort_values"
+                    and call.args
+                    and isinstance(call.args[0], ast.Constant)
+                    and isinstance(call.args[0].value, str)
+                ):
+                    continue
+                ascending = True
+                for keyword in call.keywords:
+                    if (
+                        keyword.arg == "ascending"
+                        and isinstance(keyword.value, ast.Constant)
+                        and isinstance(keyword.value.value, bool)
+                    ):
+                        ascending = keyword.value.value
+                for target_name in target_names:
+                    orders.setdefault(target_name, set()).add((
+                        str(call.args[0].value), ascending,
+                    ))
+        return orders
+
+    frame_orders = sorted_frame_orders()
+
+    def positional_row_signature(value: ast.AST) -> tuple[str, int] | None:
+        """Return the DataFrame and row position for ``frame.iloc[n]['field']``."""
+        if not isinstance(value, ast.Subscript):
+            return None
+        if not (
+            isinstance(value.slice, ast.Constant)
+            and isinstance(value.slice.value, str)
+        ):
+            return None
+        row = value.value
+        if not (
+            isinstance(row, ast.Subscript)
+            and isinstance(row.value, ast.Attribute)
+            and row.value.attr == "iloc"
+            and isinstance(row.value.value, ast.Name)
+        ):
+            return None
+        if isinstance(row.slice, ast.Constant) and isinstance(row.slice.value, int):
+            row_index = row.slice.value
+        elif (
+            isinstance(row.slice, ast.UnaryOp)
+            and isinstance(row.slice.op, ast.USub)
+            and isinstance(row.slice.operand, ast.Constant)
+            and isinstance(row.slice.operand.value, int)
+        ):
+            row_index = -row.slice.operand.value
+        else:
+            return None
+        if row_index not in {0, -1}:
+            return None
+        return row.value.value.id, row_index
+
+    def ordered_extremum_is_proven(value: ast.AST, claim_text: str) -> bool:
+        """Accept a positional row only when its stated metric is sorted."""
+        if not isinstance(value, ast.Subscript):
+            return False
+        if not (
+            isinstance(value.slice, ast.Constant)
+            and isinstance(value.slice.value, str)
+        ):
+            return False
+        metric_field = str(value.slice.value)
+        row_signature = positional_row_signature(value)
+        if row_signature is None:
+            return False
+        frame_name, row_index = row_signature
+        lower = claim_text.lower()
+        highest_markers = (
+            "highest", "largest", "peak", "dominant", "most ",
+            "\u6700\u9ad8", "\u6700\u5927", "\u6700\u591a", "\u5cf0\u503c", "\u4e3b\u5bfc", "\u4e3a\u4e3b",
+        )
+        lowest_markers = (
+            "lowest", "smallest", "\u6700\u4f4e", "\u6700\u5c0f",
+        )
+        claims_highest = any(marker in lower for marker in highest_markers)
+        claims_lowest = any(marker in lower for marker in lowest_markers)
+        if claims_highest == claims_lowest:
+            return False
+        required_ascending = row_index == -1 if claims_highest else row_index == 0
+        return (metric_field, required_ascending) in frame_orders.get(
+            frame_name, set()
+        )
+
     findings: list[dict[str, Any]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.JoinedStr):
@@ -2817,7 +3037,7 @@ def _validate_report_extrema_selection_contract(
         normalized_text = literal_text.lower()
         if not any(marker.lower() in normalized_text for marker in superlative_markers):
             continue
-        positional_expressions: list[str] = []
+        positional_values: list[ast.AST] = []
         for formatted in node.values:
             if not isinstance(formatted, ast.FormattedValue):
                 continue
@@ -2825,10 +3045,19 @@ def _validate_report_extrema_selection_contract(
                 isinstance(item, ast.Attribute) and item.attr == "iloc"
                 for item in ast.walk(formatted.value)
             ):
-                positional_expressions.append(
-                    ast.get_source_segment(code, formatted.value)
-                    or ast.unparse(formatted.value)
-                )
+                positional_values.append(formatted.value)
+        proven_rows = {
+            signature
+            for value in positional_values
+            if ordered_extremum_is_proven(value, literal_text)
+            for signature in [positional_row_signature(value)]
+            if signature is not None
+        }
+        positional_expressions = [
+            ast.get_source_segment(code, value) or ast.unparse(value)
+            for value in positional_values
+            if positional_row_signature(value) not in proven_rows
+        ]
         if positional_expressions:
             findings.append({
                 "line_no": int(getattr(node, "lineno", 0) or 0),
@@ -4588,6 +4817,193 @@ def _validate_probe_observation_contract(
     )
 
 
+def _static_node_code_context(code: str, node: ast.AST) -> dict[str, Any]:
+    source_lines = str(code or "").splitlines()
+    line_no = int(getattr(node, "lineno", 0) or 0)
+    end_line_no = int(getattr(node, "end_lineno", line_no) or line_no)
+    if not (1 <= line_no <= len(source_lines)):
+        return {}
+    start = max(1, line_no - GENERATED_CODE_CONTEXT_RADIUS)
+    end = min(len(source_lines), end_line_no + GENERATED_CODE_CONTEXT_RADIUS)
+    statement_ranges = _source_statement_patch_ranges(code, line_no)
+    return {
+        "filename": GENERATED_CODE_FILENAME,
+        "line_no": line_no,
+        "column_no": int(getattr(node, "col_offset", 0) or 0) + 1,
+        "error_line": source_lines[line_no - 1],
+        "context_lines": [
+            {
+                "line_no": current_line_no,
+                "code": source_lines[current_line_no - 1],
+                "is_error_line": line_no <= current_line_no <= end_line_no,
+            }
+            for current_line_no in range(start, end + 1)
+        ],
+        "related_context_lines": [],
+        "suggested_patch_ranges": statement_ranges,
+        "traceback_excerpt": "",
+    }
+
+
+def _static_string_values(node: ast.AST | None) -> set[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return {node.value}
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return {
+            item.value
+            for item in node.elts
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        }
+    return set()
+
+
+_UNFINISHED_REPORT_SENTINELS = {
+    "placeholder",
+    "report placeholder",
+    "todo",
+    "tbd",
+    "占位",
+    "占位符",
+    "待补充",
+    "待生成",
+    "待完善",
+}
+
+
+def _is_unfinished_report_sentinel(report_text: Any) -> bool:
+    """Return whether the entire report is an explicit unfinished sentinel."""
+    normalized = re.sub(
+        r"[\s#*_`~:：;；,.，。!！?？\-]+",
+        " ",
+        str(report_text or "").strip().lower(),
+    ).strip()
+    return normalized in _UNFINISHED_REPORT_SENTINELS
+
+
+def _find_static_unfinished_report_call(tree: ast.AST) -> tuple[ast.Call, str] | None:
+    """Find a direct sentinel literal passed to save_analysis_result(...)."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        function_name = (
+            func.id if isinstance(func, ast.Name)
+            else func.attr if isinstance(func, ast.Attribute)
+            else ""
+        )
+        if function_name != "save_analysis_result":
+            continue
+        report_node: ast.AST | None = node.args[0] if node.args else None
+        for keyword in node.keywords:
+            if keyword.arg == "analysis_report":
+                report_node = keyword.value
+                break
+        if (
+            isinstance(report_node, ast.Constant)
+            and isinstance(report_node.value, str)
+            and _is_unfinished_report_sentinel(report_node.value)
+        ):
+            return node, report_node.value
+    return None
+
+
+def _validate_grouped_visible_dimension_contract(
+    tree: ast.AST,
+    code: str,
+) -> RetryResult | None:
+    """Reject unproven first/last values exposed as grouped dimensions."""
+    visible_dimension_fields: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            mapping = {
+                key.value: value.value
+                for key, value in zip(node.keys, node.values)
+                if isinstance(key, ast.Constant)
+                and isinstance(key.value, str)
+                and isinstance(value, ast.Constant)
+                and isinstance(value.value, str)
+            }
+            if "key" in mapping:
+                visible_dimension_fields.add(mapping["key"])
+        if isinstance(node, ast.Call):
+            for keyword in node.keywords:
+                if (
+                    keyword.arg == "category_field"
+                    and isinstance(keyword.value, ast.Constant)
+                    and isinstance(keyword.value.value, str)
+                ):
+                    visible_dimension_fields.add(keyword.value.value)
+    if not visible_dimension_fields:
+        return None
+
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if not isinstance(call.func, ast.Attribute) or call.func.attr not in {"agg", "aggregate"}:
+            continue
+        group_call = call.func.value
+        if (
+            not isinstance(group_call, ast.Call)
+            or not isinstance(group_call.func, ast.Attribute)
+            or group_call.func.attr != "groupby"
+        ):
+            continue
+        group_fields = _static_string_values(group_call.args[0] if group_call.args else None)
+        risky_dimensions: list[dict[str, str]] = []
+        for keyword in call.keywords:
+            if keyword.arg not in visible_dimension_fields:
+                continue
+            if not isinstance(keyword.value, (ast.Tuple, ast.List)) or len(keyword.value.elts) < 2:
+                continue
+            source_fields = _static_string_values(keyword.value.elts[0])
+            reducers = _static_string_values(keyword.value.elts[1])
+            if not source_fields or not (reducers & {"first", "last"}):
+                continue
+            source_field = next(iter(source_fields))
+            if source_field in group_fields:
+                continue
+            risky_dimensions.append({
+                "output_field": str(keyword.arg),
+                "source_field": source_field,
+                "reducer": next(iter(reducers & {"first", "last"})),
+            })
+        if call.args and isinstance(call.args[0], ast.Dict):
+            for key, value in zip(call.args[0].keys, call.args[0].values):
+                source_fields = _static_string_values(key)
+                reducers = _static_string_values(value)
+                if not source_fields or not (reducers & {"first", "last"}):
+                    continue
+                source_field = next(iter(source_fields))
+                if source_field not in visible_dimension_fields or source_field in group_fields:
+                    continue
+                risky_dimensions.append({
+                    "output_field": source_field,
+                    "source_field": source_field,
+                    "reducer": next(iter(reducers & {"first", "last"})),
+                })
+        if not risky_dimensions:
+            continue
+        code_error_context = _static_node_code_context(code, call)
+        return request_retry(
+            retry_type="query_constraint_violation",
+            message=_format_error_message_with_code_location(
+                "分组结果把未证明唯一的首值或末值作为用户可见维度，可能给汇总指标附上错误标签。",
+                code_error_context,
+            ),
+            diagnostics={
+                "violated_contract": "grouped_visible_dimension_functional_dependency",
+                "group_fields": sorted(group_fields),
+                "risky_dimensions": risky_dimensions,
+                "code_error_context": code_error_context,
+            },
+            repair_instructions=[
+                "保持查询、指标和洞察目标不变；若该字段属于结果粒度，将它加入 groupby 分组键。",
+                "若分析确实要跨该字段汇总，从用户可见结果中移除该标签，不要用 first/last 冒充汇总维度。",
+                "不要仅替换首值文本；同步让图表、表格和报告消费修正后的同一粒度结果。",
+            ],
+            code_error_context=code_error_context,
+        )
+    return None
+
+
 def _validate_generated_code_contract(code: str) -> RetryResult | None:
     """Validate the static tool contract of generated Python code before execution."""
     try:
@@ -4691,6 +5107,29 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
                 ],
             )
 
+        unfinished_report = _find_static_unfinished_report_call(tree)
+        if unfinished_report is not None:
+            report_call, report_value = unfinished_report
+            code_error_context = _static_node_code_context(code or "", report_call)
+            return request_retry(
+                retry_type="missing_report",
+                message=_format_error_message_with_code_location(
+                    "正式分析代码仍使用未完成的报告占位值，不能作为成功结果保存。",
+                    code_error_context,
+                ),
+                diagnostics={
+                    "violated_contract": "unfinished_report_sentinel",
+                    "report_value": report_value,
+                    "code_error_context": code_error_context,
+                },
+                repair_instructions=[
+                    "保留已经正确完成的查询、计算、图表和表格，不要缩减分析范围。",
+                    "使用已有计算结果构造面向用户的 Markdown 洞察报告，再传给 save_analysis_result(...)。",
+                    "对于数据不足或无法确认的分析问题，在报告中如实说明限制和建议，不要用占位文本代替最终报告。",
+                ],
+                code_error_context=code_error_context,
+            )
+
         validation_order_retry = _validate_analysis_sql_validation_order(tree)
         if validation_order_retry is not None:
             return validation_order_retry
@@ -4710,6 +5149,10 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
         paired_metric_retry = _validate_report_paired_metric_population_contract(tree, code or '')
         if paired_metric_retry is not None:
             return paired_metric_retry
+
+        grouped_dimension_retry = _validate_grouped_visible_dimension_contract(tree, code or '')
+        if grouped_dimension_retry is not None:
+            return grouped_dimension_retry
 
         helper_chart_retry = _validate_helper_chart_usage_contract(tree, calls)
         if helper_chart_retry is not None:
@@ -5222,7 +5665,7 @@ class SourceCodePatch(BaseModel):
 
     start_line: int = Field(description="被替换区间的起始行号（1-based，包含）。")
     end_line: int = Field(description="被替换区间的结束行号（1-based，包含）。")
-    replacement: str = Field(description="替换该行区间的完整 Python 源码。")
+    replacement: str = Field(description="替换一个完整 Python 语句或代码块的可解析源码。")
 
 
 class ExePythonCodeInput(BaseModel):
@@ -5252,8 +5695,9 @@ class ExePythonCodeInput(BaseModel):
     patches: list[SourceCodePatch] = Field(
         default_factory=list,
         description=(
-            "针对 base_execution_id 完整源码的非重叠行区间替换。只提交错误所需的最小修改；"
-            "后端按行号合成完整代码，未覆盖区域保持原样。"
+            "针对 base_execution_id 完整源码的非重叠语句替换。start_line/end_line 必须完整覆盖"
+            "错误反馈 repair_target.allowed_ranges 中的一个 Python 语句或代码块；"
+            "后端合成并验证完整代码，未覆盖区域保持原样。"
         ),
     )
 
@@ -5735,6 +6179,34 @@ def _chart_point_count(chart: dict[str, Any]) -> int:
         if isinstance(data_items, list):
             total += len(data_items)
     return total
+
+
+def _has_materialized_structured_values(exec_result: StructuredResult) -> bool:
+    """Return whether a returned chart/table carries at least one real data value.
+
+    This is deliberately an output-shape check, not a judgement about the report's
+    prose quality.  An analysis result cannot satisfy the structured-artifact
+    contract by returning a schema-only table or an empty chart after successful
+    calculation of a non-empty population.
+    """
+    for table in exec_result.tables or []:
+        if not isinstance(table, dict):
+            continue
+        rows = table.get("rows")
+        if not isinstance(rows, list):
+            rows = table.get("data")
+        if isinstance(rows, list) and rows:
+            return True
+    for chart in exec_result.charts or []:
+        if not isinstance(chart, dict):
+            continue
+        if _chart_point_count(chart) > 0:
+            return True
+        document = chart.get("chart_document")
+        dataset = document.get("dataset") if isinstance(document, dict) else None
+        if isinstance(dataset, dict) and isinstance(dataset.get("rows"), list) and dataset["rows"]:
+            return True
+    return False
 
 
 def _find_no_data_status_charts(charts: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -6230,17 +6702,43 @@ def _validate_structured_result_contract(
             ],
         )
 
+    if _is_unfinished_report_sentinel(report_text):
+        return request_retry(
+            retry_type="missing_report",
+            message="当前代码返回的 analysis_report 仍是未完成的占位值，不能作为成功结果保存。",
+            diagnostics={
+                "violated_contract": "unfinished_report_sentinel",
+                "report_value": report_text,
+                "chart_count": len(exec_result.charts or []),
+                "table_count": len(exec_result.tables or []),
+            },
+            repair_instructions=[
+                "保留已经正确完成的查询、计算、图表和表格，不要缩减分析范围。",
+                "使用当前执行中已计算的真实结果构造完整 Markdown 洞察报告。",
+                "对于数据不足或无法确认的分析问题，在报告中如实说明限制和建议，不要返回占位文本。",
+            ],
+            analysis_report=report_text,
+        )
+
     unrendered_placeholders = _find_unrendered_report_placeholders(
         report_text,
         generated_code=generated_code,
     )
     if unrendered_placeholders:
+        code_error_context = _locate_unrendered_placeholder_source(
+            generated_code,
+            unrendered_placeholders,
+        )
         return request_retry(
             retry_type="result_contract_error",
-            message="The analysis report contains unrendered Python formatting expressions.",
+            message=_format_error_message_with_code_location(
+                "The analysis report contains unrendered Python formatting expressions.",
+                code_error_context,
+            ),
             diagnostics={
                 "violated_contract": "unrendered_report_placeholder",
                 "placeholders": unrendered_placeholders,
+                "code_error_context": code_error_context,
             },
             repair_instructions=[
                 "Keep the existing queries, calculations, charts, tables, and report narrative unchanged.",
@@ -6248,6 +6746,7 @@ def _validate_structured_result_contract(
                 "Do not replace the expressions with hard-coded values. Use the already calculated variables so local reruns remain correct.",
             ],
             analysis_report=report_text,
+            code_error_context=code_error_context,
         )
 
     chart_dump = _find_chart_structure_dump_in_report(report_text)
@@ -6390,7 +6889,36 @@ def _validate_structured_result_contract(
             analysis_report=report_text,
         )
 
-    if not (exec_result.charts or exec_result.tables):
+    has_structured_artifact = bool(exec_result.charts or exec_result.tables)
+    has_empty_table_shell = any(
+        isinstance(table, dict)
+        and isinstance(table.get("rows", table.get("data")), list)
+        and not table.get("rows", table.get("data"))
+        for table in exec_result.tables or []
+    )
+    if has_empty_table_shell and not _has_materialized_structured_values(exec_result):
+        if not _is_no_data_like_report(report_text):
+            return request_retry(
+                retry_type="result_contract_error",
+                message=(
+                    "当前结果返回了图表或表格外壳，但其中没有任何可展示的数据行或数据点；"
+                    "不能用空结构替代已计算的分析产物。"
+                ),
+                diagnostics={
+                    "violated_contract": "empty_structured_artifact",
+                    "chart_count": len(exec_result.charts or []),
+                    "table_count": len(exec_result.tables or []),
+                    "analysis_report_preview": report_text[:800],
+                },
+                repair_instructions=[
+                    "保留已完成的查询、计算口径和业务范围，不要将中间统计或空壳结果保存为最终分析。",
+                    "使用本次已计算的聚合、明细或趋势 DataFrame 构造至少一个实际包含数据行/点的图表或结构化表格。",
+                    "报告必须同步解释该真实结构化产物中的关键发现；若所有总体查询确实为空，应走无数据结论而不是返回空壳。",
+                ],
+                analysis_report=report_text,
+            )
+
+    if not has_structured_artifact:
         if allow_empty_artifact_no_data and _is_expected_time_no_data_report(report_text, expected_time_range or {}):
             return None
         return request_retry(
@@ -6514,6 +7042,68 @@ def _find_unrendered_report_placeholders(
     return findings
 
 
+def _locate_unrendered_placeholder_source(
+    generated_code: str,
+    placeholders: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Locate plain source strings that emitted formatting fields verbatim."""
+    try:
+        tree = ast.parse(str(generated_code or ""))
+    except (SyntaxError, ValueError, TypeError):
+        return {}
+
+    placeholder_texts = {
+        str(item.get("text") or "")
+        for item in placeholders
+        if isinstance(item, dict) and str(item.get("text") or "")
+    }
+    if not placeholder_texts:
+        return {}
+
+    source_lines = str(generated_code or "").splitlines()
+    matched_nodes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and any(text in node.value for text in placeholder_texts)
+    ]
+    if not matched_nodes:
+        return {}
+
+    matched_nodes.sort(key=lambda node: int(getattr(node, "lineno", 0) or 0))
+    primary = matched_nodes[0]
+    line_no = int(getattr(primary, "lineno", 0) or 0)
+    end_line_no = int(getattr(primary, "end_lineno", line_no) or line_no)
+    start = max(1, line_no - GENERATED_CODE_CONTEXT_RADIUS)
+    end = min(len(source_lines), end_line_no + GENERATED_CODE_CONTEXT_RADIUS)
+    context_lines = [
+        {
+            "line_no": current_line_no,
+            "code": source_lines[current_line_no - 1],
+            "is_error_line": line_no <= current_line_no <= end_line_no,
+        }
+        for current_line_no in range(start, end + 1)
+    ]
+    related_context_lines = []
+    for node in matched_nodes[1:8]:
+        related_line_no = int(getattr(node, "lineno", 0) or 0)
+        if 1 <= related_line_no <= len(source_lines):
+            related_context_lines.append({
+                "line_no": related_line_no,
+                "code": source_lines[related_line_no - 1],
+            })
+    return {
+        "filename": GENERATED_CODE_FILENAME,
+        "line_no": line_no or None,
+        "column_no": int(getattr(primary, "col_offset", 0) or 0) + 1,
+        "error_line": source_lines[line_no - 1] if 1 <= line_no <= len(source_lines) else "",
+        "context_lines": context_lines,
+        "related_context_lines": related_context_lines,
+        "traceback_excerpt": "",
+    }
+
+
 def _find_repeated_numeric_display_units(report_text: str) -> list[dict[str, Any]]:
     unit_pattern = r"(?:万元|亿元|元|个|台|条|天|月|年|小时|分钟|秒|次|份|件|人|%|‰)"
     pattern = re.compile(
@@ -6609,12 +7199,27 @@ def _build_analysis_logic_signature(code: str) -> str:
 
 
 def _apply_source_code_patches(code: str, patches: list[SourceCodePatch]) -> str:
-    """Apply non-overlapping line edits to an immutable source snapshot."""
+    """Apply syntax-safe complete-statement edits to an immutable source snapshot."""
     source_lines = str(code or '').splitlines()
     if not source_lines:
         raise ValueError('base_execution_id 对应的执行记录没有可修复代码。')
     if not patches:
         raise ValueError('使用 base_execution_id 修复时必须提供至少一个 patches 行区间替换。')
+
+    try:
+        source_tree = ast.parse(code or '')
+    except SyntaxError as exc:
+        raise ValueError(
+            '失败代码本身无法建立可靠的 Python 语句边界，请提交完整 code 重新生成，不能使用 patches。'
+        ) from exc
+    valid_statement_ranges = {
+        (
+            int(getattr(node, 'lineno', 0) or 0),
+            int(getattr(node, 'end_lineno', 0) or 0),
+        )
+        for node in ast.walk(source_tree)
+        if isinstance(node, ast.stmt)
+    }
 
     normalized = sorted(patches, key=lambda item: (item.start_line, item.end_line))
     previous_end = 0
@@ -6627,6 +7232,10 @@ def _apply_source_code_patches(code: str, patches: list[SourceCodePatch]) -> str
             )
         if patch.start_line <= previous_end:
             raise ValueError('patches 不能包含重叠的源码行区间。')
+        if (patch.start_line, patch.end_line) not in valid_statement_ranges:
+            raise ValueError(
+                'patches 必须完整替换一个 Python 语句或代码块，不能从字典、字符串、调用参数或缩进块中间截断。'
+            )
         previous_end = patch.end_line
 
     for patch in reversed(normalized):
@@ -6635,6 +7244,13 @@ def _apply_source_code_patches(code: str, patches: list[SourceCodePatch]) -> str
     rendered = '\n'.join(source_lines)
     if str(code or '').endswith(('\n', '\r')):
         rendered += '\n'
+    try:
+        ast.parse(rendered)
+    except SyntaxError as exc:
+        raise ValueError(
+            f'patches 合成后的完整代码存在语法错误（第 {exc.lineno or 0} 行：{exc.msg}）；'
+            '本次补丁未创建执行，请按完整语句边界重新修复或提交完整 code。'
+        ) from exc
     return rendered
 
 
@@ -7001,6 +7617,7 @@ def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -
     CURRENT_LAST_QUERY_KEY.set('')
     CURRENT_EXECUTION_INTENT.set('')
     conn_info_payload = payload.get('database_conn_info') or {}
+    token = str(payload.get('token') or '').strip()
     if conn_info_payload:
         supos_kernel_api._database_conn_info = DatabaseConnInfo(
             host=str(conn_info_payload.get('host') or ''),
@@ -7009,13 +7626,15 @@ def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -
             password=str(conn_info_payload.get('password') or ''),
             lake_rds_database_name=str(conn_info_payload.get('lake_rds_database_name') or ''),
             ts_query_source=str(conn_info_payload.get('ts_query_source') or ''),
+            authorization_token=token,
         )
         supos_kernel_api._database_pool = None
         return
 
-    token = str(payload.get('token') or '').strip()
     if token:
-        supos_kernel_api.get_database_conn_info(token)
+        conn_info = supos_kernel_api.get_database_conn_info(token)
+        conn_info.authorization_token = token
+        supos_kernel_api._database_pool = None
 
 
 def _relationship_key_counts(
@@ -8171,6 +8790,10 @@ def _validate_analysis_scope_against_execution_history(
             getattr(previous, 'generated_code', '') or '',
             selected_datasource_snapshot=selected_datasource_snapshot,
         )
+        if selected_datasource_snapshot and not referenced_ids:
+            # A rejected attempt with declarations but no data-access implementation
+            # cannot become the semantic scope anchor for later repairs.
+            continue
         if referenced_ids:
             previous_used_ids = [
                 datasource_id
@@ -8549,6 +9172,30 @@ def _tool_error_message(
             TOOL_ERROR_CODE_CONTEXT_MAX_CHARS,
         )
 
+    patch_ranges = clipped_code_error_context.get('suggested_patch_ranges')
+    patch_ranges = patch_ranges if isinstance(patch_ranges, list) else []
+    patch_available_error_types = {
+        'chart_contract_error',
+        'data_type_or_time_mismatch',
+        'library_api_signature_mismatch',
+        'runtime_error',
+        'schema_or_column_mismatch',
+        'undefined_name',
+    }
+    patch_required_error_types = {
+        'data_type_or_time_mismatch',
+        'library_api_signature_mismatch',
+        'schema_or_column_mismatch',
+        'undefined_name',
+    }
+    patch_available = bool(
+        execution_id > 0
+        and current_failed_code
+        and patch_ranges
+        and error_type in patch_available_error_types
+    )
+    patch_required = patch_available and error_type in patch_required_error_types
+
     payload = {
         'tool': 'execute_python',
         'status': 'failed',
@@ -8563,7 +9210,7 @@ def _tool_error_message(
         ),
         'error_signature': clipped_error_signature,
         'code_error_context': clipped_code_error_context,
-        'minimal_patch_required': True,
+        'minimal_patch_required': patch_required,
         'current_failed_code': clipped_current_code,
         'current_failed_code_truncated': clipped_current_code != (current_failed_code or ''),
         'previous_failure_messages': _clip_retry_context_list(
@@ -8578,15 +9225,16 @@ def _tool_error_message(
         ),
         'previous_failure_count': len(previous_failure_messages or []),
     }
-    if execution_id > 0 and current_failed_code:
+    if patch_available:
         payload['repair_target'] = {
             'base_execution_id': int(execution_id),
             'source_sha256': _build_analysis_logic_signature(current_failed_code),
             'line_count': len(str(current_failed_code).splitlines()),
             'mode': 'line_patch',
+            'allowed_ranges': patch_ranges,
             'usage': (
-                '局部技术错误优先再次调用 execute_python，令 code 为空，并提交 '
-                'base_execution_id 与非重叠 patches；后端会保留未修改的完整分析代码和数据源范围。'
+                '仅当修复可完整落在 allowed_ranges 的语句边界内时，才令 code 为空并提交 '
+                'base_execution_id 与 patches；涉及查询范围、整体契约或多处逻辑调整时提交完整 code。'
             ),
         }
     if feedback_kind:
@@ -8924,6 +9572,7 @@ def execute_python(
         turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
         current_execution_id=execution_id,
     )
+    selected_datasource_snapshot = _get_runtime_selected_datasource_snapshot(runtime.context)
     contract_retry = _validate_tool_used_datasource_ids(
         context=runtime.context,
         used_datasource_ids=normalized_used_datasource_ids,
@@ -8936,6 +9585,7 @@ def execute_python(
             current_execution_id=execution_id,
             current_used_datasource_ids=normalized_used_datasource_ids,
             current_code=code,
+            selected_datasource_snapshot=selected_datasource_snapshot,
         )
     if contract_retry is None:
         contract_retry = _validate_analysis_relationship_contract(
@@ -8984,6 +9634,7 @@ def execute_python(
             feedback_kind='retryable_feedback',
             retry_reason_code=contract_retry.retry_type,
             diagnostics=contract_retry.diagnostics,
+            code_error_context=contract_retry.code_error_context,
             analysis_report=contract_retry.analysis_report,
             current_failed_code=code,
             previous_failure_messages=failure_memory.get('previous_failure_messages', []),
@@ -9327,7 +9978,6 @@ def execute_python(
         )
 
     if isinstance(exec_result, StructuredResult):
-        selected_datasource_snapshot = _get_runtime_selected_datasource_snapshot(runtime.context)
         canonical_used_datasource_ids = _canonicalize_used_datasource_ids(
             exec_result,
             declared_datasource_ids=normalized_used_datasource_ids,
@@ -9428,6 +10078,7 @@ def execute_python(
                 feedback_kind='retryable_feedback',
                 retry_reason_code=contract_retry.retry_type,
                 diagnostics=contract_retry.diagnostics,
+                code_error_context=contract_retry.code_error_context,
                 analysis_report=contract_retry.analysis_report,
                 current_failed_code=code,
                 previous_failure_messages=failure_memory.get('previous_failure_messages', []),

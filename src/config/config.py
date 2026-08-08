@@ -167,6 +167,11 @@ class Config:
     SEMANTIC_DATASOURCE_TOP_K = int(
         os.environ.get('SEMANTIC_DATASOURCE_TOP_K', 10)
     )
+    # Optional service credential.  UNS materialization must still use the
+    # requesting user's platform authorization rather than this credential.
+    SEMANTIC_DATASOURCE_AUTHORIZATION = os.environ.get(
+        'SEMANTIC_DATASOURCE_AUTHORIZATION', ''
+    ).strip()
     SEMANTIC_REQUEST_TIMEOUT_SECONDS = float(
         os.environ.get('SEMANTIC_REQUEST_TIMEOUT_SECONDS', 60)
     )

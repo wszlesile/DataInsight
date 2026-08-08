@@ -233,6 +233,45 @@ def test_semantic_retrieve_materializes_node_ids_and_normalizes_relationships(mo
     },)
 
 
+def test_semantic_retrieve_uses_service_credential_without_replacing_uns_user_auth(monkeypatch):
+    calls = {}
+
+    def fake_post(*args, **kwargs):
+        calls['request'] = kwargs
+        return _Response({'entity_ids': ['10001'], 'relationships': []})
+
+    monkeypatch.setattr(semantic.requests, 'post', fake_post)
+    monkeypatch.setattr(semantic, 'session_scope', lambda **kwargs: _Scope())
+    monkeypatch.setattr(semantic.Config, 'SEMANTIC_DATASOURCE_AUTHORIZATION', 'Bearer semantic-service')
+
+    class _Materializer:
+        def __init__(self, session):
+            pass
+
+        def materialize_semantic_uns_node_ids(self, **kwargs):
+            calls['materialize'] = kwargs
+            return {'10001': 101}
+
+    class _SnapshotBuilder:
+        def __init__(self, session):
+            pass
+
+        def build_datasource_snapshot_by_ids(self, **kwargs):
+            return [{'datasource_id': 101, 'metadata_schema': {}}]
+
+    monkeypatch.setattr(semantic, 'InsightNsRelDatasourceService', _Materializer)
+    monkeypatch.setattr(semantic, 'ConversationContextService', _SnapshotBuilder)
+
+    semantic.SemanticDatasourceSelectionService(base_url='http://semantic').retrieve(
+        query='分析订单客户情况',
+        authorization='Bearer platform-user',
+        namespace_id=6,
+    )
+
+    assert calls['request']['headers']['Authorization'] == 'Bearer semantic-service'
+    assert calls['materialize']['authorization'] == 'Bearer platform-user'
+
+
 @pytest.mark.parametrize('payload', [
     {},
     {'entity_ids': [], 'relationships': []},

@@ -74,10 +74,13 @@ class SemanticDatasourceSelectionService:
         if not authorization.strip():
             raise SemanticDatasourceSelectionError('semantic selection requires authorization')
 
+        provider_authorization = str(
+            getattr(Config, 'SEMANTIC_DATASOURCE_AUTHORIZATION', '') or authorization
+        ).strip()
         try:
             response = requests.post(
                 f'{self.base_url}{self.retrieve_path}',
-                headers={'Authorization': authorization},
+                headers={'Authorization': provider_authorization},
                 json={'query': query, 'top_k': self.top_k},
                 timeout=self.timeout_seconds,
             )

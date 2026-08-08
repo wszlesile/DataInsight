@@ -100,8 +100,9 @@ def test_datasource_context_preserves_preparation_semantic_handoff(monkeypatch):
     assert message is not None
     payload = json.loads(message.content[message.content.index("{"):])
     assert payload["analysis_semantic_context"] == semantic_context
-    assert message.content.index('"datasources"') < message.content.index('"analysis_semantic_context"')
+    assert message.content.index('"analysis_semantic_context"') < message.content.index('"datasources"')
     assert "正式分析不再重新选源" in message.content
+    assert "逐项阅读 `analysis_semantic_context.business_questions`" in message.content
     assert "开放式洞察方向" in message.content
     assert "不规定报告章节或结论" in message.content
     assert "已选候选范围" not in message.content

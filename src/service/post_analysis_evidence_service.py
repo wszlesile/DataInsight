@@ -103,10 +103,50 @@ Additional posthoc report-candidate rules:
     joined loop or repeated template, use the yielded value expression and put
     the dimension value that selects this occurrence in parameter_bindings;
     do not bind the whole paragraph or summary object.
+18. A catalog candidate is not presumed to be a metric. First decide whether
+    it is a rendered data fact, a presentation literal, or genuinely unresolved.
+    Date/time scope fragments (including abbreviated end dates), condition or
+    comparison cutoffs (with or without a unit), ranking/section ordinals, and
+    display limits are non-metric even when they appear beside a query-derived
+    expression. Only a value that states an observed or calculated business
+    result may be included in metric.report_candidate_ids.
 
 The JSON object may include report_candidate_ids and calculation_source_refs on
 each metric and a top-level non_metric_report_candidate_ids array.
 """
+
+
+STRUCTURED_EVIDENCE_RESOLVER_PROMPT = """
+You recover calculation lineage only for chart/table numeric output slots that
+the deterministic compiler could not prove. The successful Python analysis and
+its outputs must not be changed. Inspect only structured_output_catalog.
+
+For every output_node_id, either bind it to exactly one metric or return it in
+unresolved_outputs. Metrics that share the same parameterized calculation may
+contain multiple output_node_ids. Locate the smallest complete Python
+calculation with calculation_source_refs. Use only query ids and real fields
+from query_catalog. attestation_confidence may be high only when the output,
+calculation, query, and field boundary are all certain. Do not return values,
+SQL, evidence ids, Markdown, or outputs outside the catalog.
+
+Return one JSON object matching this shape:
+{
+  "metrics": [{
+    "calculation_id": "structured_recovery",
+    "output_node_ids": ["out_..."],
+    "calculation_source_refs": [{"source_line": 1, "expression": "..."}],
+    "claimed_query_node_ids": ["q_..."],
+    "claimed_metric_fields": ["field"],
+    "attestation_confidence": "high|medium|low",
+    "metric_key": "stable_semantic_name",
+    "business_name": "user-facing metric name",
+    "business_explanation": "user-facing scope and calculation explanation",
+    "value_type": "number|integer|currency|percentage|duration|other",
+    "display_unit": ""
+  }],
+  "unresolved_outputs": [{"output_node_id": "out_...", "reason": "..."}]
+}
+""".strip()
 
 
 class ReportSourceAnchorRef(BaseModel):
@@ -375,6 +415,27 @@ class LineageIndexer:
         "replace", "rename", "drop_duplicates", "copy",
         "sorted", "dataframe",
     }
+
+    @staticmethod
+    def _explicit_display_unit(*values: str) -> str:
+        """Return only units explicitly encoded by artifact presentation metadata."""
+        for value in values:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            if re.fullmatch(r"[%‰￥¥$€£]", text):
+                return text
+            match = re.search(r"[（(]([^（）()]{1,12})[）)]\s*$", text)
+            if match:
+                return match.group(1).strip()
+            match = re.match(
+                r"^(?P<unit>[%‰￥¥$€£]|百分点|[\u4e00-\u9fff](?:/[\u4e00-\u9fff]{1,4})?)"
+                r"(?=\s|\*\*|[，。；、,.;：:）)]|$)",
+                text,
+            )
+            if match:
+                return match.group("unit")
+        return ""
 
     def build(self, snapshot: AnalysisExecutionSnapshot) -> dict[str, Any]:
         query_snapshots = self._lineage_query_snapshots(snapshot.query_snapshots)
@@ -928,6 +989,46 @@ class LineageIndexer:
                             "source": source[:1200],
                         })
                 operations.extend(self._dataframe_literal_series_operations(node, code))
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "append"
+                and isinstance(node.func.value, ast.Name)
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Dict)
+            ):
+                container_name = node.func.value.id
+                for key_node, value_node in zip(node.args[0].keys, node.args[0].values):
+                    if not (
+                        isinstance(key_node, ast.Constant)
+                        and isinstance(key_node.value, str)
+                    ):
+                        continue
+                    field = str(key_node.value)
+                    value_source = ast.get_source_segment(code, value_node) or ast.unparse(value_node)
+                    target = f"{container_name}[{field!r}]"
+                    source = f"{target} = {value_source}"
+                    semantic_kind = (
+                        "formula"
+                        if any(
+                            isinstance(item, (ast.BinOp, ast.BoolOp, ast.Compare, ast.IfExp))
+                            for item in ast.walk(value_node)
+                        )
+                        else "presentation"
+                    )
+                    operations.append({
+                        "operation_node_id": (
+                            f"op_record_write_{getattr(value_node, 'lineno', 0)}_"
+                            f"{_digest(source, 8)}"
+                        ),
+                        "line": getattr(value_node, "lineno", 0),
+                        "kind": "calculation",
+                        "semantic_kind": semantic_kind,
+                        "query_node_id": "",
+                        "targets": [target],
+                        "loads": _loaded_names(value_node),
+                        "source": source[:1200],
+                    })
             if (
                 isinstance(node, ast.JoinedStr)
                 and id(node) not in synthetic_concatenation_joined_strings
@@ -2068,6 +2169,15 @@ class LineageIndexer:
         if query_node_id:
             return "query_load"
         called = _called_operation_names(node)
+        loaded_names = set(_loaded_names(node))
+        presentation_parameter_names = {
+            "analysis_parameters", "int", "float", "str", "bool", "round",
+        }
+        if (
+            "analysis_parameters" in loaded_names
+            and not (loaded_names - presentation_parameter_names)
+        ):
+            return "presentation"
         if any(isinstance(item, ast.BinOp) for item in ast.walk(node)):
             return "formula"
         if called.intersection({
@@ -2692,7 +2802,11 @@ class LineageIndexer:
                     "label": label,
                     "sample_values": sample_values,
                     "structured_numeric_display": bool(numeric_display),
-                    "display_unit_hint": str((numeric_display or {}).get("display_unit") or ""),
+                    "display_unit_hint": str(
+                        (numeric_display or {}).get("display_unit")
+                        or self._explicit_display_unit(label)
+                        or ""
+                    ),
                     "source_frame": source_frame,
                     "lineage_fields": [source_field] if source_field else [key],
                 })
@@ -3280,14 +3394,50 @@ class LineageIndexer:
                         if isinstance(dataframe_argument, ast.Name)
                         else list(dataframe_argument.elts)
                     )
+                    record_container = (
+                        dataframe_argument.id
+                        if isinstance(dataframe_argument, ast.Name)
+                        else ""
+                    )
                     max_columns = max((len(record.keys) for record in records), default=0)
                     positions: list[dict[str, set[str]]] = []
                     for column_index in range(max_columns):
-                        column_origins = [
-                            expression_origin(record.values[column_index], line)
-                            for record in records
-                            if column_index < len(record.values)
-                        ]
+                        column_origins: list[dict[str, set[str]]] = []
+                        for record in records:
+                            if column_index >= len(record.values):
+                                continue
+                            value_node = record.values[column_index]
+                            field_origin = expression_origin(
+                                value_node,
+                                int(getattr(value_node, "lineno", line) or line),
+                            )
+                            key_node = (
+                                record.keys[column_index]
+                                if column_index < len(record.keys)
+                                else None
+                            )
+                            field = static_string(key_node)
+                            if record_container and field and field_origin.get("queries"):
+                                write_target = f"{record_container}[{field!r}]"
+                                value_line = int(getattr(value_node, "lineno", line) or line)
+                                write_operation = next(
+                                    (
+                                        operation
+                                        for operation in operations_by_line.get(value_line, [])
+                                        if write_target in (operation.get("targets") or [])
+                                        and operation.get("semantic_kind")
+                                        in {"aggregation", "formula", "ranking"}
+                                    ),
+                                    None,
+                                )
+                                if write_operation is not None:
+                                    operation_id = str(
+                                        write_operation.get("operation_node_id") or ""
+                                    )
+                                    if operation_id:
+                                        field_origin["operations"].add(operation_id)
+                                        field_origin["boundaries"] = {operation_id}
+                            column_origins.append(field_origin)
                         origin = merge_origins(*column_origins)
                         positions.append(origin)
                         first_key = next(
@@ -3418,6 +3568,40 @@ class LineageIndexer:
                         continue
 
                 source_frame = frame_name_from_expression(value)
+                row_selector = (
+                    value
+                    if isinstance(value, ast.Subscript)
+                    and isinstance(value.value, ast.Attribute)
+                    and value.value.attr in {"loc", "iloc"}
+                    and frame_name_from_expression(value.value.value) == source_frame
+                    else None
+                )
+                row_selector_returns_row = False
+                if row_selector is not None:
+                    selector_items = (
+                        list(row_selector.slice.elts)
+                        if isinstance(row_selector.slice, (ast.Tuple, ast.List))
+                        else [row_selector.slice]
+                    )
+                    row_selector_returns_row = len(selector_items) == 1 or (
+                        len(selector_items) >= 2
+                        and isinstance(selector_items[1], ast.Slice)
+                        and selector_items[1].lower is None
+                        and selector_items[1].upper is None
+                        and selector_items[1].step is None
+                    )
+                if source_frame and row_selector_returns_row:
+                    copy_frame(target, source_frame)
+                    operation = operation_for(node)
+                    operation_id = str((operation or {}).get("operation_node_id") or "")
+                    if operation_id:
+                        for column_origin in frame_columns.get(target, {}).values():
+                            if column_origin.get("queries"):
+                                column_origin["operations"].add(operation_id)
+                    row_origin = merge_origins(*(frame_columns.get(target) or {}).values())
+                    if row_origin["queries"]:
+                        scalar_origins[target] = row_origin
+                    continue
                 has_positional_scalar_access = any(
                     isinstance(item, ast.Subscript)
                     and isinstance(item.value, ast.Attribute)
@@ -3647,6 +3831,18 @@ class LineageIndexer:
                                 and subscript_key(item)
                                 and subscript_key(item) not in group_fields
                             ))
+                            aggregate_field_origins: dict[str, dict[str, set[str]]] = {}
+                            for field in aggregate_fields:
+                                field_origin = merge_origins(
+                                    (frame_columns.get(source_frame) or {}).get(field)
+                                )
+                                if not field_origin["queries"]:
+                                    field_origin = merge_origins(aggregate_origin)
+                                field_origin["dimension_boundaries"].clear()
+                                if field_origin["queries"] and operation_id:
+                                    field_origin["operations"].add(operation_id)
+                                    field_origin["boundaries"] = {operation_id}
+                                aggregate_field_origins[field] = field_origin
                             named_aggregate_origins: dict[str, dict[str, set[str]]] = {}
                             aggregate_call = next(
                                 (
@@ -3695,7 +3891,7 @@ class LineageIndexer:
                                     for index, field in enumerate(group_fields)
                                 }
                                 for field in aggregate_fields:
-                                    frame_columns[target][field] = aggregate_origin
+                                    frame_columns[target][field] = aggregate_field_origins[field]
                                 frame_columns[target].update(named_aggregate_origins)
                                 metric_positions = [
                                     *(frame_columns[target][field] for field in aggregate_fields),
@@ -3934,10 +4130,27 @@ class LineageIndexer:
                         continue
                     if field not in column_order:
                         column_order.append(field)
-                    column_origins[field] = merge_origins(
+                    field_origin = merge_origins(
                         column_origins.get(field),
                         expression_origin(value_node, line),
                     )
+                    write_target = f"{container_name}[{field!r}]"
+                    write_operation = next(
+                        (
+                            operation
+                            for operation in operations_by_line.get(line, [])
+                            if write_target in (operation.get("targets") or [])
+                            and operation.get("semantic_kind")
+                            in {"aggregation", "formula", "ranking"}
+                        ),
+                        None,
+                    )
+                    if field_origin.get("queries") and write_operation is not None:
+                        operation_id = str(write_operation.get("operation_node_id") or "")
+                        if operation_id:
+                            field_origin["operations"].add(operation_id)
+                            field_origin["boundaries"] = {operation_id}
+                    column_origins[field] = field_origin
             if column_origins:
                 frame_columns[container_name] = column_origins
                 frame_positions[container_name] = [
@@ -4283,11 +4496,20 @@ class LineageIndexer:
                 for item in output.get("lineage_fields") or []
                 if str(item or "").strip()
             ]
-            lineage_fields = list(dict.fromkeys(
-                str(item or "").strip()
-                for item in (declared_lineage_fields or [field])
-                if str(item or "").strip()
-            ))
+            # A rendered mapping member (for example ``alarm_sum['count']``)
+            # carries both a business field and a container identity. Keeping
+            # the full member expression prevents a same-named field written
+            # into an unrelated record from stealing its calculation boundary.
+            expression_field = field if "[" in field else ""
+            lineage_fields = (
+                [expression_field]
+                if expression_field
+                else list(dict.fromkeys(
+                    str(item or "").strip()
+                    for item in (declared_lineage_fields or [field])
+                    if str(item or "").strip()
+                ))
+            )
             direct = [
                 str(item) for item in output.get("direct_operation_node_ids") or []
                 if str(item) in operation_by_id
@@ -4602,8 +4824,19 @@ class LineageIndexer:
         normalized_target = str(target or "").strip()
         if normalized_target == field:
             return True
-        if "[" in field and normalized_target == field.split("[", 1)[0]:
-            return True
+        if "[" in field:
+            field_root = field.split("[", 1)[0]
+            if normalized_target == field_root:
+                return True
+            # A rendered expression such as ``alarm_sum['count']`` can be
+            # produced by its container assignment, but not by an unrelated
+            # record write such as ``rows['count']`` later in the program.
+            # Field suffix matching is only sound within the same container.
+            if "[" in normalized_target:
+                return normalized_target.startswith(f"{field_root}[") and (
+                    normalized_target.endswith(f"[{field.split('[', 1)[1]}")
+                )
+            return False
         return normalized_target.endswith(f"[{field!r}]") or normalized_target.endswith(f'["{field}"]')
 
     @staticmethod
@@ -4698,6 +4931,10 @@ class LineageIndexer:
                         "text": text,
                         "display_prefix": str(expression.get("prefix") or ""),
                         "display_suffix": str(expression.get("suffix") or ""),
+                        "display_unit_hint": LineageIndexer._explicit_display_unit(
+                            str(expression.get("numeric_suffix") or ""),
+                            str(expression.get("suffix") or ""),
+                        ),
                         "presentation_ordinal": bool(
                             expression.get("presentation_ordinal")
                         ),
@@ -4756,6 +4993,10 @@ class LineageIndexer:
                         "text": text,
                         "display_prefix": prefix,
                         "display_suffix": suffix,
+                        "display_unit_hint": LineageIndexer._explicit_display_unit(
+                            str(expression.get("numeric_suffix") or ""),
+                            suffix,
+                        ),
                         "presentation_ordinal": bool(
                             expression.get("presentation_ordinal")
                         ),
@@ -4814,6 +5055,23 @@ class LineageIndexer:
                 for pattern in temporal_patterns
                 for match in re.finditer(pattern, line_text)
             )
+            if not temporal:
+                # A compact end date commonly omits the year after a complete
+                # start date, for example ``2026-08-03 至 08-09``.  Classify
+                # both date fragments as presentation literals while leaving
+                # ordinary arithmetic fractions untouched.
+                compact_date_ranges = (
+                    r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}"
+                    r"\s*(?:至|到|~|～|—|–)\s*"
+                    r"\d{1,2}[-/.]\d{1,2}",
+                    r"(?:日期|周期|时间|截至|自)\s*[:：]?\s*"
+                    r"\d{1,2}[-/.]\d{1,2}",
+                )
+                temporal = any(
+                    match.start() <= token_start and token_end <= match.end()
+                    for pattern in compact_date_ranges
+                    for match in re.finditer(pattern, line_text)
+                )
             prefix = line_text[max(0, token_start - 24):token_start]
             suffix = line_text[token_end:min(len(line_text), token_end + 24)]
             comparison_threshold = bool(
@@ -4821,13 +5079,16 @@ class LineageIndexer:
                     r"(?:高于|低于|超过|不少于|不低于|至多|至少|大于|小于|>=|<=|>|<|≥|≤)\s*(?:\*\*)?\s*$",
                     prefix,
                 )
-                and re.match(r"\s*(?:%|％|倍|元|个|件|台|项|次|天|月|年|\*\*)", suffix)
             )
             ordinal_patterns = (
                 r"^\s*#{1,6}\s+(?:第\s*)?\d+(?:\.\d+)*[.、]?",
                 r"^\s*\*\*(?:第\s*)?\d+(?:\.\d+)*[.、]?(?=\s|\*\*)",
                 r"^\s*第\s*\d+(?:\.\d+)*[章节项]",
                 r"^\s*(?:[-+*]\s+)?(?:\*\*)?\d+(?:\.\d+)*(?:[.)、]|）)(?=\s|\*\*)",
+                # A report can refer back to a question/finding in normal
+                # prose (not only as a Markdown heading). These numbers are
+                # presentation labels, never observed values.
+                r"(?:(?i:question)|\u95ee\u9898|\u53d1\u73b0)\s*\d+(?=\D|$)",
             )
             ordinal = any(
                 match.start() <= token_start and token_end <= match.end()
@@ -4906,6 +5167,13 @@ class LineageIndexer:
                         token_start=match.start(),
                         token_end=match.end(),
                     )
+                    # Markdown headings label a section rather than report an
+                    # observed metric.  Heading styles vary widely (for
+                    # example, "Finding 1" and Chinese titles without a
+                    # separator), so the Markdown grammar is the stable
+                    # boundary instead of a vocabulary-specific pattern.
+                    if stripped.startswith("#"):
+                        presentation_ordinal = True
                     occupied.add((start, end))
                     pipe_before_match = line[:match.start()].count("|")
                     table_column_index = max(0, pipe_before_match - 1)
@@ -5003,10 +5271,70 @@ class PostAnalysisEvidenceCompiler:
         self,
         *,
         planner: Callable[[dict[str, Any]], EvidencePlan] | None = None,
+        structured_planner: Callable[[dict[str, Any]], EvidencePlan] | None = None,
     ) -> None:
         self._uses_default_planner = planner is None
         self._planner = planner or self._invoke_planner
+        self._structured_planner = (
+            structured_planner or self._invoke_structured_planner
+        )
         self._resolver_id_maps: dict[str, dict[str, str]] = {}
+
+    @staticmethod
+    def _query_reachable_fields(
+        query_id: str,
+        query_snapshot: dict[str, Any] | None,
+        operation_by_id: dict[str, dict[str, Any]],
+        producers: dict[str, list[str]],
+    ) -> set[str]:
+        """Return direct and derived fields proven to depend on one query."""
+        fields: set[str] = set()
+        query_snapshot = query_snapshot if isinstance(query_snapshot, dict) else {}
+        execution = (
+            query_snapshot.get("execution")
+            if isinstance(query_snapshot.get("execution"), dict)
+            else {}
+        )
+        fields.update(
+            str(field)
+            for field in execution.get("columns") or []
+            if str(field)
+        )
+        implementation = (
+            query_snapshot.get("implementation")
+            if isinstance(query_snapshot.get("implementation"), dict)
+            else {}
+        )
+        for projection in implementation.get("projection_semantics") or []:
+            if not isinstance(projection, dict):
+                continue
+            projection_fields = projection.get("source_fields") or []
+            if not isinstance(projection_fields, list):
+                projection_fields = [projection_fields]
+            fields.update(
+                str(field)
+                for field in [projection.get("alias"), *projection_fields]
+                if str(field)
+            )
+        for operation_id, operation in operation_by_id.items():
+            if query_id not in LineageIndexer._query_dependencies(
+                [operation_id],
+                operation_by_id,
+                producers,
+            ):
+                continue
+            for target in operation.get("targets") or []:
+                target_text = str(target).strip()
+                if not target_text:
+                    continue
+                fields.add(target_text)
+                subscript_field = re.search(
+                    r"\[['\"](?P<field>[^'\"]+)['\"]\]$",
+                    target_text,
+                )
+                if subscript_field:
+                    fields.add(subscript_field.group("field"))
+        return fields
 
     def compile(self, snapshot: AnalysisExecutionSnapshot) -> dict[str, Any]:
         lineage_index = LineageIndexer().build(snapshot)
@@ -5021,12 +5349,59 @@ class PostAnalysisEvidenceCompiler:
             calculation_candidates,
         )
         all_candidates = {**calculation_candidates, **report_semantic_candidates}
-        if not all_candidates:
+        has_structured_metric_outputs = any(
+            output.get("artifact_type") in {"chart", "table"}
+            and not self._is_grouping_dimension_output(output, lineage_index)
+            for output in lineage_index.get("output_nodes") or []
+        )
+        if not all_candidates and not has_structured_metric_outputs:
             return self._empty_bundle(snapshot, lineage_index, "insufficient_calculation_boundaries")
         structured_plan = self._build_structured_evidence_plan(
             calculation_candidates,
             lineage_index,
         )
+        structured_recovery_plan = EvidencePlan()
+        structured_recovery_candidates: dict[str, dict[str, Any]] = {}
+        unresolved_structured_outputs = self._unresolved_structured_outputs(
+            lineage_index,
+            structured_plan,
+        )
+        if unresolved_structured_outputs:
+            try:
+                raw_structured_plan = self._structured_planner(
+                    self._structured_resolver_payload(
+                        snapshot,
+                        lineage_index,
+                        unresolved_structured_outputs,
+                    )
+                )
+                (
+                    structured_recovery_plan,
+                    structured_recovery_candidates,
+                ) = self._materialize_structured_recovery_plan(
+                    snapshot,
+                    lineage_index,
+                    raw_structured_plan,
+                    unresolved_structured_outputs,
+                )
+                calculation_candidates.update(structured_recovery_candidates)
+                all_candidates.update(structured_recovery_candidates)
+            except Exception as exc:
+                logger.warning(
+                    "post-analysis structured evidence resolver unavailable: execution_id=%s error=%s",
+                    snapshot.execution_id,
+                    exc,
+                    exc_info=True,
+                )
+                structured_recovery_plan = EvidencePlan(
+                    unresolved_outputs=[
+                        UnresolvedEvidenceOutput(
+                            output_node_id=str(output.get("output_node_id") or ""),
+                            reason=f"Structured lineage resolver failed: {str(exc)[:300]}",
+                        )
+                        for output in unresolved_structured_outputs
+                    ]
+                )
         structured_candidates = self._filter_candidates_by_artifact_type(
             calculation_candidates,
             lineage_index,
@@ -5054,6 +5429,7 @@ class PostAnalysisEvidenceCompiler:
                 lineage_index,
                 report_candidates,
                 recovery_only=self._uses_default_planner,
+                excluded_output_ids=verified_report_output_ids,
             ) if report_candidates else {}
             planner_required = bool(
                 planner_payload.get("report_candidate_catalog")
@@ -5161,8 +5537,12 @@ class PostAnalysisEvidenceCompiler:
                     *verified_report_plan.metrics,
                     *report_plan.metrics,
                     *structured_plan.metrics,
+                    *structured_recovery_plan.metrics,
                 ],
-                unresolved_outputs=report_plan.unresolved_outputs,
+                unresolved_outputs=[
+                    *report_plan.unresolved_outputs,
+                    *structured_recovery_plan.unresolved_outputs,
+                ],
                 non_metric_report_candidate_ids=(
                     report_plan.non_metric_report_candidate_ids
                 ),
@@ -5179,8 +5559,12 @@ class PostAnalysisEvidenceCompiler:
             # already have deterministic column-level lineage. Isolate a report
             # planner failure instead of discarding those verified boundaries.
             plan = EvidencePlan(
-                metrics=[*verified_report_plan.metrics, *structured_plan.metrics],
-                unresolved_outputs=[],
+                metrics=[
+                    *verified_report_plan.metrics,
+                    *structured_plan.metrics,
+                    *structured_recovery_plan.metrics,
+                ],
+                unresolved_outputs=structured_recovery_plan.unresolved_outputs,
             )
         validation_candidates = (
             calculation_candidates if planner_error else all_candidates
@@ -5602,6 +5986,25 @@ class PostAnalysisEvidenceCompiler:
                 *anchor_output_ids,
                 *selected_candidate_output_ids,
             ]))
+            # A report source anchor is produced from the rendered expression
+            # itself.  When that expression already has a locally resolved
+            # operation boundary, it is a stronger calculation source than a
+            # planner's compact source-line hint.  Keep the anchor operations
+            # in the same dependency closure so harmless locator ambiguity
+            # cannot discard an otherwise proven report metric.
+            anchor_boundary_operations = list(dict.fromkeys(
+                str(operation_id)
+                for output_id in anchor_output_ids
+                for operation_id in [
+                    *((output_by_id.get(output_id) or {}).get(
+                        "boundary_operation_node_ids"
+                    ) or []),
+                    *((output_by_id.get(output_id) or {}).get(
+                        "direct_operation_node_ids"
+                    ) or []),
+                ]
+                if str(operation_id) in operation_by_id
+            ))
             recovered_operations, source_ref_errors = self._resolve_calculation_source_refs(
                 snapshot.generated_code,
                 lineage_index,
@@ -5623,6 +6026,7 @@ class PostAnalysisEvidenceCompiler:
                 str(operation_id)
                 for operation_id in [
                     *metric.operation_node_ids,
+                    *anchor_boundary_operations,
                     *recovered_operations,
                 ]
                 if str(operation_id) in operation_by_id
@@ -5649,10 +6053,53 @@ class PostAnalysisEvidenceCompiler:
                 ) or []
                 if str(query_id)
             }
+            # For a posthoc report candidate, a source expression that the
+            # local resolver has already mapped to real operations is stronger
+            # evidence than the planner's compact query summary.  The latter
+            # is needed only when no local operation/query closure exists.
+            # Otherwise a correctly located calculation could be rejected just
+            # because the planner omitted one upstream query from its summary.
+            claimed_fields_for_boundary = {
+                str(field).strip()
+                for field in metric.claimed_metric_fields
+                if str(field).strip()
+            }
+            locally_reachable_fields = {
+                field
+                for query_id in query_ids
+                for field in self._query_reachable_fields(
+                    query_id,
+                    snapshot.query_snapshots.get(query_id),
+                    operation_by_id,
+                    producers,
+                )
+            }
+            locally_resolved_query_boundary = bool(
+                (
+                    resolved_anchors
+                    and anchor_boundary_operations
+                    or metric.report_candidate_ids
+                )
+                and selected_operations
+                and query_ids
+                and (
+                    not claimed_fields_for_boundary
+                    or claimed_fields_for_boundary.issubset(
+                        locally_reachable_fields
+                    )
+                )
+            )
+            if resolved_anchors and anchor_boundary_operations and query_ids:
+                # `calculation_source_refs` are an LLM aid for source forms
+                # the static parser cannot recover.  Do not let an ambiguous
+                # hint override a report expression whose local dataflow has
+                # already been proven through its anchor boundary.
+                source_ref_errors = []
             if (
                 output_verified_query_ids
                 and claimed_query_ids
                 and not output_verified_query_ids.issubset(set(claimed_query_ids))
+                and not locally_resolved_query_boundary
             ):
                 source_ref_errors.append(
                     "LLM query claim contradicts locally verified query dependencies."
@@ -5661,12 +6108,14 @@ class PostAnalysisEvidenceCompiler:
                 query_ids
                 and claimed_query_ids
                 and not set(query_ids).issubset(set(claimed_query_ids))
+                and not locally_resolved_query_boundary
             ):
                 source_ref_errors.append(
                     "Planner source locator does not support the declared query boundary."
                 )
             requires_attestation = bool(
                 metric.report_candidate_ids
+                and not locally_resolved_query_boundary
                 and claimed_query_ids
                 and (
                     metric.claimed_metric_fields
@@ -5677,47 +6126,13 @@ class PostAnalysisEvidenceCompiler:
             )
             if requires_attestation:
                 unknown_queries = set(claimed_query_ids) - successful_query_ids
-                def query_fields(query_id: str) -> set[str]:
-                    fields: set[str] = set()
-                    query_snapshot = snapshot.query_snapshots.get(query_id)
-                    query_snapshot = query_snapshot if isinstance(query_snapshot, dict) else {}
-                    execution = (
-                        query_snapshot.get("execution")
-                        if isinstance(query_snapshot.get("execution"), dict)
-                        else {}
-                    )
-                    fields.update(
-                        str(field)
-                        for field in execution.get("columns") or []
-                        if str(field)
-                    )
-                    implementation = (
-                        query_snapshot.get("implementation")
-                        if isinstance(query_snapshot.get("implementation"), dict)
-                        else {}
-                    )
-                    for projection in implementation.get("projection_semantics") or []:
-                        if not isinstance(projection, dict):
-                            continue
-                        projection_fields = projection.get("source_fields") or []
-                        if not isinstance(projection_fields, list):
-                            projection_fields = [projection_fields]
-                        fields.update(
-                            str(field)
-                            for field in [projection.get("alias"), *projection_fields]
-                            if str(field)
-                        )
-                    fields.update(
-                        str(target)
-                        for operation in operation_by_id.values()
-                        if str(operation.get("query_node_id") or "") == query_id
-                        for target in operation.get("targets") or []
-                        if str(target)
-                    )
-                    return fields
-
                 query_fields_by_id = {
-                    query_id: query_fields(query_id)
+                    query_id: self._query_reachable_fields(
+                        query_id,
+                        snapshot.query_snapshots.get(query_id),
+                        operation_by_id,
+                        producers,
+                    )
                     for query_id in successful_query_ids
                 }
                 claimed_fields = list(dict.fromkeys(
@@ -5975,6 +6390,43 @@ class PostAnalysisEvidenceCompiler:
             return False
         if output.get("artifact_type") != "report":
             return True
+        boundary_ids = {
+            str(item)
+            for item in output.get("boundary_operation_node_ids") or []
+            if str(item)
+        }
+        operations = [
+            operation
+            for operation in lineage_index.get("operation_nodes") or []
+            if str(operation.get("operation_node_id") or "") in boundary_ids
+        ]
+        if operations and all(
+            operation.get("semantic_kind") == "presentation"
+            and not str(operation.get("query_node_id") or "")
+            for operation in operations
+        ):
+            return False
+        candidate_ids = {
+            str(item)
+            for item in output.get("candidate_operation_node_ids") or []
+            if str(item)
+        }
+        candidate_operations = [
+            operation
+            for operation in lineage_index.get("operation_nodes") or []
+            if str(operation.get("operation_node_id") or "") in candidate_ids
+        ]
+        parameter_controlled = any(
+            {"analysis_parameters", "get_analysis_parameters"}.intersection(
+                str(item) for item in operation.get("loads") or []
+            )
+            for operation in candidate_operations
+        )
+        if parameter_controlled and not any(
+            str(operation.get("query_node_id") or "")
+            for operation in candidate_operations
+        ):
+            return False
         # Report output nodes only exist for numeric values located through an
         # AST-owned render template. If lineage is incomplete, retain the slot
         # as unresolved so compilation cannot report a false complete status.
@@ -6015,6 +6467,36 @@ class PostAnalysisEvidenceCompiler:
                 target_name = str(target or "").strip()
                 if target_name:
                     producers.setdefault(target_name, []).append(operation_id)
+
+        def container_field_signature(target: Any) -> tuple[str, str] | None:
+            """Return ``(container, field)`` for dict/list field access.
+
+            Renderers commonly keep grouped values in a list of dictionaries,
+            then interpolate ``summary[index]['count']`` into the report. The
+            write side is represented as ``summary['count'] = value`` by the
+            lineage index.  Their shared container/field identity is a local,
+            syntax-level fact even though the list index is dynamic.
+            """
+            try:
+                expression = ast.parse(str(target or ""), mode="eval").body
+            except SyntaxError:
+                return None
+            if not isinstance(expression, ast.Subscript):
+                return None
+            field_node = expression.slice
+            if not (
+                isinstance(field_node, ast.Constant)
+                and isinstance(field_node.value, str)
+                and str(field_node.value).strip()
+            ):
+                return None
+            container = expression.value
+            while isinstance(container, ast.Subscript):
+                container = container.value
+            if not isinstance(container, ast.Name):
+                return None
+            return container.id, str(field_node.value).strip()
+
         for output in lineage_index.get("output_nodes") or []:
             ambiguous_input = bool(output.get("ambiguous_calculation_boundary"))
             if ambiguous_input and output.get("artifact_type") != "report":
@@ -6033,6 +6515,44 @@ class PostAnalysisEvidenceCompiler:
             operation_ids = list(dict.fromkeys(
                 str(item) for item in output.get("candidate_operation_node_ids") or [] if str(item)
             ))
+            # Loop-rendered report fields can have an exact AST expression and
+            # a calculation boundary while the broad candidate walk misses its
+            # query list.  Derive that closure from the expression/boundary
+            # operations themselves.  This is a local proof, not an LLM
+            # recovery path, and keeps each rendered field's own boundary.
+            direct_operation_ids = list(dict.fromkeys(
+                str(item)
+                for item in output.get("direct_operation_node_ids") or []
+                if str(item) in operation_by_id
+            ))
+            if not boundaries:
+                output_signature = container_field_signature(output.get("field"))
+                if output_signature is not None:
+                    boundaries = list(dict.fromkeys(
+                        operation_id
+                        for operation_id, operation in operation_by_id.items()
+                        if any(
+                            container_field_signature(target) == output_signature
+                            for target in operation.get("targets") or []
+                        )
+                        and LineageIndexer._query_dependencies(
+                            [operation_id], operation_by_id, producers
+                        )
+                    ))
+            if not query_ids:
+                query_ids = list(dict.fromkeys(
+                    query_id
+                    for operation_id in [*direct_operation_ids, *boundaries]
+                    for query_id in LineageIndexer._query_dependencies(
+                        [operation_id], operation_by_id, producers
+                    )
+                    if str(query_id)
+                ))
+            if not operation_ids:
+                operation_ids = list(dict.fromkeys([
+                    *boundaries,
+                    *direct_operation_ids,
+                ]))
             if not boundaries or not query_ids or not operation_ids:
                 continue
             if PostAnalysisEvidenceCompiler._is_grouping_dimension_output(output, lineage_index):
@@ -6616,6 +7136,332 @@ class PostAnalysisEvidenceCompiler:
             ))
         return EvidencePlan(metrics=metrics)
 
+    @classmethod
+    def _unresolved_structured_outputs(
+        cls,
+        lineage_index: dict[str, Any],
+        structured_plan: EvidencePlan,
+    ) -> list[dict[str, Any]]:
+        planned_ids = {
+            str(output_id)
+            for metric in structured_plan.metrics
+            for output_id in metric.output_node_ids
+            if str(output_id)
+        }
+        return [
+            output
+            for output in lineage_index.get("output_nodes") or []
+            if output.get("artifact_type") in {"chart", "table"}
+            and str(output.get("output_node_id") or "") not in planned_ids
+            and not cls._is_grouping_dimension_output(output, lineage_index)
+        ]
+
+    def _structured_resolver_payload(
+        self,
+        snapshot: AnalysisExecutionSnapshot,
+        lineage_index: dict[str, Any],
+        outputs: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        referenced_query_ids = {
+            str(query_id)
+            for output in outputs
+            for query_id in output.get("candidate_query_node_ids") or []
+            if str(query_id)
+        }
+        query_catalog = self._planner_query_catalog(lineage_index)
+        if referenced_query_ids:
+            query_catalog = [
+                item
+                for item in query_catalog
+                if str(item.get("query_node_id") or "") in referenced_query_ids
+            ]
+        return {
+            "user_query": snapshot.user_query,
+            "analysis_code_with_lines": self._line_numbered_code(
+                snapshot.generated_code
+            ),
+            "structured_output_catalog": [
+                {
+                    "output_node_id": output.get("output_node_id"),
+                    "artifact_type": output.get("artifact_type"),
+                    "artifact_index": output.get("artifact_index"),
+                    "field": output.get("field"),
+                    "label": output.get("label"),
+                    "source_frame": output.get("source_frame"),
+                    "lineage_fields": output.get("lineage_fields") or [],
+                    "display_unit": output.get("display_unit_hint") or "",
+                    "candidate_query_node_ids": (
+                        output.get("candidate_query_node_ids") or []
+                    ),
+                }
+                for output in outputs
+            ],
+            "query_catalog": query_catalog,
+        }
+
+    def _invoke_structured_planner(self, payload: dict[str, Any]) -> EvidencePlan:
+        runtime_config = create_runtime_config()
+        model = create_data_insight_model(runtime_config)
+        if runtime_config.adapter == "openai":
+            model = model.bind(response_format={"type": "json_object"})
+        code = str(payload.get("analysis_code_with_lines") or "")
+        facts = {
+            key: value
+            for key, value in payload.items()
+            if key != "analysis_code_with_lines"
+        }
+        messages = [
+            SystemMessage(STRUCTURED_EVIDENCE_RESOLVER_PROMPT),
+            HumanMessage(_stable_json(facts)),
+            HumanMessage("Successful Python code:\n" + code),
+        ]
+        last_error: Exception | None = None
+        for attempt in range(2):
+            response_text = ""
+            try:
+                response = model.invoke(messages)
+                content = getattr(response, "content", response)
+                response_text = (
+                    "".join(
+                        str(item.get("text") or "")
+                        if isinstance(item, dict)
+                        else str(item)
+                        for item in content
+                    )
+                    if isinstance(content, list)
+                    else str(content or "")
+                )
+                plan = EvidencePlan.model_validate(
+                    self._canonicalize_planner_payload(
+                        _extract_json_object(response_text)
+                    )
+                )
+                allowed_ids = {
+                    str(item.get("output_node_id") or "")
+                    for item in payload.get("structured_output_catalog") or []
+                    if str(item.get("output_node_id") or "")
+                }
+                claims = [
+                    str(output_id)
+                    for metric in plan.metrics
+                    for output_id in metric.output_node_ids
+                    if str(output_id)
+                ] + [
+                    str(item.output_node_id)
+                    for item in plan.unresolved_outputs
+                    if str(item.output_node_id)
+                ]
+                unknown = set(claims) - allowed_ids
+                duplicate = {item for item in claims if claims.count(item) > 1}
+                missing = allowed_ids - set(claims)
+                invalid_metrics = [
+                    index
+                    for index, metric in enumerate(plan.metrics)
+                    if not metric.output_node_ids
+                    or not metric.calculation_source_refs
+                    or not metric.claimed_query_node_ids
+                    or not metric.claimed_metric_fields
+                ]
+                if unknown or duplicate or missing or invalid_metrics:
+                    raise ValueError(
+                        "invalid structured resolver coverage: "
+                        f"unknown={sorted(unknown)} duplicate={sorted(duplicate)} "
+                        f"missing={sorted(missing)} invalid_metrics={invalid_metrics}"
+                    )
+                return plan
+            except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+                last_error = exc
+                if attempt == 0:
+                    if response_text:
+                        messages.append(AIMessage(response_text))
+                    messages.append(HumanMessage(
+                        "Repair only the JSON contract and catalog coverage. "
+                        + str(exc)[:1000]
+                    ))
+                    continue
+                raise
+        raise RuntimeError(f"Structured Evidence resolver failed: {last_error}")
+
+    def _materialize_structured_recovery_plan(
+        self,
+        snapshot: AnalysisExecutionSnapshot,
+        lineage_index: dict[str, Any],
+        plan: EvidencePlan,
+        outputs: list[dict[str, Any]],
+    ) -> tuple[EvidencePlan, dict[str, dict[str, Any]]]:
+        allowed_outputs = {
+            str(output.get("output_node_id") or ""): output
+            for output in outputs
+            if str(output.get("output_node_id") or "")
+        }
+        successful_query_ids = {
+            str(query.get("query_node_id") or "")
+            for query in lineage_index.get("query_nodes") or []
+            if str(query.get("query_node_id") or "")
+        }
+        resolved: list[PlannedMetric] = []
+        unresolved = list(plan.unresolved_outputs)
+        candidates: dict[str, dict[str, Any]] = {}
+        claimed_outputs: set[str] = {
+            str(item.output_node_id)
+            for item in unresolved
+            if str(item.output_node_id)
+        }
+
+        for metric_index, metric in enumerate(plan.metrics):
+            output_ids = [
+                str(output_id)
+                for output_id in metric.output_node_ids
+                if str(output_id) in allowed_outputs
+                and str(output_id) not in claimed_outputs
+            ]
+            if not output_ids:
+                continue
+            operation_by_id = {
+                str(item.get("operation_node_id") or ""): item
+                for item in lineage_index.get("operation_nodes") or []
+                if str(item.get("operation_node_id") or "")
+            }
+            recovered, errors = self._resolve_calculation_source_refs(
+                snapshot.generated_code,
+                lineage_index,
+                metric.calculation_source_refs,
+            )
+            operation_by_id = {
+                str(item.get("operation_node_id") or ""): item
+                for item in lineage_index.get("operation_nodes") or []
+                if str(item.get("operation_node_id") or "")
+            }
+            producers: dict[str, list[str]] = {}
+            for operation_id, operation in operation_by_id.items():
+                for target in operation.get("targets") or []:
+                    target_name = str(target or "").strip()
+                    if target_name:
+                        producers.setdefault(target_name, []).append(operation_id)
+            operation_ids = list(dict.fromkeys([
+                *[
+                    str(item)
+                    for item in metric.operation_node_ids
+                    if str(item) in operation_by_id
+                ],
+                *recovered,
+            ]))
+            derived_query_ids = list(dict.fromkeys(
+                query_id
+                for operation_id in operation_ids
+                for query_id in LineageIndexer._query_dependencies(
+                    [operation_id], operation_by_id, producers
+                )
+                if query_id in successful_query_ids
+            ))
+            claimed_query_ids = list(dict.fromkeys(
+                str(item)
+                for item in metric.claimed_query_node_ids
+                if str(item) in successful_query_ids
+            ))
+            metric_fields = list(dict.fromkeys(
+                str(item).strip()
+                for item in (
+                    metric.claimed_metric_fields
+                    or [
+                        field
+                        for output_id in output_ids
+                        for field in (
+                            allowed_outputs[output_id].get("lineage_fields")
+                            or [allowed_outputs[output_id].get("field")]
+                        )
+                    ]
+                )
+                if str(item).strip()
+            ))
+            query_ids = derived_query_ids
+            verification = "verified"
+            if derived_query_ids and claimed_query_ids and not set(
+                derived_query_ids
+            ).issubset(set(claimed_query_ids)):
+                errors.append("claimed queries contradict recovered dependencies")
+            if not query_ids and metric.attestation_confidence == "high":
+                query_ids = claimed_query_ids
+                verification = "attested"
+            known_fields = {
+                field
+                for query_id in query_ids
+                for field in self._query_reachable_fields(
+                    query_id,
+                    snapshot.query_snapshots.get(query_id),
+                    operation_by_id,
+                    producers,
+                )
+            }
+            unknown_fields = set(metric_fields) - known_fields
+            if (
+                errors
+                or not operation_ids
+                or not query_ids
+                or not metric_fields
+                or unknown_fields
+            ):
+                reason = "; ".join([
+                    *errors,
+                    *( [f"unknown query fields: {sorted(unknown_fields)}"] if unknown_fields else [] ),
+                    *( ["no calculation operation"] if not operation_ids else [] ),
+                    *( ["no verified query"] if not query_ids else [] ),
+                ])
+                unresolved.extend(
+                    UnresolvedEvidenceOutput(
+                        output_node_id=output_id,
+                        reason=reason or "Structured calculation boundary is not provable.",
+                    )
+                    for output_id in output_ids
+                )
+                claimed_outputs.update(output_ids)
+                continue
+            calculation_id = (
+                f"structured_recovery_{metric_index}_"
+                f"{_digest(_stable_json(output_ids), 10)}"
+            )
+            recovered_metric = metric.model_copy(update={
+                "calculation_id": calculation_id,
+                "output_node_ids": output_ids,
+                "operation_node_ids": operation_ids,
+                "query_node_ids": query_ids,
+                "metric_source_fields": metric_fields,
+                "lineage_verification": verification,
+                "display_unit": (
+                    metric.display_unit
+                    or str(allowed_outputs[output_ids[0]].get("display_unit_hint") or "")
+                ),
+            })
+            resolved.append(recovered_metric)
+            candidates[calculation_id] = {
+                "calculation_id": calculation_id,
+                "output_node_ids": output_ids,
+                "operation_node_ids": operation_ids,
+                "boundary_operation_node_ids": operation_ids,
+                "query_node_ids": query_ids,
+                "metric_source_fields": metric_fields,
+                "recovery_candidate": True,
+                "semantic_scope": False,
+                "ambiguous_input": False,
+                "parameter_bindings": metric.parameter_bindings,
+            }
+            claimed_outputs.update(output_ids)
+
+        unresolved.extend(
+            UnresolvedEvidenceOutput(
+                output_node_id=output_id,
+                reason="Structured resolver did not classify this output.",
+            )
+            for output_id in allowed_outputs
+            if output_id not in claimed_outputs
+        )
+        return EvidencePlan(
+            metrics=resolved,
+            unresolved_outputs=self._normalize_unresolved_report_outputs(
+                EvidencePlan(unresolved_outputs=unresolved)
+            ).unresolved_outputs,
+        ), candidates
+
     @staticmethod
     def _planner_candidate_payloads(
         candidates: dict[str, dict[str, Any]],
@@ -6828,6 +7674,11 @@ class PostAnalysisEvidenceCompiler:
                 "heading": str(context.get("heading") or representative.get("label") or ""),
                 "column_label": str(context.get("column_label") or representative.get("label") or ""),
                 "line": str(context.get("line") or ""),
+                "rendered_context": str(
+                    representative.get("rendered_context")
+                    or context.get("line")
+                    or ""
+                ),
                 "occurrence_count": len(outputs),
                 "kind": "markdown_table_column" if len(outputs) > 1 else "report_span",
             })
@@ -6905,6 +7756,7 @@ class PostAnalysisEvidenceCompiler:
         calculation_candidates: dict[str, dict[str, Any]],
         *,
         recovery_only: bool = False,
+        excluded_output_ids: set[str] | None = None,
     ) -> dict[str, Any]:
         """Build one normalized fact graph without repeating operations or outputs."""
         expanded = self._planner_candidate_payloads(calculation_candidates, lineage_index)
@@ -6973,6 +7825,9 @@ class PostAnalysisEvidenceCompiler:
             for output_id in (candidate.get("local_lineage_hints") or {})
             if str(output_id)
         }
+        # The compile pass may already have proven report slots from the
+        # calculation graph. Their source anchors are not recovery work.
+        locally_verified_report_output_ids.update(excluded_output_ids or set())
         # The planner is a semantic recovery step, not a second classifier for
         # every already-proven report slot. Keep only rendered numeric outputs
         # that the local lineage graph could not bind to a calculation boundary.
@@ -8309,7 +9164,10 @@ class PostAnalysisEvidenceCompiler:
             selected_metric_fields = {
                 str(item).strip() for item in metric.metric_source_fields if str(item).strip()
             }
-            if not selected_metric_fields.issubset(allowed_metric_fields):
+            if (
+                metric.lineage_verification != "attested"
+                and not selected_metric_fields.issubset(allowed_metric_fields)
+            ):
                 errors.append(
                     f"metrics[{metric_index}] references fields outside calculation candidate: "
                     f"{sorted(selected_metric_fields - allowed_metric_fields)}"

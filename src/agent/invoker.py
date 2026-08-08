@@ -40,6 +40,12 @@ UNEXPECTED_KWARG_PATTERN = re.compile(
     r"(?P<owner>[A-Za-z_][A-Za-z0-9_]*)\.__init__\(\) got an unexpected keyword argument '(?P<arg>[^']+)'"
 )
 MISSING_DEP_PATTERN = re.compile(r"No module named '(?P<module>[^']+)'")
+UNRESOLVED_COLUMN_PATTERNS = (
+    re.compile(r"Column ['`\"](?P<field>[^'`\"]+)['`\"] cannot be resolved", re.IGNORECASE),
+    re.compile(r"Unknown column ['`\"](?P<field>[^'`\"]+)['`\"]", re.IGNORECASE),
+    re.compile(r"column ['`\"](?P<field>[^'`\"]+)['`\"] does not exist", re.IGNORECASE),
+    re.compile(r"Referenced column ['`\"](?P<field>[^'`\"]+)['`\"] not found", re.IGNORECASE),
+)
 RELATIVE_SHORT_TIME_PATTERN = re.compile(
     r"(近|最近|过去)\s*(?P<amount>\d+)\s*(?P<unit>分钟|分|小时|时|h|H|min|mins|minute|minutes)"
 )
@@ -1764,6 +1770,26 @@ def _build_failed_pattern_hints(executions: list[Any]) -> list[str]:
                 hints.append(hint)
             continue
 
+        unresolved_columns = {
+            match.group('field').strip()
+            for pattern in UNRESOLVED_COLUMN_PATTERNS
+            for match in pattern.finditer(error_message)
+            if match.group('field').strip()
+        }
+        if unresolved_columns:
+            fields = '、'.join(f'`{field}`' for field in sorted(unresolved_columns))
+            hint = (
+                f'当前真实数据源无法解析字段 {fields}。下一版必须从当前 Schema 的实际字段中重建所有引用这些字段的查询、计算和图表；'
+                '不要重复该字段，也不要仅删除字段后把缺失含义静默当成 0。'
+                '若当前代码无法从已知 Schema 确定可替代字段，下一步应先生成 execution_intent="probe"：'
+                '对失败查询涉及的每个不确定数据源使用不含业务字段投影的轻量 SELECT * ... LIMIT 1，'
+                '在 diagnostics 中返回实际 columns 和不可用字段，再基于该结果生成完整 analysis。'
+            )
+            if hint not in seen:
+                seen.add(hint)
+                hints.append(hint)
+            continue
+
         unexpected_kwarg_match = UNEXPECTED_KWARG_PATTERN.search(error_message)
         if unexpected_kwarg_match:
             owner = unexpected_kwarg_match.group('owner')
@@ -1819,6 +1845,41 @@ def _extract_execution_payload(execution: Any) -> dict[str, Any]:
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _build_structured_execution_feedback(executions: list[Any]) -> list[dict[str, Any]]:
+    """Carry bounded tool contracts into the next Runtime ReAct turn."""
+    feedback: list[dict[str, Any]] = []
+    for execution in reversed(executions):
+        if getattr(execution, 'execution_status', '') == 'success':
+            continue
+        payload = _extract_execution_payload(execution)
+        retry_type = str(
+            payload.get('retry_type') or payload.get('error_type') or ''
+        ).strip()
+        diagnostics = payload.get('diagnostics')
+        repair_instructions = payload.get('repair_instructions')
+        if not retry_type and not isinstance(diagnostics, dict) and not isinstance(repair_instructions, list):
+            continue
+        item: dict[str, Any] = {}
+        if retry_type:
+            item['retry_type'] = retry_type
+        message = str(payload.get('message') or getattr(execution, 'error_message', '') or '').strip()
+        if message:
+            item['message'] = _clip_retry_text(message, 700)
+        if isinstance(diagnostics, dict) and diagnostics:
+            item['diagnostics'] = diagnostics
+        if isinstance(repair_instructions, list) and repair_instructions:
+            item['repair_instructions'] = [
+                _clip_retry_text(str(value), 500)
+                for value in repair_instructions[:5]
+                if str(value).strip()
+            ]
+        if item:
+            feedback.append(item)
+        if len(feedback) >= RETRY_LATEST_ERROR_LIMIT:
+            break
+    return list(reversed(feedback))
 
 
 def _execution_has_time_series_empty_source_error(execution: Any) -> bool:
@@ -2048,6 +2109,9 @@ def _build_analysis_recovery_instruction(
         if isinstance(latest_probe_feedback_payload.get('diagnostics'), dict)
         else {}
     )
+    structured_execution_feedback = _build_structured_execution_feedback(
+        executions
+    )
     exact_probe_candidate_key, exact_probe_candidate = _pick_exact_probe_candidate(
         runtime.turn.user_query,
         latest_probe_diagnostics,
@@ -2059,9 +2123,9 @@ def _build_analysis_recovery_instruction(
     ]
     if latest_repair_target:
         lines.extend([
-            '最近失败代码已完整保存在不可变执行记录中，不要根据截断预览重写整份分析。',
-            '局部技术错误应再次调用 execute_python：令 code=""，使用下面的 base_execution_id，'
-            '并按 code_error_context 的原始行号提交非重叠 patches；后端会合成完整代码并保留未修改范围。',
+            '最近失败代码已完整保存在不可变执行记录中；下面的引用和原始行号可用于理解失败位置。',
+            '只有独立的局部 API 参数、单个图表字段映射或语法拼写错误，才适合令 code="" 并使用 base_execution_id + patches 修补。',
+            '如果错误影响数据源字段、查询范围、JOIN、聚合粒度、计算变量、报告求值或最终产物结构，必须在当前完整洞察语义下重新提交完整 code，不能依赖局部 patch 保留旧数据流。',
             json.dumps(latest_repair_target, ensure_ascii=False),
         ])
     explicit_time_range_guard = getattr(runtime, 'short_term_memory', {}).get('explicit_time_range_guard', {})
@@ -2083,6 +2147,11 @@ def _build_analysis_recovery_instruction(
     if latest_errors:
         lines.append('最近的执行错误如下：')
         lines.extend(f'- {item}' for item in latest_errors)
+    if structured_execution_feedback:
+        lines.extend([
+            '最近工具返回的结构化执行反馈如下。它是下一次修复的事实依据；必须消费其中的 diagnostics 和 repair_instructions，不能只根据错误摘要猜测。',
+            json.dumps(structured_execution_feedback, ensure_ascii=False),
+        ])
     if latest_error_types:
         lines.append(f'最近的结构化错误类型：{", ".join(latest_error_types)}。')
 
@@ -2109,7 +2178,7 @@ def _build_analysis_recovery_instruction(
         lines.extend(f'- {item}' for item in failed_pattern_hints)
 
     lines.extend([
-        '请基于上一版失败代码做最小必要修补，不要整段重写与当前错误无关的逻辑。',
+        '修复应保留已验证正确的业务口径和产物意图；但当错误影响数据流或结果表达时，应重建受影响的完整代码路径，不要用局部替换留下不一致的旧变量或占位文本。',
         '修复技术错误时必须保持当前用户问题的输出语言；不得翻译或切换上一版已经形成的报告、图表和表格语言。',
         '请直接修正完整 Python 代码并再次调用 execute_python。',
     ])
