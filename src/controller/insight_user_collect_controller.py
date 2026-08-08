@@ -26,7 +26,7 @@ class InsightUserCollectController(BaseController):
 
     def _get_authorization(self) -> str:
         user_context = get_current_user_context()
-        return user_context.token if user_context else ''
+        return user_context.platform_authorization if user_context else ''
 
     def list_collects(self):
         """按用户维度查询当前用户全部收藏。"""

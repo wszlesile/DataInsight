@@ -95,7 +95,7 @@ class InsightNamespaceController(BaseController):
 
         try:
             result = supos_kernel_api.fetch_uns_tree_nodes(
-                authorization=user_context.token if user_context else '',
+                authorization=user_context.platform_authorization if user_context else '',
                 parent_id=data.get('parentId', '0'),
                 page_no=data.get('pageNo', 1),
                 page_size=data.get('pageSize', 100),
@@ -157,14 +157,14 @@ class InsightNamespaceController(BaseController):
             if user_context:
                 ts_query_source = (
                     user_context.database_conn_info.ts_query_source
-                    or supos_kernel_api.ensure_ts_query_source(user_context.token)
+                    or supos_kernel_api.ensure_ts_query_source(user_context.platform_authorization)
                 )
             service = InsightNsRelDatasourceService(session)
             result = service.import_uns_nodes_to_namespace(
                 insight_namespace_id=namespace_id,
                 insight_conversation_id=insight_conversation_id,
                 nodes=nodes,
-                authorization=user_context.token if user_context else '',
+                authorization=user_context.platform_authorization if user_context else '',
                 lake_rds_database_name=user_context.database_conn_info.lake_rds_database_name if user_context else '',
                 ts_query_source=ts_query_source,
             )

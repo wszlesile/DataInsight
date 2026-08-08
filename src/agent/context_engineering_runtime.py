@@ -66,7 +66,8 @@ class CustomContext(BaseModel):
     turn_id: int = 0
     user_query: str = ''
     expected_time_range: dict[str, Any] = Field(default_factory=dict)
-    auth_token: str = ''
+    platform_authorization: str = ''
+    fedquery_authorization: str = ''
     database_conn_info: dict[str, Any] = Field(default_factory=dict)
     active_datasource_snapshot: dict[str, Any] = Field(default_factory=dict)
     analysis_task_id: int | None = None

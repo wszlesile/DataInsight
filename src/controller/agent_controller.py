@@ -50,7 +50,8 @@ def _build_agent_request(data: dict):
         conversation_id=data.get('conversation_id', ''),
         # 用户消息
         user_message=(data.get('user_message') or '').strip(),
-        auth_token=getattr(user_context, 'token', '') or '',
+        platform_authorization=getattr(user_context, 'platform_authorization', '') or '',
+        fedquery_authorization=getattr(user_context, 'fedquery_authorization', '') or '',
         selected_llm_model_id=getattr(user_context, 'selected_llm_model_id', '') or '',
         database_conn_info={
             'host': getattr(database_conn_info, 'host', '') or '',

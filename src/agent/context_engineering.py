@@ -59,7 +59,8 @@ class CustomContext(BaseModel):
     namespace_id: int = 0
     conversation_id: int = 0
     turn_id: int = 0
-    auth_token: str = ''
+    platform_authorization: str = ''
+    fedquery_authorization: str = ''
     database_conn_info: dict[str, Any] = Field(default_factory=dict)
     active_datasource_snapshot: dict[str, Any] = Field(default_factory=dict)
     analysis_parameters_override: dict[str, Any] = Field(default_factory=dict)

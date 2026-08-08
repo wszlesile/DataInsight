@@ -27,7 +27,7 @@ class LlmController(BaseController):
         api_key = (Config.SUPOS_LLM_GATEWAY_API_KEY or '').strip()
         if api_key:
             return api_key if api_key.startswith('Bearer ') else f'Bearer {api_key}'
-        return user_context.token if user_context else ''
+        return user_context.platform_authorization if user_context else ''
 
     def list_models(self):
         user_context = get_current_user_context()
@@ -71,7 +71,10 @@ class LlmController(BaseController):
 
             if user_context:
                 user_context.selected_llm_model_id = model_id
-                user_auth_service.invalidate_user_context(user_context.token)
+                user_auth_service.invalidate_user_context(
+                    user_context.platform_authorization,
+                    user_context.fedquery_authorization,
+                )
 
             result = service.build_selectable_models(
                 user_context.username if user_context else '',

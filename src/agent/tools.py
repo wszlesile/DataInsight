@@ -7552,7 +7552,8 @@ def _serialize_runtime_user_context(runtime_context: CustomContext | None) -> di
     selected_snapshot = _get_runtime_selected_datasource_snapshot(runtime_context)
     numeric_field_profiles = _build_datasource_numeric_field_profiles(selected_snapshot)
     return {
-        'token': getattr(runtime_context, 'auth_token', '') or '',
+        'platform_authorization': getattr(runtime_context, 'platform_authorization', '') or '',
+        'fedquery_authorization': getattr(runtime_context, 'fedquery_authorization', '') or '',
         'database_conn_info': dict(getattr(runtime_context, 'database_conn_info', {}) or {}),
         'expected_time_range': dict(getattr(runtime_context, 'expected_time_range', {}) or {}),
         'analysis_parameters_override': dict(getattr(runtime_context, 'analysis_parameters_override', {}) or {}),
@@ -7617,7 +7618,8 @@ def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -
     CURRENT_LAST_QUERY_KEY.set('')
     CURRENT_EXECUTION_INTENT.set('')
     conn_info_payload = payload.get('database_conn_info') or {}
-    token = str(payload.get('token') or '').strip()
+    platform_authorization = str(payload.get('platform_authorization') or '').strip()
+    fedquery_authorization = str(payload.get('fedquery_authorization') or '').strip()
     if conn_info_payload:
         supos_kernel_api._database_conn_info = DatabaseConnInfo(
             host=str(conn_info_payload.get('host') or ''),
@@ -7626,14 +7628,14 @@ def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -
             password=str(conn_info_payload.get('password') or ''),
             lake_rds_database_name=str(conn_info_payload.get('lake_rds_database_name') or ''),
             ts_query_source=str(conn_info_payload.get('ts_query_source') or ''),
-            authorization_token=token,
+            authorization_token=fedquery_authorization,
         )
         supos_kernel_api._database_pool = None
         return
 
-    if token:
-        conn_info = supos_kernel_api.get_database_conn_info(token)
-        conn_info.authorization_token = token
+    if platform_authorization:
+        conn_info = supos_kernel_api.get_database_conn_info(platform_authorization)
+        conn_info.authorization_token = fedquery_authorization
         supos_kernel_api._database_pool = None
 
 

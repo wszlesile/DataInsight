@@ -112,7 +112,8 @@ class AgentRequest:
     namespace_id: str
     conversation_id: str
     user_message: str
-    auth_token: str = ''
+    platform_authorization: str = ''
+    fedquery_authorization: str = ''
     selected_llm_model_id: str = ''
     database_conn_info: dict[str, Any] | None = None
 
@@ -610,7 +611,8 @@ def _build_agent_context(
         turn_id=runtime.turn.id,
         user_query=user_query,
         expected_time_range=_build_expected_time_range_from_user_query(user_query),
-        auth_token=agent_request.auth_token or '',
+        platform_authorization=agent_request.platform_authorization or '',
+        fedquery_authorization=agent_request.fedquery_authorization or '',
         database_conn_info=dict(agent_request.database_conn_info or {}),
         active_datasource_snapshot=dict(
             preparation.prompt_snapshot()
@@ -2914,7 +2916,8 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]
 def _build_rerun_agent_request(
     username: str,
     runtime: ConversationRunContext,
-    auth_token: str = '',
+    platform_authorization: str = '',
+    fedquery_authorization: str = '',
     selected_llm_model_id: str = '',
     database_conn_info: dict[str, Any] | None = None,
     database_context: dict[str, Any] | None = None,
@@ -2926,7 +2929,8 @@ def _build_rerun_agent_request(
         namespace_id=str(runtime.conversation.insight_namespace_id),
         conversation_id=str(runtime.conversation.id),
         user_message=runtime.turn.user_query,
-        auth_token=auth_token or '',
+        platform_authorization=platform_authorization or '',
+        fedquery_authorization=fedquery_authorization or '',
         selected_llm_model_id=selected_llm_model_id or '',
         database_conn_info=dict(database_payload or {}),
     )
@@ -2936,7 +2940,8 @@ def stream_rerun_turn(
     username: str,
     conversation_id: Any,
     turn_id: Any,
-    auth_token: str = '',
+    platform_authorization: str = '',
+    fedquery_authorization: str = '',
     selected_llm_model_id: str = '',
     database_conn_info: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
@@ -2955,7 +2960,8 @@ def stream_rerun_turn(
     agent_request = _build_rerun_agent_request(
         username=username,
         runtime=runtime,
-        auth_token=auth_token,
+        platform_authorization=platform_authorization,
+        fedquery_authorization=fedquery_authorization,
         selected_llm_model_id=selected_llm_model_id,
         database_conn_info=database_conn_info,
     )

@@ -26,7 +26,8 @@ class RerunRequestContextTestCase(unittest.TestCase):
         request = _build_rerun_agent_request(
             username="wangshuzheng",
             runtime=runtime,
-            auth_token="Bearer test-token",
+            platform_authorization="Bearer platform-token",
+            fedquery_authorization="Bearer fedquery-token",
             database_context={
                 "host": "127.0.0.1",
                 "port": "5432",
@@ -40,7 +41,8 @@ class RerunRequestContextTestCase(unittest.TestCase):
         self.assertEqual(request.namespace_id, "18")
         self.assertEqual(request.conversation_id, "105")
         self.assertEqual(request.user_message, "前天一共有多少个报警？看一下明细")
-        self.assertEqual(request.auth_token, "Bearer test-token")
+        self.assertEqual(request.platform_authorization, "Bearer platform-token")
+        self.assertEqual(request.fedquery_authorization, "Bearer fedquery-token")
         self.assertEqual(request.database_context["lake_rds_database_name"], "lake_db")
 
 

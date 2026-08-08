@@ -353,6 +353,10 @@ class SuposKernelApi:
                 if cursor is not None:
                     cursor.close()
         self._register_time_text_casts(dbapi_connection)
+        authorization = (database_conn_info.authorization_token or '').strip()
+        if authorization:
+            with dbapi_connection.cursor() as cursor:
+                cursor.execute('SET supos_authorization TO %s', (authorization,))
         return dbapi_connection
 
     def _register_time_text_casts(self, dbapi_connection) -> None:

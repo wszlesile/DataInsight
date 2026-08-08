@@ -53,11 +53,12 @@ class InsightNsConversationController(BaseController):
         user_context = get_current_user_context()
         return user_context.username if user_context else 'anonymous'
 
-    def _build_request_runtime_context(self) -> tuple[str, str, dict[str, Any]]:
+    def _build_request_runtime_context(self) -> tuple[str, str, str, dict[str, Any]]:
         user_context = get_current_user_context()
         database_conn_info = getattr(user_context, 'database_conn_info', None)
         return (
-            getattr(user_context, 'token', '') or '',
+            getattr(user_context, 'platform_authorization', '') or '',
+            getattr(user_context, 'fedquery_authorization', '') or '',
             getattr(user_context, 'selected_llm_model_id', '') or '',
             {
                 'host': getattr(database_conn_info, 'host', '') or '',
@@ -295,7 +296,7 @@ class InsightNsConversationController(BaseController):
         if not isinstance(analysis_parameters, dict):
             return self.error_response('analysis_parameters 必须是 JSON 对象', 400)
         username = self._get_username()
-        auth_token, _, database_conn_info = self._build_request_runtime_context()
+        platform_authorization, fedquery_authorization, _, database_conn_info = self._build_request_runtime_context()
         session = SessionLocal()
         try:
             try:
@@ -306,7 +307,8 @@ class InsightNsConversationController(BaseController):
                     execution_id=execution_id,
                     analysis_parameters=analysis_parameters,
                     runtime_user_context={
-                        'token': auth_token,
+                        'platform_authorization': platform_authorization,
+                        'fedquery_authorization': fedquery_authorization,
                         'database_conn_info': database_conn_info,
                     },
                 )
@@ -434,14 +436,15 @@ class InsightNsConversationController(BaseController):
         """在同一轮次内流式重跑分析，不新增新轮次。"""
         from agent.invoker import stream_rerun_turn
         username = self._get_username()
-        auth_token, selected_llm_model_id, database_conn_info = self._build_request_runtime_context()
+        platform_authorization, fedquery_authorization, selected_llm_model_id, database_conn_info = self._build_request_runtime_context()
 
         def generate():
             for event in stream_rerun_turn(
                 username=username,
                 conversation_id=conversation_id,
                 turn_id=turn_id,
-                auth_token=auth_token,
+                platform_authorization=platform_authorization,
+                fedquery_authorization=fedquery_authorization,
                 selected_llm_model_id=selected_llm_model_id,
                 database_conn_info=database_conn_info,
             ):
@@ -454,7 +457,7 @@ class InsightNsConversationController(BaseController):
         from agent.invoker import AgentRequest
 
         username = self._get_username()
-        auth_token, selected_llm_model_id, database_conn_info = self._build_request_runtime_context()
+        platform_authorization, fedquery_authorization, selected_llm_model_id, database_conn_info = self._build_request_runtime_context()
         session = SessionLocal()
         try:
             try:
@@ -482,7 +485,8 @@ class InsightNsConversationController(BaseController):
                 namespace_id=str(runtime.conversation.insight_namespace_id),
                 conversation_id=str(runtime.conversation.id),
                 user_message=runtime.turn.user_query,
-                auth_token=auth_token,
+                platform_authorization=platform_authorization,
+                fedquery_authorization=fedquery_authorization,
                 selected_llm_model_id=selected_llm_model_id,
                 database_conn_info=database_conn_info,
             )

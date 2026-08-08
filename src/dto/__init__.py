@@ -38,6 +38,7 @@ class DatabaseConnInfo:
     password: str = ''
     lake_rds_database_name: str = ''
     ts_query_source: str = ''
+    # Gateway converts the browser ticket to this JWT for FedQuery sessions.
     authorization_token: str = ''
 
     def is_ready(self) -> bool:
@@ -61,8 +62,12 @@ class UserContext:
     staff_name: str
     # 用户编码。
     user_code: str
-    # 当前认证 token。
-    token: str
+    # Original browser ticket preserved by the gateway in ``origin-token``.
+    # It is used only for platform HTTP APIs through SUPOS_GATEWAY.
+    platform_authorization: str
+    # Gateway-issued JWT received in ``Authorization``. It is used only for
+    # FedQuery PostgreSQL sessions.
+    fedquery_authorization: str = ''
     # 当前用户选择的 LLM provider。
     selected_llm_provider: str = 'supos_llm_gateway'
     # 当前用户选择的 LLM model id。
@@ -74,7 +79,8 @@ class UserContext:
     def from_auth_response(
         cls,
         data: dict,
-        token: str,
+        platform_authorization: str,
+        fedquery_authorization: str = '',
         database_conn_info: DatabaseConnInfo | None = None,
     ) -> 'UserContext':
         """从认证接口响应中构造用户上下文。"""
@@ -85,7 +91,8 @@ class UserContext:
             staff_id=str(user_session.get('staffId', '')),
             staff_name=user_session.get('staffName', ''),
             user_code=data.get('userCode', ''),
-            token=token,
+            platform_authorization=platform_authorization,
+            fedquery_authorization=fedquery_authorization,
             database_conn_info=database_conn_info or DatabaseConnInfo(),
         )
 
