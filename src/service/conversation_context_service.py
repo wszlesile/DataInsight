@@ -1163,12 +1163,16 @@ class ConversationContextService:
         """构造一条写入会话和轮次快照中的数据源摘要。"""
         config_json = safe_json_loads(datasource.datasource_config_json, {})
         datasource_type = normalize_datasource_type(datasource.datasource_type)
+        uns_node_id = str(datasource.uns_node_id or '').strip()
         payload = {
             "datasource_id": datasource.id,
             "datasource_type": datasource_type,
             "datasource_name": datasource.datasource_name,
             "datasource_identifier": extract_datasource_identifier(datasource, config_json),
             "metadata_schema": extract_datasource_schema(datasource, config_json),
+            # Selection routing needs source provenance, but runtime analysis does
+            # not need the physical UNS identifier in its prompt context.
+            "selection_origin": "uns" if uns_node_id else "external",
         }
         if datasource_type == "local_file":
             payload["recommended_loader"] = recommend_local_file_loader(

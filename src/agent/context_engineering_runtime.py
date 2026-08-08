@@ -182,6 +182,7 @@ def _build_datasource_payload_item(datasource: InsightDatasource) -> dict[str, A
 def _build_datasource_prompt_item(item: dict[str, Any]) -> dict[str, Any]:
     """Remove duplicated schema indexes while preserving every field definition."""
     payload = copy.deepcopy(item)
+    payload.pop("selection_origin", None)
     schema = payload.get("metadata_schema")
     if not isinstance(schema, dict):
         return payload

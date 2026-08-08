@@ -53,6 +53,60 @@ def test_provider_router_accepts_semantic_alias(monkeypatch):
     assert semantic.DatasourceSelectionProviderRouter.resolve() == 'semantic_center'
 
 
+def test_provider_router_uses_semantic_center_for_uns_only_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        semantic.Config,
+        'DATASOURCE_SELECTION_PROVIDER',
+        'semantic_center',
+    )
+
+    assert semantic.DatasourceSelectionProviderRouter.resolve({
+        'selected_datasource_snapshot': [{
+            'datasource_id': 11,
+            'datasource_type': 'table',
+            'selection_origin': 'uns',
+        }],
+    }) == 'semantic_center'
+
+
+def test_provider_router_forces_local_when_external_source_is_associated(monkeypatch):
+    monkeypatch.setattr(
+        semantic.Config,
+        'DATASOURCE_SELECTION_PROVIDER',
+        'semantic_center',
+    )
+
+    assert semantic.DatasourceSelectionProviderRouter.resolve({
+        'selected_datasource_snapshot': [
+            {
+                'datasource_id': 11,
+                'datasource_type': 'table',
+                'selection_origin': 'uns',
+            },
+            {
+                'datasource_id': 12,
+                'datasource_type': 'table',
+                'selection_origin': 'external',
+            },
+        ],
+    }) == 'local'
+
+
+def test_provider_router_treats_legacy_non_table_source_as_external(monkeypatch):
+    monkeypatch.setattr(
+        semantic.Config,
+        'DATASOURCE_SELECTION_PROVIDER',
+        'semantic_center',
+    )
+
+    assert semantic.DatasourceSelectionProviderRouter.resolve({
+        'selected_datasource_snapshot': [{
+            'datasource_id': 12,
+            'datasource_type': 'local_file',
+        }],
+    }) == 'local'
+
+
 def test_semantic_materialization_uses_node_ids_and_batches_missing_details(monkeypatch):
     existing = SimpleNamespace(uns_node_id='101', id=11)
 

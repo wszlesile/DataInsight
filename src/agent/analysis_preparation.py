@@ -3440,7 +3440,7 @@ class AnalysisPreparationWorkflow:
         return graph.compile()
 
     def run(self) -> PreparationResult:
-        provider = DatasourceSelectionProviderRouter.resolve()
+        provider = DatasourceSelectionProviderRouter.resolve(self.datasource_snapshot)
         try:
             state = self.compile(provider=provider).invoke({
                 "catalog": build_datasource_catalog(self.datasource_snapshot),

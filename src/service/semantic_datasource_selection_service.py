@@ -20,11 +20,19 @@ class DatasourceSelectionProviderRouter:
     """Resolve the active provider behind one replaceable routing boundary."""
 
     @staticmethod
-    def resolve() -> str:
+    def resolve(datasource_snapshot: dict[str, Any] | None = None) -> str:
         configured = str(
             getattr(Config, 'DATASOURCE_SELECTION_PROVIDER', 'local') or 'local'
         ).strip().lower()
         if configured in {'semantic', 'semantic_center', 'lightrag'}:
+            if DatasourceSelectionProviderRouter._contains_external_datasource(
+                datasource_snapshot
+            ):
+                logger.info(
+                    'external datasource is associated with this conversation; '
+                    'routing datasource selection to local provider'
+                )
+                return 'local'
             return 'semantic_center'
         if configured not in {'', 'local'}:
             logger.warning(
@@ -32,6 +40,29 @@ class DatasourceSelectionProviderRouter:
                 configured,
             )
         return 'local'
+
+    @staticmethod
+    def _contains_external_datasource(
+        datasource_snapshot: dict[str, Any] | None,
+    ) -> bool:
+        if not isinstance(datasource_snapshot, dict):
+            return False
+        for item in datasource_snapshot.get('selected_datasource_snapshot') or []:
+            if not isinstance(item, dict):
+                continue
+            origin = str(item.get('selection_origin') or '').strip().lower()
+            if origin:
+                if origin != 'uns':
+                    return True
+                continue
+            # Backward-compatible treatment for snapshots created before the
+            # provenance field existed: non-table sources are always external.
+            datasource_type = str(
+                item.get('datasource_type') or item.get('type') or ''
+            ).strip().lower()
+            if datasource_type in {'local_file', 'minio_file', 'api'}:
+                return True
+        return False
 
 
 @dataclass(frozen=True)
