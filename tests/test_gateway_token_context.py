@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import requests
 from flask import Flask, jsonify
 
 
@@ -14,6 +15,7 @@ from dto import UserContext  # noqa: E402
 from middleware.auth_middleware import init_auth_middleware  # noqa: E402
 from api.SuposkernelApi import SuposKernelApi  # noqa: E402
 from dto import DatabaseConnInfo  # noqa: E402
+from service.user_auth_service import UserAuthService  # noqa: E402
 
 
 def _user_context() -> UserContext:
@@ -85,8 +87,7 @@ def test_health_remains_anonymous_without_gateway_headers():
 
 def test_database_connection_sets_only_fedquery_authorization():
     connection = MagicMock()
-    cursor = MagicMock()
-    connection.cursor.return_value.__enter__.return_value = cursor
+    cursor = connection.cursor.return_value
     api = SuposKernelApi()
     conn_info = DatabaseConnInfo(
         host='127.0.0.1',
@@ -108,3 +109,9 @@ def test_database_connection_sets_only_fedquery_authorization():
         'SET supos_authorization TO %s',
         ('Bearer fedquery-jwt',),
     )
+
+
+def test_auth_transport_error_keeps_the_original_authorization_summary():
+    service = UserAuthService()
+    with patch('service.user_auth_service.requests.get', side_effect=requests.RequestException('offline')):
+        assert service.verify_token('Bearer platform-ticket', 'Bearer fedquery-jwt') is None

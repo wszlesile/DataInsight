@@ -218,6 +218,7 @@ def _load_latest_execution_result(
         latest_execution = ConversationContextService(session).get_latest_execution(
             runtime.turn.id,
             started_at=runtime.turn.started_at,
+            analysis_task_id=runtime.analysis_task_id,
         )
         if latest_execution is None or latest_execution.execution_status != 'success':
             return '', [], []
@@ -545,6 +546,7 @@ def _is_expected_time_no_data_execution(
         executions = ConversationContextService(session).get_turn_executions(
             runtime.turn.id,
             started_at=runtime.turn.started_at,
+            analysis_task_id=runtime.analysis_task_id,
         )
         if not executions:
             return False
@@ -578,6 +580,7 @@ def _build_expected_time_no_data_report(
         executions = ConversationContextService(session).get_turn_executions(
             runtime.turn.id,
             started_at=runtime.turn.started_at,
+            analysis_task_id=runtime.analysis_task_id,
         )
         if executions:
             latest_error = (getattr(executions[-1], 'error_message', '') or '').strip()
@@ -611,8 +614,14 @@ def _build_agent_context(
         turn_id=runtime.turn.id,
         user_query=user_query,
         expected_time_range=_build_expected_time_range_from_user_query(user_query),
-        platform_authorization=agent_request.platform_authorization or '',
-        fedquery_authorization=agent_request.fedquery_authorization or '',
+        platform_authorization=(
+            getattr(agent_request, 'platform_authorization', '')
+            or getattr(agent_request, 'auth_token', '')
+            or ''
+        ),
+        fedquery_authorization=(
+            getattr(agent_request, 'fedquery_authorization', '') or ''
+        ),
         database_conn_info=dict(agent_request.database_conn_info or {}),
         active_datasource_snapshot=dict(
             preparation.prompt_snapshot()
@@ -696,7 +705,14 @@ def _prepare_analysis_context(
             conversation_context=conversation_context,
             runtime_config=runtime_config,
             execution_context={
-                "token": agent_request.auth_token or "",
+                "token": (
+                    getattr(agent_request, "platform_authorization", "")
+                    or getattr(agent_request, "auth_token", "")
+                    or ""
+                ),
+                "fedquery_authorization": (
+                    getattr(agent_request, "fedquery_authorization", "") or ""
+                ),
                 "database_conn_info": dict(agent_request.database_conn_info or {}),
                 "namespace_id": int(runtime.conversation.insight_namespace_id or 0),
                 "conversation_id": int(runtime.conversation.id or 0),
@@ -1431,6 +1447,7 @@ def _has_latest_execution(runtime: ConversationRunContext) -> bool:
         return ConversationContextService(session).get_latest_execution(
             runtime.turn.id,
             started_at=runtime.turn.started_at,
+            analysis_task_id=runtime.analysis_task_id,
         ) is not None
 
     with session_scope(expire_on_commit=False) as session:
@@ -1605,6 +1622,7 @@ def _load_turn_executions_fresh(runtime: ConversationRunContext) -> list[Any]:
         return ConversationContextService(session).get_turn_executions(
             runtime.turn.id,
             started_at=runtime.turn.started_at,
+            analysis_task_id=runtime.analysis_task_id,
         )
 
     try:
@@ -1627,6 +1645,18 @@ def _build_failure_reason_reply(
 ) -> str:
     """当最后没有自然语言回复时，构造一条简短的失败原因说明。"""
     executions = _load_turn_executions_fresh(runtime)
+    if not executions:
+        # A fallback reply should still explain the error when the short-lived
+        # read session is temporarily unavailable. The caller owns the active
+        # request session and is a useful best-effort secondary source.
+        try:
+            executions = service.get_turn_executions(
+                runtime.turn.id,
+                started_at=runtime.turn.started_at,
+                analysis_task_id=runtime.analysis_task_id,
+            )
+        except Exception:
+            executions = []
     latest_errors = [
         (getattr(execution, 'error_message', '') or '').strip()
         for execution in executions

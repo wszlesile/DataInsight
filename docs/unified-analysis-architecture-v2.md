@@ -126,6 +126,8 @@ analysis_semantic_context
 6. 确认查询口径后，正式分析重新查询和计算，不能消费 Probe 样本作为正式结果。
 7. 多次 Probe 仍确认无数据时，生成完整无数据报告，而不是流程失败报告。
 
+Runtime Probe 可以核验当前回答所需的枚举、字段格式、时间覆盖、查询路径和无数据口径；它不得重做 Business Context 已确认的跨源关系，也不能把 Probe 样本直接作为正式结论。
+
 Preparation 在验证 ER 关系时可以复用同一组底层 Probe API，但不能把这条技术
 验证链变成正式分析的前置硬门槛。
 
@@ -147,11 +149,13 @@ Preparation 在验证 ER 关系时可以复用同一组底层 Probe API，但不
 2. 同一个计算签名可以被报告、图表和表格共同引用。
 3. 不同计算签名不能共享 Evidence。
 4. 派生比率、差额、增长率和组合值必须形成独立计算签名和 Evidence。
-5. grouped 计算按一个计算列形成 Evidence，各成员通过 selector 定位；不能按单元格生成 Evidence。
-6. TraceRef 由 LineageIndex 与产物位置编译，不由模型手写 ID。
-7. 不扫描 Markdown 数字来反推 Metric 或 Evidence。
-8. Evidence 错误不能推翻正式分析成功，也不能触发业务代码重写。
-9. 详细设计以 `post-analysis-evidence-architecture.md` 为准。
+5. QuerySnapshot 必须区分两层范围：`analysis_scope` 只记录可复用的用户时间范围和目标筛选；`query_scope` 只记录某一物理查询自己的事实、来源、聚合和粒度。后续物理查询可继承前者，绝不能继承首条查询的指标、粒度或事实边界。
+6. 未显式声明本地范围的辅助物理查询保留为 `implicit` scope：后置 Evidence 可以从真实 SQL / loader 和计算图继续解析其血缘，但不得把它伪装成首条查询的计算口径。
+7. grouped 计算按一个计算列形成 Evidence，各成员通过 selector 定位；不能按单元格生成 Evidence。
+8. TraceRef 由 LineageIndex 与产物位置编译，不由模型手写 ID。
+9. Markdown 数字扫描只用于完整定位候选；计算边界仍由 AST、真实查询快照和必要时的 LLM 语义解析共同确定，不能只凭文本数字反推 Metric 或 Evidence。
+10. Evidence 错误不能推翻正式分析成功，也不能触发业务代码重写。
+11. 详细设计以 `post-analysis-evidence-architecture.md` 为准。
 
 ### 3.6 报告仍由统一洞察 Agent 自由表达
 

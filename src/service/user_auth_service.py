@@ -79,7 +79,7 @@ class UserAuthService:
             logger.error(
                 "认证请求异常: url=%s auth_summary=%s error=%s",
                 url,
-                self._describe_auth_header(token),
+                self._describe_auth_header(platform_authorization),
                 exc,
             )
             return None

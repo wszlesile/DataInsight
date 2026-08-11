@@ -228,7 +228,10 @@ class AnalysisTaskRunner:
                 recovery_session.commit()
                 return True
 
-            latest_execution = service.get_latest_execution(int(turn_id or 0))
+            latest_execution = service.get_latest_execution(
+                int(turn_id or 0),
+                analysis_task_id=analysis_task_id,
+            )
             if latest_execution is None or latest_execution.execution_status != 'success':
                 return False
             try:

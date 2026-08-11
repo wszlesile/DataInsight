@@ -277,6 +277,7 @@ class ConversationContextService:
         latest_execution = self.get_latest_execution(
             turn.id,
             started_at=turn.started_at if replace_existing_results else None,
+            analysis_task_id=analysis_task_id,
         )
         if replace_existing_results:
             self._archive_previous_turn_results(
@@ -659,6 +660,7 @@ class ConversationContextService:
         self,
         turn_id: Any,
         started_at: datetime | None = None,
+        analysis_task_id: int | None = None,
     ) -> InsightNsExecution | None:
         turn_id_int = to_int(turn_id, 0)
         if turn_id_int <= 0:
@@ -671,6 +673,8 @@ class ConversationContextService:
         )
         if started_at is not None:
             query = query.filter(InsightNsExecution.created_at >= started_at)
+        if analysis_task_id:
+            query = query.filter(InsightNsExecution.analysis_task_id == int(analysis_task_id))
 
         return query.order_by(
             InsightNsExecution.created_at.desc(),
@@ -708,6 +712,7 @@ class ConversationContextService:
         self,
         turn_id: Any,
         started_at: datetime | None = None,
+        analysis_task_id: int | None = None,
     ) -> list[InsightNsExecution]:
         """返回某一轮内全部代码执行记录，按发生顺序排列。"""
         turn_id_int = to_int(turn_id, 0)
@@ -721,6 +726,8 @@ class ConversationContextService:
         )
         if started_at is not None:
             query = query.filter(InsightNsExecution.created_at >= started_at)
+        if analysis_task_id:
+            query = query.filter(InsightNsExecution.analysis_task_id == int(analysis_task_id))
 
         return query.order_by(
             InsightNsExecution.created_at.asc(),

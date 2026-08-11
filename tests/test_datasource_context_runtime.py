@@ -35,6 +35,19 @@ def test_datasource_context_keeps_full_snapshot_for_preparation_to_narrow(monkey
     payload = json.loads(message.content[message.content.index("{"):])
     assert payload["selected_datasource_ids"] == list(range(1, 32))
     assert len(payload["datasources"]) == 31
+    assert payload["runtime_capabilities"]["query_execution"] == {
+        "max_rows_per_sql_result": 10000,
+        "capacity_scope": "each physical load_data_with_sql execution",
+        "full_population_strategies": [
+            "push filters, joins and final aggregation into the query",
+            "use stable pagination and incrementally reduce each page",
+        ],
+        "truncation_policy": (
+            "Do not apply an arbitrary LIMIT to a full-population metric. "
+            "LIMIT is valid only for an intentional TopN, bounded detail or sample output."
+        ),
+    }
+    assert "容量边界作用于每次物理查询" in message.content
 
 
 def test_datasource_context_preserves_preparation_semantic_handoff(monkeypatch):
@@ -140,11 +153,64 @@ def test_datasource_context_compacts_only_redundant_schema_indexes(monkeypatch):
 
     payload = json.loads(message.content[message.content.index("{"):])
     datasource = payload["datasources"][0]
+    assert datasource["query_contract"] == {
+        "datasource_id": 78,
+        "datasource_identifier": "dw.contract",
+        "allowed_fields": ["amount", "department"],
+    }
     assert datasource["metadata_schema"]["properties"] == properties
     assert datasource["metadata_schema"]["all_properties_required"] is True
     assert "required" not in datasource["metadata_schema"]
     assert datasource["field_capabilities"]["all_properties_queryable"] is True
     assert "queryable_fields" not in datasource["field_capabilities"]
+    assert "字段归属的执行边界" in message.content
+
+
+def test_datasource_query_contract_localizes_verified_key_cardinality(monkeypatch):
+    snapshot = {
+        "selected_datasource_ids": [78],
+        "selected_datasource_snapshot": [{
+            "datasource_id": 78,
+            "datasource_name": "quality facts",
+            "datasource_type": "table",
+            "datasource_identifier": "dw.quality",
+            "metadata_schema": {
+                "properties": {
+                    "batch_id": {"type": "string"},
+                    "deviation": {"type": "number"},
+                },
+                "relationships": [{
+                    "relationship_id": "quality_batch",
+                    "local_fields": ["batch_id"],
+                    "observed_key_cardinality": {
+                        "local_distinct_key_count": 18653,
+                        "target_distinct_key_count": 19000,
+                        "matched_distinct_key_count": 18500,
+                    },
+                }],
+            },
+        }],
+    }
+    monkeypatch.setattr(runtime_context, "_load_conversation", lambda _: None)
+
+    message = runtime_context.get_datasource_message(
+        namespace_id=6,
+        conversation_id=99,
+        snapshot_override=snapshot,
+    )
+
+    payload = json.loads(message.content[message.content.index("{"):])
+    assert payload["datasources"][0]["query_contract"]["known_key_cardinalities"] == [{
+        "fields": ["batch_id"],
+        "observed_distinct_count": 18653,
+        "relationship_id": "quality_batch",
+    }]
+    assert payload["datasources"][0]["query_contract"]["capacity_risks"] == [{
+        "fields": ["batch_id"],
+        "observed_distinct_count": 18653,
+        "max_rows_per_sql_result": 10000,
+        "required_strategy": "query_side_final_aggregation_or_stable_pagination",
+    }]
 
 
 def test_current_semantic_context_closes_merged_system_message(monkeypatch):

@@ -81,7 +81,14 @@ class ConversationContextServiceTestCase(unittest.TestCase):
             is_deleted=0,
         ))
 
-    def _add_execution(self, *, execution_id: int, turn_id: int, status: str) -> None:
+    def _add_execution(
+        self,
+        *,
+        execution_id: int,
+        turn_id: int,
+        status: str,
+        analysis_task_id: int | None = None,
+    ) -> None:
         self.session.add(InsightNsExecution(
             id=execution_id,
             conversation_id=17,
@@ -97,6 +104,7 @@ class ConversationContextServiceTestCase(unittest.TestCase):
             stderr_text='',
             execution_seconds=1,
             error_message='' if status == 'success' else 'failed',
+            analysis_task_id=analysis_task_id,
             is_deleted=0,
         ))
 
@@ -137,6 +145,33 @@ class ConversationContextServiceTestCase(unittest.TestCase):
 
         self.assertEqual([message.role for message in messages], ['user'])
         self.assertEqual(messages[0].content, 'analyze data quality')
+
+    def test_turn_executions_can_be_scoped_to_current_analysis_task(self) -> None:
+        self._add_execution(
+            execution_id=11,
+            turn_id=40,
+            status='failed',
+            analysis_task_id=1001,
+        )
+        self._add_execution(
+            execution_id=12,
+            turn_id=40,
+            status='failed',
+            analysis_task_id=1002,
+        )
+        self.session.commit()
+
+        executions = ConversationContextService(self.session).get_turn_executions(
+            turn_id=40,
+            analysis_task_id=1002,
+        )
+        latest = ConversationContextService(self.session).get_latest_execution(
+            turn_id=40,
+            analysis_task_id=1002,
+        )
+
+        self.assertEqual([execution.id for execution in executions], [12])
+        self.assertEqual(latest.id, 12)
 
     def test_recent_prompt_messages_keeps_successful_analysis_answer(self) -> None:
         self._add_turn_messages(

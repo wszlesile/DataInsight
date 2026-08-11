@@ -60,6 +60,7 @@
 
 - 逐个覆盖 Intent 的全部 `question_id` 和事实 `fact_id`。事实绑定必须落到已选 Schema 中真实存在的字段。
 - Selection 中 `datasource_ids` 表示事实/度量来源，`supporting_datasource_ids` 表示标签、分类、对象属性或桥接语义来源。两者都要进入相应问题的 lineage，并通过 fact binding 说明各自承担的字段语义。
+- Selection 中的 `semantic_reference_datasource_ids` 仅提供口径与定义，系统不会把它们放入 `selected_datasources`。不要为这类来源创建 fact binding、ER relationship 或 Probe；其定义会由系统独立传给正式分析。
 - 原始事实 binding 填写真实 `datasource_id` 和 `fields`。无法绑定的事实只放入 `unresolved_business_facts`，不要再输出空 `fact_binding`。比例、差值、同比等派生依赖已经由 Selection 的 `derived_from_fact_ids` 定稿，Business Context 不需要重复输出；编译器会把它们作为无物理数据源的逻辑节点内聚进 lineage。不得为派生事实虚构物理数据源或字段。
 - `unresolved_business_facts` 只表示已选 Schema、字段语义或必要关系无法承载该事实。若真实字段与关系已经具备，只是仍需正式分析执行聚合、比较、排序、归因判断或提出建议，该事实应保持 direct；这些分析工作不是 Preparation 的事实缺口。
 - `synthesis_path` 描述这些事实如何共同回答业务问题，不写 SQL、指标算法、图表形式、报告章节、结论或建议。
@@ -75,7 +76,6 @@
 - `distinct_values` 用于核实用户明确提到的状态、部门、产品等候选值时，把这些原始候选写入 `expected_values`；Probe 会返回精确命中、唯一高置信近似值或 unresolved，避免正式分析继续使用未命中的字面量。
 - Probe 确认的枚举、字段格式和覆盖信息会内聚进该字段 Schema，供正式分析在完整洞察语义中使用；Business Context 不重复设计查询筛选集合或字段解析规则。
 - 已验证关系的键覆盖与字典/维度标签路径是该字段可解释性的权威事实。键字段自身的 distinct values 仍是 ID，不得据此否定已验证的标签关系，也不得再把该关系键列为 unsupported field。
-- 如果上下文包含 `resolution_phase=finalize_after_probe`，必须结合 `business_context_draft` 和 `probe_observations` 定稿：已证实的事实更新 lineage、关系和 unresolved 项；不可用的观察保留为明确缺口；输出 `probe_requests=[]`，不得把同一疑问再次交给正式分析。
 - Probe 返回的是聚合事实摘要，不是分析数据。不得把枚举频次、覆盖率或基数本身规划成用户报告结论。
 
 ## 关系证据

@@ -235,7 +235,7 @@
                                 <td
                                   v-for="column in getTableColumns(table)"
                                   :key="`${rowIndex}-${column.field}`"
-                                  :class="{ 'traceable-cell': hasTableEvidenceRef(table, column) }"
+                                  :class="{ 'traceable-cell': hasTableEvidenceRef(table, row, column) }"
                                   @click="onTableEvidenceClick(item, table, tableIndex, row, rowIndex, column)"
                                 >
                                   {{ formatTableCell(row[column.field]) }}
@@ -378,7 +378,7 @@
                                 <td
                                   v-for="column in getTableColumns(table)"
                                   :key="`${rowIndex}-${column.field}`"
-                                  :class="{ 'traceable-cell': hasTableEvidenceRef(table, column) }"
+                                  :class="{ 'traceable-cell': hasTableEvidenceRef(table, row, column) }"
                                   @click="onTableEvidenceClick({ turnId: currentTurnId }, table, tableIndex, row, rowIndex, column)"
                                 >
                                   {{ formatTableCell(row[column.field]) }}
@@ -708,7 +708,7 @@
                                 <td
                                   v-for="column in getTableColumns(table)"
                                   :key="`${rowIndex}-${column.field}`"
-                                  :class="{ 'traceable-cell': hasTableEvidenceRef(table, column) }"
+                                  :class="{ 'traceable-cell': hasTableEvidenceRef(table, row, column) }"
                                   @click="onTableEvidenceClick({ turnId: selectedVersionDetail?.turn?.id || turnDetail?.turn?.id }, table, tableIndex, row, rowIndex, column)"
                                 >
                                   {{ formatTableCell(row[column.field]) }}
@@ -1291,8 +1291,18 @@ const formatTableCell = (value) => {
 
 const getRefValueField = (ref) => String(ref?.value_field || ref?.field || ref?.x_field || ref?.y_field || '').trim()
 const getRefTableColumn = (ref) => String(ref?.column_key || ref?.value_column || ref?.column || '').trim()
-const hasTableEvidenceRef = (table, column) => (
-  getTableEvidenceRefs(table).some((ref) => getRefTableColumn(ref) === column.field || getRefTableColumn(ref) === column.title)
+const tableRefMatchesRow = (ref, row) => {
+  const selector = ref?.row_selector
+  if (!selector || typeof selector !== 'object' || Array.isArray(selector)) return true
+  if (!row || typeof row !== 'object' || Array.isArray(row)) return false
+  return Object.entries(selector).every(([field, value]) => String(row[field]) === String(value))
+}
+
+const hasTableEvidenceRef = (table, row, column) => (
+  getTableEvidenceRefs(table).some((ref) => (
+    (getRefTableColumn(ref) === column.field || getRefTableColumn(ref) === column.title)
+    && tableRefMatchesRow(ref, row)
+  ))
 )
 
 const isPlainObject = (value) => value && typeof value === 'object' && !Array.isArray(value)
@@ -1431,9 +1441,14 @@ const chartEventRawValue = (chartSpec, params, valueField) => {
   return source && dataIndex < source.length ? structuredChartValue(source[dataIndex], valueField) : undefined
 }
 
-const findTableEvidenceRef = (table, column) => {
+const findTableEvidenceRef = (table, row, column) => {
   const refs = getTableEvidenceRefs(table)
-  return refs.find((ref) => getRefTableColumn(ref) === column.field || getRefTableColumn(ref) === column.title)
+  const columnRefs = refs.filter((ref) => (
+    getRefTableColumn(ref) === column.field || getRefTableColumn(ref) === column.title
+  ))
+  return columnRefs.find((ref) => ref?.row_selector && tableRefMatchesRow(ref, row))
+    || columnRefs.find((ref) => !ref?.row_selector && String(ref?.row_scope || 'all') === 'all')
+    || columnRefs.find((ref) => tableRefMatchesRow(ref, row))
 }
 
 const resolveEvidenceDetail = async ({ turnId, artifactId, evidenceId, selection }) => {
@@ -1487,7 +1502,7 @@ const onArtifactChartEvidenceClick = (artifact, params) => {
 }
 
 const onTableEvidenceClick = (item, table, tableIndex, row, rowIndex, column) => {
-  const ref = findTableEvidenceRef(table, column)
+  const ref = findTableEvidenceRef(table, row, column)
   if (!ref?.evidence_id) return
   resolveEvidenceDetail({
     turnId: item?.turnId,

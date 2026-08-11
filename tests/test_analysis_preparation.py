@@ -372,6 +372,73 @@ def test_selection_includes_semantic_support_sources_in_canonical_scope():
     assert selection.selected_datasource_ids == [11, 12]
 
 
+def test_selection_keeps_definition_sources_out_of_physical_question_scope():
+    selection = DatasourceSelectionContract(
+        question_coverage=[BusinessQuestionCoverageContract(
+            question_id="question_1",
+            fact_coverage=[BusinessFactCoverageContract(
+                fact_id="question_1_fact_1",
+                coverage_status="direct",
+                datasource_ids=[11],
+                supporting_datasource_ids=[12],
+                semantic_reference_datasource_ids=[13, 13, 11],
+                coverage_reason="事实、标签和指标定义共同支持问题",
+            )],
+            coverage_reason="事实范围完整，定义来源只提供口径",
+        )],
+        selection_reason="保留事实、标签和定义",
+    )
+
+    fact = selection.question_coverage[0].fact_coverage[0]
+    assert fact.semantic_reference_datasource_ids == [13]
+    assert selection.question_coverage[0].datasource_ids == [11, 12]
+    assert selection.selected_datasource_ids == [11, 12, 13]
+
+
+def test_prompt_snapshot_keeps_semantic_reference_without_er_binding():
+    snapshot = _snapshot()
+    snapshot["selected_datasource_ids"].append(13)
+    snapshot["selected_datasource_snapshot"].append({
+        "datasource_id": 13,
+        "datasource_name": "合同指标口径",
+        "description": "提供合同状态与金额指标定义，不承载合同明细事实",
+        "datasource_type": "table",
+        "datasource_identifier": "dw.contract_metric_rules",
+        "metadata_schema": {
+            "fields": [{"name": "metric_definition", "type": "string"}],
+        },
+    })
+    selection_payload = _selection().model_dump()
+    selection_payload["question_coverage"][0]["fact_coverage"][0][
+        "semantic_reference_datasource_ids"
+    ] = [13]
+    selection = DatasourceSelectionContract.model_validate(selection_payload)
+
+    prompt_snapshot = PreparationResult(
+        intent=_intent(),
+        selection=selection,
+        business_context=_business_context(),
+        selected_snapshot=snapshot,
+        query_capabilities=("sql",),
+    ).prompt_snapshot()
+
+    assert prompt_snapshot["selected_datasource_ids"] == [11, 12]
+    assert {
+        item["datasource_id"]
+        for item in prompt_snapshot["selected_datasource_snapshot"]
+    } == {11, 12}
+    assert prompt_snapshot["analysis_semantic_context"]["semantic_references"] == [{
+        "datasource_id": 13,
+        "datasource_name": "合同指标口径",
+        "description": "提供合同状态与金额指标定义，不承载合同明细事实",
+    }]
+    assert all(
+        relationship["left_datasource_id"] != 13
+        and relationship["right_datasource_id"] != 13
+        for relationship in prompt_snapshot["analysis_semantic_context"]["relationships"]
+    )
+
+
 def test_derived_fact_inherits_sources_and_status_from_canonical_facts():
     selection = DatasourceSelectionContract(
         question_coverage=[BusinessQuestionCoverageContract(
@@ -633,7 +700,7 @@ def test_analysis_work_is_not_preserved_as_an_unresolved_business_fact():
     assert lineage.unresolved_business_facts == []
 
 
-def test_concrete_unsupported_field_binding_remains_unresolved():
+def test_unsupported_candidate_does_not_override_a_grounded_fact_binding():
     candidate = _business_context().model_copy(update={
         "relationships": [
             _business_context().relationships[0].model_copy(update={
@@ -649,10 +716,8 @@ def test_concrete_unsupported_field_binding_remains_unresolved():
     )
 
     lineage = completed.insight_lineage[0]
-    assert lineage.lineage_status == "partial"
-    assert [item.fact_id for item in lineage.unresolved_business_facts] == [
-        "question_1_fact_3"
-    ]
+    assert lineage.lineage_status == "direct"
+    assert lineage.unresolved_business_facts == []
 
 
 def test_selection_contract_covers_questions_without_metrics_or_probe_plan():
@@ -1045,6 +1110,62 @@ def test_business_lineage_rejects_unavailable_fact_fields():
             intent=_intent(),
         )
 
+
+def test_business_lineage_field_normalization_preserves_grounded_fields():
+    context = _business_context()
+    lineage = context.insight_lineage[0]
+    candidate = context.model_copy(update={
+        "insight_lineage": [lineage.model_copy(update={
+            "fact_bindings": [
+                lineage.fact_bindings[0].model_copy(update={
+                    "fields": ["amount", "invented_metric_field"],
+                }),
+                *lineage.fact_bindings[1:],
+            ],
+        })],
+    })
+
+    normalized = prep.AnalysisPreparationWorkflow._normalize_fact_binding_fields(
+        candidate,
+        compact_datasource_snapshot(_snapshot())["selected_datasource_snapshot"],
+    )
+
+    assert normalized.insight_lineage[0].fact_bindings[0].fields == ["amount"]
+    validate_business_context(
+        normalized,
+        compact_datasource_snapshot(_snapshot())["selected_datasource_snapshot"],
+        selection=_selection(),
+        intent=_intent(),
+    )
+
+
+def test_business_lineage_field_normalization_marks_ungrounded_fact_partial():
+    context = _business_context()
+    lineage = context.insight_lineage[0]
+    candidate = context.model_copy(update={
+        "insight_lineage": [lineage.model_copy(update={
+            "lineage_status": "direct",
+            "fact_bindings": [
+                lineage.fact_bindings[0].model_copy(update={
+                    "fact_id": "question_1_fact_4",
+                    "fields": ["invented_metric_field"],
+                }),
+            ],
+            "unresolved_business_facts": [],
+        })],
+    })
+
+    normalized = prep.AnalysisPreparationWorkflow._normalize_fact_binding_fields(
+        candidate,
+        compact_datasource_snapshot(_snapshot())["selected_datasource_snapshot"],
+    )
+
+    result = normalized.insight_lineage[0]
+    assert result.fact_bindings == []
+    assert result.lineage_status == "partial"
+    assert [item.fact_id for item in result.unresolved_business_facts] == [
+        "question_1_fact_4"
+    ]
 
 def test_direct_lineage_cannot_depend_on_unresolved_cross_source_relationship():
     context = _business_context()
@@ -1475,7 +1596,7 @@ def test_preparation_result_exposes_only_enriched_selected_schema_to_formal_anal
     )
 
 
-def test_prompt_snapshot_removes_datasource_used_only_by_unsupported_binding():
+def test_prompt_snapshot_keeps_selected_datasource_when_lineage_binding_is_unsupported():
     snapshot = _snapshot()
     snapshot["selected_datasource_ids"].append(13)
     snapshot["selected_datasource_snapshot"].append({
@@ -1527,11 +1648,11 @@ def test_prompt_snapshot_removes_datasource_used_only_by_unsupported_binding():
         query_capabilities=("sql",),
     ).prompt_snapshot()
 
-    assert prompt_snapshot["selected_datasource_ids"] == [11, 12]
+    assert prompt_snapshot["selected_datasource_ids"] == [11, 12, 13]
     assert {
         item["datasource_id"]
         for item in prompt_snapshot["selected_datasource_snapshot"]
-    } == {11, 12}
+    } == {11, 12, 13}
     assert 13 not in prompt_snapshot["analysis_semantic_context"][
         "insight_lineage"
     ][0]["datasource_ids"]
@@ -1656,6 +1777,9 @@ def test_schema_relationship_aggregation_safety_is_orientation_aware():
             "cardinality": "one_to_many",
             "left_measure_aggregation_safe": False,
             "right_measure_aggregation_safe": True,
+            "left_distinct_key_count": 12050,
+            "right_distinct_key_count": 900,
+            "matched_distinct_key_count": 875,
         }
     })
     enriched = prep.enrich_selected_datasource_schemas(
@@ -1678,7 +1802,17 @@ def test_schema_relationship_aggregation_safety_is_orientation_aware():
     assert left["aggregation_safety"]["key_domain_coverage"]["numerator"] == (
         "distinct_local_keys_intersect_distinct_target_keys"
     )
+    assert left["observed_key_cardinality"] == {
+        "local_distinct_key_count": 12050,
+        "target_distinct_key_count": 900,
+        "matched_distinct_key_count": 875,
+    }
     assert right["cardinality"] == "many_to_one"
+    assert right["observed_key_cardinality"] == {
+        "local_distinct_key_count": 900,
+        "target_distinct_key_count": 12050,
+        "matched_distinct_key_count": 875,
+    }
     assert right["aggregation_safety"]["local_measure_after_join"] == {
         "status": "safe",
         "strategy": "may_aggregate_after_join",
@@ -1774,6 +1908,10 @@ def test_prepare_analysis_runs_advisory_flow_without_failure_route(monkeypatch):
         return outputs[output_model]
 
     monkeypatch.setattr(prep, "_invoke_contract", fake_invoke_contract)
+    monkeypatch.setattr(
+        "agent.tools.execute_preparation_relationship_probe",
+        lambda **kwargs: [],
+    )
     result = prepare_analysis(
         user_query="分析合同情况",
         context_mode="fresh_analysis",
@@ -1785,7 +1923,52 @@ def test_prepare_analysis_runs_advisory_flow_without_failure_route(monkeypatch):
     prompt_snapshot = result.prompt_snapshot()
     assert prompt_snapshot["selected_datasource_ids"] == [11, 12]
     assert "preparation_envelope" not in prompt_snapshot
-    assert prompt_snapshot["analysis_semantic_context"]["relationships"] == []
+    relationships = prompt_snapshot["analysis_semantic_context"]["relationships"]
+    assert len(relationships) == 1
+    assert relationships[0]["joinability"] == "unknown"
+
+
+def test_business_context_validation_failure_preserves_normalized_candidate(monkeypatch):
+    outputs = {
+        prep.IntentContract: _intent(),
+        prep.DatasourceSelectionContract: _canonical_flow_selection(),
+        prep.BusinessContextDraftContract: prep.BusinessContextDraftContract.model_validate(
+            _canonical_flow_context().model_dump(exclude={"semantic_resolutions"})
+        ),
+    }
+    original_validate = prep.validate_business_context
+    validation_calls = 0
+
+    def fake_invoke_contract(*, output_model, **kwargs):
+        return outputs[output_model]
+
+    def fail_once(*args, **kwargs):
+        nonlocal validation_calls
+        validation_calls += 1
+        if validation_calls == 1:
+            raise ValueError("one relationship candidate requires local normalization")
+        return original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(prep, "_invoke_contract", fake_invoke_contract)
+    monkeypatch.setattr(prep, "validate_business_context", fail_once)
+    monkeypatch.setattr(
+        "agent.tools.execute_preparation_relationship_probe",
+        lambda **kwargs: [],
+    )
+
+    result = prepare_analysis(
+        user_query="分析合同情况",
+        context_mode="fresh_analysis",
+        expected_time_range={},
+        datasource_snapshot=_snapshot(),
+        conversation_context={},
+    )
+
+    semantic_context = result.prompt_snapshot()["analysis_semantic_context"]
+    assert validation_calls == 2
+    assert semantic_context["relationships"]
+    assert semantic_context["insight_lineage"]
+    assert semantic_context["relationships"][0]["joinability"] == "unknown"
 
 
 def test_semantic_selection_normalizes_to_canonical_preparation_state(monkeypatch):
@@ -1823,10 +2006,16 @@ def test_semantic_selection_normalizes_to_canonical_preparation_state(monkeypatc
         },),
     )
     monkeypatch.setattr(prep.Config, 'DATASOURCE_SELECTION_PROVIDER', 'semantic_center')
+    retrieve_call = {}
+
+    def retrieve(self, **kwargs):
+        retrieve_call.update(kwargs)
+        return semantic_result
+
     monkeypatch.setattr(
         prep.SemanticDatasourceSelectionService,
         'retrieve',
-        lambda self, **kwargs: semantic_result,
+        retrieve,
     )
     captured = {}
 
@@ -1853,6 +2042,8 @@ def test_semantic_selection_normalizes_to_canonical_preparation_state(monkeypatc
     assert captured['payload']['relationship_hints'] == list(
         semantic_result.relationship_hints
     )
+    assert _intent().business_goal in retrieve_call['query']
+    assert _intent().business_questions[0].business_question in retrieve_call['query']
 
 
 def test_semantic_relationship_is_schema_checked_and_skips_relationship_probe(
@@ -2212,6 +2403,50 @@ def test_relationship_probe_uses_only_field_pairs_present_on_both_schemas():
     assert any("Schema 不完整" in item for item in normalized.unresolved_relationships)
 
 
+def test_unverified_joinable_relationship_is_downgraded_for_local_probe():
+    context = _business_context()
+    relationship = context.relationships[0].model_copy(update={
+        "joinability": "joinable",
+        "evidence_basis": "unresolved",
+    })
+
+    normalized = prep.AnalysisPreparationWorkflow._normalize_unverified_schema_relationships(
+        context.model_copy(update={"relationships": [relationship]}),
+        compact_datasource_snapshot(_snapshot())["selected_datasource_snapshot"],
+    )
+
+    assert normalized.relationships[0].joinability == "unknown"
+    assert normalized.relationships[0].evidence_basis == "unresolved"
+
+
+def test_locally_verified_probe_relationship_survives_final_normalization():
+    context = _business_context()
+    relationship = context.relationships[0].model_copy(update={
+        "joinability": "joinable",
+        "evidence_basis": "probe",
+        "observation_id": "probe:contract_customer",
+        "probe_facts": {
+            "join_supported": True,
+            "cardinality": "many_to_one",
+        },
+    })
+
+    normalized = prep.AnalysisPreparationWorkflow._normalize_unverified_schema_relationships(
+        context.model_copy(update={"relationships": [relationship]}),
+        compact_datasource_snapshot(_snapshot())["selected_datasource_snapshot"],
+        probe_observations=[{
+            "observation_id": "probe:contract_customer",
+            "kind": "relationship_coverage",
+            "status": "verified",
+            "complete": True,
+        }],
+    )
+
+    assert normalized.relationships[0].joinability == "joinable"
+    assert normalized.relationships[0].evidence_basis == "probe"
+    assert normalized.relationships[0].observation_id == "probe:contract_customer"
+
+
 def test_one_to_many_probe_is_joinable_with_separate_aggregation_safety(monkeypatch):
     observation = {
         "observation_id": "probe:contract_customer",
@@ -2293,28 +2528,19 @@ def test_business_context_finalizes_lineage_after_bounded_probe(monkeypatch):
             related_fact_ids=["question_1_fact_1"],
         )],
     })
-    finalized = _canonical_flow_context().model_copy(update={
-        "relationships": [
-            _canonical_flow_context().relationships[0].model_copy(update={
-                "joinability": "joinable",
-                "evidence_basis": "probe",
-                "observation_id": "probe:contract_customer",
-            })
-        ],
-        "insight_lineage": [
-            _canonical_flow_context().insight_lineage[0].model_copy(update={
-                "lineage_status": "direct",
-                "unresolved_business_facts": [],
-            })
-        ],
-        "unresolved_relationships": [],
-        "probe_requests": [],
-    })
-    outputs = iter([_intent(), _canonical_flow_selection(), draft, finalized])
+    resolution = prep.BusinessContextProbeResolutionContract(
+        fact_resolutions=[prep.BusinessFactProbeResolutionContract(
+            fact_id="question_1_fact_1",
+            resolution_status="unchanged",
+        )]
+    )
+    outputs = iter([_intent(), _canonical_flow_selection(), draft, resolution])
     payloads = []
+    stages = []
 
     def fake_invoke_contract(**kwargs):
         payloads.append(kwargs.get("payload") or {})
+        stages.append(kwargs.get("stage"))
         return next(outputs)
 
     relationship_observation = {
@@ -2351,11 +2577,12 @@ def test_business_context_finalizes_lineage_after_bounded_probe(monkeypatch):
         conversation_context={},
     )
 
-    assert payloads[-1]["resolution_phase"] == "finalize_after_probe"
-    assert len(payloads[-1]["probe_observations"]) == 2
+    assert stages[-1] == "business_context_probe_resolution"
+    assert len(payloads[-1]["probe_observations"]) == 1
+    assert payloads[-1]["affected_facts"][0]["fact_id"] == "question_1_fact_1"
     assert "selected_datasources" not in payloads[-1]
     assert "query_guidance" not in payloads[-1]
-    assert payloads[-1]["business_context_draft"]
+    assert "business_context_draft" not in payloads[-1]
     assert result.business_context.probe_requests == []
     assert result.business_context.relationships[0].joinability == "joinable"
     assert result.business_context.insight_lineage[0].lineage_status == "direct"
@@ -2375,12 +2602,153 @@ def test_business_context_only_refinalizes_consumable_probe_observations():
         "status": "verified",
         "complete": False,
     }])
-    assert workflow._has_consumable_probe_observations([{
+    assert not workflow._has_consumable_probe_observations([{
         "observation_id": "probe:contract_customer",
+        "kind": "relationship_coverage",
         "status": "verified",
         "complete": True,
         "facts": {"join_supported": True},
     }])
+    assert workflow._has_consumable_probe_observations([{
+        "observation_id": "probe:status_values",
+        "kind": "distinct_values",
+        "status": "verified",
+        "complete": True,
+        "facts": {"values": [{"value": "active", "count": 8}]},
+    }])
+
+
+def test_probe_fact_resolution_merges_supported_observation_locally():
+    candidate = _canonical_flow_context()
+    lineage = candidate.insight_lineage[0]
+    candidate = candidate.model_copy(update={
+        "insight_lineage": [lineage.model_copy(update={
+            "unresolved_business_facts": [prep.UnresolvedBusinessFactContract(
+                fact_id="question_1_fact_1",
+                reason="status values require verification",
+            )],
+            "lineage_status": "partial",
+        })],
+    })
+    resolution = prep.BusinessContextProbeResolutionContract(
+        fact_resolutions=[prep.BusinessFactProbeResolutionContract(
+            fact_id="question_1_fact_1",
+            resolution_status="supported",
+            observation_ids=["probe:status_values"],
+        )]
+    )
+
+    result = prep.AnalysisPreparationWorkflow._apply_probe_fact_resolutions(
+        candidate,
+        resolution,
+        [{
+            "observation_id": "probe:status_values",
+            "datasource_id": 11,
+            "field": "status",
+            "related_fact_ids": ["question_1_fact_1"],
+        }],
+    )
+
+    assert result.insight_lineage[0].lineage_status == "direct"
+    assert result.insight_lineage[0].unresolved_business_facts == []
+    assert any(
+        binding.datasource_id == 11 and "status" in binding.fields
+        for binding in result.insight_lineage[0].fact_bindings
+    )
+
+
+def test_probe_fact_resolution_removes_only_unsupported_observed_field():
+    candidate = _canonical_flow_context()
+    lineage = candidate.insight_lineage[0]
+    candidate = candidate.model_copy(update={
+        "insight_lineage": [lineage.model_copy(update={
+            "fact_bindings": [prep.BusinessFactBindingContract(
+                fact_id="question_1_fact_1",
+                datasource_id=11,
+                fields=["status", "contract_amount"],
+            )],
+        })],
+    })
+    resolution = prep.BusinessContextProbeResolutionContract(
+        fact_resolutions=[prep.BusinessFactProbeResolutionContract(
+            fact_id="question_1_fact_1",
+            resolution_status="unsupported",
+            observation_ids=["probe:status_values"],
+            reason="observed values do not represent the requested status",
+            business_impact="status segmentation remains unavailable",
+        )]
+    )
+
+    result = prep.AnalysisPreparationWorkflow._apply_probe_fact_resolutions(
+        candidate,
+        resolution,
+        [{
+            "observation_id": "probe:status_values",
+            "datasource_id": 11,
+            "field": "status",
+            "related_fact_ids": ["question_1_fact_1"],
+        }],
+    )
+
+    assert result.insight_lineage[0].lineage_status == "partial"
+    assert result.insight_lineage[0].fact_bindings[0].fields == ["contract_amount"]
+    unresolved = result.insight_lineage[0].unresolved_business_facts[0]
+    assert unresolved.fact_id == "question_1_fact_1"
+    assert unresolved.unsupported_field_bindings[0].fields == ["status"]
+
+
+def test_relation_only_probe_reconciles_lineage_without_second_llm(monkeypatch):
+    resolved = _canonical_flow_context()
+    draft = resolved.model_copy(update={
+        "relationships": [resolved.relationships[0].model_copy(update={
+            "joinability": "unknown",
+            "evidence_basis": "unresolved",
+            "observation_id": "",
+            "probe_facts": {},
+        })],
+        "insight_lineage": [resolved.insight_lineage[0].model_copy(update={
+            "lineage_status": "partial",
+            "unresolved_business_facts": [UnresolvedBusinessFactContract(
+                fact_id="question_1_fact_1",
+                reason="the required relationship has not been verified",
+            )],
+        })],
+        "unresolved_relationships": ["contract to customer is unverified"],
+    })
+    outputs = iter([_intent(), _canonical_flow_selection(), draft])
+    calls = []
+
+    def fake_invoke_contract(**kwargs):
+        calls.append(kwargs["stage"])
+        return next(outputs)
+
+    monkeypatch.setattr(prep, "_invoke_contract", fake_invoke_contract)
+    monkeypatch.setattr(
+        "agent.tools.execute_preparation_relationship_probe",
+        lambda **kwargs: [{
+            "observation_id": "probe:contract_customer",
+            "kind": "relationship_coverage",
+            "status": "verified",
+            "complete": True,
+            "facts": {
+                "join_supported": True,
+                "cardinality": "many_to_one",
+            },
+        }],
+    )
+
+    result = prepare_analysis(
+        user_query="analyze contracts",
+        context_mode="fresh_analysis",
+        expected_time_range={},
+        datasource_snapshot=_snapshot(),
+        conversation_context={},
+    )
+
+    assert calls == ["intent_analysis", "select_datasources", "business_context"]
+    assert result.business_context.relationships[0].joinability == "joinable"
+    assert result.business_context.insight_lineage[0].lineage_status == "direct"
+    assert result.business_context.insight_lineage[0].unresolved_business_facts == []
 
 
 def test_business_context_normalizes_status_and_ignores_top_level_annotations():

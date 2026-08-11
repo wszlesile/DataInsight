@@ -33,9 +33,10 @@ def test_formal_prompt_keeps_similar_business_measures_semantically_distinct():
 def test_formal_prompt_respects_preparation_and_keeps_runtime_probe_reactive():
     prompt = PROMPT_PATH.read_text(encoding="utf-8")
 
-    assert "正式分析直接生成完整可执行分析" in prompt
-    assert "不得重新发现或改写 Business Context 已定稿的跨源关系" in prompt
-    assert "只有该正式查询无数据或日期格式异常时，下一轮才进入 Probe" in prompt
+    assert "正式分析仍拥有查询口径、可答性判断和洞察表达的最终判断权" in prompt
+    assert "不要重新做宽泛选源或推翻已确认关系" in prompt
+    assert "可以先使用有界 Probe 核验" in prompt
+    assert "Probe 不重做已确认的跨源关系发现" in prompt
 
 
 def test_formal_prompt_does_not_restore_runtime_evidence_authoring():
@@ -56,3 +57,10 @@ def test_formal_prompt_examples_compute_insight_judgements_before_narration():
     assert "peak_share =" in prompt
     assert "if variation >= 0.5" in prompt
     assert "用量并非均匀释放" not in prompt
+
+
+def test_formal_prompt_uses_the_real_table_helper_return_contract():
+    prompt = PROMPT_PATH.read_text(encoding="utf-8")
+
+    assert "tables.append(build_table_result(...))" in prompt
+    assert "不支持 `.table` 属性访问" in prompt

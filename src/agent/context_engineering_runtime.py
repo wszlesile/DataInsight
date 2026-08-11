@@ -28,6 +28,19 @@ ANALYSIS_SIGNAL_PATTERN = re.compile(
     r"\d{4}[-/年]\d{1,2}([-/月]\d{1,2})?|\d{1,2}月\d{1,2}日|"
     r"明细|详情|图表|报告|趋势|统计|分析|计算|对比|稼动率|开机率|根因|时间线)"
 )
+
+QUERY_EXECUTION_CAPABILITIES = {
+    "max_rows_per_sql_result": 10000,
+    "capacity_scope": "each physical load_data_with_sql execution",
+    "full_population_strategies": [
+        "push filters, joins and final aggregation into the query",
+        "use stable pagination and incrementally reduce each page",
+    ],
+    "truncation_policy": (
+        "Do not apply an arbitrary LIMIT to a full-population metric. "
+        "LIMIT is valid only for an intentional TopN, bounded detail or sample output."
+    ),
+}
 FOLLOWUP_ANALYSIS_KEYWORDS = (
     "继续", "刚才", "上次", "上一轮", "沿用", "基于刚才", "按刚才",
     "继续上一个", "继续上一轮", "修复一个", "重试", "重新生成", "继续分析",
@@ -189,6 +202,66 @@ def _build_datasource_prompt_item(item: dict[str, Any]) -> dict[str, Any]:
 
     properties = schema.get("properties")
     property_names = list(properties) if isinstance(properties, dict) else []
+    queryable_fields = list(property_names)
+    capabilities = payload.get("field_capabilities")
+    if isinstance(capabilities, dict) and isinstance(
+        capabilities.get("queryable_fields"),
+        list,
+    ):
+        queryable_fields = [
+            str(value)
+            for value in capabilities["queryable_fields"]
+            if str(value).strip()
+        ]
+    query_contract = {
+        "datasource_id": payload.get("datasource_id"),
+        "datasource_identifier": payload.get("datasource_identifier"),
+        "allowed_fields": queryable_fields,
+    }
+    known_key_cardinalities: list[dict[str, Any]] = []
+    seen_key_cardinalities: set[tuple[tuple[str, ...], int]] = set()
+    for relationship in schema.get("relationships") or []:
+        if not isinstance(relationship, dict):
+            continue
+        cardinality = relationship.get("observed_key_cardinality")
+        if not isinstance(cardinality, dict):
+            continue
+        fields = tuple(
+            str(value).strip()
+            for value in relationship.get("local_fields") or []
+            if str(value).strip()
+        )
+        try:
+            distinct_count = int(cardinality.get("local_distinct_key_count") or 0)
+        except (TypeError, ValueError):
+            distinct_count = 0
+        signature = (fields, distinct_count)
+        if not fields or distinct_count <= 0 or signature in seen_key_cardinalities:
+            continue
+        seen_key_cardinalities.add(signature)
+        known_key_cardinalities.append({
+            "fields": list(fields),
+            "observed_distinct_count": distinct_count,
+            "relationship_id": str(relationship.get("relationship_id") or ""),
+        })
+    if known_key_cardinalities:
+        query_contract["known_key_cardinalities"] = known_key_cardinalities
+        max_rows = int(QUERY_EXECUTION_CAPABILITIES["max_rows_per_sql_result"])
+        capacity_risks = [
+            {
+                "fields": item["fields"],
+                "observed_distinct_count": item["observed_distinct_count"],
+                "max_rows_per_sql_result": max_rows,
+                "required_strategy": (
+                    "query_side_final_aggregation_or_stable_pagination"
+                ),
+            }
+            for item in known_key_cardinalities
+            if item["observed_distinct_count"] > max_rows
+        ]
+        if capacity_risks:
+            query_contract["capacity_risks"] = capacity_risks
+    payload["query_contract"] = query_contract
     required = schema.get("required")
     if (
         property_names
@@ -198,7 +271,6 @@ def _build_datasource_prompt_item(item: dict[str, Any]) -> dict[str, Any]:
         schema.pop("required", None)
         schema["all_properties_required"] = True
 
-    capabilities = payload.get("field_capabilities")
     if isinstance(capabilities, dict):
         queryable_fields = capabilities.get("queryable_fields")
         if (
@@ -325,7 +397,11 @@ def get_datasource_message(
         )
 
     semantic_context = snapshot.get("analysis_semantic_context")
-    payload: dict[str, Any] = {}
+    payload: dict[str, Any] = {
+        "runtime_capabilities": {
+            "query_execution": copy.deepcopy(QUERY_EXECUTION_CAPABILITIES),
+        },
+    }
     selected_ids = [
         to_int(item, 0)
         for item in snapshot.get('selected_datasource_ids', [])
@@ -344,8 +420,10 @@ def get_datasource_message(
 
     instruction_lines = [
         "当前洞察空间可用的数据源信息：",
+        "- `runtime_capabilities.query_execution` 是实际数据访问能力，不是建议；其中容量边界作用于每次物理查询，而不是只作用于第一条查询或总体分析口径。",
         "- `datasources` 是当前会话可直接使用的数据源全集。",
         "- `datasource_name` 只用于理解用户语义和展示，不等同于 SQL 表名、文件路径或接口地址。",
+        "- 每个数据源的 `query_contract` 是字段归属的执行边界：只能用其中的 `datasource_identifier` 访问该数据源，并且只能从该来源读取 `allowed_fields`；同名或相邻数据源的字段不能混用。",
         "- 当用户提到的数据源名称能匹配当前 `datasources` 中的某个 `datasource_name` 时，生成代码必须使用该数据源的 `datasource_identifier` 访问数据；不要把 `datasource_name` 直接拼进 SQL。",
         "- 如果当前 `datasources` 中没有匹配项，才可以进行有限探测；探测失败后应回到当前数据源快照重新选择，而不是继续猜更多表名。",
         "- 如果 `local_file` 数据源包含 `recommended_loader`，必须优先遵守该推荐加载函数。",

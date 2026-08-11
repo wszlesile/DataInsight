@@ -14,9 +14,11 @@ if str(SRC_ROOT) not in sys.path:
 from agent import load_system_prompt  # noqa: E402
 from agent.tools import (  # noqa: E402
     NoDataFoundError,
+    CURRENT_CONFIRMED_NO_DATA_RESULT,
     CURRENT_EXECUTION_INTENT,
     CURRENT_QUERY_SNAPSHOTS,
     _augment_repair_instructions,
+    _build_query_capacity_failure_diagnostics,
     _build_repair_instructions,
     _build_no_data_feedback,
     _classify_execution_error,
@@ -222,7 +224,7 @@ class ExecutePythonNoDataRetryTestCase(unittest.TestCase):
             CURRENT_EXECUTION_INTENT.reset(intent_token)
         self.assertIn("8 条记录", result.analysis_report)
 
-    def test_auxiliary_child_query_cannot_mask_empty_root_population(self) -> None:
+    def test_positive_implicit_physical_query_preserves_partial_data_result(self) -> None:
         intent_token = CURRENT_EXECUTION_INTENT.set("analysis")
         snapshot_token = CURRENT_QUERY_SNAPSHOTS.set({
             "q_contracts": {
@@ -246,15 +248,65 @@ class ExecutePythonNoDataRetryTestCase(unittest.TestCase):
             },
         })
         try:
-            with self.assertRaises(NoDataFoundError):
-                save_analysis_result(
-                    analysis_report="## 合同概览\n\n合同为 0，供应链有数据。",
-                    charts=[],
-                    tables=[],
-                )
+            result = save_analysis_result(
+                analysis_report="## Partial result\n\nThe primary path is empty; another path has data.",
+                charts=[],
+                tables=[],
+            )
         finally:
             CURRENT_QUERY_SNAPSHOTS.reset(snapshot_token)
             CURRENT_EXECUTION_INTENT.reset(intent_token)
+        self.assertIn("another path has data", result.analysis_report)
+
+    def test_confirmed_no_data_result_can_be_saved_after_probe_limit(self) -> None:
+        intent_token = CURRENT_EXECUTION_INTENT.set("analysis")
+        confirmed_token = CURRENT_CONFIRMED_NO_DATA_RESULT.set(True)
+        snapshot_token = CURRENT_QUERY_SNAPSHOTS.set({
+            "q_contracts": {
+                "implementation": {"physical_execution": True},
+                "execution": {"status": "success", "row_count": 0},
+            },
+        })
+        try:
+            result = save_analysis_result(
+                analysis_report="## No data\n\nNo records matched the confirmed analysis scope.",
+                charts=[],
+                tables=[],
+            )
+        finally:
+            CURRENT_QUERY_SNAPSHOTS.reset(snapshot_token)
+            CURRENT_CONFIRMED_NO_DATA_RESULT.reset(confirmed_token)
+            CURRENT_EXECUTION_INTENT.reset(intent_token)
+        self.assertIn("No records matched", result.analysis_report)
+
+    def test_query_capacity_diagnostics_identify_failed_physical_query(self) -> None:
+        snapshot_token = CURRENT_QUERY_SNAPSHOTS.set({
+            "q_summary": {
+                "implementation": {
+                    "physical_execution": True,
+                    "sql": "SELECT status, COUNT(*) FROM contracts GROUP BY status",
+                },
+                "execution": {"status": "success", "row_count": 4},
+            },
+            "q_detail": {
+                "implementation": {
+                    "physical_execution": True,
+                    "sql": "SELECT * FROM contracts",
+                },
+                "execution": {"status": "failed"},
+            },
+        })
+        try:
+            diagnostics = _build_query_capacity_failure_diagnostics()
+        finally:
+            CURRENT_QUERY_SNAPSHOTS.reset(snapshot_token)
+
+        self.assertEqual(
+            diagnostics["query_execution_capability"]["max_rows_per_sql_result"],
+            10000,
+        )
+        self.assertEqual(diagnostics["failed_query"]["query_key"], "q_detail")
+        self.assertEqual(diagnostics["failed_query"]["sql"], "SELECT * FROM contracts")
 
 
 if __name__ == "__main__":

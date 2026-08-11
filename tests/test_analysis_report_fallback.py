@@ -22,7 +22,7 @@ from service.conversation_context_service import ConversationRunContext  # noqa:
 
 
 class _FakeService:
-    def get_turn_executions(self, turn_id: int, started_at=None):  # noqa: ANN001
+    def get_turn_executions(self, turn_id: int, started_at=None, analysis_task_id=None):  # noqa: ANN001
         return [
             SimpleNamespace(
                 execution_status="failed",

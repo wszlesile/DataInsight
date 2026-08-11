@@ -17,6 +17,7 @@ from agent.tools import (  # noqa: E402
     CURRENT_QUERY_SNAPSHOTS,
     StructuredResult,
     _begin_query_snapshot_execution,
+    _mark_latest_query_snapshot_execution,
     _build_execution_namespace,
     _check_time_range_constraint,
     _extract_sql_projection_semantics,
@@ -117,6 +118,10 @@ def test_probe_feedback_marks_time_coverage_as_diagnostic_only():
     ]
     assert all("设置 time_range" not in item for item in retry.repair_instructions)
     assert retry.diagnostics["_probe_contract"]["time_coverage_role"] == "diagnostic_only"
+    assert retry.diagnostics["_probe_contract"]["path_scope_role"] == "observed_paths_only"
+    assert "unprobed selected datasources" in retry.diagnostics["_probe_contract"][
+        "formal_scope_policy"
+    ]
     assert retry.diagnostics["_probe_contract"]["explicit_user_time_range"] is None
 
 
@@ -335,6 +340,32 @@ def test_build_table_result_only_returns_display_artifact():
     }]
 
 
+def test_save_analysis_result_removes_only_empty_chart_shells_and_empty_list_items():
+    result = save_analysis_result(
+        analysis_report="## Findings\n-\n- A retained finding",
+        charts=[
+            {
+                "title": "Empty branch",
+                "chart_type": "echarts",
+                "chart_document": {
+                    "dataset": {"columns": ["category", "count"], "rows": []},
+                    "chart_kind": "bar",
+                    "encoding": {"category_field": "category", "value_field": "count"},
+                },
+            },
+            {
+                "title": "Zero is data",
+                "chart_type": "echarts",
+                "chart_spec": {"series": [{"type": "bar", "data": [0]}]},
+            },
+        ],
+        tables=[],
+    )
+
+    assert result.analysis_report == "## Findings\n- A retained finding"
+    assert [chart["title"] for chart in result.charts] == ["Zero is data"]
+
+
 def test_build_table_result_accepts_records_data():
     result = build_table_result(
         title="区域完工率",
@@ -535,8 +566,74 @@ def test_each_physical_sql_gets_an_independent_execution_snapshot():
     assert snapshots["q_sales"]["implementation"]["sql"] == first_sql
     derived = next(value for key, value in snapshots.items() if key != "q_sales")
     assert derived["implementation"]["sql"] == second_sql
-    assert derived["implementation"]["scope_source_query_key"] == "q_sales"
-    assert derived["query_constraints"] == snapshots["q_sales"]["query_constraints"]
+    assert derived["implementation"]["logical_query_family"] == derived["query_key"]
+    assert derived["query_constraints"] == {}
+    assert derived["analysis_scope"] == snapshots["q_sales"]["analysis_scope"]
+    assert derived["query_scope"] == {
+        "scope_status": "implicit",
+        "query_key": derived["query_key"],
+        "logical_query_family": derived["query_key"],
+    }
+
+
+def test_paginated_sql_executions_share_one_implicit_logical_query_family():
+    CURRENT_QUERY_SNAPSHOTS.set({})
+    CURRENT_LAST_QUERY_KEY.set("")
+    first_page = "SELECT batch_id, alarm_count FROM alarms ORDER BY batch_id LIMIT 4000 OFFSET 0"
+    second_page = "SELECT batch_id, alarm_count FROM alarms ORDER BY batch_id LIMIT 4000 OFFSET 4000"
+
+    _begin_query_snapshot_execution(sql=first_page)
+    first_key = CURRENT_LAST_QUERY_KEY.get()
+    _mark_latest_query_snapshot_execution(
+        status="success",
+        row_count=4000,
+        columns=["batch_id", "alarm_count"],
+    )
+    _begin_query_snapshot_execution(sql=second_page)
+    second_key = CURRENT_LAST_QUERY_KEY.get()
+    _mark_latest_query_snapshot_execution(
+        status="success",
+        row_count=125,
+        columns=["batch_id", "alarm_count"],
+    )
+
+    snapshots = CURRENT_QUERY_SNAPSHOTS.get()
+    assert first_key == second_key
+    assert len(snapshots) == 1
+    family = snapshots[first_key]
+    assert family["execution"]["physical_execution_count"] == 2
+    assert family["execution"]["family_row_count"] == 4125
+    assert len(family["implementation"]["physical_executions"]) == 1
+    assert family["query_scope"]["scope_status"] == "implicit"
+
+
+def test_query_snapshot_separates_analysis_scope_from_query_aggregation():
+    CURRENT_QUERY_SNAPSHOTS.set({})
+    retry = validate_query_constraints(
+        query_key="q_root_causes",
+        query_constraints={
+            "time_range": {"start": "2026-01-01", "end": "2026-02-01", "end_exclusive": True},
+            "target_filters": [{"semantic_role": "batch", "value": "B-1", "match_mode": "exact"}],
+            "aggregation": {"grain": "root_cause", "metric": "fault_event_count"},
+        },
+        sql=(
+            "SELECT fault_event_count FROM root_causes "
+            "WHERE observed_at >= %s AND observed_at < %s"
+        ),
+        query_params=["2026-01-01", "2026-02-01"],
+    )
+
+    assert retry is None
+    snapshot = CURRENT_QUERY_SNAPSHOTS.get()["q_root_causes"]
+    assert snapshot["analysis_scope"] == {
+        "time_range": {"start": "2026-01-01", "end": "2026-02-01", "end_exclusive": True},
+        "target_filters": [{"semantic_role": "batch", "value": "B-1", "match_mode": "exact"}],
+    }
+    assert snapshot["query_scope"] == {
+        "scope_status": "explicit",
+        "query_key": "q_root_causes",
+        "aggregation": {"grain": "root_cause", "metric": "fault_event_count"},
+    }
 
 
 def test_local_file_loader_records_a_physical_access_snapshot(tmp_path):

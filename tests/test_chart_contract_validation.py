@@ -18,9 +18,14 @@ from agent.tools import (  # noqa: E402
     CURRENT_DATASOURCE_NUMERIC_FIELDS,
     StructuredResult,
     _build_generated_code_error_context,
+    _build_query_capacity_diagnostics,
+    _build_schema_field_mismatch_diagnostics,
+    _augment_missing_mapping_key_feedback,
     _build_execution_namespace,
     _canonicalize_used_datasource_ids,
     _extract_dataframe_reduction_clauses,
+    _extract_error_signature,
+    _find_empty_markdown_leaf_sections,
     _classify_execution_error,
     _inspect_preparation_relationship,
     _inspect_preparation_schema_fact,
@@ -31,6 +36,7 @@ from agent.tools import (  # noqa: E402
     _tool_success_message,
     _validate_analysis_relationship_contract,
     _validate_analysis_scope_against_execution_history,
+    _validate_probe_observation_provenance,
     _validate_generated_code_contract,
     _validate_scope_preserving_technical_repair,
     _validate_structured_result_contract,
@@ -41,9 +47,1203 @@ from agent.tools import (  # noqa: E402
     validate_query_constraints,
 )
 from utils.chart_document_utils import build_chart_result, normalize_chart_result_item  # noqa: E402
+from service.post_analysis_evidence_service import LineageIndexer  # noqa: E402
 
 
 class ChartContractValidationTestCase(unittest.TestCase):
+
+    def test_formal_report_cannot_copy_probe_observation_as_metric_literal(self) -> None:
+        previous = SimpleNamespace(
+            result_payload_json=json.dumps({
+                "retry_type": "probe_feedback",
+                "diagnostics": {
+                    "query_observations": [{
+                        "columns": ["total_batches", "min_date"],
+                        "value_samples": ["24", "2026-08-10"],
+                    }]
+                },
+            })
+        )
+        code = '''
+execution_intent = "analysis"
+total_batches = 24
+analysis_report = f"Total {total_batches} batches."
+'''
+
+        retry = _validate_probe_observation_provenance(
+            previous_executions=[previous],
+            current_code=code,
+        )
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "probe_observation_used_as_formal_metric",
+        )
+        self.assertEqual(retry.diagnostics["metrics"][0]["variable"], "total_batches")
+
+    def test_formal_report_accepts_metric_recomputed_from_query_result(self) -> None:
+        previous = SimpleNamespace(
+            result_payload_json=json.dumps({
+                "retry_type": "probe_feedback",
+                "diagnostics": {
+                    "query_observations": [{
+                        "columns": ["total_batches"],
+                        "value_samples": ["24"],
+                    }]
+                },
+            })
+        )
+        code = '''
+execution_intent = "analysis"
+summary = load_data_with_sql(sql="SELECT COUNT(*) AS total_batches FROM batches")
+total_batches = int(summary.iloc[0]["total_batches"])
+analysis_report = f"Total {total_batches} batches."
+'''
+
+        retry = _validate_probe_observation_provenance(
+            previous_executions=[previous],
+            current_code=code,
+        )
+
+        self.assertIsNone(retry)
+
+    def test_schema_mismatch_feedback_lists_all_fields_owned_by_another_source(self) -> None:
+        code = '''
+sql_batch = f"""
+SELECT batch_id, fault_event_count, material_lot_count
+FROM warehouse.dim_batch_quality_context
+WHERE batch_start_time >= %s
+"""
+batch_df = load_data_with_sql(sql=sql_batch)
+'''
+        selected_snapshot = [
+            {
+                "datasource_id": 61,
+                "datasource_name": "Batch quality context",
+                "datasource_identifier": "warehouse.dim_batch_quality_context",
+                "metadata_schema": {
+                    "properties": {
+                        "batch_id": {"type": "string"},
+                        "batch_start_time": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "datasource_id": 62,
+                "datasource_name": "Root cause candidates",
+                "datasource_identifier": "warehouse.dim_root_cause_candidates",
+                "metadata_schema": {
+                    "properties": {
+                        "fault_event_count": {"type": "integer"},
+                        "material_lot_count": {"type": "integer"},
+                    },
+                },
+            },
+        ]
+
+        diagnostics = _build_schema_field_mismatch_diagnostics(
+            code=code,
+            error_message="Column 'fault_event_count' cannot be resolved.",
+            selected_datasource_snapshot=selected_snapshot,
+        )
+
+        self.assertEqual(
+            diagnostics["violated_contract"],
+            "datasource_field_ownership_mismatch",
+        )
+        self.assertEqual(diagnostics["query_datasource_id"], 61)
+        self.assertEqual(
+            [item["field_name"] for item in diagnostics["incompatible_fields"]],
+            ["fault_event_count", "material_lot_count"],
+        )
+        self.assertEqual(
+            diagnostics["sql_assignment_range"]["role"],
+            "failed_query_definition",
+        )
+
+    def test_schema_mismatch_uses_reaching_sql_assignment_at_failed_load(self) -> None:
+        code = '''
+sql_batch = """
+SELECT batch_id, obsolete_field
+FROM warehouse.dim_batch_quality_context
+"""
+sql_batch = """
+SELECT batch_id, fault_event_count, material_lot_count
+FROM warehouse.dim_batch_quality_context
+"""
+batch_df = load_data_with_sql(sql=sql_batch)
+'''
+        selected_snapshot = [
+            {
+                "datasource_id": 61,
+                "datasource_name": "Batch quality context",
+                "datasource_identifier": "warehouse.dim_batch_quality_context",
+                "metadata_schema": {"properties": {"batch_id": {"type": "string"}}},
+            },
+            {
+                "datasource_id": 62,
+                "datasource_name": "Root cause candidates",
+                "datasource_identifier": "warehouse.dim_root_cause_candidates",
+                "metadata_schema": {
+                    "properties": {
+                        "fault_event_count": {"type": "integer"},
+                        "material_lot_count": {"type": "integer"},
+                    },
+                },
+            },
+        ]
+
+        diagnostics = _build_schema_field_mismatch_diagnostics(
+            code=code,
+            error_message="Column 'fault_event_count' cannot be resolved.",
+            selected_datasource_snapshot=selected_snapshot,
+            code_error_context={"line_no": 10},
+        )
+
+        self.assertEqual(
+            [item["field_name"] for item in diagnostics["incompatible_fields"]],
+            ["fault_event_count", "material_lot_count"],
+        )
+        self.assertEqual(diagnostics["sql_assignment_range"]["start_line"], 6)
+
+    def test_unresolved_database_column_is_schema_mismatch(self) -> None:
+        self.assertEqual(
+            _classify_execution_error(
+                None,
+                "Column 'fault_event_count' cannot be resolved.",
+            ),
+            "schema_or_column_mismatch",
+        )
+        self.assertEqual(
+            _extract_error_signature(
+                "schema_or_column_mismatch",
+                "query date '2026-08-10': Column 'fault_event_count' cannot be resolved.",
+            )["field_name"],
+            "fault_event_count",
+        )
+
+    def test_missing_mapping_key_feedback_lists_all_same_mapping_usages(self) -> None:
+        code = '''
+time_range = analysis_parameters["time_range"]
+chart_description = f"{time_range['display_end']}"
+report_line = f"{time_range['start']} - {time_range['display_end']}"
+other = f"{another_mapping['display_end']}"
+'''
+
+        diagnostics, instructions, context = _augment_missing_mapping_key_feedback(
+            code=code,
+            error_type="schema_or_column_mismatch",
+            error_message="'display_end'\n错误定位：生成代码第 3 行",
+            diagnostics={},
+            repair_instructions=["keep scope"],
+            code_error_context={"line_no": 3, "suggested_patch_ranges": []},
+        )
+
+        self.assertEqual(diagnostics["violated_contract"], "missing_mapping_key")
+        self.assertEqual(diagnostics["mapping_expression"], "time_range")
+        self.assertEqual(diagnostics["usage_lines"], [3, 4])
+        self.assertEqual(
+            [item["start_line"] for item in context["suggested_patch_ranges"]],
+            [3, 4],
+        )
+        self.assertIn("lines [3, 4]", instructions[0])
+
+    def test_query_capacity_feedback_includes_all_related_high_cardinality_queries(self) -> None:
+        code = '''
+quality_sql = """
+SELECT batch_id, test_value FROM warehouse.quality_results
+"""
+quality = load_data_with_sql(sql=quality_sql)
+process_sql = """
+SELECT batch_id, AVG(value) AS avg_value
+FROM warehouse.process_samples
+GROUP BY batch_id
+"""
+process = load_data_with_sql(sql=process_sql)
+'''
+        selected_snapshot = [
+            {
+                "datasource_id": 79,
+                "datasource_name": "Quality results",
+                "datasource_identifier": "warehouse.quality_results",
+                "metadata_schema": {
+                    "relationships": [{
+                        "relationship_id": "quality_batch",
+                        "local_fields": ["batch_id"],
+                        "observed_key_cardinality": {"local_distinct_key_count": 18653},
+                    }],
+                },
+            },
+            {
+                "datasource_id": 76,
+                "datasource_name": "Process samples",
+                "datasource_identifier": "warehouse.process_samples",
+                "metadata_schema": {
+                    "relationships": [{
+                        "relationship_id": "process_batch",
+                        "local_fields": ["batch_id"],
+                        "observed_key_cardinality": {"local_distinct_key_count": 18653},
+                    }],
+                },
+            },
+        ]
+
+        diagnostics = _build_query_capacity_diagnostics(
+            code=code,
+            failed_sql="SELECT batch_id, test_value FROM warehouse.quality_results",
+            selected_datasource_snapshot=selected_snapshot,
+        )
+
+        self.assertEqual(
+            diagnostics["violated_contract"],
+            "observed_query_capacity_boundary",
+        )
+        self.assertEqual(
+            diagnostics["failed_query_capacity_risks"][0]["observed_distinct_count"],
+            18653,
+        )
+        self.assertEqual(len(diagnostics["related_high_cardinality_queries"]), 2)
+        self.assertEqual(
+            diagnostics["known_high_cardinality_result_dimensions"],
+            ["batch_id"],
+        )
+        self.assertTrue(
+            diagnostics["required_result_design"]["final_result_grain_required"]
+        )
+
+    def test_structured_result_rejects_heterogeneous_metric_in_one_value_field(self) -> None:
+        code = r'''
+data = load_data_with_sql(sql="SELECT alarm_count, fault_count FROM risks")
+total_alarms = int(data["alarm_count"].sum())
+total_faults = int(data["fault_count"].sum())
+chart_data = pd.DataFrame({
+    "signal": ["Alarms", "Faults"],
+    "count": [total_alarms, total_faults],
+})
+chart = build_chart_result(
+    data=chart_data,
+    chart_kind="bar",
+    category_field="signal",
+    value_field="count",
+)
+result = save_analysis_result(analysis_report="Risk signals.", charts=[chart], tables=[])
+'''
+        result = StructuredResult(
+            analysis_report="Risk signals.",
+            charts=[{
+                "title": "Risk signals",
+                "chart_type": "echarts",
+                "chart_spec": {
+                    "xAxis": {"type": "category", "data": ["Alarms", "Faults"]},
+                    "yAxis": {"type": "value"},
+                    "series": [{"type": "bar", "data": [8, 3]}],
+                },
+                "chart_data_contract": {
+                    "encoding": {
+                        "category_field": "signal",
+                        "value_field": "count",
+                    },
+                },
+            }],
+            query_snapshots={
+                "q_risks": {
+                    "implementation": {
+                        "sql": "SELECT alarm_count, fault_count FROM risks",
+                    },
+                    "execution": {
+                        "status": "success",
+                        "columns": ["alarm_count", "fault_count"],
+                    },
+                },
+            },
+        )
+
+        retry = _validate_structured_result_contract(
+            result,
+            generated_code=code,
+        )
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(retry.retry_type, "chart_contract_error")
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "heterogeneous_structured_metric",
+        )
+
+    def test_structured_result_rejects_mapping_members_from_distinct_fact_fields(self) -> None:
+        code = r'''
+data = load_data_with_sql(sql="SELECT process_alarm_count, fault_event_count FROM risks")
+evidence = {}
+evidence["Process"] = int(data["process_alarm_count"].sum())
+evidence["Equipment"] = int(data["fault_event_count"].sum())
+chart_data = pd.DataFrame([
+    {"cause": label, "strength": value}
+    for label, value in evidence.items()
+])
+chart = build_chart_result(
+    data=chart_data,
+    chart_kind="bar",
+    category_field="cause",
+    value_field="strength",
+)
+result = save_analysis_result(analysis_report="Risk signals.", charts=[chart], tables=[])
+'''
+        result = StructuredResult(
+            analysis_report="Risk signals.",
+            charts=[{
+                "title": "Risk signals",
+                "chart_type": "echarts",
+                "chart_spec": {
+                    "xAxis": {"type": "category", "data": ["Process", "Equipment"]},
+                    "yAxis": {"type": "value"},
+                    "series": [{"type": "bar", "data": [8, 3]}],
+                },
+                "chart_data_contract": {
+                    "encoding": {
+                        "category_field": "cause",
+                        "value_field": "strength",
+                    },
+                },
+            }],
+            query_snapshots={
+                "q_risks": {
+                    "implementation": {
+                        "sql": "SELECT process_alarm_count, fault_event_count FROM risks",
+                    },
+                    "execution": {
+                        "status": "success",
+                        "columns": ["process_alarm_count", "fault_event_count"],
+                    },
+                },
+            },
+        )
+
+        retry = _validate_structured_result_contract(result, generated_code=code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "heterogeneous_structured_metric",
+        )
+
+    def test_mapping_partition_counts_from_one_fact_field_remain_coherent(self) -> None:
+        code = r'''
+data = load_data_with_sql(sql="SELECT status FROM contracts")
+counts = {}
+counts["Active"] = int((data["status"] == "active").sum())
+counts["Expired"] = int((data["status"] == "expired").sum())
+chart_data = pd.DataFrame([
+    {"status": label, "count": value}
+    for label, value in counts.items()
+])
+chart = build_chart_result(
+    data=chart_data,
+    chart_kind="pie",
+    category_field="status",
+    value_field="count",
+)
+result = save_analysis_result(analysis_report="Status distribution.", charts=[chart], tables=[])
+'''
+        result = StructuredResult(
+            analysis_report="Status distribution.",
+            charts=[{
+                "title": "Status distribution",
+                "chart_type": "echarts",
+                "chart_spec": {
+                    "series": [{
+                        "type": "pie",
+                        "data": [
+                            {"name": "Active", "value": 8},
+                            {"name": "Expired", "value": 2},
+                        ],
+                    }],
+                },
+                "chart_data_contract": {
+                    "encoding": {
+                        "category_field": "status",
+                        "value_field": "count",
+                    },
+                },
+            }],
+            query_snapshots={
+                "q_contracts": {
+                    "implementation": {"sql": "SELECT status FROM contracts"},
+                    "execution": {"status": "success", "columns": ["status"]},
+                },
+            },
+        )
+
+        retry = _validate_structured_result_contract(result, generated_code=code)
+
+        self.assertIsNone(retry)
+
+    def test_report_rejects_ranking_distinct_fact_counts_as_one_score(self) -> None:
+        code = r'''
+data = load_data_with_sql(sql="SELECT process_alarm_count, fault_event_count, material_lot_count FROM risks")
+process_count = int(data["process_alarm_count"].sum())
+fault_count = int(data["fault_event_count"].sum())
+material_count = int(data["material_lot_count"].sum())
+scores = {
+    "Process": process_count,
+    "Equipment": fault_count,
+    "Material": material_count,
+}
+ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+analysis_report = "\n".join(f"{index}. {name}: {value}" for index, (name, value) in enumerate(ranked, 1))
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+        result = StructuredResult(
+            analysis_report="1. Material: 21\n2. Equipment: 3\n3. Process: 2",
+            tables=[{
+                "title": "Scope",
+                "columns": [{"key": "note", "label": "Note"}],
+                "rows": [{"note": "Comparable population review"}],
+            }],
+            query_snapshots={
+                "q_risks": {
+                    "implementation": {
+                        "sql": "SELECT process_alarm_count, fault_event_count, material_lot_count FROM risks"
+                    },
+                    "execution": {
+                        "status": "success",
+                        "columns": [
+                            "process_alarm_count",
+                            "fault_event_count",
+                            "material_lot_count",
+                        ],
+                    },
+                },
+            },
+        )
+
+        retry = _validate_structured_result_contract(result, generated_code=code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "heterogeneous_ranking_metric",
+        )
+        self.assertEqual(len(retry.diagnostics["rankings"]), 1)
+
+    def test_report_rejects_in_place_tuple_list_ranking(self) -> None:
+        code = r'''
+data = load_data_with_sql(sql="SELECT process_alarm_count, fault_event_count, material_lot_count FROM risks")
+process_count = int(data["process_alarm_count"].sum())
+fault_count = int(data["fault_event_count"].sum())
+material_count = int(data["material_lot_count"].sum())
+scores = [
+    ("Process", process_count),
+    ("Equipment", fault_count),
+    ("Material", material_count),
+]
+scores.sort(key=lambda item: item[1], reverse=True)
+analysis_report = "\n".join(f"{name}: {value}" for name, value in scores)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+        result = StructuredResult(
+            analysis_report="Material: 21\nEquipment: 3\nProcess: 2",
+            tables=[{
+                "title": "Scope",
+                "columns": [{"key": "note", "label": "Note"}],
+                "rows": [{"note": "Candidate review"}],
+            }],
+            query_snapshots={
+                "q_risks": {
+                    "implementation": {
+                        "sql": "SELECT process_alarm_count, fault_event_count, material_lot_count FROM risks"
+                    },
+                    "execution": {
+                        "status": "success",
+                        "columns": [
+                            "process_alarm_count",
+                            "fault_event_count",
+                            "material_lot_count",
+                        ],
+                    },
+                },
+            },
+        )
+
+        retry = _validate_structured_result_contract(result, generated_code=code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "heterogeneous_ranking_metric",
+        )
+
+    def test_report_rejects_tuple_list_dataframe_ranking(self) -> None:
+        code = r'''
+data = load_data_with_sql(sql="SELECT process_alarm_count, fault_event_count, material_lot_count FROM risks")
+process_count = int(data["process_alarm_count"].sum())
+fault_count = int(data["fault_event_count"].sum())
+material_count = int(data["material_lot_count"].sum())
+evidence_items = [
+    ("Process", process_count),
+    ("Equipment", fault_count),
+    ("Material", material_count),
+]
+evidence_df = pd.DataFrame(evidence_items, columns=["cause", "evidence_strength"])
+evidence_df = evidence_df.sort_values("evidence_strength", ascending=False)
+analysis_report = "\n".join(
+    f"{row['cause']}: {row['evidence_strength']}"
+    for _, row in evidence_df.iterrows()
+)
+chart = build_chart_result(data=evidence_df, chart_kind="bar", category_field="cause", value_field="evidence_strength")
+result = save_analysis_result(analysis_report=analysis_report, charts=[chart], tables=[])
+'''
+        result = StructuredResult(
+            analysis_report="Material: 21\nEquipment: 3\nProcess: 2",
+            charts=[{
+                "title": "Evidence ranking",
+                "chart_data_contract": {
+                    "source_query_key": "q_risks",
+                    "encoding": {
+                        "category_field": "cause",
+                        "value_fields": ["evidence_strength"],
+                    },
+                },
+            }],
+            query_snapshots={
+                "q_risks": {
+                    "implementation": {
+                        "sql": "SELECT process_alarm_count, fault_event_count, material_lot_count FROM risks"
+                    },
+                    "execution": {
+                        "status": "success",
+                        "columns": [
+                            "process_alarm_count",
+                            "fault_event_count",
+                            "material_lot_count",
+                        ],
+                    },
+                },
+            },
+        )
+
+        issues = LineageIndexer._heterogeneous_ranking_issues(code)
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(
+            issues[0]["value_field"],
+            "evidence_strength",
+        )
+
+    def test_report_rejects_conditionally_appended_tuple_list_ranking(self) -> None:
+        code = r'''
+process = load_data_with_sql(sql="SELECT batch_id, alarm_flag FROM process_events")
+equipment = load_data_with_sql(sql="SELECT batch_id, fault_flag FROM equipment_events")
+material = load_data_with_sql(sql="SELECT batch_id, supplier_id FROM material_events")
+process_count = process[process["alarm_flag"] == 1]["batch_id"].nunique()
+equipment_count = equipment[equipment["fault_flag"] == 1]["batch_id"].nunique()
+material_count = material["batch_id"].nunique()
+priorities = []
+if process_count > 0:
+    priorities.append(("Process", process_count))
+if equipment_count > 0:
+    priorities.append(("Equipment", equipment_count))
+if material_count > 0:
+    priorities.append(("Material", material_count))
+priorities.sort(key=lambda item: item[1], reverse=True)
+analysis_report = f"Top direction: {priorities[0][0]} ({priorities[0][1]} batches)."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+        result = StructuredResult(
+            analysis_report="Top direction: Material (8 batches).",
+            charts=[],
+            tables=[{
+                "title": "Scope",
+                "columns": [{"key": "note", "label": "Note"}],
+                "rows": [{"note": "Candidate review"}],
+            }],
+            query_snapshots={
+                "q_process": {
+                    "implementation": {"sql": "SELECT batch_id, alarm_flag FROM process_events"},
+                    "execution": {"status": "success", "columns": ["batch_id", "alarm_flag"]},
+                },
+                "q_equipment": {
+                    "implementation": {"sql": "SELECT batch_id, fault_flag FROM equipment_events"},
+                    "execution": {"status": "success", "columns": ["batch_id", "fault_flag"]},
+                },
+                "q_material": {
+                    "implementation": {"sql": "SELECT batch_id, supplier_id FROM material_events"},
+                    "execution": {"status": "success", "columns": ["batch_id", "supplier_id"]},
+                },
+            },
+        )
+
+        retry = _validate_structured_result_contract(result, generated_code=code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "heterogeneous_ranking_metric",
+        )
+
+    def test_report_allows_ranked_rates_with_one_shared_population(self) -> None:
+        code = r'''
+data = load_data_with_sql(sql="SELECT batch_id, process_alarm_count, fault_event_count FROM risks")
+population_count = int(data["batch_id"].nunique())
+process_rate = int((data["process_alarm_count"] > 0).sum()) / population_count
+fault_rate = int((data["fault_event_count"] > 0).sum()) / population_count
+scores = {"Process": process_rate, "Equipment": fault_rate}
+ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+analysis_report = "\n".join(f"{name}: {value:.1%}" for name, value in ranked)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+        result = StructuredResult(
+            analysis_report="Process: 30.0%\nEquipment: 20.0%",
+            tables=[{
+                "title": "Scope",
+                "columns": [{"key": "note", "label": "Note"}],
+                "rows": [{"note": "Shared population rates"}],
+            }],
+            query_snapshots={
+                "q_risks": {
+                    "implementation": {
+                        "sql": "SELECT batch_id, process_alarm_count, fault_event_count FROM risks"
+                    },
+                    "execution": {
+                        "status": "success",
+                        "columns": [
+                            "batch_id",
+                            "process_alarm_count",
+                            "fault_event_count",
+                        ],
+                    },
+                },
+            },
+        )
+
+        retry = _validate_structured_result_contract(result, generated_code=code)
+
+        self.assertIsNone(retry)
+
+    def test_report_rejects_rowwise_score_over_distinct_raw_boundaries(self) -> None:
+        code = r'''
+data = load_data_with_sql(sql="SELECT candidate, batch_id, process_alarm_count, fault_event_count FROM risks")
+summary = data.groupby("candidate").agg(
+    batch_count=("batch_id", "nunique"),
+    avg_alarm=("process_alarm_count", "mean"),
+    avg_fault=("fault_event_count", "mean"),
+).reset_index()
+def evidence_score(row):
+    return row["batch_count"] + row["avg_alarm"] * 2 + row["avg_fault"] * 3
+summary["score"] = summary.apply(evidence_score, axis=1)
+summary = summary.sort_values("score", ascending=False)
+analysis_report = f"Highest candidate score: {summary.iloc[0]['score']:.1f}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+        result = StructuredResult(
+            analysis_report="Highest candidate score: 15.1.",
+            tables=[{
+                "title": "Scope",
+                "columns": [{"key": "note", "label": "Note"}],
+                "rows": [{"note": "Candidate review"}],
+            }],
+            query_snapshots={
+                "q_risks": {
+                    "implementation": {
+                        "sql": "SELECT candidate, batch_id, process_alarm_count, fault_event_count FROM risks"
+                    },
+                    "execution": {
+                        "status": "success",
+                        "columns": [
+                            "candidate",
+                            "batch_id",
+                            "process_alarm_count",
+                            "fault_event_count",
+                        ],
+                    },
+                },
+            },
+        )
+
+        retry = _validate_structured_result_contract(result, generated_code=code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "heterogeneous_ranking_metric",
+        )
+        self.assertEqual(
+            retry.diagnostics["rankings"][0]["score_function"],
+            "evidence_score",
+        )
+
+    def test_report_rejects_vectorized_composite_score_with_shared_denominator(self) -> None:
+        code = r'''
+data = load_data_with_sql(sql="SELECT candidate, test_id, process_alarm_count, fault_event_count, material_lot_count FROM risks")
+summary = data.groupby("candidate").agg(
+    test_count=("test_id", "count"),
+    process_alarm=("process_alarm_count", "sum"),
+    fault_event=("fault_event_count", "sum"),
+    material_lot=("material_lot_count", "sum"),
+).reset_index()
+summary["process_per_test"] = summary["process_alarm"] / summary["test_count"]
+summary["fault_per_test"] = summary["fault_event"] / summary["test_count"]
+summary["material_per_test"] = summary["material_lot"] / summary["test_count"]
+summary["evidence_strength_score"] = (
+    summary["process_per_test"].fillna(0)
+    + summary["fault_per_test"].fillna(0)
+    + summary["material_per_test"].fillna(0)
+)
+summary = summary.sort_values("evidence_strength_score", ascending=False)
+analysis_report = f"Highest score: {summary.iloc[0]['evidence_strength_score']:.2f}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+        result = StructuredResult(
+            analysis_report="Highest score: 4.14.",
+            tables=[{
+                "title": "Scope",
+                "columns": [{"key": "note", "label": "Note"}],
+                "rows": [{"note": "Candidate review"}],
+            }],
+            query_snapshots={
+                "q_risks": {
+                    "implementation": {
+                        "sql": "SELECT candidate, test_id, process_alarm_count, fault_event_count, material_lot_count FROM risks"
+                    },
+                    "execution": {
+                        "status": "success",
+                        "columns": [
+                            "candidate",
+                            "test_id",
+                            "process_alarm_count",
+                            "fault_event_count",
+                            "material_lot_count",
+                        ],
+                    },
+                },
+            },
+        )
+
+        retry = _validate_structured_result_contract(result, generated_code=code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "heterogeneous_ranking_metric",
+        )
+        self.assertEqual(
+            retry.diagnostics["rankings"][0]["score_function"],
+            "vectorized_composite_score",
+        )
+
+    def test_report_allows_sorted_additive_business_total(self) -> None:
+        code = r'''
+data = load_data_with_sql(sql="SELECT product, domestic_revenue, export_revenue FROM revenue")
+summary = data.groupby("product").agg(
+    domestic_revenue=("domestic_revenue", "sum"),
+    export_revenue=("export_revenue", "sum"),
+).reset_index()
+summary["total_revenue"] = summary["domestic_revenue"] + summary["export_revenue"]
+summary = summary.sort_values("total_revenue", ascending=False)
+analysis_report = f"Top revenue: {summary.iloc[0]['total_revenue']:.2f}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+
+        issues = LineageIndexer._heterogeneous_ranking_issues(code)
+
+        self.assertEqual(issues, [])
+
+    def test_report_rejects_iterrows_record_score_over_distinct_raw_boundaries(self) -> None:
+        code = r'''
+data = load_data_with_sql(sql="SELECT candidate, batch_id, process_alarm_count, fault_event_count, material_lot_count FROM risks")
+summary = data.groupby("candidate").agg(
+    test_count=("batch_id", "count"),
+    process_alarm=("process_alarm_count", "sum"),
+    fault_event=("fault_event_count", "sum"),
+    material_lot=("material_lot_count", "sum"),
+).reset_index()
+priority_rows = []
+for _, row in summary.iterrows():
+    evidence_score = row["process_alarm"] + row["fault_event"] + row["material_lot"]
+    priority_rows.append({
+        "candidate": row["candidate"],
+        "test_count": row["test_count"],
+        "evidence_score": evidence_score,
+    })
+priority_df = pd.DataFrame(priority_rows).sort_values(
+    ["evidence_score", "test_count"], ascending=False
+)
+analysis_report = f"Highest candidate score: {priority_df.iloc[0]['evidence_score']}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+        result = StructuredResult(
+            analysis_report="Highest candidate score: 29.",
+            tables=[{
+                "title": "Scope",
+                "columns": [{"key": "note", "label": "Note"}],
+                "rows": [{"note": "Candidate review"}],
+            }],
+            query_snapshots={
+                "q_risks": {
+                    "implementation": {
+                        "sql": "SELECT candidate, batch_id, process_alarm_count, fault_event_count, material_lot_count FROM risks"
+                    },
+                    "execution": {
+                        "status": "success",
+                        "columns": [
+                            "candidate",
+                            "batch_id",
+                            "process_alarm_count",
+                            "fault_event_count",
+                            "material_lot_count",
+                        ],
+                    },
+                },
+            },
+        )
+
+        retry = _validate_structured_result_contract(result, generated_code=code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "heterogeneous_ranking_metric",
+        )
+        self.assertEqual(
+            retry.diagnostics["rankings"][0]["value_field"],
+            "evidence_score",
+        )
+
+    def test_iterrows_record_without_ranking_remains_valid(self) -> None:
+        code = r'''
+data = load_data_with_sql(sql="SELECT candidate, process_alarm_count, fault_event_count FROM risks")
+summary = data.groupby("candidate").agg(
+    process_alarm=("process_alarm_count", "sum"),
+    fault_event=("fault_event_count", "sum"),
+).reset_index()
+rows = []
+for _, row in summary.iterrows():
+    total_observations = row["process_alarm"] + row["fault_event"]
+    rows.append({"candidate": row["candidate"], "total_observations": total_observations})
+table = build_table_result(
+    data=pd.DataFrame(rows),
+    columns=[
+        {"key": "candidate", "label": "Candidate"},
+        {"key": "total_observations", "label": "Observation total"},
+    ],
+)
+result = save_analysis_result(analysis_report="Observation totals.", charts=[], tables=[table])
+'''
+
+        issues = LineageIndexer._heterogeneous_ranking_issues(code)
+
+        self.assertEqual(issues, [])
+
+    def test_table_rejects_inferred_technical_field_labels(self) -> None:
+        result = StructuredResult(
+            analysis_report="Batch details are listed below.",
+            tables=[{
+                "title": "Batch details",
+                "columns": [
+                    {"key": "batch_id", "label": "batch_id"},
+                    {"key": "quality_status", "label": "quality_status"},
+                ],
+                "rows": [{"batch_id": "B-001", "quality_status": "near_limit"}],
+            }],
+        )
+
+        retry = _validate_structured_result_contract(result)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "unreadable_table_column_labels",
+        )
+        self.assertEqual(
+            [item["key"] for item in retry.diagnostics["unreadable_table_columns"]],
+            ["batch_id", "quality_status"],
+        )
+
+    def test_table_allows_explicit_business_column_labels(self) -> None:
+        result = StructuredResult(
+            analysis_report="Batch details are listed below.",
+            tables=[{
+                "title": "Batch details",
+                "columns": [
+                    {"key": "batch_id", "label": "生产批次"},
+                    {"key": "quality_status", "label": "质量状态"},
+                ],
+                "rows": [{"batch_id": "B-001", "quality_status": "near_limit"}],
+            }],
+        )
+
+        retry = _validate_structured_result_contract(result)
+
+        self.assertIsNone(retry)
+
+    def test_report_allows_rowwise_score_over_shared_population_rates(self) -> None:
+        code = r'''
+data = load_data_with_sql(sql="SELECT candidate, batch_id, process_alarm_count, fault_event_count FROM risks")
+summary = data.groupby("candidate").agg(
+    batch_count=("batch_id", "nunique"),
+    alarm_batches=("process_alarm_count", "sum"),
+    fault_batches=("fault_event_count", "sum"),
+).reset_index()
+summary["alarm_rate"] = summary["alarm_batches"] / summary["batch_count"]
+summary["fault_rate"] = summary["fault_batches"] / summary["batch_count"]
+def evidence_score(row):
+    return row["alarm_rate"] * 0.5 + row["fault_rate"] * 0.5
+summary["score"] = summary.apply(evidence_score, axis=1)
+summary = summary.sort_values("score", ascending=False)
+analysis_report = f"Highest normalized score: {summary.iloc[0]['score']:.1%}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+        result = StructuredResult(
+            analysis_report="Highest normalized score: 30.0%.",
+            tables=[{
+                "title": "Scope",
+                "columns": [{"key": "note", "label": "Note"}],
+                "rows": [{"note": "Shared-population rate score"}],
+            }],
+            query_snapshots={
+                "q_risks": {
+                    "implementation": {
+                        "sql": "SELECT candidate, batch_id, process_alarm_count, fault_event_count FROM risks"
+                    },
+                    "execution": {
+                        "status": "success",
+                        "columns": [
+                            "candidate",
+                            "batch_id",
+                            "process_alarm_count",
+                            "fault_event_count",
+                        ],
+                    },
+                },
+            },
+        )
+
+        retry = _validate_structured_result_contract(result, generated_code=code)
+
+        self.assertIsNone(retry)
+
+    def test_list_of_dict_ranking_marks_structured_score_as_heterogeneous(self) -> None:
+        code = r'''
+data = load_data_with_sql(sql="SELECT process_alarm_count, fault_event_count FROM risks")
+process_count = int(data["process_alarm_count"].sum())
+fault_count = int(data["fault_event_count"].sum())
+rows = [
+    {"cause": "Process", "score": process_count},
+    {"cause": "Equipment", "score": fault_count},
+]
+ranked = pd.DataFrame(rows).sort_values("score", ascending=False)
+chart = build_chart_result(data=ranked, chart_kind="bar", category_field="cause", value_field="score")
+result = save_analysis_result(analysis_report="Risk ranking.", charts=[chart], tables=[])
+'''
+        result = StructuredResult(
+            analysis_report="Risk ranking.",
+            charts=[{
+                "title": "Risk ranking",
+                "chart_document": {
+                    "chart_kind": "bar",
+                    "dataset": {"rows": [
+                        {"cause": "Process", "score": 8},
+                        {"cause": "Equipment", "score": 3},
+                    ]},
+                    "encoding": {
+                        "category_field": "cause",
+                        "value_field": "score",
+                    },
+                },
+                "chart_data_contract": {
+                    "source_frame": "ranked",
+                    "encoding": {
+                        "category_field": "cause",
+                        "value_field": "score",
+                    },
+                },
+            }],
+            query_snapshots={
+                "q_risks": {
+                    "implementation": {
+                        "sql": "SELECT process_alarm_count, fault_event_count FROM risks"
+                    },
+                    "execution": {
+                        "status": "success",
+                        "columns": ["process_alarm_count", "fault_event_count"],
+                    },
+                },
+            },
+        )
+
+        retry = _validate_structured_result_contract(result, generated_code=code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "heterogeneous_structured_metric",
+        )
+
+    def test_value_counts_scalar_partitions_remain_one_count_metric(self) -> None:
+        code = r'''
+data = load_data_with_sql(sql="SELECT pattern FROM process_events")
+pattern_counts = data["pattern"].value_counts()
+single_count = int(pattern_counts.get("single_burst", 0))
+drift_count = int(pattern_counts.get("continuous_drift", 0))
+chart_data = pd.DataFrame({
+    "pattern": ["Single burst", "Continuous drift"],
+    "count": [single_count, drift_count],
+})
+chart = build_chart_result(
+    data=chart_data,
+    chart_kind="pie",
+    category_field="pattern",
+    value_field="count",
+)
+result = save_analysis_result(analysis_report="Pattern distribution.", charts=[chart], tables=[])
+'''
+        result = StructuredResult(
+            analysis_report="Pattern distribution.",
+            charts=[{
+                "title": "Pattern distribution",
+                "chart_type": "echarts",
+                "chart_spec": {
+                    "series": [{
+                        "type": "pie",
+                        "data": [
+                            {"name": "Single burst", "value": 8},
+                            {"name": "Continuous drift", "value": 2},
+                        ],
+                    }],
+                },
+                "chart_data_contract": {
+                    "encoding": {
+                        "category_field": "pattern",
+                        "value_field": "count",
+                    },
+                },
+            }],
+            query_snapshots={
+                "q_process": {
+                    "implementation": {"sql": "SELECT pattern FROM process_events"},
+                    "execution": {"status": "success", "columns": ["pattern"]},
+                },
+            },
+        )
+
+        retry = _validate_structured_result_contract(result, generated_code=code)
+
+        self.assertIsNone(retry)
+
+    def test_boolean_sum_partitions_remain_one_count_metric(self) -> None:
+        code = r'''
+data = load_data_with_sql(sql="SELECT alarm_point_count FROM process_events")
+single_count = int((data["alarm_point_count"] == 1).sum())
+continuous_count = int((data["alarm_point_count"] > 1).sum())
+chart_data = pd.DataFrame([
+    {"pattern": "Single", "count": single_count},
+    {"pattern": "Continuous", "count": continuous_count},
+])
+chart = build_chart_result(
+    data=chart_data,
+    chart_kind="pie",
+    category_field="pattern",
+    value_field="count",
+)
+result = save_analysis_result(analysis_report="Pattern distribution.", charts=[chart], tables=[])
+'''
+        result = StructuredResult(
+            analysis_report="Pattern distribution.",
+            charts=[{
+                "title": "Pattern distribution",
+                "chart_document": {
+                    "chart_kind": "pie",
+                    "dataset": {"rows": [
+                        {"pattern": "Single", "count": 8},
+                        {"pattern": "Continuous", "count": 2},
+                    ]},
+                    "encoding": {
+                        "category_field": "pattern",
+                        "value_field": "count",
+                    },
+                },
+            }],
+            query_snapshots={
+                "q_process": {
+                    "implementation": {
+                        "sql": "SELECT alarm_point_count FROM process_events"
+                    },
+                    "execution": {
+                        "status": "success",
+                        "columns": ["alarm_point_count"],
+                    },
+                },
+            },
+        )
+
+        retry = _validate_structured_result_contract(result, generated_code=code)
+
+        self.assertIsNone(retry)
+
+    def test_flat_chart_rejects_additive_total_as_peer_category(self) -> None:
+        result = StructuredResult(
+            analysis_report="Parameter alarm distribution.",
+            charts=[{
+                "title": "Parameter alarm distribution",
+                "chart_document": {
+                    "chart_kind": "bar",
+                    "dataset": {"rows": [
+                        {"parameter": "Temperature", "count": 12},
+                        {"parameter": "Pressure", "count": 8},
+                        {"parameter": "Feed rate", "count": 5},
+                        {"parameter": "Process (total)", "count": 25},
+                    ]},
+                    "encoding": {
+                        "category_field": "parameter",
+                        "value_field": "count",
+                    },
+                },
+            }],
+        )
+
+        retry = _validate_structured_result_contract(result)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "overlapping_total_component_categories",
+        )
+
+    def test_flat_chart_allows_non_overlapping_peer_categories(self) -> None:
+        result = StructuredResult(
+            analysis_report="Parameter alarm distribution.",
+            charts=[{
+                "title": "Parameter alarm distribution",
+                "chart_document": {
+                    "chart_kind": "bar",
+                    "dataset": {"rows": [
+                        {"parameter": "Temperature", "count": 12},
+                        {"parameter": "Pressure", "count": 8},
+                        {"parameter": "Feed rate", "count": 5},
+                    ]},
+                    "encoding": {
+                        "category_field": "parameter",
+                        "value_field": "count",
+                    },
+                },
+            }],
+        )
+
+        retry = _validate_structured_result_contract(result)
+
+        self.assertIsNone(retry)
 
     def test_syntax_error_feedback_contains_exact_generated_code_context(self) -> None:
         retry = _validate_generated_code_contract(
@@ -281,6 +1481,57 @@ result = request_retry(
         self.assertEqual([item["datasource_id"] for item in summary["no_data"]], [2])
         self.assertEqual([item["datasource_id"] for item in summary["unavailable"]], [3])
 
+    def test_probe_feedback_elevates_query_capacity_risks(self) -> None:
+        retry = request_retry(
+            retry_type="probe_feedback",
+            message="done",
+            diagnostics={"query_observations": [{
+                "datasource_id": 62,
+                "datasource_name": "quality facts",
+                "status": "success",
+                "row_count": 20419,
+            }]},
+        )
+
+        self.assertEqual(retry.diagnostics["_query_capacity_risks"], [{
+            "datasource_id": 62,
+            "datasource_name": "quality facts",
+            "observed_row_count": 20419,
+            "observed_population_count": 20419,
+            "observed_population_counts": {},
+            "max_rows_per_physical_query": 10000,
+            "required_strategy": "query_side_final_aggregation_or_stable_pagination",
+        }])
+        self.assertTrue(
+            retry.diagnostics["_probe_contract"]["query_execution"][
+                "capacity_risks_are_formal_design_inputs"
+            ]
+        )
+
+    def test_probe_feedback_reads_population_from_aggregate_result(self) -> None:
+        retry = request_retry(
+            retry_type="probe_feedback",
+            message="done",
+            diagnostics={"query_observations": [{
+                "datasource_id": 62,
+                "datasource_name": "quality facts",
+                "status": "success",
+                "row_count": 1,
+                "data": [{"row_count": "20419", "batch_count": 18653}],
+            }]},
+        )
+
+        summary = retry.diagnostics["_probe_outcome_summary"]["successful"][0]
+        self.assertEqual(summary["row_count"], 1)
+        self.assertEqual(summary["observed_population_counts"], {
+            "row_count": 20419,
+            "batch_count": 18653,
+        })
+        self.assertEqual(
+            retry.diagnostics["_query_capacity_risks"][0]["observed_population_count"],
+            20419,
+        )
+
     def test_probe_broad_sql_exception_feedback_preserves_multi_source_scope(self) -> None:
         retry = _validate_generated_code_contract('''
 execution_intent = "probe"
@@ -389,6 +1640,39 @@ result = save_analysis_result(analysis_report="report", charts=[], tables=[])
 
         self.assertIsNotNone(retry)
         self.assertEqual(retry.diagnostics["missing_datasource_ids"], [64, 66, 79, 179])
+
+    def test_rejected_scope_regression_carries_original_scope_anchor(self) -> None:
+        history = [SimpleNamespace(
+            generated_code='''execution_intent = "analysis"
+frame = load_data_with_sql(sql="SELECT * FROM warehouse.fact_quality")
+result = save_analysis_result(...)
+''',
+            result_payload_json=json.dumps({
+                "retry_type": "contract_error",
+                "diagnostics": {
+                    "violated_contract": "analysis_scope_regression_after_technical_repair",
+                    "previous_used_datasource_ids": [61, 62, 64, 68],
+                    "current_used_datasource_ids": [61],
+                    "missing_datasource_ids": [62, 64, 68],
+                    "scope_change_authorized": False,
+                },
+            }),
+            used_datasource_ids_json='[61]',
+        )]
+
+        retry = _validate_analysis_scope_against_execution_history(
+            previous_executions=history,
+            current_used_datasource_ids=[61, 62],
+            current_code='execution_intent = "analysis"\nresult = save_analysis_result(...)',
+            selected_datasource_snapshot=[{
+                "datasource_id": 61,
+                "datasource_identifier": "warehouse.fact_quality",
+            }],
+        )
+
+        self.assertIsNotNone(retry)
+        self.assertEqual(retry.diagnostics["previous_used_datasource_ids"], [61, 62, 64, 68])
+        self.assertEqual(retry.diagnostics["missing_datasource_ids"], [64, 68])
 
     def test_probe_scope_is_allowed_to_be_narrower_than_failed_analysis(self) -> None:
         retry = _validate_analysis_scope_against_execution_history(
@@ -824,6 +2108,15 @@ charts = [build_chart_result(data=top_rows)]
                 value_field="amount",
             )],
             tables=[],
+            query_snapshots={
+                "q_shipping": {
+                    "execution": {
+                        "status": "success",
+                        "rows_before_reduction": 12,
+                        "rows_after_reduction": 3,
+                    }
+                }
+            },
         )
 
         retry = _validate_structured_result_contract(
@@ -836,6 +2129,64 @@ charts = [build_chart_result(data=top_rows)]
         )
 
         self.assertIsNotNone(retry)
+
+    def test_unproven_head_does_not_force_a_repair(self) -> None:
+        result = StructuredResult(
+            analysis_report="All three available products are shown.",
+            charts=[build_chart_result(
+                chart_kind="bar",
+                data=[
+                    {"product": "A", "amount": 100},
+                    {"product": "B", "amount": 80},
+                    {"product": "C", "amount": 60},
+                ],
+                title="Product revenue",
+                category_field="product",
+                value_field="amount",
+            )],
+            tables=[],
+        )
+
+        retry = _validate_structured_result_contract(
+            result,
+            generated_code=(
+                "top_n = 10\n"
+                "visible = products.head(top_n)\n"
+                "charts = [build_chart_result(data=visible)]"
+            ),
+        )
+
+        self.assertIsNone(retry)
+
+    def test_any_static_contract_repair_preserves_datasource_scope_by_default(self) -> None:
+        retry = _validate_scope_preserving_technical_repair(
+            previous_used_datasource_ids=[61, 62, 64, 77],
+            current_used_datasource_ids=[62],
+            previous_failure_payload={
+                "retry_type": "contract_error",
+                "diagnostics": {
+                    "violated_contract": "report_superlative_requires_explicit_extrema",
+                },
+            },
+        )
+
+        self.assertIsNotNone(retry)
+        self.assertEqual(retry.diagnostics["missing_datasource_ids"], [61, 64, 77])
+
+    def test_explicitly_authorized_contract_may_normalize_datasource_declaration(self) -> None:
+        retry = _validate_scope_preserving_technical_repair(
+            previous_used_datasource_ids=[61, 62],
+            current_used_datasource_ids=[62],
+            previous_failure_payload={
+                "retry_type": "result_contract_error",
+                "diagnostics": {
+                    "violated_contract": "declared_datasource_without_physical_access",
+                    "scope_change_authorized": True,
+                },
+            },
+        )
+
+        self.assertIsNone(retry)
 
     def test_sql_loader_coerces_only_explicit_numeric_result_columns(self) -> None:
         raw = pd.DataFrame([{
@@ -870,6 +2221,61 @@ charts = [build_chart_result(data=top_rows)]
         self.assertEqual(data.loc[0, "business_id"], "00123")
         self.assertEqual(data.loc[0, "record_count"], 7)
         self.assertEqual(data.loc[0, "total_amount"], 12.5)
+        self.assertEqual(data.loc[0, "first_business_id"], "00001")
+
+    def test_sql_loader_infers_numeric_aggregates_with_driver_placeholders(self) -> None:
+        raw = pd.DataFrame([{
+            "quality_status": "near_limit",
+            "record_count": "7",
+            "avg_abs_deviation": "12.50",
+        }])
+        with patch("agent.tools._load_data_with_fed_query", return_value=raw):
+            data = load_data_with_sql(
+                "SELECT quality_status, COUNT(*) AS record_count, "
+                "AVG(ABS(target_deviation)) AS avg_abs_deviation FROM t "
+                "WHERE quality_status IN (%s, %s) GROUP BY quality_status",
+                params=["oos", "near_limit"],
+            )
+
+        self.assertEqual(data.loc[0, "record_count"], 7)
+        self.assertEqual(data.loc[0, "avg_abs_deviation"], 12.5)
+
+    def test_sql_loader_restores_nested_aggregate_alias_type(self) -> None:
+        raw = pd.DataFrame([{
+            "batch_id": "B-001",
+            "alarm_samples": "3",
+            "min_t": "2026-08-10 00:00:00",
+        }])
+        with patch("agent.tools._load_data_with_fed_query", return_value=raw):
+            data = load_data_with_sql(
+                "SELECT t.batch_id, t.alarm_samples, t.min_t FROM ("
+                "SELECT batch_id, SUM(alarm_flag) AS alarm_samples, "
+                "MIN(sample_time) AS min_t FROM samples GROUP BY batch_id"
+                ") t ORDER BY t.batch_id LIMIT 100"
+            )
+
+        self.assertEqual(data.loc[0, "alarm_samples"], 3)
+        self.assertEqual(data.loc[0, "min_t"], "2026-08-10 00:00:00")
+
+    def test_sql_loader_uses_schema_type_for_min_max_aggregate_aliases(self) -> None:
+        raw = pd.DataFrame([{
+            "max_alarm_count": "12",
+            "first_business_id": "00001",
+        }])
+        token = CURRENT_DATASOURCE_NUMERIC_FIELDS.set([{
+            "identifiers": ["dw.process_alarm"],
+            "fields": ["alarm_count"],
+        }])
+        try:
+            with patch("agent.tools._load_data_with_fed_query", return_value=raw):
+                data = load_data_with_sql(
+                    "SELECT MAX(alarm_count) AS max_alarm_count, "
+                    "MIN(business_id) AS first_business_id FROM dw.process_alarm"
+                )
+        finally:
+            CURRENT_DATASOURCE_NUMERIC_FIELDS.reset(token)
+
+        self.assertEqual(data.loc[0, "max_alarm_count"], 12)
         self.assertEqual(data.loc[0, "first_business_id"], "00001")
 
     def test_sql_loader_infers_generated_time_part_as_numeric(self) -> None:
@@ -1111,6 +2517,36 @@ report_sections = [
         self.assertEqual(len(retry.diagnostics["placeholders"]), 3)
         self.assertEqual(retry.code_error_context["line_no"], 6)
         self.assertIn("{start_date}", retry.code_error_context["error_line"])
+
+    def test_report_rejects_unbound_identifier_placeholder(self) -> None:
+        result = StructuredResult(
+            analysis_report="## Scope\n- Total batches: {total_batches}",
+            charts=[{"title": "Trend", "chart_document": {"series": []}}],
+            tables=[],
+        )
+        generated_code = '''
+report_sections = [
+    "## Scope",
+    "- Total batches: {total_batches}",
+]
+'''
+
+        retry = _validate_structured_result_contract(
+            result,
+            generated_code=generated_code,
+        )
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "unrendered_report_placeholder",
+        )
+        self.assertEqual(
+            retry.diagnostics["placeholders"][0]["unbound_identifier"],
+            "total_batches",
+        )
+        self.assertEqual(retry.code_error_context["line_no"], 4)
 
     def test_code_rejects_literal_unfinished_report_before_execution(self) -> None:
         code = '''
@@ -1707,6 +3143,112 @@ else:
     data = load_data_with_sql("SELECT status, COUNT(*) AS contract_count FROM t GROUP BY status")
     data = data.sort_values("contract_count", ascending=False).reset_index(drop=True)
     analysis_report = f"合同状态以 {data.iloc[0]['status']} 为主，共 {data.iloc[0]['contract_count']} 个。"
+    result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+
+        self.assertIsNone(_validate_generated_code_contract(code))
+
+    def test_generated_code_allows_wrapped_metric_from_sorted_extrema_row(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"metric": "contract_count"}}
+validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT status, COUNT(*) AS contract_count FROM t GROUP BY status")
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql("SELECT status, COUNT(*) AS contract_count FROM t GROUP BY status")
+    suspicious = data.sort_values("contract_count", ascending=False).head(10)
+    analysis_report = f"Highest status is {suspicious.iloc[0]['status']} with {int(suspicious.iloc[0]['contract_count'])} contracts."
+    result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+
+        self.assertIsNone(_validate_generated_code_contract(code))
+
+    def test_generated_code_allows_inline_sorted_positional_extrema_row(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"metric": "contract_count"}}
+validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT status, COUNT(*) AS contract_count FROM t GROUP BY status")
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql("SELECT status, COUNT(*) AS contract_count FROM t GROUP BY status")
+    analysis_report = f"Highest status is {data.sort_values('contract_count', ascending=False).iloc[0]['status']} with {data.sort_values('contract_count', ascending=False).iloc[0]['contract_count']} contracts."
+    result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+
+        self.assertIsNone(_validate_generated_code_contract(code))
+
+    def test_generated_code_rejects_reversed_nearest_boundary_direction(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"metric": "boundary_distance"}}
+validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT value, lower_limit, upper_limit FROM tests")
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql("SELECT value, lower_limit, upper_limit FROM tests")
+    data["boundary_distance_ratio"] = None
+    for idx, row in data.iterrows():
+        data.at[idx, "boundary_distance_ratio"] = min(
+            row["value"] - row["lower_limit"],
+            row["upper_limit"] - row["value"],
+        ) / (row["upper_limit"] - row["lower_limit"])
+    ranked = data.sort_values("boundary_distance_ratio", ascending=False)
+    analysis_report = f"The higher the ratio, the closer it is to the specification limit. Highest risk: {ranked.iloc[0]['boundary_distance_ratio']}."
+    result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+
+        retry = _validate_generated_code_contract(code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "bounded_interval_metric_direction_mismatch",
+        )
+        self.assertEqual(
+            retry.diagnostics["descending_sorts"][0]["field"],
+            "boundary_distance_ratio",
+        )
+
+    def test_generated_code_allows_nearest_boundary_margin_ranked_ascending(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"metric": "boundary_distance"}}
+validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT value, lower_limit, upper_limit FROM tests")
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql("SELECT value, lower_limit, upper_limit FROM tests")
+    data["boundary_distance_ratio"] = None
+    for idx, row in data.iterrows():
+        data.at[idx, "boundary_distance_ratio"] = min(
+            row["value"] - row["lower_limit"],
+            row["upper_limit"] - row["value"],
+        ) / (row["upper_limit"] - row["lower_limit"])
+    ranked = data.sort_values("boundary_distance_ratio", ascending=True)
+    analysis_report = f"The lower the ratio, the closer it is to the specification limit. Boundary risk: {ranked.iloc[0]['boundary_distance_ratio']}."
+    result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+
+        self.assertIsNone(_validate_generated_code_contract(code))
+
+    def test_generated_code_allows_explicit_higher_is_riskier_boundary_score(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"metric": "boundary_risk"}}
+validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT value, lower_limit, upper_limit FROM tests")
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql("SELECT value, lower_limit, upper_limit FROM tests")
+    data["boundary_risk_score"] = 1 - min(
+        data.iloc[0]["value"] - data.iloc[0]["lower_limit"],
+        data.iloc[0]["upper_limit"] - data.iloc[0]["value"],
+    ) / (data.iloc[0]["upper_limit"] - data.iloc[0]["lower_limit"])
+    ranked = data.sort_values("boundary_risk_score", ascending=False)
+    analysis_report = f"The higher the risk score, the closer it is to the specification limit: {ranked.iloc[0]['boundary_risk_score']}."
     result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
 '''
 
@@ -2631,6 +4173,91 @@ instances_with_auth = len(main_ids & authorization_ids)
 '''
 
         self.assertIsNone(_validate_analysis_relationship_contract(context, code))
+
+    def test_empty_markdown_leaf_sections_are_structural_incompleteness(self) -> None:
+        report = """## Report
+
+### Findings
+
+#### Available population
+
+- 7 records were available.
+
+#### Missing population
+
+#### Recommendation
+
+### Method
+
+The method is documented.
+"""
+
+        findings = _find_empty_markdown_leaf_sections(report)
+
+        self.assertEqual(
+            [item["heading"] for item in findings],
+            ["Missing population", "Recommendation"],
+        )
+        retry = _validate_structured_result_contract(StructuredResult(
+            analysis_report=report,
+            charts=[{
+                "title": "Distribution",
+                "chart_spec": {"series": [{"data": [7]}]},
+            }],
+            tables=[],
+        ))
+        self.assertIsNotNone(retry)
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "empty_markdown_leaf_sections",
+        )
+
+    def test_parent_heading_with_child_sections_is_not_empty(self) -> None:
+        report = """## Report
+
+### Findings
+
+#### Distribution
+
+The population is dispersed.
+"""
+
+        self.assertEqual(_find_empty_markdown_leaf_sections(report), [])
+
+    def test_static_review_reports_multiple_independent_contracts_once(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {}
+validate_query_constraints(query_constraints=query_constraints, sql="SELECT 1")
+frame = load_data_with_sql(sql="SELECT group_id, label, value FROM metrics")
+summary = frame.groupby("group_id").agg(
+    label=("label", "first"),
+    value=("value", "sum"),
+).reset_index()
+charts = [build_chart_result(
+    title="Distribution",
+    data=summary,
+    chart_type="bar",
+    category_field="label",
+    value_fields=["value"],
+)]
+report = f"## Report\\n\\n### Finding\\n\\n分布以 {summary.iloc[0]['label']} 为主，共 {summary.iloc[0]['value']}。"
+result = save_analysis_result(analysis_report=report, charts=charts, tables=[])
+'''
+
+        retry = _validate_generated_code_contract(code)
+
+        self.assertIsNotNone(retry)
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "multiple_static_contract_violations",
+        )
+        contracts = {
+            item["diagnostics"].get("violated_contract")
+            for item in retry.diagnostics["violations"]
+        }
+        self.assertIn("report_superlative_requires_explicit_extrema", contracts)
+        self.assertIn("grouped_visible_dimension_functional_dependency", contracts)
 
 
 

@@ -76,7 +76,7 @@ class AnalysisTaskRunnerTestCase(unittest.TestCase):
         runner = AnalysisTaskRunner()
         with (
             patch("service.analysis_task_runner.get_redis_client", side_effect=RuntimeError("redis down")),
-            patch("service.analysis_task_runner.SessionLocal", self.session_factory),
+            patch("config.database.SessionLocal", self.session_factory),
         ):
             runner._run_task(task.task_id, task.id, request, 39, False)
 

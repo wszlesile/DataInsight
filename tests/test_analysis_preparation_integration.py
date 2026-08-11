@@ -126,6 +126,32 @@ def test_preparation_failure_preserves_original_datasource_context(monkeypatch):
     assert runtime.short_term_memory["preparation_result"] is result
 
 
+def test_preparation_probe_context_keeps_the_separate_fedquery_authorization(monkeypatch):
+    runtime = _runtime(_snapshot(11))
+    captured = {}
+    request = _request()
+    request.platform_authorization = "Bearer platform-ticket"
+    request.fedquery_authorization = "Bearer fedquery-jwt"
+
+    def fake_prepare(**kwargs):
+        captured.update(kwargs)
+        return _preparation(_snapshot(11))
+
+    monkeypatch.setattr(invoker, "prepare_analysis", fake_prepare)
+
+    invoker._prepare_analysis_context(
+        runtime=runtime,
+        agent_request=request,
+        runtime_config=SimpleNamespace(),
+    )
+
+    assert captured["execution_context"]["token"] == "Bearer platform-ticket"
+    assert (
+        captured["execution_context"]["fedquery_authorization"]
+        == "Bearer fedquery-jwt"
+    )
+
+
 def test_rerun_is_always_an_analysis_request_even_when_text_classifier_is_uncertain():
     runtime = _runtime(_snapshot(11))
     runtime.is_rerun = True

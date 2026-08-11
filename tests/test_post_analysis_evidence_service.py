@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 import sys
 from unittest.mock import patch
@@ -1062,6 +1063,76 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     assert output["candidate_query_node_ids"] == ["q_monthly"]
 
 
+def test_report_len_of_dynamically_written_mapping_reaches_source_query():
+    sql = "SELECT batch_id, alarm_count FROM process_signals"
+    code = r'''
+sql = "SELECT batch_id, alarm_count FROM process_signals"
+data = load_data_with_sql(sql=sql)
+affected_batches = {}
+for _, row in data.iterrows():
+    if row["alarm_count"] > 0:
+        affected_batches[row["batch_id"]] = int(row["alarm_count"])
+analysis_report = f"Affected batches: {len(affected_batches)}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Affected batches: 6.",
+        query_snapshots={
+            "q_signals": _query_snapshot(
+                sql,
+                columns=["batch_id", "alarm_count"],
+            ),
+        },
+    )
+    lineage = LineageIndexer().build(snapshot)
+    output = next(
+        item
+        for item in lineage["output_nodes"]
+        if item.get("artifact_type") == "report"
+        and item.get("text") == "6"
+    )
+
+    assert output["field"] == "len(affected_batches)"
+    assert output["candidate_query_node_ids"] == ["q_signals"]
+
+
+def test_report_len_of_nested_mapping_mutation_reaches_source_query():
+    sql = "SELECT batch_id, event_count FROM equipment_events"
+    code = r'''
+sql = "SELECT batch_id, event_count FROM equipment_events"
+data = load_data_with_sql(sql=sql)
+affected_batches = {}
+for _, row in data.iterrows():
+    batch_id = row["batch_id"]
+    affected_batches.setdefault(batch_id, {"events": 0})
+    affected_batches[batch_id]["events"] += int(row["event_count"])
+analysis_report = f"Affected batches: {len(affected_batches)}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Affected batches: 1.",
+        query_snapshots={
+            "q_events": _query_snapshot(
+                sql,
+                columns=["batch_id", "event_count"],
+            ),
+        },
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    output = next(
+        item
+        for item in lineage["output_nodes"]
+        if item.get("artifact_type") == "report"
+        and item.get("text") == "1"
+    )
+
+    assert output["field"] == "len(affected_batches)"
+    assert output["candidate_query_node_ids"] == ["q_events"]
+
+
 def test_local_file_uses_execution_schema_as_source_field_lineage():
     path = "C:/data/sales.csv"
     code = r'''
@@ -1206,6 +1277,60 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
 
     assert bundle["status"] == "complete", bundle["diagnostics"]
     assert [item["text"] for item in bundle["report_trace_refs"]] == ["3", "1"]
+
+
+def test_inline_dataframe_nunique_report_metric_is_not_omitted():
+    sql = "SELECT product_id FROM quality_results"
+    code = r'''
+data = load_data_with_sql(sql="SELECT product_id FROM quality_results")
+analysis_report = f"Results cover {data['product_id'].nunique()} products."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Results cover 9 products.",
+        query_snapshots={"q_quality": _query_snapshot(sql, columns=["product_id"])},
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert [item["text"] for item in bundle["report_trace_refs"]] == ["9"]
+    assert len(bundle["evidence_definitions"]) == 1
+
+
+def test_conditional_nunique_or_len_report_metric_is_not_omitted():
+    sql = "SELECT test_result_id FROM quality_results"
+    code = r'''
+data = load_data_with_sql(sql="SELECT test_result_id FROM quality_results")
+analysis_report = f"There are {data['test_result_id'].nunique() if 'test_result_id' in data.columns else len(data)} test records."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="There are 7 test records.",
+        query_snapshots={
+            "q_quality": _query_snapshot(sql, columns=["test_result_id"])
+        },
+    )
+    snapshot = replace(
+        snapshot,
+        selected_datasource_snapshot=[{
+            "metadata_schema": {
+                "properties": {
+                    "test_result_id": {
+                        "type": "string",
+                        "description": "Test result identifier",
+                    }
+                }
+            }
+        }],
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert [item["text"] for item in bundle["report_trace_refs"]] == ["7"]
     assert len(bundle["evidence_definitions"]) == 1
 
 
@@ -1476,6 +1601,96 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     ] == ["70.0", "7", "70.0", "7", "3", "350", "88.5"]
 
 
+def test_conditional_join_fragments_keep_disjoint_report_source_regions():
+    code = r'''
+oos_products = {"PP": 1}
+oos_grades = {"PP-H1100": 1}
+near_products = {"HDPE": 6, "LLDPE": 4}
+near_grades = {"HD5502": 6, "LL7042": 4}
+oos_product_text = "、".join([f"{k}({v} batches)" for k, v in oos_products.items()]) if oos_products else "none"
+oos_grade_text = "、".join([f"{k}({v} batches)" for k, v in oos_grades.items()]) if oos_grades else "none"
+near_product_text = "、".join([f"{k}({v} batches)" for k, v in near_products.items()]) if near_products else "none"
+near_grade_text = "、".join([f"{k}({v} batches)" for k, v in near_grades.items()]) if near_grades else "none"
+report_parts = [
+    "## Distribution",
+    f"- OOS products: {oos_product_text}; grades: {oos_grade_text}.",
+    f"- Near-limit products: {near_product_text}; grades: {near_grade_text}.",
+]
+analysis_report = "\n".join(report_parts)
+'''
+    report = (
+        "## Distribution\n"
+        "- OOS products: PP(1 batches); grades: PP-H1100(1 batches).\n"
+        "- Near-limit products: HDPE(6 batches)、LLDPE(4 batches); "
+        "grades: HD5502(6 batches)、LL7042(4 batches)."
+    )
+
+    _, expressions, _, _, _, _ = LineageIndexer()._index_code(code, {})
+    outputs = LineageIndexer._locate_report_outputs(report, expressions)
+    numeric_outputs = [
+        item for item in outputs
+        if item.get("field") == "v"
+    ]
+
+    assert [item["text"] for item in numeric_outputs] == ["1", "1", "6", "4", "6", "4"]
+    assert [item["source_line"] for item in numeric_outputs] == [
+        6, 7, 8, 8, 9, 9,
+    ]
+
+
+def test_conditional_join_fragments_compile_independent_calculation_boundaries():
+    sql = "SELECT risk_type, product, grade FROM quality_results"
+    code = r'''
+sql = "SELECT risk_type, product, grade FROM quality_results"
+data = load_data_with_sql(sql=sql)
+oos = data[data["risk_type"] == "oos"]
+near = data[data["risk_type"] == "near"]
+oos_products = oos.groupby("product").size().to_dict()
+oos_grades = oos.groupby("grade").size().to_dict()
+near_products = near.groupby("product").size().to_dict()
+near_grades = near.groupby("grade").size().to_dict()
+oos_product_text = "、".join([f"{k}({v} batches)" for k, v in oos_products.items()]) if oos_products else "none"
+oos_grade_text = "、".join([f"{k}({v} batches)" for k, v in oos_grades.items()]) if oos_grades else "none"
+near_product_text = "、".join([f"{k}({v} batches)" for k, v in near_products.items()]) if near_products else "none"
+near_grade_text = "、".join([f"{k}({v} batches)" for k, v in near_grades.items()]) if near_grades else "none"
+report_parts = [
+    "## Distribution",
+    f"- OOS products: {oos_product_text}; grades: {oos_grade_text}.",
+    f"- Near-limit products: {near_product_text}; grades: {near_grade_text}.",
+]
+analysis_report = "\n".join(report_parts)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    report = (
+        "## Distribution\n"
+        "- OOS products: PP(1 batches); grades: PP-H1100(1 batches).\n"
+        "- Near-limit products: HDPE(6 batches)、LLDPE(4 batches); "
+        "grades: HD5502(6 batches)、LL7042(4 batches)."
+    )
+    snapshot = _snapshot(
+        code=code,
+        report=report,
+        query_snapshots={
+            "q_quality": _query_snapshot(
+                sql,
+                columns=["risk_type", "product", "grade"],
+            ),
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    refs = sorted(bundle["report_trace_refs"], key=lambda item: item["start"])
+    assert [item["text"] for item in refs] == ["1", "1", "6", "4", "6", "4"]
+    keys = [item["evidence_key"] for item in refs]
+    assert len(set(keys)) == 4
+    assert keys[2] == keys[3]
+    assert keys[4] == keys[5]
+    assert keys[0] != keys[1]
+    assert keys[2] != keys[4]
+
+
 def test_named_aggregate_columns_used_only_by_table_keep_evidence():
     sql = "SELECT product, price, revenue FROM sales"
     code = r'''
@@ -1526,6 +1741,128 @@ result = save_analysis_result(
     assert {item["column_key"] for item in bundle["table_trace_refs"]} == {
         "average_price", "total_revenue",
     }
+
+
+def test_column_aliases_do_not_collapse_formula_to_first_source_field():
+    tree = __import__("ast").parse(
+        """
+priority_df["score"] = (
+    priority_df["cnt"] * 0.5
+    + priority_df["evidence_strength"] * 0.5
+)
+priority_df["clean_cnt"] = priority_df["cnt"].fillna(0)
+"""
+    )
+
+    aliases = LineageIndexer._column_aliases(tree)
+
+    assert "score" not in aliases.get("priority_df", {})
+    assert aliases["priority_df"]["clean_cnt"] == "cnt"
+
+
+def test_named_lambda_aggregates_on_same_source_keep_independent_table_metrics():
+    sql = "SELECT batch_id, quality_status FROM quality_tests"
+    code = r'''
+sql = "SELECT batch_id, quality_status FROM quality_tests"
+data = load_data_with_sql(sql=sql)
+summary = data.groupby("batch_id", as_index=False).agg(
+    oos_count=("quality_status", lambda values: (values == "oos").sum()),
+    near_limit_count=("quality_status", lambda values: (values == "near_limit").sum()),
+)
+table = build_table_result(
+    title="Batch quality",
+    data=[
+        {
+            "Batch": row["batch_id"],
+            "OOS count": int(row["oos_count"]),
+            "Near-limit count": int(row["near_limit_count"]),
+        }
+        for row in summary.head(20).to_dict("records")
+    ],
+    columns=[
+        {"key": "Batch", "label": "Batch"},
+        {"key": "OOS count", "label": "OOS count"},
+        {"key": "Near-limit count", "label": "Near-limit count"},
+    ],
+)
+result = save_analysis_result(analysis_report="Batch quality.", charts=[], tables=[table])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Batch quality.",
+        tables=[{
+            "title": "Batch quality",
+            "columns": [
+                {"key": "Batch", "label": "Batch"},
+                {"key": "OOS count", "label": "OOS count"},
+                {"key": "Near-limit count", "label": "Near-limit count"},
+            ],
+            "rows": [{"Batch": "B1", "OOS count": 1, "Near-limit count": 0}],
+        }],
+        query_snapshots={
+            "q_quality": _query_snapshot(sql, columns=["batch_id", "quality_status"]),
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=lambda _: EvidencePlan()).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert {item["column_key"] for item in bundle["table_trace_refs"]} == {
+        "OOS count", "Near-limit count",
+    }
+
+
+def test_table_priority_sequence_is_presentation_not_evidence_metric():
+    sql = "SELECT cause, alarm_count, fault_count FROM risks"
+    code = r'''
+sql = "SELECT cause, alarm_count, fault_count FROM risks"
+data = load_data_with_sql(sql=sql)
+summary = data.groupby("cause").agg(
+    alarm_total=("alarm_count", "sum"),
+    fault_total=("fault_count", "sum"),
+).reset_index()
+summary["score"] = summary["alarm_total"] + summary["fault_total"] * 2
+summary = summary.sort_values("score", ascending=False)
+priority_rows = []
+rank = 1
+for _, row in summary.iterrows():
+    priority_rows.append({
+        "Priority": rank,
+        "Cause": row["cause"],
+        "Score": row["score"],
+    })
+    rank += 1
+priority_table = pd.DataFrame(priority_rows)
+table = build_table_result(title="Cause priority", data=priority_table)
+result = save_analysis_result(analysis_report="## Summary\nSee ranking.", charts=[], tables=[table])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="## Summary\nSee ranking.",
+        query_snapshots={
+            "q_risks": _query_snapshot(
+                sql,
+                columns=["cause", "alarm_count", "fault_count"],
+            )
+        },
+        tables=[{
+            "title": "Cause priority",
+            "columns": [
+                {"key": "Priority", "label": "Priority"},
+                {"key": "Cause", "label": "Cause"},
+                {"key": "Score", "label": "Score"},
+            ],
+            "rows": [
+                {"Priority": 1, "Cause": "A", "Score": 8.0},
+                {"Priority": 2, "Cause": "B", "Score": 3.0},
+            ],
+        }],
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert {item["column_key"] for item in bundle["table_trace_refs"]} == {"Score"}
 
 
 def test_string_join_is_not_described_as_a_relational_data_join():
@@ -1926,6 +2263,82 @@ result = save_analysis_result(analysis_report="", charts=[], tables=[table])
     assert {item["column_key"] for item in bundle["table_trace_refs"]} == set(outputs)
 
 
+def test_direct_record_table_keeps_each_scalar_calculation_boundary():
+    batch_sql = "SELECT batch_id, quality_status FROM quality_results"
+    alarm_sql = "SELECT batch_id, alarm_id FROM process_alarms"
+    code = r'''
+batch_data = load_data_with_sql(sql="SELECT batch_id, quality_status FROM quality_results")
+alarm_data = load_data_with_sql(sql="SELECT batch_id, alarm_id FROM process_alarms")
+total_batches = batch_data["batch_id"].nunique()
+oos_batches = batch_data.loc[batch_data["quality_status"] == "oos", "batch_id"].nunique()
+oos_rate = oos_batches / total_batches * 100 if total_batches else 0
+alarm_batches = alarm_data["batch_id"].nunique()
+tables = [build_table_result(
+    title="Quality overview",
+    columns=[
+        {"key": "Total batches", "label": "Total batches"},
+        {"key": "OOS batches", "label": "OOS batches"},
+        {"key": "OOS rate", "label": "OOS rate"},
+        {"key": "Alarm batches", "label": "Alarm batches"},
+    ],
+    rows=[{
+        "Total batches": total_batches,
+        "OOS batches": oos_batches,
+        "OOS rate": oos_rate,
+        "Alarm batches": alarm_batches,
+    }],
+)]
+result = save_analysis_result(analysis_report="", charts=[], tables=tables)
+'''
+    snapshot = _snapshot(
+        code=code,
+        tables=[{
+            "title": "Quality overview",
+            "columns": [
+                {"key": "Total batches", "label": "Total batches"},
+                {"key": "OOS batches", "label": "OOS batches"},
+                {"key": "OOS rate", "label": "OOS rate"},
+                {"key": "Alarm batches", "label": "Alarm batches"},
+            ],
+            "rows": [{
+                "Total batches": 20,
+                "OOS batches": 3,
+                "OOS rate": 15.0,
+                "Alarm batches": 4,
+            }],
+        }],
+        query_snapshots={
+            "q_batches": _query_snapshot(
+                batch_sql,
+                columns=["batch_id", "quality_status"],
+            ),
+            "q_alarms": _query_snapshot(
+                alarm_sql,
+                columns=["batch_id", "alarm_id"],
+            ),
+        },
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    outputs = {
+        item["field"]: item
+        for item in lineage["output_nodes"]
+        if item.get("artifact_type") == "table"
+    }
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert outputs["Total batches"]["candidate_query_node_ids"] == ["q_batches"]
+    assert outputs["OOS batches"]["candidate_query_node_ids"] == ["q_batches"]
+    assert outputs["OOS rate"]["candidate_query_node_ids"] == ["q_batches"]
+    assert outputs["Alarm batches"]["candidate_query_node_ids"] == ["q_alarms"]
+    assert len({
+        tuple(outputs[field]["boundary_operation_node_ids"])
+        for field in outputs
+    }) == 4
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert {item["column_key"] for item in bundle["table_trace_refs"]} == set(outputs)
+
+
 def test_record_list_branches_share_parameterized_formula_boundary():
     sql = "SELECT batch_id, process_alarm_count, fault_count FROM quality_risk"
     code = r'''
@@ -2015,6 +2428,72 @@ result = save_analysis_result(analysis_report="", charts=[chart], tables=[table]
     )
 
 
+def test_record_list_table_uses_business_row_selectors_for_distinct_boundaries():
+    process_sql = "SELECT batch_id FROM process_events WHERE alarm_flag = 1"
+    device_sql = "SELECT equipment_id FROM equipment_faults WHERE fault_flag = 1"
+    code = r'''
+process = load_data_with_sql(sql="SELECT batch_id FROM process_events WHERE alarm_flag = 1")
+device = load_data_with_sql(sql="SELECT equipment_id FROM equipment_faults WHERE fault_flag = 1")
+process_count = process["batch_id"].nunique()
+device_count = device["equipment_id"].nunique()
+root_causes = []
+root_causes.append({"candidate": "Process", "evidence_count": process_count})
+root_causes.append({"candidate": "Device", "evidence_count": device_count})
+root_df = pd.DataFrame(root_causes)
+table = build_table_result(
+    title="Root causes",
+    data=root_df,
+    columns=[
+        {"key": "candidate", "label": "Candidate"},
+        {"key": "evidence_count", "label": "Evidence count"},
+    ],
+)
+result = save_analysis_result(analysis_report="", charts=[], tables=[table])
+'''
+    snapshot = _snapshot(
+        code=code,
+        tables=[{
+            "title": "Root causes",
+            "columns": [
+                {"key": "candidate", "label": "Candidate"},
+                {"key": "evidence_count", "label": "Evidence count"},
+            ],
+            "rows": [
+                {"candidate": "Process", "evidence_count": 2},
+                {"candidate": "Device", "evidence_count": 1},
+            ],
+        }],
+        query_snapshots={
+            "q_process": _query_snapshot(process_sql, columns=["batch_id"]),
+            "q_device": _query_snapshot(device_sql, columns=["equipment_id"]),
+        },
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    outputs = [
+        item for item in lineage["output_nodes"]
+        if item.get("artifact_type") == "table"
+        and item.get("field") == "evidence_count"
+    ]
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+    refs = [
+        item for item in bundle["table_trace_refs"]
+        if item["column_key"] == "evidence_count"
+    ]
+
+    assert len(outputs) == 2
+    assert {tuple(item["row_selector"].items()) for item in outputs} == {
+        (("candidate", "Process"),),
+        (("candidate", "Device"),),
+    }
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert {tuple(item["row_selector"].items()) for item in refs} == {
+        (("candidate", "Process"),),
+        (("candidate", "Device"),),
+    }
+    assert len({item["evidence_key"] for item in refs}) == 2
+
+
 def test_structured_llm_resolver_recovers_locally_ambiguous_output():
     sql = "SELECT amount FROM sales"
     code = '''data = load_data_with_sql(sql="SELECT amount FROM sales")
@@ -2076,6 +2555,71 @@ result = save_analysis_result(analysis_report="", charts=[], tables=[table])
     assert bundle["status"] == "complete", bundle["diagnostics"]
     assert len(bundle["table_trace_refs"]) == 1
     assert bundle["evidence_definitions"][0]["query_refs"] == ["q_sales"]
+
+
+def test_structured_recovery_keeps_locally_verified_lineage_over_planner_claims():
+    sales_sql = "SELECT amount FROM sales"
+    quality_sql = "SELECT deviation FROM quality"
+    code = '''sales = load_data_with_sql(sql="SELECT amount FROM sales")
+quality = load_data_with_sql(sql="SELECT deviation FROM quality")
+total_amount = sales["amount"].sum()
+table = build_table_result(
+    title="Sales total",
+    data=[{"total_amount": total_amount}],
+    columns=[{"key": "total_amount", "label": "Total amount"}],
+)
+result = save_analysis_result(analysis_report="", charts=[], tables=[table])
+'''
+    snapshot = _snapshot(
+        code=code,
+        tables=[{
+            "title": "Sales total",
+            "columns": [{"key": "total_amount", "label": "Total amount"}],
+            "rows": [{"total_amount": 30.0}],
+        }],
+        query_snapshots={
+            "q_sales": _query_snapshot(sales_sql, columns=["amount"]),
+            "q_quality": _query_snapshot(quality_sql, columns=["deviation"]),
+        },
+    )
+    lineage = LineageIndexer().build(snapshot)
+    output = next(
+        item for item in lineage["output_nodes"]
+        if item.get("artifact_type") == "table"
+        and item.get("field") == "total_amount"
+    )
+    output["ambiguous_calculation_boundary"] = True
+
+    def resolve_structured(_payload: dict) -> EvidencePlan:
+        return EvidencePlan(metrics=[PlannedMetric(
+            calculation_id="structured_recovery",
+            output_node_ids=[output["output_node_id"]],
+            calculation_source_refs=[CalculationSourceRef(
+                source_line=3,
+                expression='total_amount = sales["amount"].sum()',
+            )],
+            # These claims are intentionally wrong.  They must not veto or
+            # replace the locally proven structured-artifact lineage.
+            claimed_query_node_ids=["q_quality"],
+            claimed_metric_fields=["deviation"],
+            attestation_confidence="high",
+            metric_key="total_amount",
+            business_name="Total amount",
+            business_explanation="Sum of sales amount.",
+            value_type="currency",
+        )])
+
+    with patch.object(LineageIndexer, "build", return_value=lineage):
+        bundle = PostAnalysisEvidenceCompiler(
+            planner=_semantic_plan,
+            structured_planner=resolve_structured,
+        ).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert bundle["evidence_definitions"][0]["query_refs"] == ["q_sales"]
+    assert bundle["evidence_definitions"][0]["calculation"]["metric_fields"] == [
+        "total_amount"
+    ]
 
 
 def test_sorted_metric_mapping_dataframe_keeps_chart_lineage():
@@ -2213,6 +2757,86 @@ result = save_analysis_result(analysis_report="", charts=charts, tables=[])
     assert len(output["boundary_operation_node_ids"]) == 2
     assert len(bundle["chart_trace_refs"]) == 1
     assert len(bundle["evidence_definitions"]) == 1
+
+
+def test_boolean_mask_sum_counts_share_one_column_level_evidence_boundary():
+    sql = "SELECT batch_id, quality_status FROM quality_results"
+    code = r'''
+sql = "SELECT batch_id, quality_status FROM quality_results"
+data = load_data_with_sql(sql=sql)
+oos_count = int(data["quality_status"].astype(str).str.lower().isin(["oos"]).sum())
+near_limit_count = int(data["quality_status"].astype(str).str.lower().isin(["near_limit"]).sum())
+chart_data = pd.DataFrame({
+    "status": ["OOS", "Near limit"],
+    "test_count": [oos_count, near_limit_count],
+})
+charts = [build_chart_result(
+    data=chart_data,
+    chart_kind="bar",
+    category_field="status",
+    value_field="test_count",
+)]
+result = save_analysis_result(analysis_report="", charts=charts, tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        charts=[{
+            "title": "Quality status",
+            "chart_data_contract": {
+                "encoding": {"category_field": "status", "value_field": "test_count"}
+            },
+        }],
+        query_snapshots={
+            "q_quality": _query_snapshot(sql, columns=["batch_id", "quality_status"])
+        },
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    output = next(item for item in lineage["output_nodes"] if item["artifact_type"] == "chart")
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert output["ambiguous_calculation_boundary"] is False
+    assert len(output["boundary_operation_node_ids"]) == 2
+    assert len(bundle["chart_trace_refs"]) == 1
+    assert len(bundle["evidence_definitions"]) == 1
+
+
+def test_numeric_sums_remain_distinct_structured_metric_boundaries():
+    sql = "SELECT amount, profit FROM contracts"
+    code = r'''
+sql = "SELECT amount, profit FROM contracts"
+data = load_data_with_sql(sql=sql)
+amount = data["amount"].sum()
+profit = data["profit"].sum()
+chart_data = pd.DataFrame({
+    "metric": ["Amount", "Profit"],
+    "value": [amount, profit],
+})
+charts = [build_chart_result(
+    data=chart_data,
+    chart_kind="bar",
+    category_field="metric",
+    value_field="value",
+)]
+result = save_analysis_result(analysis_report="", charts=charts, tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        charts=[{
+            "title": "Financial metrics",
+            "chart_data_contract": {
+                "encoding": {"category_field": "metric", "value_field": "value"}
+            },
+        }],
+        query_snapshots={
+            "q_contracts": _query_snapshot(sql, columns=["amount", "profit"])
+        },
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    output = next(item for item in lineage["output_nodes"] if item["artifact_type"] == "chart")
+
+    assert output["ambiguous_calculation_boundary"] is True
 
 
 def test_melted_same_boundary_metric_columns_keep_chart_evidence():
@@ -2391,6 +3015,74 @@ result = save_analysis_result(analysis_report="Status distribution.", charts=cha
     assert len(bundle["chart_trace_refs"]) == 1
     assert len(bundle["evidence_definitions"]) == 1
     assert bundle["evidence_definitions"][0]["query_refs"] == ["q_contracts"]
+
+
+def test_paginated_joined_sql_family_keeps_chart_lineage():
+    runtime_sql = (
+        "SELECT batch_id, pattern FROM process_events "
+        "ORDER BY batch_id LIMIT 4000 OFFSET 4000"
+    )
+    code = r'''
+page_size = 4000
+offset = 0
+sql_page = f"SELECT batch_id, pattern FROM process_events ORDER BY batch_id LIMIT {page_size} OFFSET {offset}"
+page = load_data_with_sql(sql=sql_page)
+frames = []
+frames.append(page)
+data = pd.concat(frames, ignore_index=True)
+status_counts = data["pattern"].value_counts().reset_index(name="count")
+charts = [build_chart_result(
+    data=status_counts,
+    chart_kind="pie",
+    category_field="pattern",
+    value_field="count",
+)]
+result = save_analysis_result(analysis_report="Pattern distribution.", charts=charts, tables=[])
+'''
+    family_snapshot = _query_snapshot(
+        runtime_sql,
+        columns=["batch_id", "pattern"],
+    )
+    family_snapshot["query_scope"] = {
+        "scope_status": "implicit",
+        "query_key": "query_auto_page_family",
+        "logical_query_family": "query_auto_page_family",
+    }
+    family_snapshot["implementation"]["logical_query_family"] = (
+        "query_auto_page_family"
+    )
+    snapshot = _snapshot(
+        code=code,
+        report="Pattern distribution.",
+        charts=[{
+            "title": "Pattern distribution",
+            "chart_document": {
+                "chart_kind": "pie",
+                "dataset": {"rows": [
+                    {"pattern": "single_burst", "count": 8},
+                    {"pattern": "continuous_drift", "count": 2},
+                ]},
+                "encoding": {
+                    "category_field": "pattern",
+                    "value_field": "count",
+                },
+            },
+        }],
+        query_snapshots={"query_auto_page_family": family_snapshot},
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    page_load = next(
+        item for item in lineage["operation_nodes"]
+        if "page" in (item.get("targets") or [])
+    )
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert page_load["query_node_id"] == "query_auto_page_family"
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert bundle["evidence_definitions"][0]["query_refs"] == [
+        "query_auto_page_family"
+    ]
 
 
 def test_skipped_conditional_chart_does_not_drop_other_chart_lineage():
@@ -2831,6 +3523,120 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     assert [item["text"] for item in bundle["report_trace_refs"]] == ["1,280.50"]
 
 
+def test_repeated_static_report_value_reuses_the_verified_calculation_boundary():
+    sql = "SELECT status FROM quality_results"
+    code = r'''
+data = load_data_with_sql(sql="SELECT status FROM quality_results")
+near_count = int((data["status"] == "near_limit").sum())
+if near_count == 1:
+    observation = "There are 1 records of near-limit tests requiring attention."
+else:
+    observation = f"There are {near_count} near-limit tests requiring attention."
+analysis_report = f"Near-limit tests: {near_count} records.\n{observation}"
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    report = (
+        "Near-limit tests: 1 records.\n"
+        "There are 1 records of near-limit tests requiring attention."
+    )
+    snapshot = _snapshot(
+        code=code,
+        report=report,
+        query_snapshots={"q_quality": _query_snapshot(sql, columns=["status"])},
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    refs = sorted(bundle["report_trace_refs"], key=lambda item: item["start"])
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert [item["text"] for item in refs] == ["1", "1"]
+    assert refs[0]["evidence_key"] == refs[1]["evidence_key"]
+
+
+def test_static_zero_result_branch_gets_query_backed_report_evidence():
+    sql = "SELECT batch_id FROM batch_context"
+    code = r'''
+batch_data = load_data_with_sql(sql="SELECT batch_id FROM batch_context")
+batch_available = not batch_data.empty
+if batch_available:
+    batch_line = f"Matched {len(batch_data)} batches."
+else:
+    batch_line = "No batch matched the confirmed scope (0 batches)."
+analysis_report = "## Overview\n" + batch_line
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    query_snapshot = _query_snapshot(sql, columns=["batch_id"])
+    query_snapshot["execution"]["row_count"] = 0
+    snapshot = _snapshot(
+        code=code,
+        report="## Overview\nNo batch matched the confirmed scope (0 batches).",
+        query_snapshots={"q_batch": query_snapshot},
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert [item["text"] for item in bundle["report_trace_refs"]] == ["0"]
+    assert bundle["evidence_definitions"][0]["query_refs"] == ["q_batch"]
+    assert (
+        bundle["evidence_definitions"][0]["calculation"]["lineage_verification"]
+        == "verified"
+    )
+
+
+def test_repeated_value_completion_does_not_guess_between_equal_boundaries():
+    sql = "SELECT category FROM quality_results"
+    code = r'''
+data = load_data_with_sql(sql="SELECT category FROM quality_results")
+first_count = int((data["category"] == "first").sum())
+second_count = int((data["category"] == "second").sum())
+if first_count == second_count:
+    detail = "The selected category has 1 records."
+else:
+    detail = "The selected categories have different counts."
+analysis_report = f"First: {first_count} records; second: {second_count} records.\n{detail}"
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    report = (
+        "First: 1 records; second: 1 records.\n"
+        "The selected category has 1 records."
+    )
+    snapshot = _snapshot(
+        code=code,
+        report=report,
+        query_snapshots={"q_quality": _query_snapshot(sql, columns=["category"])},
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert [item["start"] for item in bundle["report_trace_refs"]] == [7, 26]
+    assert bundle["status"] == "partial"
+
+
+def test_static_zero_without_a_query_empty_check_remains_unresolved():
+    sql = "SELECT amount FROM sales"
+    code = r'''
+data = load_data_with_sql(sql="SELECT amount FROM sales")
+total = data["amount"].sum()
+if total > 100:
+    note = "Score 0 is the lowest display category."
+else:
+    note = "Score 0 is the lowest display category."
+analysis_report = f"Total: {total:.2f}.\n{note}"
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Total: 50.00.\nScore 0 is the lowest display category.",
+        query_snapshots={"q_sales": _query_snapshot(sql, columns=["amount"])},
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert [item["text"] for item in bundle["report_trace_refs"]] == ["50.00"]
+    assert bundle["status"] == "partial"
+
+
 def test_llm_source_locator_recovers_inline_calculation_missing_from_operation_catalog():
     sql = "SELECT amount FROM sales"
     code = '''
@@ -3019,6 +3825,87 @@ report_sections.append(
     assert [item["line"] for item in enriched[0]["source_line_hints"]] == [4]
 
 
+def test_report_candidate_source_hints_match_exact_dynamic_string_slot():
+    code = '''
+for rank, (name, score) in enumerate(ranking, 1):
+    parts.append(f"{rank}. {name} (score {score})")
+'''
+    catalog = [{
+        "candidate_id": "rc_score",
+        "text_examples": ["39"],
+        "heading": "Root cause ranking",
+        "line": "1. Material (score 39); 2. Process (score 22)",
+        "token_prefix": "1. Material (score ",
+        "token_suffix": "); 2. Process (score 22)",
+    }]
+    anchors = [{
+        "anchor_id": "a_score",
+        "source_line": 3,
+        "expression": "score",
+        "display_prefix": " (score ",
+        "display_suffix": ")",
+        "numeric_suffix": "",
+    }, {
+        "anchor_id": "a_rank",
+        "source_line": 3,
+        "expression": "rank",
+        "display_prefix": "",
+        "display_suffix": ". ",
+        "numeric_suffix": "",
+    }]
+
+    enriched = PostAnalysisEvidenceCompiler._attach_candidate_source_line_hints(
+        catalog,
+        code,
+        anchors,
+    )
+    slot_hints = [
+        item
+        for item in enriched[0]["source_line_hints"]
+        if item.get("match_kind") == "rendered_slot"
+    ]
+
+    assert [(item["anchor_id"], item["expression"]) for item in slot_hints] == [
+        ("a_score", "score"),
+    ]
+
+
+def test_report_candidate_source_hints_ignore_unbounded_dynamic_slots():
+    code = '''
+rates["abnormal"] = rates["abnormal"].map(lambda x: f"{x:.4f}")
+report_sections.append(
+    f"Only 1 batch is classified as a single-batch fluctuation."
+)
+'''
+    catalog = [{
+        "candidate_id": "rc_threshold",
+        "text_examples": ["1"],
+        "heading": "Pattern classification",
+        "line": "Only 1 batch is classified as a single-batch fluctuation.",
+        "token_prefix": "Only ",
+        "token_suffix": " batch is classified as a single-batch fluctuation.",
+    }]
+    anchors = [{
+        "anchor_id": "a_unrelated_rate",
+        "source_line": 2,
+        "expression": "x",
+        "display_prefix": "",
+        "display_suffix": "",
+        "numeric_suffix": "",
+    }]
+
+    enriched = PostAnalysisEvidenceCompiler._attach_candidate_source_line_hints(
+        catalog,
+        code,
+        anchors,
+    )
+
+    assert not any(
+        item.get("match_kind") == "rendered_slot"
+        for item in enriched[0]["source_line_hints"]
+    )
+
+
 def test_high_confidence_llm_attestation_materializes_when_local_dataflow_is_unavailable():
     sql = "SELECT category, amount FROM sales"
     code = '''
@@ -3065,6 +3952,83 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     assert calculation["lineage_verification"] == "attested"
     assert calculation["metric_fields"] == ["amount"]
     assert bundle["evidence_definitions"][0]["query_refs"] == ["q_sales"]
+
+
+def test_source_anchor_attestation_materializes_across_unresolved_helper_dataflow():
+    sql = "SELECT category, alarm_count, sample_count FROM signals"
+    code = r'''
+data = load_data_with_sql(sql="SELECT category, alarm_count, sample_count FROM signals")
+def build_rates(frame):
+    result = {}
+    for _, row in frame.iterrows():
+        total = row["sample_count"]
+        result[row["category"]] = {
+            "rate": row["alarm_count"] / total if total else 0.0,
+        }
+    return result
+rates = build_rates(data)
+selected = rates.get("target", {"rate": 0.0})
+rate = selected["rate"]
+analysis_report = f"Target alarm rate: {rate:.2%}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Target alarm rate: 12.50%.",
+        query_snapshots={
+            "q_signals": _query_snapshot(
+                sql,
+                columns=["category", "alarm_count", "sample_count"],
+            ),
+        },
+    )
+    lineage = LineageIndexer().build(snapshot)
+    report_output = next(
+        item for item in lineage["output_nodes"]
+        if item.get("artifact_type") == "report"
+        and item.get("field") == "rate"
+    )
+    report_output["candidate_query_node_ids"] = []
+    report_output["candidate_operation_node_ids"] = []
+    report_output["boundary_operation_node_ids"] = []
+    lineage["operation_nodes"] = [
+        operation
+        for operation in lineage["operation_nodes"]
+        if not set(operation.get("targets") or []) & {"rates", "selected", "rate"}
+    ]
+
+    def attest(payload: dict) -> EvidencePlan:
+        anchor = next(
+            item for item in payload["source_anchor_catalog"]
+            if item["expression"] == "rate"
+        )
+        query = payload["query_catalog"][0]
+        assert query["result_bindings"][0]["variable"] == "data"
+        return EvidencePlan(metrics=[PlannedMetric(
+            calculation_id="report_semantic_scope",
+            source_anchors=[ReportSourceAnchorRef.model_validate(anchor)],
+            calculation_source_refs=[CalculationSourceRef(
+                source_line=13,
+                expression='rate = selected["rate"]',
+            )],
+            claimed_query_node_ids=[query["query_node_id"]],
+            claimed_metric_fields=["alarm_count", "sample_count"],
+            attestation_confidence="high",
+            metric_key="target_alarm_rate",
+            business_name="Target alarm rate",
+            business_explanation="Alarm count divided by sample count for the target category.",
+            value_type="percentage",
+            display_unit="%",
+        )])
+
+    with patch.object(LineageIndexer, "build", return_value=lineage):
+        bundle = PostAnalysisEvidenceCompiler(planner=attest).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert len(bundle["report_trace_refs"]) == 1
+    calculation = bundle["evidence_definitions"][0]["calculation"]
+    assert calculation["lineage_verification"] == "attested"
+    assert calculation["metric_fields"] == ["alarm_count", "sample_count"]
 
 
 def test_query_reachable_fields_include_derived_dataframe_columns():
@@ -3381,6 +4345,80 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     ) == ["q_quality"]
 
 
+def test_source_locator_prefers_exact_expression_over_nearby_same_target():
+    code = '''data = load_data_with_sql(sql="SELECT amount FROM sales")
+value = data["amount"].sum()
+value = data["amount"].max()
+analysis_report = f"Maximum: {value}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Maximum: 20.",
+        query_snapshots={
+            "q_sales": _query_snapshot(
+                "SELECT amount FROM sales", columns=["amount"]
+            ),
+        },
+    )
+    lineage = LineageIndexer().build(snapshot)
+
+    operation_ids, errors = (
+        PostAnalysisEvidenceCompiler._resolve_calculation_source_refs(
+            code,
+            lineage,
+            [CalculationSourceRef(
+                source_line=3,
+                expression='value = data["amount"].max()',
+            )],
+        )
+    )
+
+    assert errors == []
+    assert len(operation_ids) == 1
+    operation = next(
+        item for item in lineage["operation_nodes"]
+        if item["operation_node_id"] == operation_ids[0]
+    )
+    assert ".max()" in operation["source"]
+
+
+def test_source_locator_compares_assignment_syntax_not_quote_spelling():
+    code = '''data = load_data_with_sql(sql="SELECT retry_flag FROM quality")
+signals = {}
+signals['retest'] = int(data['retry_flag'].fillna(0).sum())
+analysis_report = f"Retest: {signals['retest']}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Retest: 6.",
+        query_snapshots={
+            "q_quality": _query_snapshot(
+                "SELECT retry_flag FROM quality", columns=["retry_flag"]
+            ),
+        },
+    )
+    lineage = LineageIndexer().build(snapshot)
+
+    operation_ids, errors = (
+        PostAnalysisEvidenceCompiler._resolve_calculation_source_refs(
+            code,
+            lineage,
+            [CalculationSourceRef(
+                source_line=3,
+                expression=(
+                    'signals["retest"] = '
+                    'int(data["retry_flag"].fillna(0).sum())'
+                ),
+            )],
+        )
+    )
+
+    assert errors == []
+    assert len(operation_ids) == 1
+
+
 def test_default_planner_repairs_a_locally_rejected_semantic_claim_once():
     sql = "SELECT deviation FROM quality"
     code = '''
@@ -3474,6 +4512,36 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     assert not any("op_5_" in operation_id for operation_id in operations)
 
 
+def test_nested_mapping_member_exposes_outer_business_selector():
+    code = '''
+evidence = {}
+evidence["Process"] = {
+    "candidate_share": int(candidate_counts.get("Process", 0)),
+    "evidence_share": process_count / population_count,
+}
+'''
+    tree = __import__("ast").parse(code)
+    assignment = tree.body[1]
+
+    operations = LineageIndexer._mapping_literal_member_operations(
+        assignment,
+        code,
+    )
+
+    assert [item["parameter_bindings"] for item in operations] == [
+        {
+            "mapping_key": "candidate_share",
+            "mapping_path": ["Process", "candidate_share"],
+            "mapping_selector": "Process",
+        },
+        {
+            "mapping_key": "evidence_share",
+            "mapping_path": ["Process", "evidence_share"],
+            "mapping_selector": "Process",
+        },
+    ]
+
+
 def test_rendered_report_year_month_is_not_a_metric_candidate():
     candidates = LineageIndexer._locate_report_numeric_candidates(
         "2026年3月销售收入为 1,280.50 元。",
@@ -3556,6 +4624,25 @@ def test_rendered_report_unitless_comparison_cutoff_is_not_a_metric_candidate():
     assert metric_texts == ["33"]
 
 
+def test_rendered_report_labelled_interval_endpoints_are_not_metric_candidates():
+    report = "偏离度 20%~50%（中等偏离）风险批次 0 个。"
+
+    candidates = LineageIndexer._locate_report_numeric_candidates(
+        report,
+        occupied=set(),
+    )
+    metric_texts = [
+        item["text"]
+        for item in candidates
+        if PostAnalysisEvidenceCompiler._is_report_metric_output(
+            item,
+            {"operation_nodes": []},
+        )
+    ]
+
+    assert metric_texts == ["0"]
+
+
 def test_rendered_report_bold_list_ordinals_are_not_metric_candidates():
     report = (
         "### \u56db\u3001\u6839\u56e0\u5019\u9009\u4f18\u5148\u7ea7\u6392\u5e8f\n"
@@ -3585,6 +4672,29 @@ def test_rendered_report_bold_list_ordinals_are_not_metric_candidates():
 
     assert ordinal_texts == ["1", "2"]
     assert metric_texts == ["81", "81", "10", "10"]
+
+
+def test_rendered_report_inline_rank_ordinals_are_not_metric_candidates():
+    report = "1. Process (39); 2. Equipment (34); 3. Material (22); 4. Retest (11)"
+
+    candidates = LineageIndexer._locate_report_numeric_candidates(
+        report,
+        occupied=set(),
+    )
+    ordinal_texts = [
+        item["text"] for item in candidates if item.get("presentation_ordinal")
+    ]
+    metric_texts = [
+        item["text"]
+        for item in candidates
+        if PostAnalysisEvidenceCompiler._is_report_metric_output(
+            item,
+            {"operation_nodes": []},
+        )
+    ]
+
+    assert ordinal_texts == ["1", "2", "3", "4"]
+    assert metric_texts == ["39", "34", "22", "11"]
 
 
 def test_rendered_report_heading_number_is_not_a_metric_candidate():
@@ -3717,6 +4827,21 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     assert not PostAnalysisEvidenceCompiler._is_report_metric_output(
         outputs[0],
         lineage,
+    )
+
+
+def test_rendered_report_top_n_display_limit_is_not_a_metric_candidate():
+    candidates = LineageIndexer._locate_report_numeric_candidates(
+        "下表为报警样本数最高的前10个参数组合。",
+        occupied=set(),
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0]["text"] == "10"
+    assert candidates[0]["presentation_display_limit"] is True
+    assert not PostAnalysisEvidenceCompiler._is_report_metric_output(
+        candidates[0],
+        {"operation_nodes": []},
     )
 
 
@@ -3857,6 +4982,157 @@ def test_discovery_contract_requires_every_verified_report_anchor_to_be_classifi
     assert errors == ["verified report source anchors are unclassified: ['a1']"]
 
 
+def test_discovery_contract_rejects_merging_distinct_mapping_selectors():
+    payload = {
+        "source_anchor_catalog": [],
+        "query_catalog": [{"query_node_id": "q1"}],
+        "operation_catalog": [
+            {
+                "operation_node_id": "op1",
+                "parameter_bindings": {"mapping_selector": "Process"},
+            },
+            {
+                "operation_node_id": "op2",
+                "parameter_bindings": {"mapping_selector": "Equipment"},
+            },
+        ],
+        "report_candidate_catalog": [
+            {"candidate_id": "rc1", "slot_bindings": {"k": "Process"}},
+            {"candidate_id": "rc2", "slot_bindings": {"k": "Equipment"}},
+        ],
+    }
+    plan = EvidencePlan(metrics=[PlannedMetric(
+        calculation_id="report_semantic_scope",
+        report_candidate_ids=["rc1", "rc2"],
+        operation_node_ids=["op1", "op2"],
+        claimed_query_node_ids=["q1"],
+        metric_key="candidate_share",
+        business_name="Candidate count",
+        business_explanation="Count by candidate.",
+    )])
+
+    errors = PostAnalysisEvidenceCompiler._discovery_plan_reference_errors(
+        plan,
+        payload,
+    )
+
+    assert any("split one metric per selector" in error for error in errors)
+
+
+def test_planner_mapping_metric_is_split_by_proven_rendered_selector():
+    payload = {
+        "operation_catalog": [
+            {
+                "operation_node_id": "op1",
+                "parameter_bindings": {"mapping_selector": "Process"},
+            },
+            {
+                "operation_node_id": "op2",
+                "parameter_bindings": {"mapping_selector": "Equipment"},
+            },
+        ],
+        "report_candidate_catalog": [
+            {"candidate_id": "rc1", "slot_bindings": {"k": "Process"}},
+            {"candidate_id": "rc2", "slot_bindings": {"k": "Equipment"}},
+        ],
+    }
+    plan = EvidencePlan(metrics=[PlannedMetric(
+        calculation_id="report_semantic_scope",
+        report_candidate_ids=["rc1", "rc2"],
+        operation_node_ids=["op1", "op2"],
+        calculation_source_refs=[
+            CalculationSourceRef(source_line=10, expression="process_count"),
+            CalculationSourceRef(source_line=11, expression="equipment_count"),
+        ],
+        claimed_query_node_ids=["q1", "q2"],
+        claimed_metric_fields=["process_count", "equipment_count"],
+        metric_key="candidate_count",
+        business_name="Candidate count",
+        business_explanation="Count by candidate.",
+    )])
+
+    normalized = PostAnalysisEvidenceCompiler._split_distinct_mapping_selector_metrics(
+        plan,
+        payload,
+    )
+
+    assert len(normalized.metrics) == 2
+    assert [metric.report_candidate_ids for metric in normalized.metrics] == [
+        ["rc1"],
+        ["rc2"],
+    ]
+    assert [metric.operation_node_ids for metric in normalized.metrics] == [
+        ["op1"],
+        ["op2"],
+    ]
+    assert all(not metric.calculation_source_refs for metric in normalized.metrics)
+    assert all(not metric.claimed_query_node_ids for metric in normalized.metrics)
+    assert all(not metric.claimed_metric_fields for metric in normalized.metrics)
+
+
+def test_mapping_selector_split_compiles_reused_loop_alias_positions():
+    sql = "SELECT process_count, equipment_count, population_count FROM risks"
+    code = '''
+data = load_data_with_sql(sql="SELECT process_count, equipment_count, population_count FROM risks")
+population_count = int(data["population_count"].sum())
+evidence = {}
+evidence["Process"] = {
+    "share": data["process_count"].sum() / population_count,
+}
+evidence["Equipment"] = {
+    "share": data["equipment_count"].sum() / population_count,
+}
+ranked = list(evidence.items())
+report_lines = []
+for name, values in ranked:
+    share = values["share"]
+    report_lines.append(f"{name}: {share:.1%}")
+analysis_report = "\\n".join(report_lines)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Process: 25.0%\nEquipment: 50.0%",
+        query_snapshots={
+            "q_risks": _query_snapshot(
+                sql,
+                columns=["process_count", "equipment_count", "population_count"],
+            ),
+        },
+    )
+
+    def planner(payload: dict) -> EvidencePlan:
+        selectors = {"Process", "Equipment"}
+        return EvidencePlan(metrics=[PlannedMetric(
+            calculation_id="report_semantic_scope",
+            report_candidate_ids=[
+                item["candidate_id"]
+                for item in payload["report_candidate_catalog"]
+            ],
+            operation_node_ids=[
+                item["operation_node_id"]
+                for item in payload["operation_catalog"]
+                if (item.get("parameter_bindings") or {}).get("mapping_selector")
+                in selectors
+            ],
+            metric_key="evidence_share",
+            business_name="Evidence share",
+            business_explanation="Share by candidate.",
+            value_type="percentage",
+            display_unit="%",
+        )])
+
+    compiler = PostAnalysisEvidenceCompiler(planner=planner)
+    compiler._uses_default_planner = True
+    bundle = compiler.compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert [item["text"] for item in bundle["report_trace_refs"]] == [
+        "25.0",
+        "50.0",
+    ]
+
+
 def test_unresolved_report_outputs_are_deduplicated_and_never_override_claims():
     metric = PlannedMetric(
         calculation_id="report_semantic_scope",
@@ -3958,6 +5234,364 @@ result = save_analysis_result(
     assert len(bundle["report_trace_refs"]) == 1
     assert bundle["evidence_definitions"]
     assert bundle["diagnostics"]["reason"] == "planner_unavailable"
+
+
+def test_table_record_comprehension_keeps_column_lineage_without_llm_recovery():
+    sql = "SELECT product, amount FROM sales"
+    code = r'''
+sql = "SELECT product, amount FROM sales"
+data = load_data_with_sql(sql=sql)
+summary = data.groupby("product", as_index=False).agg(sales_amount=("amount", "sum"))
+table = build_table_result(
+    title="Sales by product",
+    data=[
+        {"Product": row["product"], "Sales amount": float(row["sales_amount"])}
+        for row in summary.head(10).to_dict(orient="records")
+    ],
+    columns=[
+        {"key": "Product", "label": "Product"},
+        {"key": "Sales amount", "label": "Sales amount"},
+    ],
+)
+result = save_analysis_result(analysis_report="Sales by product.", charts=[], tables=[table])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Sales by product.",
+        tables=[{
+            "title": "Sales by product",
+            "columns": [
+                {"key": "Product", "label": "Product"},
+                {"key": "Sales amount", "label": "Sales amount"},
+            ],
+            "rows": [{"Product": "A", "Sales amount": 1280.5}],
+        }],
+        query_snapshots={"q_sales": _query_snapshot(sql, columns=["product", "amount"])},
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=lambda _: EvidencePlan()).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert len(bundle["table_trace_refs"]) == 1
+    assert bundle["table_trace_refs"][0]["column_key"] == "Sales amount"
+
+
+def test_groupby_selected_rows_rebuilt_as_dataframe_keep_structured_lineage():
+    sql = "SELECT batch_id, test_value, spec_upper, spec_lower FROM quality_tests"
+    code = r'''
+sql = "SELECT batch_id, test_value, spec_upper, spec_lower FROM quality_tests"
+data = load_data_with_sql(sql=sql)
+data["deviation"] = (
+    (data["test_value"] - data["spec_lower"])
+    / (data["spec_upper"] - data["spec_lower"])
+)
+selected_rows = []
+for batch_id, group in data.groupby("batch_id"):
+    row = group.loc[group["deviation"].abs().idxmax()].copy()
+    selected_rows.append(row)
+summary = pd.DataFrame(selected_rows) if selected_rows else pd.DataFrame()
+chart_data = summary[["batch_id", "deviation"]].copy()
+chart_data["absolute_deviation"] = chart_data["deviation"].abs()
+chart = build_chart_result(
+    data=chart_data,
+    chart_kind="bar",
+    category_field="batch_id",
+    value_field="absolute_deviation",
+)
+table = build_table_result(
+    data=summary,
+    columns=[
+        {"key": "batch_id", "label": "Batch"},
+        {"key": "test_value", "label": "Value"},
+        {"key": "deviation", "label": "Deviation"},
+    ],
+)
+result = save_analysis_result(analysis_report="", charts=[chart], tables=[table])
+'''
+    snapshot = _snapshot(
+        code=code,
+        charts=[{
+            "title": "Deviation",
+            "chart_data_contract": {
+                "encoding": {
+                    "category_field": "batch_id",
+                    "value_field": "absolute_deviation",
+                }
+            },
+        }],
+        tables=[{
+            "title": "Deviation details",
+            "columns": [
+                {"key": "batch_id", "label": "Batch"},
+                {"key": "test_value", "label": "Value"},
+                {"key": "deviation", "label": "Deviation"},
+            ],
+            "rows": [{"batch_id": "B1", "test_value": 12.0, "deviation": 1.2}],
+        }],
+        query_snapshots={
+            "q_quality": _query_snapshot(
+                sql,
+                columns=["batch_id", "test_value", "spec_upper", "spec_lower"],
+            ),
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(
+        planner=lambda _: EvidencePlan(),
+        structured_planner=lambda _: EvidencePlan(),
+    ).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert len(bundle["chart_trace_refs"]) == 1
+    assert {item["column_key"] for item in bundle["table_trace_refs"]} == {
+        "test_value",
+        "deviation",
+    }
+    assert {
+        query_ref
+        for definition in bundle["evidence_definitions"]
+        for query_ref in definition["query_refs"]
+    } == {"q_quality"}
+
+
+def test_chart_scalar_selected_from_dynamic_record_mapping_keeps_query_lineage():
+    sql = """
+SELECT has_alarm, COUNT(*) AS batch_count, AVG(offset_value) AS mean_offset
+FROM batch_offsets
+GROUP BY has_alarm
+"""
+    code = r'''
+sql = """
+SELECT has_alarm, COUNT(*) AS batch_count, AVG(offset_value) AS mean_offset
+FROM batch_offsets
+GROUP BY has_alarm
+"""
+data = load_data_with_sql(sql=sql)
+offsets = {}
+for _, row in data.iterrows():
+    offsets[int(row["has_alarm"])] = {
+        "batch_count": int(row["batch_count"]),
+        "mean_offset": float(row["mean_offset"]),
+    }
+with_alarm = offsets.get(1, {"batch_count": 0, "mean_offset": 0.0})
+without_alarm = offsets.get(0, {"batch_count": 0, "mean_offset": 0.0})
+mean_with = with_alarm["mean_offset"]
+mean_without = without_alarm["mean_offset"]
+chart_data = pd.DataFrame({
+    "scope": ["target batches"],
+    "with alarm": [mean_with],
+    "without alarm": [mean_without],
+})
+charts = [build_multi_metric_chart_result(
+    data=chart_data,
+    category_field="scope",
+    value_fields=["with alarm", "without alarm"],
+)]
+result = save_analysis_result(analysis_report="", charts=charts, tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        charts=[{
+            "title": "Offset comparison",
+            "chart_data_contract": {
+                "encoding": {
+                    "category_field": "scope",
+                    "value_fields": ["with alarm", "without alarm"],
+                }
+            },
+        }],
+        query_snapshots={
+            "q_offsets": _query_snapshot(
+                sql,
+                columns=["has_alarm", "batch_count", "mean_offset"],
+            )
+        },
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    outputs = [
+        item for item in lineage["output_nodes"]
+        if item.get("artifact_type") == "chart"
+    ]
+
+    assert len(outputs) == 2
+    assert all(output["candidate_query_node_ids"] == ["q_offsets"] for output in outputs)
+    operation_by_id = {
+        item["operation_node_id"]: item
+        for item in lineage["operation_nodes"]
+    }
+    for output in outputs:
+        boundary_fields = {
+            field
+            for operation_id in output["boundary_operation_node_ids"]
+            for field in operation_by_id[operation_id].get("targets") or []
+        }
+        assert "mean_offset" in boundary_fields
+        assert "batch_count" not in boundary_fields
+
+
+def test_ranked_row_numeric_projection_remains_a_report_metric():
+    sql = "SELECT cause, batch_id FROM risk_events"
+    code = r'''
+sql = "SELECT cause, batch_id FROM risk_events"
+data = load_data_with_sql(sql=sql)
+ranking = data.groupby("cause")["batch_id"].nunique().reset_index(name="batch_count")
+ranking = ranking.sort_values("batch_count", ascending=False)
+top_cause = ranking.iloc[0]["cause"]
+top_count = ranking.iloc[0]["batch_count"]
+analysis_report = f"Top cause is {top_cause}, covering {top_count} batches."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Top cause is process variation, covering 38 batches.",
+        query_snapshots={
+            "q_risks": _query_snapshot(sql, columns=["cause", "batch_id"]),
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=lambda _: EvidencePlan()).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert [item["text"] for item in bundle["report_trace_refs"]] == ["38"]
+
+
+def test_invalid_report_metric_does_not_erase_verified_structured_evidence(monkeypatch):
+    sql = "SELECT product, SUM(amount) AS sales_amount FROM sales GROUP BY product"
+    code = r'''
+sql = "SELECT product, SUM(amount) AS sales_amount FROM sales GROUP BY product"
+data = load_data_with_sql(sql=sql)
+total_amount = data["sales_amount"].sum()
+analysis_report = f"Sales amount: {total_amount:,.2f}."
+table = build_table_result(
+    title="Sales by product",
+    data=data,
+    columns=[
+        {"key": "product", "label": "Product"},
+        {"key": "sales_amount", "label": "Sales amount"},
+    ],
+)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[table])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Sales amount: 1,280.50.",
+        tables=[{
+            "title": "Sales by product",
+            "columns": [
+                {"key": "product", "label": "Product"},
+                {"key": "sales_amount", "label": "Sales amount"},
+            ],
+            "rows": [{"product": "A", "sales_amount": 1280.5}],
+        }],
+        query_snapshots={"q_sales": _query_snapshot(sql, columns=["product", "sales_amount"])},
+    )
+    original_errors = PostAnalysisEvidenceCompiler._plan_reference_errors
+    calls = {"count": 0, "bad_metric_key": ""}
+
+    def reject_one_metric(plan, candidates, require_complete=False):
+        errors = original_errors(plan, candidates, require_complete=require_complete)
+        calls["count"] += 1
+        if errors:
+            return errors
+        if calls["bad_metric_key"] and any(
+            metric.metric_key == calls["bad_metric_key"] for metric in plan.metrics
+        ):
+            return ["metrics[0] selects queries not reachable from its operations: ['q_wrong']"]
+        if len(plan.metrics) > 1:
+            bad_metric = next(
+                (
+                    metric for metric in plan.metrics
+                    if any("report" in str(output_id) for output_id in metric.output_node_ids)
+                ),
+                plan.metrics[-1],
+            )
+            calls["bad_metric_key"] = bad_metric.metric_key
+            return ["metrics[1] selects queries not reachable from its operations: ['q_wrong']"]
+        return []
+
+    monkeypatch.setattr(
+        PostAnalysisEvidenceCompiler,
+        "_plan_reference_errors",
+        staticmethod(reject_one_metric),
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=lambda _: EvidencePlan()).compile(snapshot)
+
+    assert bundle["evidence_definitions"]
+    assert bundle["table_trace_refs"]
+    assert bundle["status"] in {"complete", "partial"}
+    assert calls["bad_metric_key"]
+    assert calls["count"] > 1
+
+
+def test_unproven_operation_reachability_does_not_reject_llm_source_locator():
+    candidates = {
+        "calc_unproven": {
+            "calculation_id": "calc_unproven",
+            "output_node_ids": ["out_report"],
+            "operation_node_ids": ["op_recovered"],
+            "boundary_operation_node_ids": ["op_recovered"],
+            "query_node_ids": ["q_sales"],
+            "operation_query_ids": {"op_recovered": ["q_sales"]},
+            "output_operation_ids": {"out_report": []},
+            "semantic_scope": True,
+            "ambiguous_input": False,
+        },
+    }
+    plan = EvidencePlan(metrics=[PlannedMetric(
+        calculation_id="calc_unproven",
+        output_node_ids=["out_report"],
+        operation_node_ids=["op_recovered"],
+        query_node_ids=["q_sales"],
+        metric_key="sales",
+        business_name="Sales",
+        business_explanation="Recovered from an exact source locator.",
+    )])
+
+    errors = PostAnalysisEvidenceCompiler._plan_reference_errors(
+        plan,
+        candidates,
+        require_complete=False,
+    )
+
+    assert not any("do not reach its outputs" in error for error in errors)
+
+
+def test_proven_conflicting_operation_reachability_rejects_llm_binding():
+    candidates = {
+        "calc_conflict": {
+            "calculation_id": "calc_conflict",
+            "output_node_ids": ["out_report"],
+            "operation_node_ids": ["op_actual", "op_wrong"],
+            "boundary_operation_node_ids": ["op_actual", "op_wrong"],
+            "query_node_ids": ["q_sales"],
+            "operation_query_ids": {
+                "op_actual": ["q_sales"],
+                "op_wrong": ["q_sales"],
+            },
+            "output_operation_ids": {"out_report": ["op_actual"]},
+            "semantic_scope": True,
+            "ambiguous_input": False,
+        },
+    }
+    plan = EvidencePlan(metrics=[PlannedMetric(
+        calculation_id="calc_conflict",
+        output_node_ids=["out_report"],
+        operation_node_ids=["op_wrong"],
+        query_node_ids=["q_sales"],
+        metric_key="sales",
+        business_name="Sales",
+        business_explanation="Wrong operation for the output.",
+    )])
+
+    errors = PostAnalysisEvidenceCompiler._plan_reference_errors(
+        plan,
+        candidates,
+        require_complete=False,
+    )
+
+    assert any("do not reach its outputs" in error for error in errors)
 
 
 def test_ambiguous_report_candidate_is_resolved_by_llm_selection_then_locally_verified():
@@ -4070,6 +5704,414 @@ def test_ambiguous_report_candidate_is_resolved_by_llm_selection_then_locally_ve
             candidates,
         )
     )
+
+
+def test_verified_report_completion_leaves_ambiguous_loop_output_for_planner():
+    lineage = {
+        "query_nodes": [{"query_node_id": "q_root"}],
+        "operation_nodes": [],
+        "output_nodes": [{
+            "output_node_id": "out_report_value",
+            "artifact_type": "report",
+            "field": "value",
+            "numeric_hint": True,
+            "boundary_operation_node_ids": ["op_a", "op_b"],
+            "candidate_operation_node_ids": ["op_a", "op_b"],
+            "candidate_query_node_ids": ["q_root"],
+        }],
+    }
+    candidates = {
+        "calc_ambiguous": {
+            "calculation_id": "calc_ambiguous",
+            "output_node_ids": ["out_report_value"],
+            "operation_node_ids": ["op_a", "op_b"],
+            "query_node_ids": ["q_root"],
+            "ambiguous_input": True,
+        }
+    }
+
+    plan = PostAnalysisEvidenceCompiler._build_verified_report_completion_plan(
+        EvidencePlan(), candidates, lineage,
+    )
+
+    assert plan.metrics == []
+
+
+def test_ambiguous_template_occurrences_are_independent_semantic_candidates():
+    sql = "SELECT material_count, retry_count FROM root_causes"
+    code = r'''
+sql = "SELECT material_count, retry_count FROM root_causes"
+data = load_data_with_sql(sql=sql)
+material_count = data["material_count"].sum()
+retry_count = data["retry_count"].sum()
+ranking = [("Material", material_count), ("Retest", retry_count)]
+lines = []
+for index, (name, value) in enumerate(ranking, 1):
+    lines.append(f"{index}. {name}: {value}")
+analysis_report = "\n".join(lines)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="1. Material: 120\n2. Retest: 34",
+        query_snapshots={
+            "q_root": _query_snapshot(
+                sql, columns=["material_count", "retry_count"]
+            )
+        },
+    )
+    compiler = PostAnalysisEvidenceCompiler()
+    lineage = LineageIndexer().build(snapshot)
+    calculations = compiler._build_calculation_candidates(lineage)
+    semantic = compiler._build_report_semantic_candidates(
+        lineage, calculations,
+    )
+    verified = compiler._build_verified_report_completion_plan(
+        EvidencePlan(), calculations, lineage,
+    )
+    payload = compiler._planner_fact_payload(
+        snapshot,
+        lineage,
+        semantic,
+        recovery_only=True,
+        excluded_output_ids={
+            output_id
+            for metric in verified.metrics
+            for output_id in metric.output_node_ids
+        },
+    )
+
+    candidates = payload["report_candidate_catalog"]
+    assert len(candidates) == 2
+    assert {item["line"] for item in candidates} == {
+        "1. Material: 120", "2. Retest: 34",
+    }
+    assert payload["source_anchor_catalog"] == []
+
+
+def test_report_recovery_query_catalog_exposes_python_result_binding():
+    sql = "SELECT status, COUNT(*) AS total FROM contracts GROUP BY status"
+    code = r'''
+sql = "SELECT status, COUNT(*) AS total FROM contracts GROUP BY status"
+status_rows = load_data_with_sql(sql=sql)
+summary = status_rows.iloc[0]
+total = summary["total"]
+analysis_report = f"Contracts: {total}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Contracts: 12.",
+        query_snapshots={
+            "q_contracts": _query_snapshot(sql, columns=["status", "total"]),
+        },
+    )
+    compiler = PostAnalysisEvidenceCompiler()
+    lineage = LineageIndexer().build(snapshot)
+    calculations = compiler._build_calculation_candidates(lineage)
+    semantic = compiler._build_report_semantic_candidates(
+        lineage, calculations,
+    )
+
+    payload = compiler._planner_fact_payload(
+        snapshot,
+        lineage,
+        semantic,
+        recovery_only=True,
+        excluded_output_ids=set(),
+    )
+
+    query = next(
+        item for item in payload["query_catalog"]
+        if item["query_node_id"] == "q1"
+    )
+    assert query["result_bindings"] == [{
+        "variable": "status_rows",
+        "source_line": 3,
+    }]
+
+
+def test_sorted_dynamic_template_without_local_closure_exposes_each_occurrence():
+    sql = "SELECT material_count, retry_count FROM root_causes"
+    code = r'''
+sql = "SELECT material_count, retry_count FROM root_causes"
+data = load_data_with_sql(sql=sql)
+material_count = int(data["material_count"].sum())
+retry_count = int(data["retry_count"].sum())
+ranking = [("Material", material_count), ("Retest", retry_count)]
+ranking = sorted(ranking, key=lambda item: item[1], reverse=True)
+lines = []
+rank = 1
+for name, value in ranking:
+    lines.append(f"{rank}. **{name}**: {value} batches")
+    rank += 1
+analysis_report = "\n".join(lines)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="1. **Material**: 120 batches\n2. **Retest**: 34 batches",
+        query_snapshots={
+            "q_root": _query_snapshot(
+                sql, columns=["material_count", "retry_count"]
+            )
+        },
+    )
+    compiler = PostAnalysisEvidenceCompiler()
+    lineage = LineageIndexer().build(snapshot)
+    calculations = compiler._build_calculation_candidates(lineage)
+    semantic = compiler._build_report_semantic_candidates(
+        lineage, calculations,
+    )
+    payload = compiler._planner_fact_payload(
+        snapshot,
+        lineage,
+        semantic,
+        recovery_only=True,
+        excluded_output_ids=set(),
+    )
+
+    candidates = payload["report_candidate_catalog"]
+    assert len(candidates) == 2
+    assert {item["text_examples"][0] for item in candidates} == {"120", "34"}
+    assert {item["line"] for item in candidates} == {
+        "1. **Material**: 120 batches",
+        "2. **Retest**: 34 batches",
+    }
+    assert payload["source_anchor_catalog"] == []
+
+
+def test_ranked_mapping_exposes_each_labelled_calculation_to_semantic_planner():
+    equipment_sql = "SELECT fault_event_count FROM equipment_events"
+    packaging_sql = "SELECT package_id FROM packaging_events"
+    code = r'''
+equipment = load_data_with_sql(sql="SELECT fault_event_count FROM equipment_events")
+packaging = load_data_with_sql(sql="SELECT package_id FROM packaging_events")
+scores = {
+    "Equipment": equipment["fault_event_count"].sum(),
+    "Packaging": packaging["package_id"].count(),
+}
+ranking = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+lines = []
+for rank, (category, score) in enumerate(ranking, 1):
+    lines.append(f"{rank}. **{category}**: evidence strength {score}")
+analysis_report = "\n".join(lines)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report=(
+            "1. **Packaging**: evidence strength 66\n"
+            "2. **Equipment**: evidence strength 1"
+        ),
+        query_snapshots={
+            "q_equipment": _query_snapshot(
+                equipment_sql, columns=["fault_event_count"]
+            ),
+            "q_packaging": _query_snapshot(
+                packaging_sql, columns=["package_id"]
+            ),
+        },
+    )
+    compiler = PostAnalysisEvidenceCompiler()
+    lineage = LineageIndexer().build(snapshot)
+    members = {
+        target: operation
+        for operation in lineage["operation_nodes"]
+        for target in operation.get("targets") or []
+        if target.startswith("scores[")
+    }
+
+    assert set(members) == {"scores['Equipment']", "scores['Packaging']"}
+    assert members["scores['Equipment']"]["loads"] == ["equipment"]
+    assert members["scores['Packaging']"]["loads"] == ["packaging"]
+
+    calculations = compiler._build_calculation_candidates(lineage)
+    semantic = compiler._build_report_semantic_candidates(lineage, calculations)
+    payload = compiler._planner_fact_payload(
+        snapshot,
+        lineage,
+        semantic,
+        recovery_only=True,
+        excluded_output_ids=set(),
+    )
+    operation_sources = {
+        item["expression"] for item in payload["operation_catalog"]
+    }
+    assert any(
+        "scores['Packaging']" in source and "package_id" in source
+        for source in operation_sources
+    )
+
+
+def test_sorted_dynamic_template_semantic_sources_survive_local_verification():
+    sql = "SELECT material_count, retry_count FROM root_causes"
+    code = r'''
+sql = "SELECT material_count, retry_count FROM root_causes"
+data = load_data_with_sql(sql=sql)
+material_count = int(data["material_count"].sum())
+retry_count = int(data["retry_count"].sum())
+ranking = [("Material", material_count), ("Retest", retry_count)]
+ranking = sorted(ranking, key=lambda item: item[1], reverse=True)
+lines = []
+rank = 1
+for name, value in ranking:
+    lines.append(f"{rank}. **{name}**: {value} batches")
+    rank += 1
+analysis_report = "\n".join(lines)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="1. **Material**: 120 batches\n2. **Retest**: 34 batches",
+        query_snapshots={
+            "q_root": _query_snapshot(
+                sql, columns=["material_count", "retry_count"]
+            )
+        },
+    )
+
+    def resolve(payload: dict) -> EvidencePlan:
+        metrics = []
+        for candidate in payload["report_candidate_catalog"]:
+            is_material = "Material" in candidate["line"]
+            metrics.append(PlannedMetric(
+                calculation_id="report_semantic_scope",
+                report_candidate_ids=[candidate["candidate_id"]],
+                calculation_source_refs=[CalculationSourceRef(
+                    source_line=4 if is_material else 5,
+                    expression=(
+                        'int(data["material_count"].sum())'
+                        if is_material
+                        else 'int(data["retry_count"].sum())'
+                    ),
+                )],
+                claimed_query_node_ids=["q_root"],
+                claimed_metric_fields=[
+                    "material_count" if is_material else "retry_count"
+                ],
+                metric_key="material" if is_material else "retry",
+                business_name="Material" if is_material else "Retest",
+                business_explanation="Count of affected batches.",
+                display_unit="batches",
+            ))
+        return EvidencePlan(metrics=metrics)
+
+    bundle = PostAnalysisEvidenceCompiler(planner=resolve).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    refs = sorted(bundle["report_trace_refs"], key=lambda item: item["start"])
+    assert [item["text"] for item in refs] == ["120", "34"]
+    assert refs[0]["evidence_key"] != refs[1]["evidence_key"]
+
+
+def test_invalid_posthoc_metric_does_not_erase_independent_evidence():
+    candidates = {
+        "calc_valid": {
+            "calculation_id": "calc_valid",
+            "output_node_ids": ["out_chart"],
+            "operation_node_ids": ["op_valid"],
+            "query_node_ids": ["q_valid"],
+            "operation_query_ids": {"op_valid": ["q_valid"]},
+        },
+        "calc_invalid": {
+            "calculation_id": "calc_invalid",
+            "output_node_ids": ["out_report"],
+            "operation_node_ids": ["op_a", "op_b"],
+            "query_node_ids": ["q_valid"],
+            "operation_query_ids": {
+                "op_a": ["q_valid"],
+                "op_b": ["q_valid"],
+            },
+            "ambiguous_input": True,
+            "operation_family_signatures": {"op_a": "a", "op_b": "b"},
+            "operation_write_signatures": {"op_a": "a", "op_b": "b"},
+            "operation_semantic_kinds": {
+                "op_a": "aggregation",
+                "op_b": "aggregation",
+            },
+        },
+    }
+    valid = PlannedMetric(
+        calculation_id="calc_valid",
+        output_node_ids=["out_chart"],
+        operation_node_ids=["op_valid"],
+        query_node_ids=["q_valid"],
+        metric_key="valid",
+        business_name="Valid",
+        business_explanation="Valid boundary",
+    )
+    invalid = PlannedMetric(
+        calculation_id="calc_invalid",
+        output_node_ids=["out_report"],
+        operation_node_ids=["op_a", "op_b"],
+        query_node_ids=["q_valid"],
+        metric_key="invalid",
+        business_name="Invalid",
+        business_explanation="Ambiguous boundary",
+    )
+
+    isolated = PostAnalysisEvidenceCompiler._isolate_invalid_metrics(
+        EvidencePlan(metrics=[valid, invalid]), candidates,
+    )
+
+    assert [metric.metric_key for metric in isolated.metrics] == ["valid"]
+    assert [item.output_node_id for item in isolated.unresolved_outputs] == [
+        "out_report"
+    ]
+
+
+def test_structured_chart_keeps_query_lineage_through_dataframe_helper_function():
+    sql = "SELECT product_name, batch_id FROM quality_batches"
+    code = r'''
+data = load_data_with_sql(sql="SELECT product_name, batch_id FROM quality_batches")
+near_batches = data[data["batch_id"].notna()]
+def product_concentration(frame):
+    if frame.empty:
+        return pd.DataFrame(columns=["product_name", "batch_count"])
+    result = frame.groupby("product_name").agg(
+        batch_count=("batch_id", "nunique")
+    ).reset_index()
+    return result.sort_values("batch_count", ascending=False)
+near_products = product_concentration(near_batches)
+chart = build_chart_result(
+    data=near_products.head(8),
+    chart_kind="bar",
+    category_field="product_name",
+    value_field="batch_count",
+)
+result = save_analysis_result(analysis_report="Near-limit distribution.", charts=[chart], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Near-limit distribution.",
+        charts=[{
+            "title": "Near-limit distribution",
+            "chart_data_contract": {
+                "encoding": {
+                    "category_field": "product_name",
+                    "value_field": "batch_count",
+                },
+            },
+        }],
+        query_snapshots={
+            "q_quality": _query_snapshot(
+                sql, columns=["product_name", "batch_id"]
+            ),
+        },
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    output = next(
+        item for item in lineage["output_nodes"]
+        if item.get("artifact_type") == "chart"
+        and item.get("field") == "batch_count"
+    )
+
+    assert output["candidate_query_node_ids"] == ["q_quality"]
+    assert len(output["boundary_operation_node_ids"]) == 1
+
+
 def test_compiled_multi_series_chart_selection_resolves_current_value():
     service = InsightNsConversationService(None)
     artifact = {
@@ -5084,6 +7126,46 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     ]
     assert all(position in refs_by_start for position in expected_positions)
     assert len(bundle["report_trace_refs"]) == len(expected_positions)
+
+
+def test_reused_concatenated_conditional_fragment_keeps_inner_numeric_slots():
+    code = r'''
+top_name = "Material"
+top_score = 247.2
+second_name = "Laboratory"
+second_score = 69.4
+gap = top_score - second_score
+priority_text = (
+    f"Top cause: {top_name} ({top_score:.1f}); "
+    + (f"ahead of {second_name} ({second_score:.1f}) by {gap:.1f}." if second_name else "")
+)
+report_parts = [
+    "## Summary",
+    f"- {priority_text}",
+    "## Ranking",
+    f"{priority_text}",
+]
+analysis_report = "\n".join(report_parts)
+'''
+    report = (
+        "## Summary\n- Top cause: Material (247.2); ahead of Laboratory "
+        "(69.4) by 177.8.\n## Ranking\nTop cause: Material (247.2); "
+        "ahead of Laboratory (69.4) by 177.8."
+    )
+
+    _, expressions, _, _, _, _ = LineageIndexer()._index_code(code, {})
+    outputs = LineageIndexer._locate_report_outputs(report, expressions)
+    relevant = [
+        item for item in outputs
+        if item.get("field") in {"top_score", "second_score", "gap"}
+    ]
+
+    assert [item["text"] for item in relevant] == [
+        "247.2", "247.2", "69.4", "177.8", "69.4", "177.8",
+    ]
+    assert [item["field"] for item in relevant] == [
+        "top_score", "top_score", "second_score", "gap", "second_score", "gap",
+    ]
 
 
 def test_top_level_conditional_report_expression_keeps_rendered_numeric_slots():
