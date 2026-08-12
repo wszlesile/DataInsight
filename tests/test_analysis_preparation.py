@@ -2005,7 +2005,11 @@ def test_semantic_selection_normalizes_to_canonical_preparation_state(monkeypatc
             'verification_status': 'provider_asserted',
         },),
     )
-    monkeypatch.setattr(prep.Config, 'DATASOURCE_SELECTION_PROVIDER', 'semantic_center')
+    monkeypatch.setattr(
+        prep.DatasourceSelectionProviderRouter,
+        'resolve',
+        lambda snapshot=None: 'semantic_center',
+    )
     retrieve_call = {}
 
     def retrieve(self, **kwargs):
@@ -2044,6 +2048,52 @@ def test_semantic_selection_normalizes_to_canonical_preparation_state(monkeypatc
     )
     assert _intent().business_goal in retrieve_call['query']
     assert _intent().business_questions[0].business_question in retrieve_call['query']
+
+
+def test_semantic_selection_seeds_an_empty_conversation_snapshot(monkeypatch):
+    from service.semantic_datasource_selection_service import (
+        SemanticDatasourceSelectionResult,
+    )
+
+    discovered_snapshot = _snapshot()
+    workflow = prep.AnalysisPreparationWorkflow(
+        user_query='鍒嗘瀽鍚堝悓鎯呭喌',
+        context_mode='fresh_analysis',
+        expected_time_range={},
+        datasource_snapshot={},
+        conversation_context={},
+        runtime_config=None,
+        execution_context={
+            'token': 'Bearer test',
+            'namespace_id': 6,
+            'database_conn_info': {},
+        },
+        cancelled=None,
+        stage_callback=None,
+    )
+    monkeypatch.setattr(
+        prep.SemanticDatasourceSelectionService,
+        'retrieve',
+        lambda self, **kwargs: SemanticDatasourceSelectionResult(
+            datasource_ids=(11, 12),
+            datasource_snapshot=discovered_snapshot,
+            relationship_hints=(),
+        ),
+    )
+    monkeypatch.setattr(
+        prep,
+        '_invoke_contract',
+        lambda **kwargs: _selection(),
+    )
+
+    result = workflow.semantic_selection({
+        'intent': _intent(),
+        'catalog': [],
+    })
+
+    assert result['selection'].selected_datasource_ids == [11, 12]
+    assert result['selected_snapshot']['selected_datasource_ids'] == [11, 12]
+    assert result['query_capabilities'] == ('sql',)
 
 
 def test_semantic_relationship_is_schema_checked_and_skips_relationship_probe(
@@ -2187,7 +2237,11 @@ def test_semantic_provider_reuses_canonical_intent_before_selection(monkeypatch)
     selection = _selection()
     calls = []
 
-    monkeypatch.setattr(prep.Config, 'DATASOURCE_SELECTION_PROVIDER', 'semantic_center')
+    monkeypatch.setattr(
+        prep.DatasourceSelectionProviderRouter,
+        'resolve',
+        lambda snapshot=None: 'semantic_center',
+    )
 
     def intent_node(state):
         calls.append('intent_analysis')
@@ -2235,7 +2289,11 @@ def test_semantic_selection_failure_runs_complete_local_preparation(monkeypatch)
         cancelled=None,
         stage_callback=None,
     )
-    monkeypatch.setattr(prep.Config, 'DATASOURCE_SELECTION_PROVIDER', 'semantic_center')
+    monkeypatch.setattr(
+        prep.DatasourceSelectionProviderRouter,
+        'resolve',
+        lambda snapshot=None: 'semantic_center',
+    )
 
     def fail_semantic(self, **kwargs):
         raise prep.SemanticDatasourceSelectionError('gateway unavailable')
@@ -2278,6 +2336,40 @@ def test_semantic_selection_failure_runs_complete_local_preparation(monkeypatch)
 
     assert local_calls == ['intent_analysis', 'select_datasources', 'business_context']
     assert result.selection.selected_datasource_ids == [11, 12]
+
+
+def test_empty_semantic_selection_failure_does_not_run_local_selection(monkeypatch):
+    workflow = prep.AnalysisPreparationWorkflow(
+        user_query='鍒嗘瀽鍚堝悓鎯呭喌',
+        context_mode='fresh_analysis',
+        expected_time_range={},
+        datasource_snapshot={},
+        conversation_context={},
+        runtime_config=None,
+        execution_context={'token': 'Bearer test', 'namespace_id': 6},
+        cancelled=None,
+        stage_callback=None,
+    )
+    monkeypatch.setattr(
+        prep.DatasourceSelectionProviderRouter,
+        'resolve',
+        lambda snapshot=None: 'semantic_center',
+    )
+    monkeypatch.setattr(
+        prep.SemanticDatasourceSelectionService,
+        'retrieve',
+        lambda self, **kwargs: (_ for _ in ()).throw(
+            prep.SemanticDatasourceSelectionError('gateway unavailable')
+        ),
+    )
+    monkeypatch.setattr(
+        workflow,
+        'select_datasources',
+        lambda state: pytest.fail('empty local selection must not be invoked'),
+    )
+
+    with pytest.raises(prep.SemanticDatasourceSelectionError):
+        workflow.run()
 
 
 def test_business_context_rejects_fabricated_probe_relationship():

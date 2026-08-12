@@ -35,29 +35,49 @@ class _Scope:
         return False
 
 
-def test_provider_router_defaults_unknown_values_to_local(monkeypatch):
+def test_provider_router_uses_local_when_semantic_center_is_not_installed(monkeypatch):
     monkeypatch.setattr(
-        semantic.Config,
-        'DATASOURCE_SELECTION_PROVIDER',
-        'future-provider',
+        semantic.semantic_center_availability,
+        'is_installed',
+        lambda: False,
     )
     assert semantic.DatasourceSelectionProviderRouter.resolve() == 'local'
 
 
-def test_provider_router_accepts_semantic_alias(monkeypatch):
+def test_provider_router_uses_semantic_center_when_application_is_installed(monkeypatch):
     monkeypatch.setattr(
-        semantic.Config,
-        'DATASOURCE_SELECTION_PROVIDER',
-        'lightrag',
+        semantic.semantic_center_availability,
+        'is_installed',
+        lambda: True,
     )
     assert semantic.DatasourceSelectionProviderRouter.resolve() == 'semantic_center'
 
 
+def test_provider_router_allows_semantic_discovery_for_empty_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        semantic.semantic_center_availability,
+        'is_installed',
+        lambda: True,
+    )
+
+    assert semantic.DatasourceSelectionProviderRouter.can_discover_without_bound_datasource({})
+
+
+def test_provider_router_does_not_allow_local_discovery_for_empty_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        semantic.semantic_center_availability,
+        'is_installed',
+        lambda: False,
+    )
+
+    assert not semantic.DatasourceSelectionProviderRouter.can_discover_without_bound_datasource({})
+
+
 def test_provider_router_uses_semantic_center_for_uns_only_snapshot(monkeypatch):
     monkeypatch.setattr(
-        semantic.Config,
-        'DATASOURCE_SELECTION_PROVIDER',
-        'semantic_center',
+        semantic.semantic_center_availability,
+        'is_installed',
+        lambda: True,
     )
 
     assert semantic.DatasourceSelectionProviderRouter.resolve({
@@ -71,9 +91,9 @@ def test_provider_router_uses_semantic_center_for_uns_only_snapshot(monkeypatch)
 
 def test_provider_router_forces_local_when_external_source_is_associated(monkeypatch):
     monkeypatch.setattr(
-        semantic.Config,
-        'DATASOURCE_SELECTION_PROVIDER',
-        'semantic_center',
+        semantic.semantic_center_availability,
+        'is_installed',
+        lambda: True,
     )
 
     assert semantic.DatasourceSelectionProviderRouter.resolve({
@@ -94,9 +114,9 @@ def test_provider_router_forces_local_when_external_source_is_associated(monkeyp
 
 def test_provider_router_treats_legacy_non_table_source_as_external(monkeypatch):
     monkeypatch.setattr(
-        semantic.Config,
-        'DATASOURCE_SELECTION_PROVIDER',
-        'semantic_center',
+        semantic.semantic_center_availability,
+        'is_installed',
+        lambda: True,
     )
 
     assert semantic.DatasourceSelectionProviderRouter.resolve({
@@ -105,6 +125,63 @@ def test_provider_router_treats_legacy_non_table_source_as_external(monkeypatch)
             'datasource_type': 'local_file',
         }],
     }) == 'local'
+
+
+def test_semantic_center_availability_reads_kernel_once_per_cache_window(monkeypatch):
+    calls = []
+    availability = semantic.SemanticCenterAvailability()
+    monkeypatch.setattr(
+        semantic.supos_kernel_api,
+        'is_platform_application_installed',
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+
+    assert availability.is_installed()
+    assert availability.is_installed()
+    assert calls == [{
+        'group': 'toolkit',
+        'name': 'supos-rag-semantic-center',
+    }]
+
+
+def test_semantic_center_availability_falls_back_to_local_on_kernel_error(monkeypatch):
+    availability = semantic.SemanticCenterAvailability()
+    monkeypatch.setattr(
+        semantic.supos_kernel_api,
+        'is_platform_application_installed',
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError('kernel unavailable')),
+    )
+    monkeypatch.setattr(
+        semantic,
+        'semantic_center_availability',
+        availability,
+    )
+
+    assert semantic.DatasourceSelectionProviderRouter.resolve({}) == 'local'
+
+
+def test_semantic_selection_uses_platform_service_address(monkeypatch):
+    monkeypatch.setattr(
+        semantic.Config,
+        'SEMANTIC_BASE',
+        'http://toolkit-semantic-center:9621',
+    )
+
+    service = semantic.SemanticDatasourceSelectionService()
+
+    assert service.base_url == 'http://toolkit-semantic-center:9621'
+
+
+def test_semantic_selection_accepts_configured_service_address(monkeypatch):
+    monkeypatch.setattr(
+        semantic.Config,
+        'SEMANTIC_BASE',
+        'http://127.0.0.1:19621/',
+    )
+
+    service = semantic.SemanticDatasourceSelectionService()
+
+    assert service.base_url == 'http://127.0.0.1:19621'
 
 
 def test_semantic_materialization_uses_node_ids_and_batches_missing_details(monkeypatch):

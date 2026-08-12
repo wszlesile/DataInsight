@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 import agent.invoker as invoker
 from agent.analysis_preparation import (
     BusinessFactCoverageContract,
@@ -124,6 +126,54 @@ def test_preparation_failure_preserves_original_datasource_context(monkeypatch):
     assert result.selected_snapshot == original
     assert runtime.active_datasource_snapshot == original
     assert runtime.short_term_memory["preparation_result"] is result
+
+
+def test_semantic_provider_allows_analysis_without_bound_datasource(monkeypatch):
+    runtime = _runtime(_snapshot())
+    monkeypatch.setattr(
+        invoker.DatasourceSelectionProviderRouter,
+        "resolve",
+        lambda snapshot=None: "semantic_center",
+    )
+    monkeypatch.setattr(
+        invoker,
+        "_is_analysis_request_expected",
+        lambda runtime, user_message: True,
+    )
+
+    assert not invoker._should_finish_without_datasource(runtime, "分析合同情况")
+
+
+def test_local_provider_still_requires_bound_datasource(monkeypatch):
+    runtime = _runtime(_snapshot())
+    monkeypatch.setattr(
+        invoker.DatasourceSelectionProviderRouter,
+        "resolve",
+        lambda snapshot=None: "local",
+    )
+    monkeypatch.setattr(
+        invoker,
+        "_is_analysis_request_expected",
+        lambda runtime, user_message: True,
+    )
+
+    assert invoker._should_finish_without_datasource(runtime, "分析合同情况")
+
+
+def test_empty_semantic_preparation_failure_converges_to_no_datasource(monkeypatch):
+    runtime = _runtime(_snapshot())
+    monkeypatch.setattr(
+        invoker,
+        "prepare_analysis",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("semantic unavailable")),
+    )
+
+    with pytest.raises(invoker.NoDatasourceAvailableForAnalysis):
+        invoker._prepare_analysis_context(
+            runtime=runtime,
+            agent_request=_request(),
+            runtime_config=SimpleNamespace(),
+        )
 
 
 def test_preparation_probe_context_keeps_the_separate_fedquery_authorization(monkeypatch):

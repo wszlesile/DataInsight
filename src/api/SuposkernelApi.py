@@ -65,6 +65,49 @@ class SuposKernelApi:
         response.raise_for_status()
         return response.json()
 
+    def is_platform_application_installed(
+        self,
+        *,
+        group: str,
+        name: str,
+        authorization: str | None = None,
+    ) -> bool:
+        """Return whether one Application resource is currently installed."""
+        normalized_group = str(group or '').strip()
+        normalized_name = str(name or '').strip()
+        if not normalized_group or not normalized_name:
+            raise ValueError('platform application group and name are required')
+
+        credential = str(
+            authorization or Config.SUPOS_DATAINSIGHT_SERVER_APPKEY or ''
+        ).strip()
+        if not credential:
+            raise ValueError('SUPOS application credential is not configured')
+        if not credential.startswith('Bearer '):
+            credential = f'Bearer {credential}'
+
+        namespace = f'{normalized_group}.{normalized_name}'
+        url = (
+            f"{self.supos_gateway.rstrip('/')}/apis/ns/v1/system/apps/"
+            f'{namespace}/{normalized_name}'
+        )
+        response = requests.get(
+            url,
+            headers={'Authorization': credential},
+            timeout=self.timeout,
+        )
+        if response.status_code == 404:
+            return False
+        response.raise_for_status()
+        payload = response.json()
+        metadata = payload.get('$metadata') or {}
+        return bool(
+            payload.get('$kind') == 'apps.supos.com;v1alpha1:Application'
+            and payload.get('group') == normalized_group
+            and metadata.get('name') == normalized_name
+            and not metadata.get('deletionTimestamp')
+        )
+
     def fetch_license_detail(self, authorization: str, feature_id: int) -> dict[str, Any]:
         """获取平台授权详情。"""
         if not authorization:

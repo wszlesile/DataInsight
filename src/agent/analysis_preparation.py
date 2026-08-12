@@ -3583,6 +3583,8 @@ class AnalysisPreparationWorkflow:
                 "with the existing intent: %s",
                 exc,
             )
+            if not state.get("catalog"):
+                raise
             return self.select_datasources(state)
 
 
@@ -3992,6 +3994,8 @@ class AnalysisPreparationWorkflow:
                 "semantic Preparation unavailable; falling back to local Preparation: %s",
                 exc,
             )
+            if not build_datasource_catalog(self.datasource_snapshot):
+                raise
             state = self.compile(provider="local").invoke({
                 "catalog": build_datasource_catalog(self.datasource_snapshot),
             })

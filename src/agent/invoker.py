@@ -30,6 +30,7 @@ from agent.intent_classifier import resolve_context_mode_with_llm
 from config import Config
 from config.database import session_scope
 from service.conversation_context_service import ConversationContextService, ConversationRunContext
+from service.semantic_datasource_selection_service import DatasourceSelectionProviderRouter
 from utils import logger
 from utils.datasource_utils import safe_json_loads
 from utils.analysis_task_cancel import AnalysisTaskCancelled, CANCELLED_MESSAGE, is_analysis_task_cancelled
@@ -106,6 +107,12 @@ NO_DATASOURCE_ANALYSIS_REPLY = (
     '当前会话还没有关联任何数据源，暂时无法执行数据分析。'
     '请先在当前会话中关联相关数据源，然后再发起分析。'
 )
+
+
+class NoDatasourceAvailableForAnalysis(RuntimeError):
+    """Preparation could not establish any datasource scope for this analysis."""
+
+
 @dataclass
 class AgentRequest:
     """控制器层传入 Agent 层的标准化请求对象。"""
@@ -750,6 +757,10 @@ def _prepare_analysis_context(
                 if isinstance(item, dict)
                 and int(item.get("datasource_id") or item.get("id") or 0) > 0
             ]
+        if not selected_ids:
+            raise NoDatasourceAvailableForAnalysis(
+                "no datasource could be established for analysis"
+            ) from exc
         result = PreparationResult(
             intent=IntentContract(
                 business_goal=user_query or "完成本轮数据洞察分析",
@@ -1495,7 +1506,13 @@ def _has_bound_datasource(runtime: ConversationRunContext) -> bool:
 
 def _should_finish_without_datasource(runtime: ConversationRunContext, user_message: str) -> bool:
     """分析型请求在当前会话无绑定数据源时，不进入 execute_python。"""
-    return _is_analysis_request_expected(runtime, user_message) and not _has_bound_datasource(runtime)
+    if not _is_analysis_request_expected(runtime, user_message):
+        return False
+    if _has_bound_datasource(runtime):
+        return False
+    return not DatasourceSelectionProviderRouter.can_discover_without_bound_datasource(
+        runtime.active_datasource_snapshot
+    )
 
 
 def _finalize_run(
@@ -2455,15 +2472,30 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
             )
 
         runtime_config = _resolve_agent_runtime_config(agent_request)
-        preparation = (
-            _prepare_analysis_context(
-                runtime=runtime,
-                agent_request=agent_request,
-                runtime_config=runtime_config,
+        try:
+            preparation = (
+                _prepare_analysis_context(
+                    runtime=runtime,
+                    agent_request=agent_request,
+                    runtime_config=runtime_config,
+                )
+                if analysis_request_expected
+                else None
             )
-            if analysis_request_expected
-            else None
-        )
+        except NoDatasourceAvailableForAnalysis:
+            assistant_message = NO_DATASOURCE_ANALYSIS_REPLY
+            allow_report_only = True
+            return _finalize_run_with_fresh_session(
+                runtime=runtime,
+                username=agent_request.username,
+                user_message=agent_request.user_message,
+                analysis_flow_started=analysis_flow_started,
+                assistant_message=assistant_message,
+                analysis_report=analysis_report,
+                charts=charts,
+                tables=tables,
+                allow_report_only=allow_report_only,
+            )
 
         agent = get_data_insight_agent(runtime_config)
 
@@ -2705,15 +2737,43 @@ def _stream_with_runtime(
             return
 
         runtime_config = _resolve_agent_runtime_config(agent_request)
-        preparation = (
-            yield from _stream_analysis_preparation(
-                runtime=runtime,
-                agent_request=agent_request,
-                runtime_config=runtime_config,
+        try:
+            preparation = (
+                yield from _stream_analysis_preparation(
+                    runtime=runtime,
+                    agent_request=agent_request,
+                    runtime_config=runtime_config,
+                )
+                if analysis_request_expected
+                else None
             )
-            if analysis_request_expected
-            else None
-        )
+        except NoDatasourceAvailableForAnalysis:
+            assistant_message = NO_DATASOURCE_ANALYSIS_REPLY
+            allow_report_only = True
+            yield _build_progress_event(
+                'assistant',
+                conversation_id=runtime.conversation.id,
+                turn_id=runtime.turn.id,
+                stage='no_datasource',
+                message=assistant_message,
+            )
+            _finalize_run_with_fresh_session(
+                runtime=runtime,
+                username=agent_request.username,
+                user_message=agent_request.user_message,
+                analysis_flow_started=analysis_flow_started,
+                assistant_message=assistant_message,
+                analysis_report=analysis_report,
+                charts=charts,
+                tables=tables,
+                allow_report_only=allow_report_only,
+            )
+            yield _build_progress_event(
+                'done',
+                conversation_id=runtime.conversation.id,
+                turn_id=runtime.turn.id,
+            )
+            return
 
         agent = get_data_insight_agent(runtime_config)
 

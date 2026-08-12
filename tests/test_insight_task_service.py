@@ -218,6 +218,105 @@ def test_manual_run_uses_shared_runtime_and_persists_independent_history():
         session.close()
 
 
+def test_manual_run_executes_with_current_user_context_and_is_not_runner_work():
+    session = _session()
+    try:
+        execution = _source_execution(session)
+        service = InsightTaskService(session)
+        task = service.create_task(
+            username='owner',
+            source_execution_id=execution.id,
+            name='Manual user execution',
+            description='',
+            schedule={'frequency': 'daily', 'time': '09:00', 'timezone': 'Asia/Shanghai'},
+        )
+        runtime_context = {
+            'platform_authorization': 'Bearer user-ticket',
+            'fedquery_authorization': 'Bearer user-jwt',
+        }
+
+        with patch(
+            'insight_task.service.run_generated_code_locally',
+            return_value={
+                'status': 'success',
+                'analysis_report': 'manual result',
+                'execution_seconds': 25,
+            },
+        ) as execute_code:
+            result = service.execute_manual_run(
+                username='owner',
+                task_id=task['task_id'],
+                parameters={},
+                runtime_user_context=runtime_context,
+                worker_id='api:manual',
+            )
+
+        assert result['trigger_type'] == 'manual'
+        assert result['status'] == 'success'
+        assert result['execution_principal'] == 'owner'
+        assert result['worker_id'] == 'api:manual'
+        call = execute_code.call_args.kwargs
+        assert call['runtime_user_context'] == runtime_context
+        assert call['execution_source'] == 'manual_task'
+
+        queued_manual = service.enqueue_manual_run(
+            username='owner',
+            task_id=task['task_id'],
+            parameters={},
+        )
+        assert queued_manual['status'] == 'queued'
+        assert service.list_queued_runs() == []
+    finally:
+        session.close()
+
+
+def test_recovery_requeues_scheduled_runs_but_fails_interrupted_manual_runs():
+    session = _session()
+    try:
+        execution = _source_execution(session)
+        service = InsightTaskService(session)
+        task = service.create_task(
+            username='owner',
+            source_execution_id=execution.id,
+            name='Recovery boundaries',
+            description='',
+            schedule={'frequency': 'daily', 'time': '09:00', 'timezone': 'Asia/Shanghai'},
+        )
+        revision = session.query(InsightTaskRevision).filter(
+            InsightTaskRevision.task_definition_id == task['id'],
+        ).one()
+        manual = InsightTaskRun(
+            run_id='manual-stale',
+            task_definition_id=task['id'],
+            revision_id=revision.id,
+            trigger_type='manual',
+            scheduled_for=datetime.utcnow(),
+            status='running',
+            lease_until=datetime.utcnow() - timedelta(seconds=1),
+        )
+        scheduled = InsightTaskRun(
+            run_id='scheduled-stale',
+            task_definition_id=task['id'],
+            revision_id=revision.id,
+            trigger_type='scheduled',
+            scheduled_for=datetime.utcnow() + timedelta(seconds=1),
+            status='running',
+            lease_until=datetime.utcnow() - timedelta(seconds=1),
+        )
+        session.add_all([manual, scheduled])
+        session.commit()
+
+        assert service.recover_expired_runs() == 2
+        session.refresh(manual)
+        session.refresh(scheduled)
+        assert manual.status == 'failed'
+        assert manual.error_message == '手动执行请求已中断，请重新执行'
+        assert scheduled.status == 'queued'
+        assert scheduled.error_message == ''
+    finally:
+        session.close()
+
+
 def test_failed_task_execution_is_hidden_from_source_turn():
     session = _session()
     try:

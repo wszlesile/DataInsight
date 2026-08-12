@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import Lock
+from time import monotonic
 from typing import Any
 
 import requests
 
+from api import supos_kernel_api
 from config import Config
 from config.database import session_scope
 from service.conversation_context_service import ConversationContextService
@@ -16,30 +19,76 @@ class SemanticDatasourceSelectionError(RuntimeError):
     """Semantic retrieval could not produce one complete analysis source scope."""
 
 
+class SemanticCenterAvailability:
+    """Resolve semantic-center installation state from the platform Kernel."""
+
+    APPLICATION_GROUP = 'toolkit'
+    APPLICATION_NAME = 'supos-rag-semantic-center'
+    CACHE_TTL_SECONDS = 60.0
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._cached_until = 0.0
+        self._cached_installed = False
+
+    def is_installed(self) -> bool:
+        now = monotonic()
+        if now < self._cached_until:
+            return self._cached_installed
+        with self._lock:
+            now = monotonic()
+            if now < self._cached_until:
+                return self._cached_installed
+            try:
+                installed = supos_kernel_api.is_platform_application_installed(
+                    group=self.APPLICATION_GROUP,
+                    name=self.APPLICATION_NAME,
+                )
+            except Exception as exc:
+                logger.warning(
+                    'failed to resolve semantic-center installation from Kernel; '
+                    'using local datasource selection: %s',
+                    exc,
+                )
+                installed = False
+            self._cached_installed = installed
+            self._cached_until = now + self.CACHE_TTL_SECONDS
+            return installed
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._cached_until = 0.0
+
+
+semantic_center_availability = SemanticCenterAvailability()
+
+
 class DatasourceSelectionProviderRouter:
     """Resolve the active provider behind one replaceable routing boundary."""
 
     @staticmethod
     def resolve(datasource_snapshot: dict[str, Any] | None = None) -> str:
-        configured = str(
-            getattr(Config, 'DATASOURCE_SELECTION_PROVIDER', 'local') or 'local'
-        ).strip().lower()
-        if configured in {'semantic', 'semantic_center', 'lightrag'}:
-            if DatasourceSelectionProviderRouter._contains_external_datasource(
-                datasource_snapshot
-            ):
-                logger.info(
-                    'external datasource is associated with this conversation; '
-                    'routing datasource selection to local provider'
-                )
-                return 'local'
-            return 'semantic_center'
-        if configured not in {'', 'local'}:
-            logger.warning(
-                'unknown datasource selection provider=%s; using local selection',
-                configured,
+        if DatasourceSelectionProviderRouter._contains_external_datasource(
+            datasource_snapshot
+        ):
+            logger.info(
+                'external datasource is associated with this conversation; '
+                'routing datasource selection to local provider'
             )
+            return 'local'
+        if semantic_center_availability.is_installed():
+            return 'semantic_center'
         return 'local'
+
+    @staticmethod
+    def can_discover_without_bound_datasource(
+        datasource_snapshot: dict[str, Any] | None = None,
+    ) -> bool:
+        """Return whether the active provider can seed an empty conversation."""
+        return (
+            DatasourceSelectionProviderRouter.resolve(datasource_snapshot)
+            == 'semantic_center'
+        )
 
     @staticmethod
     def _contains_external_datasource(

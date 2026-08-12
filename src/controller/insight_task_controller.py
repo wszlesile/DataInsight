@@ -117,20 +117,26 @@ class InsightTaskController(BaseController):
 
     def create_run(self, task_id: str):
         payload = self.get_json_data()
+        context = get_current_user_context()
+        if context is None:
+            return self.error_response('缺少当前用户上下文', 401)
         session = SessionLocal()
         try:
             try:
-                data = InsightTaskService(session).enqueue_manual_run(
+                data = InsightTaskService(session).execute_manual_run(
                     username=self._username(),
                     task_id=task_id,
                     parameters=payload.get('analysis_parameters'),
+                    runtime_user_context=self._runtime_user_context(context),
+                    worker_id=f'{socket.gethostname()}:manual',
+                    include_result=False,
                 )
             except ValueError as exc:
                 session.rollback()
                 return self.error_response(str(exc), 400)
             if data is None:
                 return self.error_response('洞察任务不存在', 404)
-            return jsonify(Result.success(data=data, message='任务运行已加入队列', code=202).to_dict()), 202
+            return jsonify(Result.success(data=data, message='任务运行已完成').to_dict())
         finally:
             session.close()
 
@@ -152,25 +158,12 @@ class InsightTaskController(BaseController):
         context = get_current_user_context()
         if not self._is_service_account_request(context):
             return self.error_response('仅允许洞察任务服务账号执行该接口', 403)
-        database_conn_info = getattr(context, 'database_conn_info', None)
-        runtime_context = {
-            'platform_authorization': getattr(context, 'platform_authorization', '') or '',
-            'fedquery_authorization': getattr(context, 'fedquery_authorization', '') or '',
-            'database_conn_info': {
-                'host': getattr(database_conn_info, 'host', '') or '',
-                'port': getattr(database_conn_info, 'port', '') or '',
-                'user': getattr(database_conn_info, 'user', '') or '',
-                'password': getattr(database_conn_info, 'password', '') or '',
-                'lake_rds_database_name': getattr(database_conn_info, 'lake_rds_database_name', '') or '',
-                'ts_query_source': getattr(database_conn_info, 'ts_query_source', '') or '',
-            } if database_conn_info else {},
-        }
         session = SessionLocal()
         try:
             data = InsightTaskService(session).execute_run(
                 run_id=run_id,
                 execution_principal=getattr(context, 'username', '') or 'DataInsight-Server',
-                runtime_user_context=runtime_context,
+                runtime_user_context=self._runtime_user_context(context),
                 worker_id=f'{socket.gethostname()}:internal',
                 include_result=False,
             )
@@ -188,3 +181,19 @@ class InsightTaskController(BaseController):
         actual_token = actual[7:] if actual.startswith('Bearer ') else actual
         expected_token = expected[7:] if expected.startswith('Bearer ') else expected
         return bool(actual_token and hmac.compare_digest(actual_token, expected_token))
+
+    @staticmethod
+    def _runtime_user_context(context) -> dict:
+        database_conn_info = getattr(context, 'database_conn_info', None)
+        return {
+            'platform_authorization': getattr(context, 'platform_authorization', '') or '',
+            'fedquery_authorization': getattr(context, 'fedquery_authorization', '') or '',
+            'database_conn_info': {
+                'host': getattr(database_conn_info, 'host', '') or '',
+                'port': getattr(database_conn_info, 'port', '') or '',
+                'user': getattr(database_conn_info, 'user', '') or '',
+                'password': getattr(database_conn_info, 'password', '') or '',
+                'lake_rds_database_name': getattr(database_conn_info, 'lake_rds_database_name', '') or '',
+                'ts_query_source': getattr(database_conn_info, 'ts_query_source', '') or '',
+            } if database_conn_info else {},
+        }

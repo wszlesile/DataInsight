@@ -5,6 +5,19 @@ from agent import tools as runtime_tools
 from dto import DatabaseConnInfo
 
 
+class FakeHttpResponse:
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._payload
+
+
 class FakeCursor:
     def __init__(self, error=None):
         self.error = error
@@ -96,6 +109,49 @@ def test_database_connection_without_authorization_skips_set(monkeypatch):
 
     assert cursor.calls == []
     assert connection.commit_count == 0
+
+
+def test_platform_application_installation_uses_exact_kernel_resource(monkeypatch):
+    captured = {}
+
+    def fake_get(url, *, headers, timeout):
+        captured.update(url=url, headers=headers, timeout=timeout)
+        return FakeHttpResponse(200, {
+            '$kind': 'apps.supos.com;v1alpha1:Application',
+            '$metadata': {
+                'name': 'supos-rag-semantic-center',
+                'namespace': '/system/apps/toolkit.supos-rag-semantic-center',
+            },
+            'group': 'toolkit',
+        })
+
+    monkeypatch.setattr('api.SuposkernelApi.requests.get', fake_get)
+    api = SuposKernelApi()
+    api.supos_gateway = 'http://platform-base-gateway:8000'
+
+    assert api.is_platform_application_installed(
+        group='toolkit',
+        name='supos-rag-semantic-center',
+        authorization='service-app-key',
+    )
+    assert captured['url'].endswith(
+        '/apis/ns/v1/system/apps/'
+        'toolkit.supos-rag-semantic-center/supos-rag-semantic-center'
+    )
+    assert captured['headers'] == {'Authorization': 'Bearer service-app-key'}
+
+
+def test_platform_application_installation_treats_not_found_as_not_installed(monkeypatch):
+    monkeypatch.setattr(
+        'api.SuposkernelApi.requests.get',
+        lambda *args, **kwargs: FakeHttpResponse(404),
+    )
+
+    assert not SuposKernelApi().is_platform_application_installed(
+        group='toolkit',
+        name='supos-rag-semantic-center',
+        authorization='Bearer service-app-key',
+    )
 
 
 def test_database_authorization_failure_closes_connection(monkeypatch):

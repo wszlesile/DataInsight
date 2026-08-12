@@ -176,6 +176,50 @@ class InsightTaskService:
         task_id: str,
         parameters: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
+        run = self._create_manual_run(
+            username=username,
+            task_id=task_id,
+            parameters=parameters,
+        )
+        if run is None:
+            return None
+        self.session.commit()
+        return run.to_dict()
+
+    def execute_manual_run(
+        self,
+        *,
+        username: str,
+        task_id: str,
+        parameters: dict[str, Any] | None,
+        runtime_user_context: dict[str, Any],
+        worker_id: str,
+        include_result: bool = False,
+    ) -> dict[str, Any] | None:
+        """Create and execute a manual run with the authenticated user's context."""
+        run = self._create_manual_run(
+            username=username,
+            task_id=task_id,
+            parameters=parameters,
+        )
+        if run is None:
+            return None
+        self.session.flush()
+        return self.execute_run(
+            run_id=run.run_id,
+            execution_principal=username,
+            runtime_user_context=runtime_user_context,
+            worker_id=worker_id,
+            include_result=include_result,
+        )
+
+    def _create_manual_run(
+        self,
+        *,
+        username: str,
+        task_id: str,
+        parameters: dict[str, Any] | None,
+    ) -> InsightTaskRun | None:
         task = self._get_task_model(username=username, task_id=task_id)
         if task is None:
             return None
@@ -194,8 +238,7 @@ class InsightTaskService:
             parameters_json=dump_json(effective_parameters),
         )
         self.session.add(run)
-        self.session.commit()
-        return run.to_dict()
+        return run
 
     def enqueue_due_runs(self, *, limit: int = 10) -> list[dict[str, Any]]:
         now = utc_now()
@@ -243,14 +286,16 @@ class InsightTaskService:
         now = utc_now()
         runs = self.session.query(InsightTaskRun).filter(
             InsightTaskRun.status == 'queued',
+            InsightTaskRun.trigger_type == 'scheduled',
             or_(InsightTaskRun.next_attempt_at.is_(None), InsightTaskRun.next_attempt_at <= now),
         ).order_by(InsightTaskRun.created_at.asc(), InsightTaskRun.id.asc()).limit(max(1, limit)).all()
         return [item.to_dict(include_result=False) for item in runs]
 
     def recover_expired_runs(self) -> int:
         now = utc_now()
-        updated = self.session.query(InsightTaskRun).filter(
+        scheduled_updated = self.session.query(InsightTaskRun).filter(
             InsightTaskRun.status == 'running',
+            InsightTaskRun.trigger_type == 'scheduled',
             or_(InsightTaskRun.lease_until.is_(None), InsightTaskRun.lease_until < now),
         ).update({
             InsightTaskRun.status: 'queued',
@@ -259,8 +304,27 @@ class InsightTaskService:
             InsightTaskRun.next_attempt_at: None,
             InsightTaskRun.updated_at: now,
         }, synchronize_session=False)
+        manual_updated = self.session.query(InsightTaskRun).filter(
+            InsightTaskRun.trigger_type == 'manual',
+            or_(
+                InsightTaskRun.status == 'queued',
+                InsightTaskRun.status == 'running',
+            ),
+            or_(
+                InsightTaskRun.status == 'queued',
+                InsightTaskRun.lease_until.is_(None),
+                InsightTaskRun.lease_until < now,
+            ),
+        ).update({
+            InsightTaskRun.status: 'failed',
+            InsightTaskRun.error_message: '手动执行请求已中断，请重新执行',
+            InsightTaskRun.finished_at: now,
+            InsightTaskRun.lease_until: None,
+            InsightTaskRun.next_attempt_at: None,
+            InsightTaskRun.updated_at: now,
+        }, synchronize_session=False)
         self.session.commit()
-        return int(updated or 0)
+        return int(scheduled_updated or 0) + int(manual_updated or 0)
 
     def list_runs(
         self,
@@ -383,7 +447,7 @@ class InsightTaskService:
                 username=task.username,
                 analysis_parameters=parameters,
                 runtime_user_context=runtime_user_context,
-                execution_source='scheduled_task',
+                execution_source='scheduled_task' if run.trigger_type == 'scheduled' else 'manual_task',
             )
         except Exception as exc:
             return self._finish_failed(run, str(exc) or '洞察任务执行异常', include_result=include_result)

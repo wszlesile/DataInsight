@@ -27,7 +27,9 @@
 
 ## 调度与认证
 
-调度器通过数据库 `next_run_at` 发现到期任务，以 `(task_definition_id, scheduled_for)` 保证幂等。运行记录采用原子状态抢占和执行租约，进程异常后只恢复过期租约。Gateway 超时、限流和服务端错误采用持久化的有界指数退避；确定性客户端错误直接结束，避免无效重试。
+手动“立即执行”在当前用户请求内创建运行记录并直接调用本地 Runtime，使用当前用户的 Gateway JWT、平台票据和数据权限。用户凭证只存在于请求内存，不进入任务定义、任务版本或运行历史。
+
+调度器只领取 `trigger_type=scheduled` 的运行记录，通过数据库 `next_run_at` 发现到期任务，以 `(task_definition_id, scheduled_for)` 保证幂等。运行记录采用原子状态抢占和执行租约，进程异常后只恢复过期租约。Gateway 超时、限流和服务端错误采用持久化的有界指数退避；确定性客户端错误直接结束，避免无效重试。
 
 任务 Runner 每次使用 `SUPOS_DATAINSIGHT-SERVER_APPKEY` 经过 Gateway 请求内部执行接口。Gateway 将 appkey 放入 `origin-token`，并将 Service Account JWT 放入 `Authorization`；平台接口继续使用前者，FedQuery 使用后者。内部执行接口必须校验原始 appkey 与服务配置一致。
 

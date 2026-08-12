@@ -139,7 +139,7 @@ class Config:
     SUPOS_LLM_GATEWAY_API_KEY = os.environ.get('SUPOS_DATAINSIGHT-SERVER_APPKEY', '')
     BASE_URL = os.environ.get('BASE_URL', 'https://api.minimax.chat/v1')
     TEMPERATURE = float(os.environ.get('TEMPERATURE', 0.7))
-    LLM_REQUEST_TIMEOUT_SECONDS = float(os.environ.get('LLM_REQUEST_TIMEOUT_SECONDS', 60))
+    LLM_REQUEST_TIMEOUT_SECONDS = float(os.environ.get('LLM_REQUEST_TIMEOUT_SECONDS', 180))
     LLM_MAX_RETRIES = int(os.environ.get('LLM_MAX_RETRIES', 1))
 
     CONTEXT_COMPRESSION_ENABLED = os.environ.get('CONTEXT_COMPRESSION_ENABLED', 'true').lower() == 'true'
@@ -176,11 +176,10 @@ class Config:
     DATASOURCE_SELECTION_SHORTLIST_TRIGGER_CHARS = int(
         os.environ.get('DATASOURCE_SELECTION_SHORTLIST_TRIGGER_CHARS', 24000)
     )
-    DATASOURCE_SELECTION_PROVIDER = os.environ.get(
-        'DATASOURCE_SELECTION_PROVIDER', 'local'
-    ).strip().lower()
+    # Platform Workload services are addressed as {group}-{component}:port.
+    # Local development may override the platform default through env.local.
     SEMANTIC_BASE = os.environ.get(
-        'SEMANTIC_BASE', 'http://192.168.11.189:9622'
+        'SEMANTIC_BASE', 'http://toolkit-semantic-center:9621'
     ).rstrip('/')
     SEMANTIC_DATASOURCE_RETRIEVE_PATH = os.environ.get(
         'SEMANTIC_DATASOURCE_RETRIEVE_PATH',

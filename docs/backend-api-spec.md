@@ -2561,8 +2561,9 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 
 用途：
 
-- 把一次手动运行加入后台队列。
-- 接口只负责入队，不同步等待分析完成。
+- 使用当前请求用户的认证上下文立即执行一次本地分析。
+- 手动执行不进入定时任务 Runner，也不使用 Service Account 身份。
+- 用户 Token 仅在当前请求内传递给 Runtime，不写入任务定义或运行历史。
 
 请求体：
 
@@ -2579,7 +2580,7 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
   - 应符合 `revision.snapshot.parameter_schema`。
   - 没有可变参数时提交 `{}`，或省略后由后端使用任务版本的默认参数。
 
-成功响应：HTTP `202`。
+成功响应：HTTP `200`。响应中的运行记录已经进入终态。
 
 ```json
 {
@@ -2590,17 +2591,17 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
     "revision_id": 12,
     "trigger_type": "manual",
     "scheduled_for": "2026-08-12T02:00:00Z",
-    "status": "queued",
+    "status": "success",
     "parameters": {},
     "error_message": "",
-    "execution_seconds": 0
+    "execution_seconds": 8120
   },
-  "message": "任务运行已加入队列",
-  "code": 202
+  "message": "任务运行已完成",
+  "code": 200
 }
 ```
 
-前端收到 `202` 后应立即显示“等待执行”，并仅在该运行仍为 `queued` 或 `running` 时轮询。
+若本地代码执行失败，接口仍返回该次运行记录，`data.status` 为 `failed`，具体原因见 `data.error_message`。前端应刷新任务详情并选中这条终态记录，不需要为手动执行启动轮询。
 
 ### 12.9 获取单次运行详情
 
