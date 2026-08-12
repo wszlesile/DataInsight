@@ -259,6 +259,42 @@ export function removeCollect(payload) {
   return api.delete('/insight/collects', { data: payload })
 }
 
+export function listInsightTasks() {
+  return api.get('/insight/tasks')
+}
+
+export function createInsightTask(payload) {
+  return api.post('/insight/tasks', payload)
+}
+
+export function getInsightTask(taskId) {
+  return api.get(`/insight/tasks/${taskId}`)
+}
+
+export function updateInsightTask(taskId, payload) {
+  return api.put(`/insight/tasks/${taskId}`, payload)
+}
+
+export function deleteInsightTask(taskId) {
+  return api.delete(`/insight/tasks/${taskId}`)
+}
+
+export function runInsightTask(taskId, analysisParameters = {}) {
+  return api.post(`/insight/tasks/${taskId}/runs`, {
+    analysis_parameters: analysisParameters || {}
+  })
+}
+
+export function getInsightTaskRun(taskId, runId) {
+  return api.get(`/insight/tasks/${taskId}/runs/${runId}`)
+}
+
+export function listInsightTaskRuns(taskId, pageNo = 1, pageSize = 50) {
+  return api.get(`/insight/tasks/${taskId}/runs`, {
+    params: { page_no: pageNo, page_size: pageSize }
+  })
+}
+
 export function streamAgent(params, onMessage, onError, onDone) {
   return streamRequest(`${API_BASE_PATH}/agent/stream`, params, onMessage, onError, onDone)
 }

@@ -11,6 +11,7 @@ from controller.insight_namespace_controller import create_insight_namespace_con
 from controller.insight_ns_conversation_controller import create_insight_ns_conversation_controller
 from controller.insight_ns_rel_datasource_controller import create_insight_ns_rel_datasource_controller
 from controller.insight_user_collect_controller import create_insight_user_collect_controller
+from controller.insight_task_controller import create_insight_task_controller
 from controller.llm_controller import create_llm_controller
 from middleware.auth_middleware import init_auth_middleware
 from utils import logger
@@ -56,6 +57,7 @@ def _register_routes(app: Flask):
     app.register_blueprint(create_insight_ns_conversation_controller())
     app.register_blueprint(create_insight_ns_rel_datasource_controller())
     app.register_blueprint(create_insight_user_collect_controller())
+    app.register_blueprint(create_insight_task_controller())
     app.register_blueprint(create_llm_controller())
 
     @app.route('/health')

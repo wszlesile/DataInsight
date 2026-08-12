@@ -94,6 +94,15 @@
       </div>
 
       <div class="panel-footer-links">
+        <div class="notebook-item footer-item" @click="$emit('open-insight-tasks')">
+          <div class="notebook-icon footer-icon task">T</div>
+          <div v-if="!collapsed" class="notebook-info">
+            <div class="notebook-name">洞察任务</div>
+            <div class="notebook-count">{{ insightTaskCount }} 个任务</div>
+          </div>
+          <span v-if="!collapsed && insightTaskCount" class="favorites-badge">{{ insightTaskCount }}</span>
+        </div>
+
         <div class="notebook-item footer-item" @click="$emit('open-knowledge')">
           <div class="notebook-icon footer-icon knowledge">KB</div>
           <div v-if="!collapsed" class="notebook-info">
@@ -123,6 +132,7 @@ const props = defineProps({
   activeSpace: { type: String, default: '' },
   conversations: { type: Array, default: () => [] },
   collects: { type: Array, default: () => [] },
+  insightTaskCount: { type: Number, default: 0 },
   activeConversationId: { type: Number, default: 0 }
 })
 
@@ -135,6 +145,7 @@ defineEmits([
   'new-space',
   'new-conversation',
   'open-favorites',
+  'open-insight-tasks',
   'open-knowledge'
 ])
 
@@ -424,6 +435,10 @@ const notebookAbbr = (name) => {
 
 .footer-icon.knowledge {
   background: linear-gradient(135deg, #0ea5e9, #2563eb);
+}
+
+.footer-icon.task {
+  background: #0f766e;
 }
 
 .footer-icon.favorite {

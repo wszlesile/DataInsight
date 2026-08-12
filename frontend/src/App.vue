@@ -45,6 +45,7 @@
         :active-space="activeNamespace"
         :conversations="conversations"
         :collects="collects"
+        :insight-task-count="insightTasks.length"
         :active-conversation-id="activeConversationId"
         @select-space="onSelectSpace"
         @select-conversation="onSelectConversation"
@@ -54,6 +55,7 @@
         @new-space="onNewSpace"
         @new-conversation="onNewConversation"
         @open-favorites="favoritesPanelVisible = true"
+        @open-insight-tasks="openInsightTasks"
         @open-knowledge="showKnowledgePlaceholder"
       />
 
@@ -173,6 +175,15 @@
                           @click="onLocalRerunTurn(item)"
                         >
                           {{ localRerunLoading && localRerunTurnId === item.turnId ? '本地执行中...' : '本地执行' }}
+                        </button>
+                        <button
+                          class="action-btn"
+                          type="button"
+                          :disabled="!hasTaskRunnableExecution(item.latestExecution)"
+                          :title="getTaskDisabledReason(item.latestExecution)"
+                          @click="openCreateTask(item)"
+                        >
+                          加入任务
                         </button>
                         <button
                           class="action-btn"
@@ -510,6 +521,206 @@
       </div>
     </aside>
 
+    <el-drawer
+      v-model="insightTaskPanelVisible"
+      title="洞察任务"
+      size="72%"
+      destroy-on-close
+      @opened="insightTaskPanelOpened = true"
+      @closed="insightTaskPanelOpened = false"
+    >
+      <div class="task-workspace">
+        <div class="task-list-pane">
+          <div class="task-pane-header">
+            <div>
+              <div class="section-title">任务列表</div>
+              <div class="detail-meta">{{ insightTasks.length }} 个可复用洞察任务</div>
+            </div>
+            <button class="action-btn" type="button" @click="fetchInsightTasks">刷新</button>
+          </div>
+          <div v-if="insightTasksLoading" class="detail-empty">正在加载任务...</div>
+          <button
+            v-for="task in insightTasks"
+            v-else
+            :key="task.task_id"
+            class="task-card"
+            :class="{ active: selectedInsightTask?.task_id === task.task_id }"
+            type="button"
+            @click="selectInsightTask(task)"
+          >
+            <div class="task-card-title-row">
+              <span class="task-card-title">{{ task.name }}</span>
+              <span class="detail-pill" :class="{ muted: task.status !== 'enabled' }">
+                {{ task.status === 'enabled' ? '已启用' : '已暂停' }}
+              </span>
+            </div>
+            <div class="task-card-schedule">{{ formatTaskSchedule(task.schedule) }}</div>
+            <div class="task-card-meta">
+              <span>运行 {{ task.run_count || 0 }} 次</span>
+              <span>{{ formatTaskRunStatus(task.latest_run) }}</span>
+              <span>{{ task.next_run_at ? `下次 ${formatDateTime(task.next_run_at)}` : '无自动计划' }}</span>
+            </div>
+          </button>
+          <div v-if="!insightTasksLoading && !insightTasks.length" class="favorites-empty task-empty">
+            <p>还没有洞察任务</p>
+            <span>在成功分析结果旁点击“加入任务”。</span>
+          </div>
+        </div>
+
+        <div class="task-detail-pane">
+          <div v-if="insightTaskDetailLoading" class="detail-empty">正在加载任务详情...</div>
+          <template v-else-if="selectedInsightTask">
+            <div class="task-detail-header">
+              <div>
+                <div class="detail-title">{{ selectedInsightTask.name }}</div>
+                <div class="detail-meta">{{ selectedInsightTask.description || '暂无任务描述' }}</div>
+              </div>
+              <div class="detail-list-actions">
+                <button class="action-btn" type="button" @click="selectInsightTask(selectedInsightTask)">刷新结果</button>
+                <button
+                  class="action-btn"
+                  type="button"
+                  :disabled="insightTaskRunSubmitting || hasPendingTaskRun(selectedInsightTask)"
+                  @click="runSelectedInsightTask"
+                >
+                  {{ insightTaskRunSubmitting ? '提交中...' : (hasPendingTaskRun(selectedInsightTask) ? '执行中...' : '立即执行') }}
+                </button>
+                <button class="action-btn" type="button" @click="toggleSelectedTaskStatus">
+                  {{ selectedInsightTask.status === 'enabled' ? '暂停' : '恢复' }}
+                </button>
+                <button class="action-btn" type="button" @click="removeSelectedInsightTask">删除</button>
+              </div>
+            </div>
+
+            <div class="task-detail-sections">
+              <details class="task-detail-section task-caliber-section">
+                <summary class="task-caliber-head">
+                  <div class="section-title">统计口径</div>
+                  <span class="task-caliber-meta">结构化 · 可复用</span>
+                </summary>
+                <div class="task-caliber-grid">
+                  <div
+                    v-for="item in getTaskStatisticalCaliber(selectedInsightTask, selectedInsightTaskRun)"
+                    :key="item.key"
+                    class="task-caliber-item"
+                    :class="{ wide: item.wide }"
+                  >
+                    <label>{{ item.label }}</label>
+                    <span>{{ item.value }}</span>
+                  </div>
+                </div>
+              </details>
+
+              <section class="task-detail-section">
+                <div class="task-section-heading">
+                  <div>
+                    <div class="section-title">分析报告</div>
+                    <div class="detail-meta">
+                      {{ selectedInsightTaskRun?.finished_at ? `结果时间：${formatDateTime(selectedInsightTaskRun.finished_at)}` : '选择成功执行记录后查看结果' }}
+                    </div>
+                  </div>
+                  <span v-if="selectedInsightTaskRun?.status" class="detail-pill" :class="{ muted: selectedInsightTaskRun.status !== 'success' }">
+                    {{ selectedInsightTaskRun.status }}
+                  </span>
+                </div>
+                <div v-if="insightTaskPanelOpened && getTaskRunCharts(selectedInsightTaskRun).length" class="answer-chart-grid">
+                  <div v-for="(chart, index) in getTaskRunCharts(selectedInsightTaskRun)" :key="`task-chart-${index}`" class="answer-chart">
+                    <ChartDisplay :chart-spec="chart.chart_spec || chart.chartSpec || {}" />
+                  </div>
+                </div>
+                <div v-if="getTaskRunTables(selectedInsightTaskRun).length" class="answer-table-list">
+                  <div v-for="(table, index) in getTaskRunTables(selectedInsightTaskRun)" :key="`task-table-${index}`" class="answer-table-card">
+                    <div class="answer-table-title">{{ table.title || `表格 ${index + 1}` }}</div>
+                    <div class="answer-table-scroll">
+                      <table class="answer-table">
+                        <thead><tr><th v-for="column in getTableColumns(table)" :key="column.field">{{ column.title || column.field }}</th></tr></thead>
+                        <tbody><tr v-for="(row, rowIndex) in table.rows || []" :key="rowIndex"><td v-for="column in getTableColumns(table)" :key="column.field">{{ row[column.field] }}</td></tr></tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+                <div v-if="selectedInsightTaskRun?.analysis_report" class="detail-card answer-report" v-html="renderMarkdown(selectedInsightTaskRun.analysis_report)" />
+                <div v-else class="detail-empty">选择一条成功执行记录后查看报告。</div>
+              </section>
+
+              <section class="task-detail-section">
+                <div class="task-section-heading">
+                  <div>
+                    <div class="section-title">执行记录</div>
+                    <div class="detail-meta">共 {{ selectedInsightTask.run_count || 0 }} 次执行，点击记录可查看对应结果</div>
+                  </div>
+                </div>
+                <div class="task-run-list">
+                  <button
+                    v-for="run in selectedInsightTask.runs || []"
+                    :key="run.run_id"
+                    class="task-run-item"
+                    :class="{ active: selectedInsightTaskRun?.run_id === run.run_id }"
+                    type="button"
+                    @click="selectInsightTaskRun(run)"
+                  >
+                    <span>{{ run.trigger_type === 'manual' ? '手动执行' : '定时执行' }}</span>
+                    <span class="detail-pill" :class="{ muted: run.status !== 'success' }">{{ run.status }}</span>
+                    <span>{{ formatDateTime(run.scheduled_for) }}</span>
+                    <span>{{ run.execution_seconds ? `${(run.execution_seconds / 1000).toFixed(1)}s` : '-' }}</span>
+                  </button>
+                  <div v-if="!(selectedInsightTask.runs || []).length" class="detail-empty">暂无执行记录。</div>
+                  <button
+                    v-if="Number(selectedInsightTask.run_count || 0) > (selectedInsightTask.runs || []).length"
+                    class="action-btn task-load-more"
+                    type="button"
+                    :disabled="insightTaskRunsLoading"
+                    @click="loadMoreInsightTaskRuns"
+                  >
+                    {{ insightTaskRunsLoading ? '加载中...' : '加载更多执行记录' }}
+                  </button>
+                </div>
+                <div v-if="selectedInsightTaskRun?.error_message" class="task-run-error">
+                  {{ selectedInsightTaskRun.error_message }}
+                </div>
+              </section>
+            </div>
+          </template>
+          <div v-else class="detail-empty">从左侧选择一个洞察任务。</div>
+        </div>
+      </div>
+    </el-drawer>
+
+    <el-dialog v-model="createInsightTaskVisible" title="加入洞察任务" width="520px" destroy-on-close>
+      <el-form label-position="top">
+        <el-form-item label="任务名称">
+          <el-input v-model="createInsightTaskForm.name" maxlength="260" show-word-limit />
+        </el-form-item>
+        <el-form-item label="任务描述">
+          <el-input v-model="createInsightTaskForm.description" type="textarea" :rows="3" maxlength="1000" show-word-limit />
+        </el-form-item>
+        <el-form-item label="任务频率">
+          <el-select v-model="createInsightTaskForm.frequency" style="width: 100%">
+            <el-option label="每天" value="daily" />
+            <el-option label="工作日" value="weekdays" />
+            <el-option label="每周" value="weekly" />
+            <el-option label="每月" value="monthly" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="执行时间">
+          <el-time-picker v-model="createInsightTaskForm.time" format="HH:mm" value-format="HH:mm" style="width: 100%" />
+        </el-form-item>
+        <el-form-item v-if="createInsightTaskForm.frequency === 'weekly'" label="执行星期">
+          <el-checkbox-group v-model="createInsightTaskForm.weekdays">
+            <el-checkbox v-for="item in weekdayOptions" :key="item.value" :value="item.value">{{ item.label }}</el-checkbox>
+          </el-checkbox-group>
+        </el-form-item>
+        <el-form-item v-if="createInsightTaskForm.frequency === 'monthly'" label="执行日期">
+          <el-input-number v-model="createInsightTaskForm.dayOfMonth" :min="1" :max="31" controls-position="right" />
+          <span class="task-schedule-hint">当月没有该日期时，在当月最后一天执行</span>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <button class="action-btn" type="button" @click="createInsightTaskVisible = false">取消</button>
+        <el-button type="primary" :loading="createInsightTaskLoading" @click="submitCreateInsightTask">创建任务</el-button>
+      </template>
+    </el-dialog>
+
     <el-drawer v-model="turnDetailVisible" title="轮次详情" size="48%" destroy-on-close>
       <div v-if="turnDetailLoading" class="detail-empty">正在加载详情...</div>
       <div v-else-if="turnDetail" class="turn-detail">
@@ -527,6 +738,15 @@
               @click="onLocalRerunTurn(getTurnDetailLocalRunItem())"
             >
               {{ localRerunLoading && localRerunTurnId === turnDetail.turn.id ? '本地执行中...' : '本地执行' }}
+            </button>
+            <button
+              class="action-btn"
+              type="button"
+              :disabled="!hasTaskRunnableExecution(turnDetail.latest_execution)"
+              :title="getTaskDisabledReason(turnDetail.latest_execution)"
+              @click="openCreateTask(getTurnDetailLocalRunItem())"
+            >
+              加入任务
             </button>
             <button
               class="action-btn"
@@ -810,7 +1030,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
 import { marked } from 'marked'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -824,30 +1044,38 @@ import {
   createConversation,
   createNamespace,
   createCollect,
+  createInsightTask,
   cancelAnalysisTask,
   deleteConversation,
   deleteNamespace,
   exportTurnPdf,
   getInitialTurnVersion,
+  getInsightTask,
+  getInsightTaskRun,
   getConversationHistory,
   getTurnDetail,
   getTurnVersionDetail,
   listLlmModels,
   listCollects,
+  listInsightTasks,
+  listInsightTaskRuns,
   listConversations,
   listNamespaces,
   listTurnVersions,
   removeCollect,
+  deleteInsightTask,
   renameConversation,
   renameNamespace,
   rerunExecutionLocally,
+  runInsightTask,
   resolveEvidence,
   selectLlmModel,
   submitAgentTask,
   submitRerunTurnTask,
   streamTurnEvents,
   getAnalysisTask,
-  getRunningTurn
+  getRunningTurn,
+  updateInsightTask
 } from './api/agent.js'
 
 marked.setOptions({ breaks: true, gfm: true })
@@ -890,9 +1118,43 @@ const evidenceDrawerVisible = ref(false)
 const evidenceLoading = ref(false)
 const evidenceDetail = ref(null)
 const favoritesPanelVisible = ref(false)
+const insightTasks = ref([])
+const insightTasksLoading = ref(false)
+const insightTaskPanelVisible = ref(false)
+const insightTaskPanelOpened = ref(false)
+const insightTaskDetailLoading = ref(false)
+const selectedInsightTask = ref(null)
+const selectedInsightTaskRun = ref(null)
+const insightTaskPolling = ref(false)
+const insightTaskRunsLoading = ref(false)
+const insightTaskRunSubmitting = ref(false)
+let insightTaskPollTimer = null
+let insightTaskDetailRequestId = 0
+let insightTaskRunRequestId = 0
+const createInsightTaskVisible = ref(false)
+const createInsightTaskLoading = ref(false)
+const createInsightTaskSource = ref(null)
+const createInsightTaskForm = ref({
+  name: '',
+  description: '',
+  frequency: 'daily',
+  time: '09:00',
+  weekdays: [1],
+  dayOfMonth: 1
+})
 const llmModels = ref([])
 const llmModelsLoading = ref(false)
 const selectedLlmModelId = ref('')
+
+const weekdayOptions = [
+  { label: '周一', value: 1 },
+  { label: '周二', value: 2 },
+  { label: '周三', value: 3 },
+  { label: '周四', value: 4 },
+  { label: '周五', value: 5 },
+  { label: '周六', value: 6 },
+  { label: '周日', value: 7 }
+]
 
 const quickPrompts = [
   '分析2024年Q4季度的销售趋势',
@@ -1808,6 +2070,465 @@ const fetchCollects = async () => {
   }
 }
 
+const fetchInsightTasks = async ({ silent = false } = {}) => {
+  if (!silent) insightTasksLoading.value = true
+  try {
+    const response = await listInsightTasks()
+    if (response.data?.success) insightTasks.value = response.data.data || []
+  } catch (error) {
+    console.error('List insight tasks error:', error)
+  } finally {
+    if (!silent) insightTasksLoading.value = false
+  }
+}
+
+const isPendingTaskRun = (run) => ['queued', 'running'].includes(String(run?.status || ''))
+
+const hasPendingTaskRun = (task) => (
+  isPendingTaskRun(task?.latest_run)
+  || (Array.isArray(task?.runs) && task.runs.some(isPendingTaskRun))
+  || (task?.task_id === selectedInsightTask.value?.task_id && isPendingTaskRun(selectedInsightTaskRun.value))
+)
+
+const hasAnyPendingTaskRun = () => (
+  insightTasks.value.some(hasPendingTaskRun)
+  || hasPendingTaskRun(selectedInsightTask.value)
+)
+
+const formatTaskRunStatus = (run) => {
+  const labels = {
+    queued: '等待执行',
+    running: '正在执行',
+    success: '最近执行成功',
+    failed: '最近执行失败',
+    cancelled: '最近执行已取消'
+  }
+  return labels[String(run?.status || '')] || '尚未执行'
+}
+
+const hasRunnableExecution = (execution) => Boolean(
+  execution?.id
+  && (!execution.execution_status || execution.execution_status === 'success')
+  && (execution.is_runnable === true || String(execution.generated_code || '').trim())
+)
+
+const hasTaskRunnableExecution = (execution) => hasRunnableExecution(execution)
+
+const getTaskDisabledReason = (execution) => {
+  if (!execution?.id) return '当前轮次没有可复用的执行记录'
+  if (execution.execution_status && execution.execution_status !== 'success') return '只有成功的分析结果可以加入任务'
+  if (!hasRunnableExecution(execution)) return '当前执行记录缺少可复用分析代码'
+  return '将当前分析逻辑保存为洞察任务'
+}
+
+const openCreateTask = (item) => {
+  const execution = item?.latestExecution
+  if (!hasTaskRunnableExecution(execution)) {
+    ElMessage.warning(getTaskDisabledReason(execution))
+    return
+  }
+  createInsightTaskSource.value = execution
+  createInsightTaskForm.value = {
+    name: String(item?.question || execution.title || '洞察任务').slice(0, 260),
+    description: execution.description || '',
+    frequency: 'daily',
+    time: '09:00',
+    weekdays: [1],
+    dayOfMonth: 1
+  }
+  createInsightTaskVisible.value = true
+}
+
+const submitCreateInsightTask = async () => {
+  const execution = createInsightTaskSource.value
+  const form = createInsightTaskForm.value
+  if (!hasTaskRunnableExecution(execution)) return
+  if (!String(form.name || '').trim()) {
+    ElMessage.warning('请输入任务名称')
+    return
+  }
+  if (form.frequency === 'weekly' && !form.weekdays.length) {
+    ElMessage.warning('请至少选择一个执行星期')
+    return
+  }
+  createInsightTaskLoading.value = true
+  try {
+    const schedule = { frequency: form.frequency }
+    schedule.time = form.time || '09:00'
+    if (form.frequency === 'weekly') schedule.weekdays = [...form.weekdays]
+    if (form.frequency === 'monthly') schedule.day_of_month = form.dayOfMonth || 1
+    const response = await createInsightTask({
+      source_execution_id: execution.id,
+      name: form.name.trim(),
+      description: form.description.trim(),
+      schedule
+    })
+    if (!response.data?.success) throw new Error(response.data?.message || '创建任务失败')
+    createInsightTaskVisible.value = false
+    ElMessage.success('洞察任务已创建')
+    await fetchInsightTasks()
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.message || error?.message || '创建任务失败')
+  } finally {
+    createInsightTaskLoading.value = false
+  }
+}
+
+const openInsightTasks = async () => {
+  insightTaskPanelVisible.value = true
+  await fetchInsightTasks()
+  if (!selectedInsightTask.value && insightTasks.value.length) {
+    await selectInsightTask(insightTasks.value[0])
+  }
+  scheduleInsightTaskPolling()
+}
+
+const selectInsightTask = async (task) => {
+  if (!task?.task_id) return
+  const taskId = task.task_id
+  const requestId = ++insightTaskDetailRequestId
+  insightTaskRunRequestId += 1
+  insightTaskDetailLoading.value = true
+  selectedInsightTaskRun.value = null
+  try {
+    const response = await getInsightTask(taskId)
+    if (requestId !== insightTaskDetailRequestId) return
+    if (!response.data?.success) throw new Error(response.data?.message || '加载任务失败')
+    selectedInsightTask.value = response.data.data
+    const successfulRun = (selectedInsightTask.value.runs || []).find((item) => item.status === 'success')
+    if (successfulRun) await selectInsightTaskRun(successfulRun)
+    scheduleInsightTaskPolling()
+  } catch (error) {
+    if (requestId !== insightTaskDetailRequestId) return
+    ElMessage.error(error?.response?.data?.message || error?.message || '加载任务失败')
+  } finally {
+    if (requestId === insightTaskDetailRequestId) insightTaskDetailLoading.value = false
+  }
+}
+
+const refreshSelectedInsightTask = async () => {
+  const taskId = selectedInsightTask.value?.task_id
+  if (!taskId) return
+  const previousRunId = selectedInsightTaskRun.value?.run_id || ''
+  const previousRunStatus = selectedInsightTaskRun.value?.status || ''
+  const response = await getInsightTask(taskId)
+  if (selectedInsightTask.value?.task_id !== taskId) return
+  if (!response.data?.success) return
+  const detail = response.data.data
+  const loadedRuns = selectedInsightTask.value?.runs || []
+  if (loadedRuns.length > (detail.runs || []).length) {
+    const mergedRuns = new Map((detail.runs || []).map((item) => [item.run_id, item]))
+    for (const item of loadedRuns) {
+      if (!mergedRuns.has(item.run_id)) mergedRuns.set(item.run_id, item)
+    }
+    detail.runs = [...mergedRuns.values()].sort((left, right) => (
+      String(right.scheduled_for || '').localeCompare(String(left.scheduled_for || ''))
+    ))
+  }
+  selectedInsightTask.value = detail
+  const runs = detail.runs || []
+  const previousRun = runs.find((item) => item.run_id === previousRunId)
+  const latestSuccess = runs.find((item) => item.status === 'success')
+  const targetRun = previousRun || latestSuccess
+  if (
+    targetRun?.run_id
+    && (
+      targetRun.run_id !== previousRunId
+      || targetRun.status !== previousRunStatus
+      || !selectedInsightTaskRun.value?.result_payload
+    )
+  ) {
+    await selectInsightTaskRun(targetRun)
+  }
+}
+
+const pollInsightTasks = async () => {
+  if (!insightTaskPanelVisible.value || insightTaskPolling.value) return
+  insightTaskPolling.value = true
+  try {
+    await fetchInsightTasks({ silent: true })
+    await refreshSelectedInsightTask()
+  } catch (error) {
+    console.error('Poll insight tasks error:', error)
+  } finally {
+    insightTaskPolling.value = false
+    scheduleInsightTaskPolling()
+  }
+}
+
+const scheduleInsightTaskPolling = () => {
+  stopInsightTaskPolling()
+  if (!insightTaskPanelVisible.value || !hasAnyPendingTaskRun()) return
+  insightTaskPollTimer = window.setTimeout(() => {
+    insightTaskPollTimer = null
+    pollInsightTasks()
+  }, 2000)
+}
+
+const stopInsightTaskPolling = () => {
+  if (!insightTaskPollTimer) return
+  window.clearTimeout(insightTaskPollTimer)
+  insightTaskPollTimer = null
+}
+
+const selectInsightTaskRun = async (run) => {
+  if (!selectedInsightTask.value?.task_id || !run?.run_id) return
+  const taskId = selectedInsightTask.value.task_id
+  const runId = run.run_id
+  const requestId = ++insightTaskRunRequestId
+  try {
+    const response = await getInsightTaskRun(taskId, runId)
+    if (
+      requestId === insightTaskRunRequestId
+      && selectedInsightTask.value?.task_id === taskId
+      && response.data?.success
+    ) {
+      selectedInsightTaskRun.value = response.data.data
+    }
+  } catch (error) {
+    if (requestId !== insightTaskRunRequestId) return
+    ElMessage.error(error?.response?.data?.message || '加载执行记录失败')
+  }
+}
+
+const loadMoreInsightTaskRuns = async () => {
+  const task = selectedInsightTask.value
+  if (!task?.task_id || insightTaskRunsLoading.value) return
+  insightTaskRunsLoading.value = true
+  try {
+    const pageSize = 50
+    const pageNo = Math.floor((task.runs || []).length / pageSize) + 1
+    const response = await listInsightTaskRuns(task.task_id, pageNo, pageSize)
+    if (!response.data?.success) throw new Error(response.data?.message || '加载执行记录失败')
+    const page = response.data.data || {}
+    const existing = task.runs || []
+    const byId = new Map(existing.map((item) => [item.run_id, item]))
+    for (const item of page.items || []) byId.set(item.run_id, item)
+    task.runs = [...byId.values()].sort((left, right) => (
+      String(right.scheduled_for || '').localeCompare(String(left.scheduled_for || ''))
+    ))
+    task.run_count = Number(page.total || task.run_count || task.runs.length)
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.message || error?.message || '加载执行记录失败')
+  } finally {
+    insightTaskRunsLoading.value = false
+  }
+}
+
+const getTaskRunCharts = (run) => (
+  Array.isArray(run?.result_payload?.charts) ? run.result_payload.charts : []
+)
+
+const getTaskRunTables = (run) => (
+  Array.isArray(run?.result_payload?.tables) ? run.result_payload.tables : []
+)
+
+const runSelectedInsightTask = async () => {
+  const task = selectedInsightTask.value
+  if (!task?.task_id || insightTaskRunSubmitting.value || hasPendingTaskRun(task)) return
+  const snapshot = getTaskSnapshot(task)
+  insightTaskRunSubmitting.value = true
+  try {
+    const response = await runInsightTask(task.task_id, snapshot.default_parameters || {})
+    if (!response.data?.success) throw new Error(response.data?.message || '提交运行失败')
+    const queuedRun = response.data.data || null
+    selectedInsightTaskRun.value = queuedRun
+    if (queuedRun?.run_id) {
+      const existingRuns = Array.isArray(selectedInsightTask.value?.runs) ? selectedInsightTask.value.runs : []
+      selectedInsightTask.value.runs = [queuedRun, ...existingRuns.filter((item) => item.run_id !== queuedRun.run_id)]
+      selectedInsightTask.value.latest_run = queuedRun
+    }
+    ElMessage.success('任务运行已加入队列')
+    await fetchInsightTasks({ silent: true })
+    scheduleInsightTaskPolling()
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.message || error?.message || '提交运行失败')
+  } finally {
+    insightTaskRunSubmitting.value = false
+  }
+}
+
+const toggleSelectedTaskStatus = async () => {
+  const task = selectedInsightTask.value
+  if (!task?.task_id) return
+  const status = task.status === 'enabled' ? 'paused' : 'enabled'
+  try {
+    const response = await updateInsightTask(task.task_id, { status })
+    if (!response.data?.success) throw new Error(response.data?.message || '更新任务失败')
+    selectedInsightTask.value = response.data.data
+    await fetchInsightTasks()
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.message || error?.message || '更新任务失败')
+  }
+}
+
+const removeSelectedInsightTask = async () => {
+  const task = selectedInsightTask.value
+  if (!task?.task_id) return
+  try {
+    await ElMessageBox.confirm(`确定删除洞察任务“${task.name}”吗？`, '删除洞察任务', {
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+      type: 'warning'
+    })
+    await deleteInsightTask(task.task_id)
+    selectedInsightTask.value = null
+    selectedInsightTaskRun.value = null
+    await fetchInsightTasks()
+    if (insightTasks.value.length) await selectInsightTask(insightTasks.value[0])
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') {
+      ElMessage.error(error?.response?.data?.message || '删除任务失败')
+    }
+  }
+}
+
+const getTaskSnapshot = (task) => task?.revision?.snapshot || {}
+
+const getTaskDatasourceBindings = (task) => {
+  const snapshot = getTaskSnapshot(task)
+  if (Array.isArray(snapshot.datasource_bindings) && snapshot.datasource_bindings.length) {
+    return snapshot.datasource_bindings.filter((item) => item && typeof item === 'object')
+  }
+  return (snapshot.used_datasource_ids || []).map((datasourceId) => ({ datasource_id: datasourceId }))
+}
+
+const getTaskQueryCriteria = (task, run) => {
+  const snapshots = run?.result_payload?.query_snapshots
+  if (snapshots && typeof snapshots === 'object' && !Array.isArray(snapshots)) {
+    return Object.entries(snapshots)
+      .filter(([, value]) => value && typeof value === 'object')
+      .map(([queryKey, value]) => ({
+        query_key: value.query_key || queryKey,
+        query_constraints: value.query_constraints || {},
+        query_scope: value.query_scope || {},
+        datasource_ids: value.query_scope?.datasource_ids || [],
+        execution: value.execution || {}
+      }))
+  }
+  const sourceCriteria = getTaskSnapshot(task).query_criteria
+  return Array.isArray(sourceCriteria) ? sourceCriteria : []
+}
+
+const uniqueCaliberValues = (values) => [...new Set(values.filter((item) => String(item || '').trim()).map((item) => String(item).trim()))]
+
+const formatCaliberAtom = (value) => {
+  if (value === null || value === undefined || value === '') return ''
+  if (Array.isArray(value)) return value.map(formatCaliberAtom).filter(Boolean).join('、')
+  if (typeof value === 'object') {
+    return String(value.label || value.title || value.name || value.field || value.value || '').trim()
+  }
+  if (value === true) return '是'
+  if (value === false) return '否'
+  return String(value)
+}
+
+const formatTaskParameterEntries = (task, run) => {
+  const snapshot = getTaskSnapshot(task)
+  const schema = snapshot.parameter_schema || {}
+  const values = run?.parameters || snapshot.default_parameters || schema.defaults || {}
+  const parameters = Array.isArray(schema.parameters)
+    ? schema.parameters.filter((parameter) => parameter && typeof parameter === 'object')
+    : []
+  return parameters.map((parameter) => {
+    const name = parameter?.name
+    const rawValue = values?.[name]
+    const option = Array.isArray(parameter?.options)
+      ? parameter.options.find((item) => (
+          item && typeof item === 'object'
+            ? String(item.value) === String(rawValue)
+            : String(item) === String(rawValue)
+        ))
+      : null
+    const displayValue = option && typeof option === 'object'
+      ? formatCaliberAtom(option.label || option.title || option.value)
+      : formatCaliberAtom(rawValue)
+    if (!displayValue) return ''
+    return `${parameter?.label || parameter?.description || name || '参数'}：${displayValue}`
+  }).filter(Boolean)
+}
+
+const formatTaskTimeRange = (timeRange) => {
+  if (!timeRange) return ''
+  if (typeof timeRange === 'string') return timeRange
+  if (typeof timeRange !== 'object') return formatCaliberAtom(timeRange)
+  const start = timeRange.start || timeRange.from || timeRange.start_time
+  const end = timeRange.end || timeRange.to || timeRange.end_time
+  if (!start && !end) return formatCaliberAtom(timeRange)
+  return `${start || '不限'} 至 ${end || '不限'}`
+}
+
+const formatTaskFilter = (filter) => {
+  if (!filter || typeof filter !== 'object') return formatCaliberAtom(filter)
+  const field = filter.label || filter.semantic_role || filter.field || '条件'
+  const value = filter.value ?? filter.values ?? filter.target ?? ''
+  const renderedValue = formatCaliberAtom(value)
+  return `${field} ${filter.operator || '='}${renderedValue ? ` ${renderedValue}` : ''}`
+}
+
+const getTaskStatisticalCaliber = (task, run) => {
+  const criteria = getTaskQueryCriteria(task, run)
+  const constraints = criteria
+    .map((item) => item?.query_constraints)
+    .filter((item) => item && typeof item === 'object' && Object.keys(item).length)
+  const aggregations = constraints
+    .map((item) => item.aggregation)
+    .filter((item) => item && typeof item === 'object')
+  const timeRanges = uniqueCaliberValues(constraints.map((item) => formatTaskTimeRange(item.time_range)))
+  const dimensions = uniqueCaliberValues(aggregations.flatMap((item) => [
+    ...[].concat(item.group_by || []),
+    ...[].concat(item.dimensions || []),
+    item.dimension,
+    item.grain
+  ].map(formatCaliberAtom)))
+  const metrics = uniqueCaliberValues(aggregations.flatMap((item) => [
+    ...[].concat(item.metrics || []),
+    ...[].concat(item.measures || []),
+    item.metric,
+    item.measure
+  ].map(formatCaliberAtom)))
+  const filters = uniqueCaliberValues(constraints.flatMap((item) => (
+    Array.isArray(item.target_filters) ? item.target_filters.map(formatTaskFilter) : []
+  )))
+  const dedupRules = uniqueCaliberValues(constraints.flatMap((item) => {
+    const aggregation = item.aggregation && typeof item.aggregation === 'object' ? item.aggregation : {}
+    return [
+      item.dedup_rule,
+      item.distinct_by,
+      aggregation.dedup_rule,
+      aggregation.distinct_by,
+      aggregation.distinct_field,
+      aggregation.distinct === true ? '按指标定义去重' : ''
+    ].map(formatCaliberAtom)
+  }))
+  const definitions = uniqueCaliberValues(constraints.map((item) => item.notes || item.business_definition))
+  const parameters = formatTaskParameterEntries(task, run)
+  const bindings = getTaskDatasourceBindings(task)
+    .map((item) => item.datasource_name || '')
+    .filter(Boolean)
+
+  return [
+    { key: 'time', label: '时间范围', value: timeRanges.join('；') || '未限定' },
+    { key: 'dimension', label: '维度', value: dimensions.join('、') || '按整体口径统计' },
+    { key: 'metric', label: '指标', value: metrics.join('、') || '按固化分析逻辑计算' },
+    { key: 'filter', label: '过滤', value: filters.join('；') || '无额外筛选' },
+    { key: 'parameters', label: '参数取值', value: parameters.join('；') || '无可变参数' },
+    { key: 'dedup', label: '去重规则', value: dedupRules.join('；') || '按固化查询逻辑执行' },
+    { key: 'definition', label: '业务定义', value: definitions.join('；') || task?.description || '按分析目标执行', wide: true },
+    { key: 'source', label: '口径来源', value: bindings.length ? bindings.join('、') : '来源分析任务', wide: true }
+  ]
+}
+
+const formatTaskSchedule = (schedule = {}) => {
+  const frequency = schedule?.frequency || 'manual'
+  if (frequency === 'manual') return '仅手动执行'
+  if (frequency === 'daily') return `每天 ${schedule.time || '09:00'}`
+  if (frequency === 'weekdays') return `工作日 ${schedule.time || '09:00'}`
+  if (frequency === 'monthly') return `每月 ${schedule.day_of_month || 1} 日 ${schedule.time || '09:00'}`
+  const weekdayLabels = (schedule.weekdays || []).map((item) => weekdayOptions.find((option) => option.value === item)?.label || item)
+  return `每周 ${weekdayLabels.join('、')} ${schedule.time || '09:00'}`
+}
+
 const normalizeLlmModels = (items = []) =>
   (Array.isArray(items) ? items : [])
     .filter((item) => item && item.id)
@@ -2337,11 +3058,7 @@ const hasReusableParameterSchema = (schema) => (
   && !Array.isArray(schema.defaults)
 )
 
-const hasLocalRunnableExecution = (execution) => {
-  if (!execution?.id) return false
-  if (execution.execution_status && execution.execution_status !== 'success') return false
-  return hasReusableParameterSchema(getExecutionParameterSchema(execution))
-}
+const hasLocalRunnableExecution = (execution) => hasRunnableExecution(execution)
 
 const canLocalRunTurn = (item) => Boolean(item?.turnId && hasLocalRunnableExecution(item.latestExecution))
 
@@ -2350,7 +3067,8 @@ const getLocalRunDisabledReason = (item) => {
   if (!execution?.id) return '当前轮次没有可复用的执行记录'
   if (execution.execution_status && execution.execution_status !== 'success') return '只有成功的执行记录可以本地执行'
   const schema = getExecutionParameterSchema(execution)
-  if (!hasReusableParameterSchema(schema)) return '当前执行记录没有参数契约，请先刷新生成可本地执行版本'
+  if (!hasRunnableExecution(execution)) return '当前执行记录缺少可复用分析代码'
+  if (!hasReusableParameterSchema(schema)) return '当前分析使用固定口径，将直接本地执行'
   if (!getSchemaParameters(schema).length) return '当前分析没有可调整参数，将按固定口径本地执行'
   return '使用当前参数在本地重新执行'
 }
@@ -2858,8 +3576,17 @@ const showKnowledgePlaceholder = () => {
   ElMessage.info('知识库区域已预留，后续按统一知识资源接口接入。')
 }
 
+watch(insightTaskPanelVisible, (visible) => {
+  if (visible) scheduleInsightTaskPolling()
+  else {
+    insightTaskDetailRequestId += 1
+    insightTaskRunRequestId += 1
+    stopInsightTaskPolling()
+  }
+})
+
 onMounted(async () => {
-  await Promise.all([fetchLlmModels(), fetchSpaces()])
+  await Promise.all([fetchLlmModels(), fetchSpaces(), fetchInsightTasks()])
   if (spaces.value.length > 0) {
     await onSelectSpace(spaces.value[0])
     return
@@ -2870,6 +3597,10 @@ onMounted(async () => {
   collects.value = []
   chatHistory.value = []
   resetCurrentConversationState()
+})
+
+onUnmounted(() => {
+  stopInsightTaskPolling()
 })
 </script>
 
@@ -3118,6 +3849,41 @@ onMounted(async () => {
 .version-summary { margin-bottom: 2px; }
 .version-json { margin: 0; overflow-x: auto; font-size: 12px; white-space: pre; }
 .version-empty { min-height: 120px; border: 1px dashed #dbe3ef; border-radius: 12px; display: flex; align-items: center; justify-content: center; background: #f8fbff; }
+.task-workspace { min-height: calc(100vh - 150px); display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 18px; }
+.task-list-pane { padding-right: 16px; border-right: 1px solid #e5edf7; overflow-y: auto; }
+.task-detail-pane { min-width: 0; overflow-y: auto; }
+.task-pane-header, .task-detail-header, .task-card-title-row, .task-card-meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.task-pane-header, .task-detail-header { margin-bottom: 16px; }
+.task-card { width: 100%; margin-bottom: 10px; padding: 14px; border: 1px solid #e5edf7; border-radius: 8px; background: #fff; color: #334155; text-align: left; cursor: pointer; }
+.task-card:hover, .task-card.active { border-color: #3b82f6; background: #f8fbff; }
+.task-card-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 700; color: #0f172a; }
+.task-card-schedule { margin-top: 10px; font-size: 12px; color: #475569; }
+.task-schedule-hint { margin-left: 12px; font-size: 12px; color: #64748b; }
+.task-card-meta { margin-top: 10px; font-size: 11px; color: #64748b; }
+.task-empty { min-height: 180px; }
+.task-caliber-section { padding: 0; overflow: hidden; }
+.task-caliber-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; background: #f8fafc; cursor: pointer; list-style: none; user-select: none; }
+.task-caliber-head::-webkit-details-marker { display: none; }
+.task-caliber-head::after { content: '⌄'; margin-left: 6px; font-size: 14px; color: #64748b; }
+.task-caliber-section[open] .task-caliber-head { border-bottom: 1px solid #e5edf7; }
+.task-caliber-section[open] .task-caliber-head::after { content: '⌃'; }
+.task-caliber-meta { font-size: 11px; color: #64748b; }
+.task-caliber-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 24px; padding: 14px 16px; }
+.task-caliber-item { min-width: 0; }
+.task-caliber-item.wide { grid-column: 1 / -1; }
+.task-caliber-item label { display: block; margin-bottom: 3px; font-size: 11px; color: #64748b; }
+.task-caliber-item span { display: block; overflow-wrap: anywhere; font-size: 13px; line-height: 1.55; color: #334155; }
+.task-datasource-list { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; }
+.task-schedule-summary { margin-top: 10px; font-size: 14px; font-weight: 700; color: #0f172a; }
+.task-run-list { display: flex; flex-direction: column; gap: 8px; }
+.task-run-item { display: grid; grid-template-columns: minmax(90px, 1fr) auto minmax(150px, 1fr) 70px; align-items: center; gap: 10px; width: 100%; padding: 11px 12px; border: 1px solid #e5edf7; border-radius: 8px; background: #fff; color: #334155; text-align: left; cursor: pointer; }
+.task-run-item:hover, .task-run-item.active { border-color: #60a5fa; background: #f8fbff; }
+.task-run-error { margin-top: 12px; padding: 12px; border-radius: 8px; background: #fff1f2; color: #be123c; font-size: 13px; line-height: 1.6; }
+.task-load-more { align-self: center; margin-top: 4px; }
+.task-detail-sections { display: flex; flex-direction: column; gap: 18px; }
+.task-detail-section { min-width: 0; padding: 18px; border: 1px solid #e5edf7; border-radius: 8px; background: #fff; }
+.task-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid #eef2f7; }
 @media (max-width: 1180px) { .version-layout { grid-template-columns: 1fr; } }
+@media (max-width: 960px) { .task-workspace, .task-caliber-grid { grid-template-columns: 1fr; } .task-caliber-item.wide { grid-column: auto; } .task-list-pane { border-right: none; border-bottom: 1px solid #e5edf7; padding: 0 0 14px; } }
 @media (max-width: 1440px) { .result-card { margin-left: 0; } }
 </style>

@@ -3,9 +3,11 @@ import json
 import re
 from calendar import monthrange
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Iterator
+from queue import Empty, Queue
+from typing import Any, Callable, Iterator
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -670,6 +672,7 @@ def _prepare_analysis_context(
     runtime: ConversationRunContext,
     agent_request: AgentRequest,
     runtime_config,
+    stage_callback: Callable[[str], None] | None = None,
 ) -> PreparationResult:
     """Select and enrich datasource Schema without owning insight semantics."""
     cached = runtime.short_term_memory.get("preparation_result")
@@ -719,11 +722,10 @@ def _prepare_analysis_context(
                 "turn_id": int(runtime.turn.id or 0),
             },
             cancelled=lambda: _raise_if_analysis_task_cancelled(runtime),
-            stage_callback=lambda stage: logger.info(
-                "analysis preparation stage started: conversation_id=%s turn_id=%s stage=%s",
-                runtime.conversation.id,
-                runtime.turn.id,
-                stage,
+            stage_callback=lambda stage: _notify_preparation_stage(
+                runtime=runtime,
+                stage=stage,
+                stage_callback=stage_callback,
             ),
         )
     except AnalysisTaskCancelled:
@@ -808,6 +810,107 @@ def _prepare_analysis_context(
                 datasource_snapshot=prepared_rows,
             )
     runtime.short_term_memory["preparation_result"] = result
+    return result
+
+
+PREPARATION_STAGE_MESSAGES = {
+    "intent_analysis": "正在理解业务问题，明确本轮需要分析的业务范围。",
+    "semantic_selection": "正在从语义中心检索与业务问题相关的数据源。",
+    "select_datasources": "正在核对候选数据源，确认其对业务问题的覆盖情况。",
+    "business_context": "正在梳理已选数据源之间的业务关系与可分析事实。",
+}
+
+
+def _notify_preparation_stage(
+    *,
+    runtime: ConversationRunContext,
+    stage: str,
+    stage_callback: Callable[[str], None] | None,
+) -> None:
+    logger.info(
+        "analysis preparation stage started: conversation_id=%s turn_id=%s stage=%s",
+        runtime.conversation.id,
+        runtime.turn.id,
+        stage,
+    )
+    if stage_callback is not None:
+        stage_callback(stage)
+
+
+def _stream_analysis_preparation(
+    *,
+    runtime: ConversationRunContext,
+    agent_request: AgentRequest,
+    runtime_config,
+) -> Iterator[dict[str, Any]]:
+    """Run Preparation off the stream thread while forwarding stage progress."""
+    stage_queue: Queue[str] = Queue()
+    emitted_stages: set[str] = set()
+
+    yield _build_progress_event(
+        'status',
+        conversation_id=runtime.conversation.id,
+        turn_id=runtime.turn.id,
+        stage='preparation',
+        level='info',
+        message='正在准备本轮分析所需的业务与数据上下文。',
+    )
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix='analysis-preparation') as executor:
+        future = executor.submit(
+            _prepare_analysis_context,
+            runtime=runtime,
+            agent_request=agent_request,
+            runtime_config=runtime_config,
+            stage_callback=stage_queue.put,
+        )
+        while not future.done():
+            _raise_if_analysis_task_cancelled(runtime)
+            try:
+                stage = stage_queue.get(timeout=0.25)
+            except Empty:
+                continue
+            if stage in emitted_stages:
+                continue
+            emitted_stages.add(stage)
+            yield _build_progress_event(
+                'status',
+                conversation_id=runtime.conversation.id,
+                turn_id=runtime.turn.id,
+                stage=f'preparation:{stage}',
+                level='info',
+                message=PREPARATION_STAGE_MESSAGES.get(
+                    stage,
+                    '正在完善本轮分析所需的数据上下文。',
+                ),
+            )
+
+        while not stage_queue.empty():
+            stage = stage_queue.get_nowait()
+            if stage in emitted_stages:
+                continue
+            emitted_stages.add(stage)
+            yield _build_progress_event(
+                'status',
+                conversation_id=runtime.conversation.id,
+                turn_id=runtime.turn.id,
+                stage=f'preparation:{stage}',
+                level='info',
+                message=PREPARATION_STAGE_MESSAGES.get(
+                    stage,
+                    '正在完善本轮分析所需的数据上下文。',
+                ),
+            )
+        result = future.result()
+
+    yield _build_progress_event(
+        'status',
+        conversation_id=runtime.conversation.id,
+        turn_id=runtime.turn.id,
+        stage='preparation:complete',
+        level='success',
+        message='分析范围和数据关系已准备完成，开始执行洞察分析。',
+    )
     return result
 
 
@@ -2603,7 +2706,7 @@ def _stream_with_runtime(
 
         runtime_config = _resolve_agent_runtime_config(agent_request)
         preparation = (
-            _prepare_analysis_context(
+            yield from _stream_analysis_preparation(
                 runtime=runtime,
                 agent_request=agent_request,
                 runtime_config=runtime_config,

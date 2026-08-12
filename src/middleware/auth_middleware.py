@@ -1,7 +1,9 @@
+import hmac
 from uuid import uuid4
 
 from flask import g, jsonify, request
 
+from config.config import Config
 from dto import UserContext
 from service.platform_license_service import (
     LicenseExpiredError,
@@ -35,6 +37,20 @@ def _normalize_bearer_token(raw_token: str) -> str:
     return value if value.startswith('Bearer ') else f'Bearer {value}'
 
 
+def _resolve_local_authorizations(request_authorization: str) -> tuple[str, str] | None:
+    if str(Config.PROFILE or '').strip().lower() != 'local':
+        return None
+
+    platform_authorization = _normalize_bearer_token(Config.LOCAL_ORIGIN_TOKEN)
+    fedquery_authorization = _normalize_bearer_token(Config.LOCAL_GATEWAY_JWT)
+    supplied_authorization = _normalize_bearer_token(request_authorization)
+    if not platform_authorization or not fedquery_authorization or not supplied_authorization:
+        return None
+    if not hmac.compare_digest(supplied_authorization, platform_authorization):
+        return None
+    return fedquery_authorization, platform_authorization
+
+
 def _extract_authorizations() -> tuple[str, str, str]:
     """Return gateway JWT, original platform ticket, and their source summary."""
     fedquery_authorization = (request.headers.get('Authorization', '') or '').strip()
@@ -42,14 +58,22 @@ def _extract_authorizations() -> tuple[str, str, str]:
     if fedquery_authorization and platform_authorization:
         return fedquery_authorization, platform_authorization, 'gateway:Authorization+origin-token'
 
-    # Public routes and local development may still carry only a browser ticket.
-    # This fallback is never a substitute for the two headers on protected /api.
+    local_authorizations = _resolve_local_authorizations(fedquery_authorization)
+    if local_authorizations:
+        local_fedquery_authorization, local_platform_authorization = local_authorizations
+        return local_fedquery_authorization, local_platform_authorization, 'local:configured-dual-token'
+
     if fedquery_authorization:
         return fedquery_authorization, '', 'header:Authorization'
 
     cookie_token = (request.cookies.get('suposTicket') or '').strip()
     if cookie_token:
-        return '', _normalize_bearer_token(cookie_token), 'cookie:suposTicket'
+        normalized_cookie_token = _normalize_bearer_token(cookie_token)
+        local_authorizations = _resolve_local_authorizations(normalized_cookie_token)
+        if local_authorizations:
+            local_fedquery_authorization, local_platform_authorization = local_authorizations
+            return local_fedquery_authorization, local_platform_authorization, 'local:configured-cookie-token'
+        return '', normalized_cookie_token, 'cookie:suposTicket'
 
     return '', '', 'none'
 

@@ -1689,6 +1689,14 @@ class InsightNsConversationService:
             "title": execution.get("title", ''),
             "description": execution.get("description", ''),
             "execution_status": execution.get("execution_status", ''),
+            "is_runnable": bool(
+                execution.get("is_runnable")
+                if "is_runnable" in execution
+                else (
+                    execution.get("execution_status") == "success"
+                    and str(execution.get("generated_code") or '').strip()
+                )
+            ),
             "result_payload_json": execution.get("result_payload_json", '{}'),
             "analysis_report": execution.get("analysis_report", ''),
             "analysis_parameters_schema": execution.get("analysis_parameters_schema", {}),

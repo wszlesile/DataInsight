@@ -152,6 +152,46 @@ def test_preparation_probe_context_keeps_the_separate_fedquery_authorization(mon
     )
 
 
+def test_streaming_preparation_forwards_each_stage_as_user_readable_status(monkeypatch):
+    runtime = _runtime(_snapshot(11))
+    expected = _preparation(_snapshot(11))
+
+    def fake_prepare_context(*, stage_callback, **kwargs):
+        for stage in (
+            "intent_analysis",
+            "semantic_selection",
+            "select_datasources",
+            "business_context",
+        ):
+            stage_callback(stage)
+        return expected
+
+    monkeypatch.setattr(invoker, "_prepare_analysis_context", fake_prepare_context)
+    stream = invoker._stream_analysis_preparation(
+        runtime=runtime,
+        agent_request=_request(),
+        runtime_config=SimpleNamespace(),
+    )
+    events = []
+    while True:
+        try:
+            events.append(next(stream))
+        except StopIteration as completed:
+            result = completed.value
+            break
+
+    assert result is expected
+    assert [event["stage"] for event in events] == [
+        "preparation",
+        "preparation:intent_analysis",
+        "preparation:semantic_selection",
+        "preparation:select_datasources",
+        "preparation:business_context",
+        "preparation:complete",
+    ]
+    assert all(event["message"] for event in events)
+
+
 def test_rerun_is_always_an_analysis_request_even_when_text_classifier_is_uncertain():
     runtime = _runtime(_snapshot(11))
     runtime.is_rerun = True

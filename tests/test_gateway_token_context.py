@@ -76,6 +76,59 @@ def test_protected_api_rejects_a_request_without_gateway_origin_token():
     get_context.assert_not_called()
 
 
+def test_local_api_uses_configured_gateway_jwt_for_matching_platform_ticket():
+    app = _app()
+    with (
+        patch('middleware.auth_middleware.Config.PROFILE', 'local'),
+        patch('middleware.auth_middleware.Config.LOCAL_ORIGIN_TOKEN', 'Bearer platform-ticket'),
+        patch('middleware.auth_middleware.Config.LOCAL_GATEWAY_JWT', 'Bearer fedquery-jwt'),
+        patch('middleware.auth_middleware.platform_license_service.ensure_agent_authorized') as license_check,
+        patch('middleware.auth_middleware.user_auth_service.get_user_context', return_value=_user_context()) as get_context,
+    ):
+        response = app.test_client().get(
+            '/api/protected',
+            headers={'Authorization': 'Bearer platform-ticket'},
+        )
+
+    assert response.status_code == 200
+    license_check.assert_called_once_with('Bearer platform-ticket')
+    get_context.assert_called_once_with('Bearer platform-ticket', 'Bearer fedquery-jwt')
+
+
+def test_local_api_rejects_a_ticket_that_does_not_match_local_configuration():
+    app = _app()
+    with (
+        patch('middleware.auth_middleware.Config.PROFILE', 'local'),
+        patch('middleware.auth_middleware.Config.LOCAL_ORIGIN_TOKEN', 'Bearer configured-ticket'),
+        patch('middleware.auth_middleware.Config.LOCAL_GATEWAY_JWT', 'Bearer fedquery-jwt'),
+        patch('middleware.auth_middleware.user_auth_service.get_user_context') as get_context,
+    ):
+        response = app.test_client().get(
+            '/api/protected',
+            headers={'Authorization': 'Bearer another-ticket'},
+        )
+
+    assert response.status_code == 401
+    get_context.assert_not_called()
+
+
+def test_production_api_does_not_use_local_dual_token_configuration():
+    app = _app()
+    with (
+        patch('middleware.auth_middleware.Config.PROFILE', 'prod'),
+        patch('middleware.auth_middleware.Config.LOCAL_ORIGIN_TOKEN', 'Bearer platform-ticket'),
+        patch('middleware.auth_middleware.Config.LOCAL_GATEWAY_JWT', 'Bearer fedquery-jwt'),
+        patch('middleware.auth_middleware.user_auth_service.get_user_context') as get_context,
+    ):
+        response = app.test_client().get(
+            '/api/protected',
+            headers={'Authorization': 'Bearer platform-ticket'},
+        )
+
+    assert response.status_code == 401
+    get_context.assert_not_called()
+
+
 def test_health_remains_anonymous_without_gateway_headers():
     app = _app()
     with patch('middleware.auth_middleware.user_auth_service.get_user_context') as get_context:

@@ -4,6 +4,8 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from agent.tools import run_generated_code_locally
+from analysis_runtime import AnalysisExecutionSnapshot, LocalAnalysisRuntime
+from analysis_runtime.parameters import normalize_parameter_schema, validate_analysis_parameters
 from model import InsightNsArtifact, InsightNsConversation, InsightNsExecution, InsightNsTurn
 from service.analysis_task_service import AnalysisTaskService
 from utils.datasource_utils import dump_json, safe_json_loads, to_int
@@ -37,10 +39,21 @@ class AnalysisExecutionRerunService:
         if original.execution_status != 'success':
             raise ValueError('只能基于成功的执行记录进行本地复跑')
 
-        schema = safe_json_loads(original.analysis_parameters_schema_json, {})
-        if not isinstance(schema, dict) or not schema:
-            raise ValueError('当前执行记录没有可复跑的参数定义，请先重新生成一次参数化分析')
-        normalized_parameters = self._validate_parameters(schema, analysis_parameters)
+        schema = normalize_parameter_schema(safe_json_loads(original.analysis_parameters_schema_json, {}))
+        normalized_parameters = validate_analysis_parameters(schema, analysis_parameters)
+        snapshot = AnalysisExecutionSnapshot(
+            source_execution_id=original.id,
+            conversation_id=conversation.id,
+            turn_id=turn.id,
+            code=original.generated_code,
+            title=original.title,
+            description=original.description,
+            used_datasource_ids=safe_json_loads(original.used_datasource_ids_json, []),
+            query_snapshots=(safe_json_loads(original.result_payload_json, {}) or {}).get('query_snapshots') or {},
+            parameter_schema=schema,
+            default_parameters=safe_json_loads(original.analysis_parameters_json, {}),
+            logic_signature=original.analysis_logic_signature or '',
+        )
 
         old_turn_state = {
             'status': turn.status,
@@ -72,21 +85,22 @@ class AnalysisExecutionRerunService:
         task_service.mark_running(task.task_id, worker_id='local')
         self.session.commit()
 
-        run_result = run_generated_code_locally(
-            conversation_id=conversation.id,
-            turn_id=turn.id,
+        runtime_result = LocalAnalysisRuntime(run_generated_code_locally).execute(
+            snapshot=snapshot,
             username=username,
-            code=original.generated_code,
-            title=original.title,
-            description=original.description,
-            used_datasource_ids=safe_json_loads(original.used_datasource_ids_json, []),
             runtime_user_context=runtime_user_context or {},
             analysis_task_id=task.id,
-            parent_execution_id=original.id,
             execution_source='manual_param_rerun',
-            analysis_parameters_schema=schema,
             analysis_parameters=normalized_parameters,
         )
+        run_result = {
+            'execution_id': runtime_result.execution_id,
+            'status': runtime_result.status,
+            'error_message': runtime_result.error_message,
+            'analysis_report': runtime_result.analysis_report,
+            'charts': runtime_result.charts,
+            'tables': runtime_result.tables,
+        }
 
         if run_result.get('status') != 'success':
             self._disable_execution_content(run_result.get('execution_id'))
@@ -278,69 +292,3 @@ class AnalysisExecutionRerunService:
         self.session.add(artifact)
         self.session.flush()
         return artifact.to_dict()
-
-    def _validate_parameters(self, schema: dict[str, Any], values: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(values, dict):
-            raise ValueError('analysis_parameters 必须是 JSON 对象')
-        defaults = schema.get('defaults') if isinstance(schema.get('defaults'), dict) else {}
-        normalized = dict(defaults)
-        normalized.update(values)
-
-        parameters = schema.get('parameters')
-        if not isinstance(parameters, list):
-            return normalized
-
-        for item in parameters:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get('name') or '').strip()
-            if not name:
-                continue
-            required = bool(item.get('required'))
-            if required and name not in normalized:
-                raise ValueError(f'缺少必填分析参数: {name}')
-            if name not in normalized:
-                continue
-            value = normalized.get(name)
-            parameter_type = str(item.get('type') or '').strip().lower()
-            self._validate_parameter_type(name, value, parameter_type)
-            options = item.get('options')
-            if isinstance(options, list) and options:
-                self._validate_parameter_options(name, value, parameter_type, options)
-        return normalized
-
-    def _validate_parameter_options(
-        self,
-        name: str,
-        value: Any,
-        parameter_type: str,
-        options: list[Any],
-    ) -> None:
-        if parameter_type in {'array', 'list', 'multi_select'}:
-            if not isinstance(value, list):
-                raise ValueError(f'分析参数 {name} 必须是数组')
-            invalid_values = [item for item in value if item not in options]
-            if invalid_values:
-                raise ValueError(f'分析参数 {name} 不在允许选项内: {invalid_values[0]}')
-            return
-
-        if value not in options:
-            raise ValueError(f'分析参数 {name} 不在允许选项内')
-
-    def _validate_parameter_type(self, name: str, value: Any, parameter_type: str) -> None:
-        if value is None or not parameter_type:
-            return
-        if parameter_type in {'string', 'text', 'date', 'datetime', 'time_range'}:
-            if parameter_type == 'time_range' and not isinstance(value, dict):
-                raise ValueError(f'分析参数 {name} 必须是对象')
-            if parameter_type != 'time_range' and not isinstance(value, str):
-                raise ValueError(f'分析参数 {name} 必须是字符串')
-        elif parameter_type in {'number', 'integer'}:
-            if not isinstance(value, (int, float)) or isinstance(value, bool):
-                raise ValueError(f'分析参数 {name} 必须是数字')
-        elif parameter_type in {'boolean', 'bool'}:
-            if not isinstance(value, bool):
-                raise ValueError(f'分析参数 {name} 必须是布尔值')
-        elif parameter_type in {'array', 'list', 'multi_select'}:
-            if not isinstance(value, list):
-                raise ValueError(f'分析参数 {name} 必须是数组')

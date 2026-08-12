@@ -8,6 +8,7 @@ wheels/
 .idea
 # Virtual environments
 .venv
+src/.env.local
 uv.lock
 # Generated files
 *.db
@@ -25,3 +26,8 @@ uploads/
 /data-insight-agent_v1/images/
 /.claude/settings.local.json
 tmp/
+
+# Codex local regression artifacts and disposable execution scripts
+/.codex-work/
+/.codex-*
+/.tmp-exec-*

@@ -4,6 +4,10 @@ from typing import Any
 
 # 加载 .env 文件
 load_dotenv()
+load_dotenv(
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env.local'),
+    override=True,
+)
 
 
 def _get_env(name: str, default: str = '') -> str:
@@ -55,7 +59,7 @@ class Config:
     # 应用配置
     APP_NAME = "DataInsight App"
     VERSION = "1.0.0"
-    SCHEMA_VERSION = os.environ.get('DATA_INSIGHT_SCHEMA_VERSION', '1.6.0')
+    SCHEMA_VERSION = os.environ.get('DATA_INSIGHT_SCHEMA_VERSION', '1.7.0')
 
     # 用户系统配置
     USER_AUTH_ENDPOINT = '/os/inter-api/auth/v1/current-user/sessionInfo'
@@ -63,6 +67,9 @@ class Config:
 
     # SUPOS / Kernel 配置
     SUPOS_GATEWAY = os.environ.get('SUPOS_GATEWAY', 'http://localhost:8080')
+    SUPOS_DATAINSIGHT_SERVER_APPKEY = os.environ.get('SUPOS_DATAINSIGHT-SERVER_APPKEY', '').strip()
+    LOCAL_ORIGIN_TOKEN = os.environ.get('DATAINSIGHT_LOCAL_ORIGIN_TOKEN', '').strip()
+    LOCAL_GATEWAY_JWT = os.environ.get('DATAINSIGHT_LOCAL_GATEWAY_JWT', '').strip()
     SUPOS_REQUEST_TIMEOUT = int(os.environ.get('SUPOS_REQUEST_TIMEOUT', 15))
     PLATFORM_LICENSE_CACHE_REFRESH_SECONDS = int(os.environ.get('PLATFORM_LICENSE_CACHE_REFRESH_SECONDS', 300))
     SUPOS_LLM_GATEWAY_MODEL_TIMEOUT_SECONDS = float(
@@ -109,6 +116,21 @@ class Config:
     ANALYSIS_TASK_MAX_ACTIVE_PER_USER = int(os.environ.get('DATAINSIGHT_ANALYSIS_TASK_MAX_ACTIVE_PER_USER', 20))
     ANALYSIS_TASK_QUEUED_STALE_SECONDS = int(os.environ.get('DATAINSIGHT_ANALYSIS_TASK_QUEUED_STALE_SECONDS', 30))
     ANALYSIS_TASK_RUNNING_STALE_SECONDS = int(os.environ.get('DATAINSIGHT_ANALYSIS_TASK_RUNNING_STALE_SECONDS', 1800))
+    INSIGHT_APP_ROLE = os.environ.get('INSIGHT_APP_ROLE', 'all').strip().lower()
+    INSIGHT_TASK_SCHEDULER_POLL_SECONDS = float(os.environ.get('INSIGHT_TASK_SCHEDULER_POLL_SECONDS', 5))
+    INSIGHT_TASK_RUN_LEASE_SECONDS = int(os.environ.get('INSIGHT_TASK_RUN_LEASE_SECONDS', 300))
+    INSIGHT_TASK_MAX_CONCURRENCY = int(os.environ.get('INSIGHT_TASK_MAX_CONCURRENCY', 1))
+    INSIGHT_TASK_INTERNAL_EXECUTE_PATH = os.environ.get(
+        'INSIGHT_TASK_INTERNAL_EXECUTE_PATH',
+        '/os/toolkit/data-insight-agent/api/insight/tasks/internal/runs/{run_id}/execute',
+    )
+    INSIGHT_TASK_DISPATCH_TIMEOUT_SECONDS = float(
+        os.environ.get('INSIGHT_TASK_DISPATCH_TIMEOUT_SECONDS', 180)
+    )
+    INSIGHT_TASK_DISPATCH_MAX_ATTEMPTS = int(os.environ.get('INSIGHT_TASK_DISPATCH_MAX_ATTEMPTS', 3))
+    INSIGHT_TASK_DISPATCH_RETRY_BASE_SECONDS = int(
+        os.environ.get('INSIGHT_TASK_DISPATCH_RETRY_BASE_SECONDS', 5)
+    )
 
     # LLM配置
     LLM_PROVIDER = os.environ.get('LLM_PROVIDER', 'minimax')

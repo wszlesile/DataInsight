@@ -2063,6 +2063,14 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 - `listCollects`
 - `createCollect`
 - `removeCollect`
+- `listInsightTasks`
+- `createInsightTask`
+- `getInsightTask`
+- `updateInsightTask`
+- `deleteInsightTask`
+- `runInsightTask`
+- `getInsightTaskRun`
+- `listInsightTaskRuns`
 
 ---
 
@@ -2195,3 +2203,516 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 ```
 
 响应 `data` 与 `GET /api/llm/models` 一致，返回带 `selected` 字段的模型数组。
+
+---
+
+## 12. 洞察任务
+
+洞察任务把一次成功分析固化为可重复执行的本地分析逻辑。任务运行读取最新数据，但不再次调用大模型，也不会覆盖来源会话和轮次的分析结果。
+
+所有对外接口均按当前登录用户隔离数据。前端使用公共 `task_id`、`run_id` 访问任务和运行记录，不应依赖数据库自增 `id`。
+
+### 12.1 调度规则
+
+公共请求中的 `schedule` 支持以下结构：
+
+每天：
+
+```json
+{
+  "frequency": "daily",
+  "time": "09:00"
+}
+```
+
+工作日：
+
+```json
+{
+  "frequency": "weekdays",
+  "time": "09:00"
+}
+```
+
+每周：
+
+```json
+{
+  "frequency": "weekly",
+  "time": "09:00",
+  "weekdays": [1, 3, 5]
+}
+```
+
+每月：
+
+```json
+{
+  "frequency": "monthly",
+  "time": "09:00",
+  "day_of_month": 31
+}
+```
+
+字段约定：
+
+- `frequency`
+  - `daily`：每天。
+  - `weekdays`：工作日，后端归一为星期一至星期五。
+  - `weekly`：每周指定星期执行。
+  - `monthly`：每月指定日期执行。
+  - 后端保留 `manual` 频率能力，但当前“加入洞察任务”产品入口不提供该选项；所有任务均可通过“立即执行”手动运行。
+- `time`
+  - `HH:mm` 格式，24 小时制。
+- `weekdays`
+  - 仅 `weekly` 使用。
+  - 取值 `1` 至 `7`，分别表示星期一至星期日。
+  - 至少选择一天。
+- `day_of_month`
+  - 仅 `monthly` 使用。
+  - 取值 `1` 至 `31`。
+  - 当月不存在该日期时，在当月最后一天执行。
+- 时区
+  - 前端请求不提交时区。
+  - 后端统一使用中国标准时间 `Asia/Shanghai` 计算调度时间。
+  - 响应中的 `timezone` 及 `schedule.timezone` 是后端归一化结果，前端无需提供配置入口。
+
+### 12.2 任务与运行状态
+
+任务状态 `status`：
+
+- `enabled`：任务已启用，定时计划生效。
+- `paused`：任务已暂停，不再产生新的定时运行。
+
+任务状态不是执行状态。前端不得把 `enabled` 显示为“运行中”。
+
+运行状态 `latest_run.status` 或运行记录 `status`：
+
+- `queued`：等待执行。
+- `running`：正在执行。
+- `success`：执行成功。
+- `failed`：执行失败。
+- `cancelled`：执行已取消。
+
+只有 `queued`、`running` 属于非终态。前端仅在存在非终态运行时轮询，进入终态后停止轮询。
+
+### 12.3 获取洞察任务列表
+
+`GET /api/insight/tasks`
+
+用途：
+
+- 获取当前用户的全部有效洞察任务。
+- 任务按更新时间倒序返回。
+- 列表项只携带最近运行摘要，不携带完整报告、图表和表格。
+
+响应 `data` 示例：
+
+```json
+[
+  {
+    "id": 12,
+    "task_id": "7fe691274c4d4f31b455129ce2785ddf",
+    "namespace_id": 6,
+    "source_conversation_id": 99,
+    "source_turn_id": 342,
+    "active_revision_id": 12,
+    "name": "产品月度成本利润洞察",
+    "description": "按月刷新各产品成本和利润情况",
+    "status": "enabled",
+    "schedule": {
+      "frequency": "monthly",
+      "time": "09:00",
+      "day_of_month": 1,
+      "timezone": "Asia/Shanghai"
+    },
+    "timezone": "Asia/Shanghai",
+    "next_run_at": "2026-09-01T01:00:00Z",
+    "last_run_at": "2026-08-01T01:00:08Z",
+    "run_count": 3,
+    "latest_run": {
+      "run_id": "1ef9d3556c0048fc93bc821b4db08ebf",
+      "trigger_type": "scheduled",
+      "scheduled_for": "2026-08-01T01:00:00Z",
+      "status": "success",
+      "parameters": {},
+      "error_message": "",
+      "execution_seconds": 8120,
+      "started_at": "2026-08-01T01:00:00Z",
+      "finished_at": "2026-08-01T01:00:08Z"
+    },
+    "created_at": "2026-07-20T02:30:00Z",
+    "updated_at": "2026-08-01T01:00:08Z"
+  }
+]
+```
+
+前端主要使用字段：
+
+- `task_id`：公共任务 ID，后续接口路径参数。
+- `name`、`description`：任务名称和描述。
+- `status`：任务启用状态。
+- `schedule`：结构化调度规则。
+- `next_run_at`、`last_run_at`：UTC 时间字符串，前端按本地时区格式化。
+- `run_count`：历史运行总数。
+- `latest_run`：最近运行摘要，可能为 `null`。
+
+`execution_seconds` 虽沿用历史字段名，当前值的单位为毫秒；前端展示秒数时需要除以 `1000`。
+
+### 12.4 创建洞察任务
+
+`POST /api/insight/tasks`
+
+用途：
+
+- 从一次成功且可本地重复执行的分析结果创建洞察任务。
+- 创建时后端冻结执行代码、参数协议、数据源绑定、查询快照和逻辑签名为不可变任务版本。
+
+请求体：
+
+```json
+{
+  "source_execution_id": 1194,
+  "name": "产品月度成本利润洞察",
+  "description": "每月刷新各产品成本和利润情况",
+  "schedule": {
+    "frequency": "monthly",
+    "time": "09:00",
+    "day_of_month": 1
+  }
+}
+```
+
+请求字段说明：
+
+- `source_execution_id`
+  - 必填，来源分析执行记录的数据库 ID。
+  - 来源执行必须属于当前用户可访问的洞察空间。
+  - 来源执行必须为 `success` 且包含可复用的 `generated_code`。
+  - 会话历史和轮次详情中的 `latest_execution.is_runnable=true` 可作为前端启用“加入任务”的直接判断条件。
+- `name`
+  - 必填，去除首尾空格后不能为空。
+  - 最大保存 260 个字符。
+- `description`
+  - 可选。
+- `schedule`
+  - 必填，结构见 12.1。
+  - 不提交时区。
+
+成功响应：HTTP `201`，`data` 为 12.5 所述任务详情对象。
+
+常见失败：
+
+- HTTP `400`：来源执行不存在、不可复用、任务名称为空或调度规则非法。
+- HTTP `400`：当前用户无权基于该执行记录创建任务。
+
+### 12.5 获取洞察任务详情
+
+`GET /api/insight/tasks/{task_id}`
+
+用途：
+
+- 获取任务定义、当前不可变版本摘要以及最近 50 条运行摘要。
+- 该接口不返回历史运行的完整报告；需要通过 12.9 按 `run_id` 获取。
+
+响应 `data` 在列表项字段基础上增加：
+
+```json
+{
+  "task_id": "7fe691274c4d4f31b455129ce2785ddf",
+  "name": "产品月度成本利润洞察",
+  "status": "enabled",
+  "schedule": {
+    "frequency": "monthly",
+    "time": "09:00",
+    "day_of_month": 1,
+    "timezone": "Asia/Shanghai"
+  },
+  "run_count": 3,
+  "latest_run": {},
+  "revision": {
+    "id": 12,
+    "version": 1,
+    "source_execution_id": 1194,
+    "runtime_contract_version": "v1",
+    "logic_signature": "sha256-signature",
+    "created_at": "2026-07-20T02:30:00Z",
+    "snapshot": {
+      "source_execution_id": 1194,
+      "analysis_question": "分析今年各产品的成本和利润",
+      "title": "产品成本利润分析",
+      "description": "",
+      "used_datasource_ids": [179, 181],
+      "datasource_bindings": [
+        {
+          "datasource_id": 179,
+          "datasource_name": "产品月度利润_公司产线",
+          "datasource_type": "postgresql"
+        }
+      ],
+      "query_criteria": [
+        {
+          "query_key": "monthly_product_profit",
+          "query_constraints": {
+            "time_range": {
+              "start": "2026-01-01",
+              "end": "2026-12-31"
+            },
+            "target_filters": [],
+            "aggregation": {
+              "grain": "product_month",
+              "metrics": ["cost", "profit"]
+            }
+          },
+          "query_scope": {
+            "datasource_ids": [179, 181]
+          },
+          "datasource_ids": [179, 181],
+          "execution": {
+            "status": "success",
+            "row_count": 36
+          }
+        }
+      ],
+      "parameter_schema": {},
+      "default_parameters": {},
+      "logic_signature": "sha256-signature",
+      "runtime_contract_version": "v1"
+    }
+  },
+  "runs": [
+    {
+      "run_id": "1ef9d3556c0048fc93bc821b4db08ebf",
+      "status": "success",
+      "trigger_type": "manual",
+      "scheduled_for": "2026-08-12T02:00:00Z",
+      "execution_seconds": 8120
+    }
+  ]
+}
+```
+
+统计口径展示建议使用：
+
+- 任务定义：`revision.snapshot.query_criteria`。
+- 当前选择运行的参数值：运行详情 `parameters`。
+- 当前选择运行的真实查询快照：运行详情 `result_payload.query_snapshots`。
+
+前端不得展示任务版本中的生成代码；详情响应也不会返回该代码。
+
+任务不存在或不属于当前用户时返回 HTTP `404`。
+
+### 12.6 更新洞察任务
+
+`PUT /api/insight/tasks/{task_id}`
+
+请求体字段均为可选，仅更新显式提交的字段：
+
+```json
+{
+  "name": "产品月度成本利润洞察",
+  "description": "每月刷新",
+  "schedule": {
+    "frequency": "monthly",
+    "time": "09:00",
+    "day_of_month": 1
+  },
+  "status": "enabled"
+}
+```
+
+字段说明：
+
+- `name`：非空字符串。
+- `description`：任务描述。
+- `schedule`：完整调度规则，不提交时区。
+- `status`：仅支持 `enabled`、`paused`。
+
+更新调度规则后，后端重新计算 `next_run_at`。暂停任务时 `next_run_at` 变为 `null`；恢复任务时按原调度规则重新计算。
+
+成功响应 `data` 为完整任务详情对象。
+
+### 12.7 删除洞察任务
+
+`DELETE /api/insight/tasks/{task_id}`
+
+用途：
+
+- 软删除任务。
+- 同时暂停任务并清空下一次执行时间。
+- 删除后不再出现在任务列表中。
+
+成功响应：
+
+```json
+{
+  "success": true,
+  "data": null,
+  "message": "洞察任务已删除",
+  "code": 200
+}
+```
+
+任务不存在或不属于当前用户时返回 HTTP `404`。
+
+### 12.8 立即执行洞察任务
+
+`POST /api/insight/tasks/{task_id}/runs`
+
+用途：
+
+- 把一次手动运行加入后台队列。
+- 接口只负责入队，不同步等待分析完成。
+
+请求体：
+
+```json
+{
+  "analysis_parameters": {}
+}
+```
+
+字段说明：
+
+- `analysis_parameters`
+  - 可选对象。
+  - 应符合 `revision.snapshot.parameter_schema`。
+  - 没有可变参数时提交 `{}`，或省略后由后端使用任务版本的默认参数。
+
+成功响应：HTTP `202`。
+
+```json
+{
+  "success": true,
+  "data": {
+    "run_id": "8ab8d07ee42c4df4a76787aa52069857",
+    "task_definition_id": 12,
+    "revision_id": 12,
+    "trigger_type": "manual",
+    "scheduled_for": "2026-08-12T02:00:00Z",
+    "status": "queued",
+    "parameters": {},
+    "error_message": "",
+    "execution_seconds": 0
+  },
+  "message": "任务运行已加入队列",
+  "code": 202
+}
+```
+
+前端收到 `202` 后应立即显示“等待执行”，并仅在该运行仍为 `queued` 或 `running` 时轮询。
+
+### 12.9 获取单次运行详情
+
+`GET /api/insight/tasks/{task_id}/runs/{run_id}`
+
+用途：
+
+- 获取一次运行的完整结果。
+- 任务报告、图表、表格只在该接口中完整返回。
+
+成功响应 `data` 示例：
+
+```json
+{
+  "run_id": "8ab8d07ee42c4df4a76787aa52069857",
+  "task_definition_id": 12,
+  "revision_id": 12,
+  "trigger_type": "manual",
+  "scheduled_for": "2026-08-12T02:00:00Z",
+  "status": "success",
+  "parameters": {},
+  "error_message": "",
+  "execution_seconds": 8120,
+  "started_at": "2026-08-12T02:00:00Z",
+  "finished_at": "2026-08-12T02:00:08Z",
+  "analysis_report": "## 管理层摘要\n...",
+  "result_payload": {
+    "analysis_report": "## 管理层摘要\n...",
+    "charts": [
+      {
+        "title": "各产品利润对比",
+        "chart_spec": {}
+      }
+    ],
+    "tables": [
+      {
+        "title": "产品成本利润明细",
+        "columns": [
+          {"field": "product_name", "title": "产品"},
+          {"field": "profit", "title": "利润"}
+        ],
+        "rows": [
+          {"product_name": "产品A", "profit": 128000}
+        ]
+      }
+    ],
+    "analysis_parameters_schema": {},
+    "analysis_parameters": {},
+    "query_snapshots": {}
+  }
+}
+```
+
+展示约定：
+
+- 报告使用顶层 `analysis_report`。
+- 图表使用 `result_payload.charts[].chart_spec`，复用洞察结果现有图表组件。
+- 表格使用 `result_payload.tables[]`，复用洞察结果现有表格组件。
+- 失败运行通过 `error_message` 展示失败原因。
+- 当前本地任务重跑不重新生成 Evidence，前端不要假定任务运行结果包含可点击证据链。
+
+任务或运行不存在、或不属于当前用户时返回 HTTP `404`。
+
+### 12.10 分页获取执行记录
+
+`GET /api/insight/tasks/{task_id}/runs?page_no=1&page_size=50`
+
+查询参数：
+
+- `page_no`
+  - 从 `1` 开始，默认 `1`。
+- `page_size`
+  - 默认 `50`。
+  - 最小 `1`，最大 `100`。
+
+响应 `data`：
+
+```json
+{
+  "items": [
+    {
+      "run_id": "8ab8d07ee42c4df4a76787aa52069857",
+      "trigger_type": "manual",
+      "scheduled_for": "2026-08-12T02:00:00Z",
+      "status": "success",
+      "parameters": {},
+      "error_message": "",
+      "execution_seconds": 8120,
+      "started_at": "2026-08-12T02:00:00Z",
+      "finished_at": "2026-08-12T02:00:08Z"
+    }
+  ],
+  "total": 63,
+  "page_no": 1,
+  "page_size": 50,
+  "has_more": true
+}
+```
+
+列表中的运行记录不携带 `analysis_report` 和 `result_payload`。用户点击某条记录时，再调用 12.9 获取完整结果。
+
+### 12.11 内部任务执行接口
+
+`POST /api/insight/tasks/internal/runs/{run_id}/execute`
+
+该接口只供洞察任务 Runner 通过 Gateway 调用，前端禁止调用。
+
+约束：
+
+- 请求必须由 `SUPOS_DATAINSIGHT-SERVER_APPKEY` 对应的服务账号发起。
+- Gateway 将原始 appkey 放入 `origin-token`，将服务账号 JWT 放入 `Authorization`。
+- 后端校验服务账号身份后执行已入队任务。
+- 响应只包含运行状态和审计字段，不经 Gateway 返回完整报告和图表。
+
+非服务账号请求返回 HTTP `403`。

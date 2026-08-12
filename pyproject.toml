@@ -36,3 +36,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.uv]
+# The application runs directly from the src source root. Avoid rebuilding the
+# local project during uv sync/run, which would otherwise require downloading
+# the isolated setuptools build dependency.
+package = false

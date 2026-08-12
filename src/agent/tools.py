@@ -8124,6 +8124,7 @@ def _create_execution_record(
     execution_source: str = 'llm_generated',
     analysis_parameters_schema: dict[str, Any] | None = None,
     analysis_parameters: dict[str, Any] | None = None,
+    content_enabled: int = 1,
 ) -> int:
     """在生成代码真正执行前，先创建一条执行记录。"""
     from config.database import SessionLocal
@@ -8145,7 +8146,7 @@ def _create_execution_record(
             analysis_logic_signature=_build_analysis_logic_signature(code),
             parent_execution_id=parent_execution_id,
             execution_source=execution_source or 'llm_generated',
-            content_enabled=1,
+            content_enabled=int(content_enabled or 0),
             analysis_task_id=analysis_task_id,
         )
         session.add(execution)
@@ -10901,6 +10902,7 @@ def run_generated_code_locally(
         execution_source=execution_source,
         analysis_parameters_schema=analysis_parameters_schema,
         analysis_parameters=analysis_parameters,
+        content_enabled=0,
     )
 
     timeout_seconds = max(int(getattr(Config, 'PYTHON_EXEC_TIMEOUT_SECONDS', 90) or 90), 1)
@@ -11036,6 +11038,7 @@ def run_generated_code_locally(
         'analysis_report': exec_result.analysis_report,
         'charts': exec_result.charts,
         'tables': exec_result.tables,
+        'query_snapshots': exec_result.query_snapshots,
         'analysis_parameters_schema': result_schema,
         'analysis_parameters': result_parameters,
         'stdout_text': stdout_text,

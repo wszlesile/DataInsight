@@ -2,7 +2,7 @@ import json
 from datetime import datetime
 from typing import TypeVar
 
-from sqlalchemy import Column, DateTime, Index, Integer, String, Text
+from sqlalchemy import Column, DateTime, Index, Integer, String, Text, UniqueConstraint
 
 from config.database import Base
 
@@ -11,6 +11,10 @@ POT = TypeVar('POT', bound=Base)
 
 def _now() -> datetime:
     return datetime.now()
+
+
+def _utcnow() -> datetime:
+    return datetime.utcnow()
 
 
 def _safe_json_loads(value, fallback):
@@ -26,6 +30,10 @@ def _safe_json_loads(value, fallback):
 
 def _format(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
+
+
+def _format_utc(value: datetime | None) -> str | None:
+    return f'{value.isoformat()}Z' if value else None
 
 
 class InsightNamespace(Base):
@@ -414,6 +422,152 @@ class InsightAnalysisTask(Base):
         }
 
 
+class InsightTaskDefinition(Base):
+    """A reusable insight task owned by a user."""
+
+    __tablename__ = 'insight_task_definition'
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment='Task definition primary key')
+    task_id = Column(String(64), nullable=False, unique=True, comment='Public task id')
+    username = Column(String(64), nullable=False, comment='Task owner username')
+    namespace_id = Column(Integer, nullable=False, default=0, comment='Source namespace id')
+    source_conversation_id = Column(Integer, nullable=False, default=0, comment='Source conversation id')
+    source_turn_id = Column(Integer, nullable=False, default=0, comment='Source turn id')
+    active_revision_id = Column(Integer, nullable=True, comment='Active immutable revision id')
+    name = Column(String(260), nullable=False, comment='Task name')
+    description = Column(Text, nullable=False, default='', comment='Task description')
+    status = Column(String(32), nullable=False, default='enabled', comment='enabled or paused')
+    schedule_json = Column(Text, nullable=False, default='{}', comment='Structured schedule JSON')
+    timezone = Column(String(64), nullable=False, default='Asia/Shanghai', comment='Schedule timezone')
+    next_run_at = Column(DateTime, nullable=True, comment='Next scheduled run in UTC')
+    last_run_at = Column(DateTime, nullable=True, comment='Last run time in UTC')
+    is_deleted = Column(Integer, nullable=False, default=0, comment='Soft delete flag')
+    created_at = Column(DateTime, default=_utcnow, comment='Created time')
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, comment='Updated time')
+
+    __table_args__ = (
+        Index('idx_insight_task_owner_status', 'username', 'status'),
+        Index('idx_insight_task_due', 'status', 'next_run_at'),
+        {'comment': 'Reusable insight task definitions'},
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'task_id': self.task_id,
+            'username': self.username,
+            'namespace_id': self.namespace_id,
+            'source_conversation_id': self.source_conversation_id,
+            'source_turn_id': self.source_turn_id,
+            'active_revision_id': self.active_revision_id,
+            'name': self.name,
+            'description': self.description,
+            'status': self.status,
+            'schedule': _safe_json_loads(self.schedule_json, {}),
+            'timezone': self.timezone,
+            'next_run_at': _format_utc(self.next_run_at),
+            'last_run_at': _format_utc(self.last_run_at),
+            'is_deleted': self.is_deleted,
+            'created_at': _format_utc(self.created_at),
+            'updated_at': _format_utc(self.updated_at),
+        }
+
+
+class InsightTaskRevision(Base):
+    """Immutable executable snapshot for an insight task."""
+
+    __tablename__ = 'insight_task_revision'
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment='Revision primary key')
+    task_definition_id = Column(Integer, nullable=False, comment='Task definition id')
+    version = Column(Integer, nullable=False, default=1, comment='Revision number')
+    source_execution_id = Column(Integer, nullable=False, comment='Source successful execution id')
+    runtime_contract_version = Column(String(32), nullable=False, default='v1', comment='Runtime contract version')
+    logic_signature = Column(String(128), nullable=False, default='', comment='Analysis logic signature')
+    snapshot_json = Column(Text, nullable=False, default='{}', comment='Immutable execution snapshot JSON')
+    created_at = Column(DateTime, default=_utcnow, comment='Created time')
+
+    __table_args__ = (
+        UniqueConstraint('task_definition_id', 'version', name='uq_insight_task_revision_version'),
+        Index('idx_insight_task_revision_task', 'task_definition_id'),
+        {'comment': 'Immutable insight task revisions'},
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'task_definition_id': self.task_definition_id,
+            'version': self.version,
+            'source_execution_id': self.source_execution_id,
+            'runtime_contract_version': self.runtime_contract_version,
+            'logic_signature': self.logic_signature,
+            'created_at': _format_utc(self.created_at),
+        }
+
+
+class InsightTaskRun(Base):
+    """One immutable execution history item for an insight task."""
+
+    __tablename__ = 'insight_task_run'
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment='Run primary key')
+    run_id = Column(String(64), nullable=False, unique=True, comment='Public run id')
+    task_definition_id = Column(Integer, nullable=False, comment='Task definition id')
+    revision_id = Column(Integer, nullable=False, comment='Revision id used by this run')
+    trigger_type = Column(String(32), nullable=False, default='scheduled', comment='scheduled or manual')
+    scheduled_for = Column(DateTime, nullable=False, comment='Logical scheduled time in UTC')
+    status = Column(String(32), nullable=False, default='queued', comment='Run lifecycle status')
+    dispatch_attempts = Column(Integer, nullable=False, default=0, comment='Gateway dispatch attempt count')
+    next_attempt_at = Column(DateTime, nullable=True, comment='Earliest next dispatch time in UTC')
+    parameters_json = Column(Text, nullable=False, default='{}', comment='Effective parameters JSON')
+    result_payload_json = Column(Text, nullable=False, default='{}', comment='Structured result JSON')
+    analysis_report = Column(Text, nullable=False, default='', comment='Rendered analysis report')
+    execution_id = Column(Integer, nullable=True, comment='Internal execution audit id')
+    worker_id = Column(String(128), nullable=False, default='', comment='Claiming worker id')
+    lease_until = Column(DateTime, nullable=True, comment='Run lease expiry in UTC')
+    execution_principal = Column(String(128), nullable=False, default='', comment='Actual service principal')
+    error_message = Column(Text, nullable=False, default='', comment='Execution error')
+    execution_seconds = Column(Integer, nullable=False, default=0, comment='Execution milliseconds')
+    created_at = Column(DateTime, default=_utcnow, comment='Created time')
+    started_at = Column(DateTime, nullable=True, comment='Started time')
+    finished_at = Column(DateTime, nullable=True, comment='Finished time')
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, comment='Updated time')
+
+    __table_args__ = (
+        UniqueConstraint('task_definition_id', 'scheduled_for', name='uq_insight_task_run_schedule'),
+        Index('idx_insight_task_run_task_created', 'task_definition_id', 'created_at'),
+        Index('idx_insight_task_run_status_lease', 'status', 'lease_until'),
+        {'comment': 'Insight task execution history'},
+    )
+
+    def to_dict(self, *, include_result: bool = True):
+        result = {
+            'id': self.id,
+            'run_id': self.run_id,
+            'task_definition_id': self.task_definition_id,
+            'revision_id': self.revision_id,
+            'trigger_type': self.trigger_type,
+            'scheduled_for': _format_utc(self.scheduled_for),
+            'status': self.status,
+            'dispatch_attempts': self.dispatch_attempts,
+            'next_attempt_at': _format_utc(self.next_attempt_at),
+            'parameters': _safe_json_loads(self.parameters_json, {}),
+            'execution_id': self.execution_id,
+            'worker_id': self.worker_id,
+            'execution_principal': self.execution_principal,
+            'error_message': self.error_message,
+            'execution_seconds': self.execution_seconds,
+            'created_at': _format_utc(self.created_at),
+            'started_at': _format_utc(self.started_at),
+            'finished_at': _format_utc(self.finished_at),
+            'updated_at': _format_utc(self.updated_at),
+        }
+        if include_result:
+            result['analysis_report'] = self.analysis_report
+            result['result_payload'] = _safe_json_loads(self.result_payload_json, {})
+        return result
+
+
 class InsightNsExecution(Base):
     """一条由大模型生成并执行的 Python 分析记录。"""
 
@@ -464,6 +618,10 @@ class InsightNsExecution(Base):
             "used_datasource_ids_json": self.used_datasource_ids_json,
             "used_datasource_ids": _safe_json_loads(self.used_datasource_ids_json, []),
             "execution_status": self.execution_status,
+            "is_runnable": bool(
+                self.execution_status == 'success'
+                and str(self.generated_code or '').strip()
+            ),
             "analysis_report": self.analysis_report,
             "result_payload_json": self.result_payload_json,
             "analysis_parameters_schema_json": self.analysis_parameters_schema_json,
