@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+from langchain_core.messages import AIMessage
 
 import agent.invoker as invoker
 from agent.analysis_preparation import (
@@ -242,9 +243,100 @@ def test_streaming_preparation_forwards_each_stage_as_user_readable_status(monke
     assert all(event["message"] for event in events)
 
 
-def test_rerun_is_always_an_analysis_request_even_when_text_classifier_is_uncertain():
+def test_streaming_general_conversation_skips_preparation(monkeypatch):
+    runtime = _runtime(_snapshot())
+    runtime.context_mode = "general"
+    runtime.is_rerun = False
+    runtime.history_turn_limit = None
+    runtime.conversation.title = "普通对话"
+    request = _request()
+    request.user_message = "你好"
+    request.selected_llm_model_id = ""
+
+    class FakeAgent:
+        def stream(self, *_args, **_kwargs):
+            yield "updates", {
+                "model": {"messages": [AIMessage(content="你好，请问想了解哪些数据？")]}
+            }
+
+    monkeypatch.setattr(invoker, "_resolve_agent_runtime_config", lambda _request: SimpleNamespace())
+    monkeypatch.setattr(invoker, "get_data_insight_agent", lambda _config: FakeAgent())
+    monkeypatch.setattr(
+        invoker,
+        "_stream_analysis_preparation",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("general conversation must skip Preparation")),
+    )
+    monkeypatch.setattr(invoker, "_build_agent_input_with_runtime_instruction", lambda **_kwargs: {})
+    monkeypatch.setattr(invoker, "_build_agent_context", lambda *_args, **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(invoker, "_did_enter_analysis_flow", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        invoker,
+        "_resolve_analysis_outputs",
+        lambda **kwargs: (kwargs["analysis_report"], kwargs["charts"] or [], kwargs["tables"] or []),
+    )
+    monkeypatch.setattr(
+        invoker,
+        "_finalize_run_with_fresh_session",
+        lambda **kwargs: invoker.AgentResponse(
+            username=kwargs["username"],
+            message=kwargs["assistant_message"],
+            conversation_id=runtime.conversation.id,
+            turn_id=runtime.turn.id,
+            charts=[],
+            tables=[],
+        ),
+    )
+
+    events = list(invoker._stream_with_runtime(None, runtime, request))
+
+    assert any(
+        event["type"] == "assistant" and "你好" in event["message"]
+        for event in events
+    )
+    assert events[-1]["type"] == "done"
+    assert not any(event["type"] == "error" for event in events)
+
+
+def test_rerun_with_prior_analysis_activity_remains_an_analysis_request(monkeypatch):
     runtime = _runtime(_snapshot(11))
     runtime.is_rerun = True
     runtime.context_mode = "general"
+    monkeypatch.setattr(invoker, "_rerun_has_prior_analysis_activity", lambda _runtime: True)
 
     assert invoker._is_analysis_request_expected(runtime, "历史问题文本")
+
+
+def test_rerun_without_prior_analysis_activity_respects_general_mode(monkeypatch):
+    runtime = _runtime(_snapshot())
+    runtime.is_rerun = True
+    runtime.context_mode = "general"
+    monkeypatch.setattr(invoker, "_rerun_has_prior_analysis_activity", lambda _runtime: False)
+
+    assert not invoker._is_analysis_request_expected(runtime, "你好")
+
+
+def test_rerun_without_prior_analysis_activity_uses_intent_classifier(monkeypatch):
+    runtime = _runtime(_snapshot())
+    runtime.is_rerun = True
+    monkeypatch.setattr(invoker, "_rerun_has_prior_analysis_activity", lambda _runtime: False)
+    monkeypatch.setattr(
+        invoker,
+        "resolve_context_mode_with_llm",
+        lambda *_args: SimpleNamespace(
+            mode="general",
+            source="llm",
+            confidence=0.99,
+            reason="普通问候",
+        ),
+    )
+
+    assert invoker._resolve_runtime_context_mode(runtime, "你好") == "general"
+
+
+def test_prior_analysis_rerun_does_not_downgrade_ambiguous_question(monkeypatch):
+    runtime = _runtime(_snapshot(11))
+    runtime.is_rerun = True
+    monkeypatch.setattr(invoker, "_rerun_has_prior_analysis_activity", lambda _runtime: True)
+    monkeypatch.setattr(invoker, "classify_analysis_context_mode", lambda _message: "general")
+
+    assert invoker._resolve_runtime_context_mode(runtime, "年费合同情况如何") == "fresh_analysis"

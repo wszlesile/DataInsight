@@ -926,11 +926,14 @@ def _stream_analysis_preparation(
 
 
 def _resolve_runtime_context_mode(runtime: ConversationRunContext, user_message: str) -> str:
-    if runtime.is_rerun:
+    if runtime.is_rerun and _rerun_has_prior_analysis_activity(runtime):
         context_mode = classify_analysis_context_mode(user_message)
+        if context_mode == 'general':
+            context_mode = 'fresh_analysis'
         runtime.context_mode = context_mode
         logger.info(
-            "Resolved analysis context mode for rerun locally: conversation_id=%s turn_id=%s mode=%s",
+            "Resolved analysis context mode for prior analysis rerun locally: "
+            "conversation_id=%s turn_id=%s mode=%s",
             getattr(runtime.conversation, 'id', ''),
             getattr(runtime.turn, 'id', ''),
             context_mode,
@@ -952,7 +955,7 @@ def _resolve_runtime_context_mode(runtime: ConversationRunContext, user_message:
 
 
 def _is_analysis_request_expected(runtime: ConversationRunContext, user_message: str) -> bool:
-    if runtime.is_rerun:
+    if runtime.is_rerun and _rerun_has_prior_analysis_activity(runtime):
         return True
     if _is_regenerate_request(user_message):
         return True
@@ -1376,6 +1379,44 @@ def _build_followup_anchor_instruction_lines(runtime: ConversationRunContext) ->
     if report_preview:
         lines.append(f'- 最近成功分析报告摘要：{report_preview}')
     return lines
+
+
+def _rerun_has_prior_analysis_activity(runtime: ConversationRunContext) -> bool:
+    """Return whether the original turn already entered the analysis execution path."""
+    if not runtime.is_rerun:
+        return False
+
+    cache = getattr(runtime, 'short_term_memory', None)
+    if not isinstance(cache, dict):
+        cache = {}
+        runtime.short_term_memory = cache
+    cache_key = 'rerun_has_prior_analysis_activity'
+    if cache_key in cache:
+        return bool(cache[cache_key])
+
+    from model import InsightNsArtifact, InsightNsExecution
+
+    def _has_prior(session):
+        started_at = getattr(runtime.turn, 'started_at', None)
+        execution_query = session.query(InsightNsExecution.id).filter(
+            InsightNsExecution.conversation_id == runtime.conversation.id,
+            InsightNsExecution.turn_id == runtime.turn.id,
+            InsightNsExecution.is_deleted == 0,
+        )
+        artifact_query = session.query(InsightNsArtifact.id).filter(
+            InsightNsArtifact.conversation_id == runtime.conversation.id,
+            InsightNsArtifact.turn_id == runtime.turn.id,
+            InsightNsArtifact.is_deleted == 0,
+        )
+        if started_at is not None:
+            execution_query = execution_query.filter(InsightNsExecution.created_at < started_at)
+            artifact_query = artifact_query.filter(InsightNsArtifact.created_at < started_at)
+        return execution_query.first() is not None or artifact_query.first() is not None
+
+    with session_scope(expire_on_commit=False) as session:
+        result = _has_prior(session)
+    cache[cache_key] = result
+    return result
 
 
 def _rerun_has_prior_analysis_result(
@@ -2704,7 +2745,11 @@ def _stream_with_runtime(
             turn_id=runtime.turn.id,
             stage='rerun',
             level='info',
-            message='正在重新执行本轮分析。',
+            message=(
+                '正在重新执行本轮分析。'
+                if analysis_request_expected
+                else '正在重新生成本轮回复。'
+            ),
         )
 
     try:
@@ -2738,15 +2783,13 @@ def _stream_with_runtime(
 
         runtime_config = _resolve_agent_runtime_config(agent_request)
         try:
-            preparation = (
-                yield from _stream_analysis_preparation(
+            preparation = None
+            if analysis_request_expected:
+                preparation = yield from _stream_analysis_preparation(
                     runtime=runtime,
                     agent_request=agent_request,
                     runtime_config=runtime_config,
                 )
-                if analysis_request_expected
-                else None
-            )
         except NoDatasourceAvailableForAnalysis:
             assistant_message = NO_DATASOURCE_ANALYSIS_REPLY
             allow_report_only = True

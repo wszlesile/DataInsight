@@ -580,10 +580,10 @@
                 <button
                   class="action-btn"
                   type="button"
-                  :disabled="insightTaskRunSubmitting || hasPendingTaskRun(selectedInsightTask)"
+                  :disabled="insightTaskRunSubmitting"
                   @click="runSelectedInsightTask"
                 >
-                  {{ insightTaskRunSubmitting ? '提交中...' : (hasPendingTaskRun(selectedInsightTask) ? '执行中...' : '立即执行') }}
+                  {{ insightTaskRunSubmitting ? '执行中...' : '立即执行' }}
                 </button>
                 <button class="action-btn" type="button" @click="toggleSelectedTaskStatus">
                   {{ selectedInsightTask.status === 'enabled' ? '暂停' : '恢复' }}
@@ -2325,24 +2325,29 @@ const getTaskRunTables = (run) => (
 
 const runSelectedInsightTask = async () => {
   const task = selectedInsightTask.value
-  if (!task?.task_id || insightTaskRunSubmitting.value || hasPendingTaskRun(task)) return
+  if (!task?.task_id || insightTaskRunSubmitting.value) return
   const snapshot = getTaskSnapshot(task)
   insightTaskRunSubmitting.value = true
   try {
     const response = await runInsightTask(task.task_id, snapshot.default_parameters || {})
-    if (!response.data?.success) throw new Error(response.data?.message || '提交运行失败')
-    const queuedRun = response.data.data || null
-    selectedInsightTaskRun.value = queuedRun
-    if (queuedRun?.run_id) {
+    if (!response.data?.success) throw new Error(response.data?.message || '执行任务失败')
+    const completedRun = response.data.data || null
+    selectedInsightTaskRun.value = completedRun
+    if (completedRun?.run_id) {
       const existingRuns = Array.isArray(selectedInsightTask.value?.runs) ? selectedInsightTask.value.runs : []
-      selectedInsightTask.value.runs = [queuedRun, ...existingRuns.filter((item) => item.run_id !== queuedRun.run_id)]
-      selectedInsightTask.value.latest_run = queuedRun
+      selectedInsightTask.value.runs = [completedRun, ...existingRuns.filter((item) => item.run_id !== completedRun.run_id)]
+      selectedInsightTask.value.latest_run = completedRun
     }
-    ElMessage.success('任务运行已加入队列')
     await fetchInsightTasks({ silent: true })
-    scheduleInsightTaskPolling()
+    await refreshSelectedInsightTask()
+    if (completedRun?.run_id) await selectInsightTaskRun(completedRun)
+    if (completedRun?.status === 'success') {
+      ElMessage.success('任务执行成功')
+    } else {
+      ElMessage.error(completedRun?.error_message || '任务执行失败')
+    }
   } catch (error) {
-    ElMessage.error(error?.response?.data?.message || error?.message || '提交运行失败')
+    ElMessage.error(error?.response?.data?.message || error?.message || '执行任务失败')
   } finally {
     insightTaskRunSubmitting.value = false
   }
