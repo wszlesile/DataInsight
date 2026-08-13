@@ -2296,6 +2296,12 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 
 只有 `queued`、`running` 属于非终态。前端仅在存在非终态运行时轮询，进入终态后停止轮询。
 
+运行记录的 `trigger_type`：
+
+- `initial`：创建任务时固化的来源会话分析结果，不会再次执行查询或进入 Runner。
+- `manual`：用户点击“立即执行”产生的本地运行。
+- `scheduled`：调度计划产生的本地运行。
+
 ### 12.3 获取洞察任务列表
 
 `GET /api/insight/tasks`
@@ -2367,6 +2373,7 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 
 - 从一次成功且可本地重复执行的分析结果创建洞察任务。
 - 创建时后端冻结执行代码、参数协议、数据源绑定、查询快照和逻辑签名为不可变任务版本。
+- 创建时同步将来源分析的报告、图表、表格、参数、查询快照和耗时写为一条成功的“初次执行”记录；不会重新查询数据或调用模型。
 
 请求体：
 
@@ -2399,7 +2406,7 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
   - 必填，结构见 12.1。
   - 不提交时区。
 
-成功响应：HTTP `201`，`data` 为 12.5 所述任务详情对象。
+成功响应：HTTP `201`，`data` 为 12.5 所述任务详情对象。新任务的 `run_count` 为 `1`，`latest_run.trigger_type` 为 `initial`，`runs` 中包含该初次执行摘要；完整结果仍通过 12.9 的运行详情接口按 `run_id` 获取。
 
 常见失败：
 

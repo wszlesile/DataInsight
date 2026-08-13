@@ -1,8 +1,9 @@
 import hashlib
 import json
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
@@ -15,6 +16,7 @@ from model import (
     InsightNamespace,
     InsightDatasource,
     InsightNsConversation,
+    InsightNsArtifact,
     InsightNsExecution,
     InsightNsTurn,
     InsightTaskDefinition,
@@ -74,6 +76,15 @@ class InsightTaskService:
         self.session.add(revision)
         self.session.flush()
         task.active_revision_id = revision.id
+        initial_run = self._initial_run_from_execution(
+            task=task,
+            revision=revision,
+            execution=execution,
+            default_parameters=snapshot.default_parameters,
+            username=username,
+        )
+        self.session.add(initial_run)
+        task.last_run_at = initial_run.finished_at
         self.session.commit()
         return self.get_task(username=username, task_id=task.task_id) or {}
 
@@ -552,6 +563,96 @@ class InsightTaskService:
     def _snapshot_signature(self, snapshot: AnalysisExecutionSnapshot) -> str:
         payload = json.dumps(snapshot.to_dict(), ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+    def _initial_run_from_execution(
+        self,
+        *,
+        task: InsightTaskDefinition,
+        revision: InsightTaskRevision,
+        execution: InsightNsExecution,
+        default_parameters: dict[str, Any],
+        username: str,
+    ) -> InsightTaskRun:
+        result_payload, analysis_report = self._source_result_payload(execution)
+        source_finished_at = self._as_utc_naive(
+            execution.finished_at or execution.updated_at or execution.created_at,
+            task.timezone,
+        )
+        source_started_at = self._as_utc_naive(execution.created_at, task.timezone) or source_finished_at
+        recorded_at = source_finished_at or utc_now()
+        return InsightTaskRun(
+            run_id=uuid.uuid4().hex,
+            task_definition_id=task.id,
+            revision_id=revision.id,
+            trigger_type='initial',
+            scheduled_for=recorded_at,
+            status='success',
+            parameters_json=dump_json(default_parameters),
+            result_payload_json=dump_json(result_payload),
+            analysis_report=analysis_report,
+            execution_id=execution.id,
+            execution_principal=username,
+            execution_seconds=int(execution.execution_seconds or 0),
+            started_at=source_started_at,
+            finished_at=recorded_at,
+        )
+
+    def _source_result_payload(self, execution: InsightNsExecution) -> tuple[dict[str, Any], str]:
+        source_payload = safe_json_loads(execution.result_payload_json, {})
+        payload = dict(source_payload) if isinstance(source_payload, dict) else {}
+        analysis_report = str(payload.get('analysis_report') or execution.analysis_report or '')
+
+        artifacts = self.session.query(InsightNsArtifact).filter(
+            InsightNsArtifact.execution_id == execution.id,
+            InsightNsArtifact.is_deleted == 0,
+        ).order_by(InsightNsArtifact.sort_no.asc(), InsightNsArtifact.id.asc()).all()
+        charts: list[dict[str, Any]] = []
+        tables: list[dict[str, Any]] = []
+        report_evidence_refs: dict[str, Any] = {}
+        for artifact in artifacts:
+            content = safe_json_loads(artifact.content_json, {})
+            if not isinstance(content, dict):
+                continue
+            metadata = safe_json_loads(artifact.metadata_json, {})
+            metadata = metadata if isinstance(metadata, dict) else {}
+            evidence_refs = metadata.get('evidence_refs')
+            if artifact.artifact_type == 'chart':
+                item = dict(content)
+                if isinstance(evidence_refs, dict) and 'evidence_refs' not in item:
+                    item['evidence_refs'] = evidence_refs
+                charts.append(item)
+            elif artifact.artifact_type == 'table':
+                item = dict(content)
+                if isinstance(evidence_refs, dict) and 'evidence_refs' not in item:
+                    item['evidence_refs'] = evidence_refs
+                tables.append(item)
+            elif artifact.artifact_type == 'report':
+                analysis_report = str(content.get('report_markdown') or artifact.summary_text or analysis_report)
+                if isinstance(evidence_refs, dict):
+                    report_evidence_refs = evidence_refs
+
+        if charts:
+            payload['charts'] = charts
+        elif not isinstance(payload.get('charts'), list):
+            payload['charts'] = []
+        if tables:
+            payload['tables'] = tables
+        elif not isinstance(payload.get('tables'), list):
+            payload['tables'] = []
+        payload['analysis_report'] = analysis_report
+        payload['analysis_parameters_schema'] = safe_json_loads(execution.analysis_parameters_schema_json, {})
+        payload['analysis_parameters'] = safe_json_loads(execution.analysis_parameters_json, {})
+        if report_evidence_refs:
+            payload['report_evidence_refs'] = report_evidence_refs
+        return payload, analysis_report
+
+    @staticmethod
+    def _as_utc_naive(value: datetime | None, timezone_name: str) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=ZoneInfo(timezone_name or 'Asia/Shanghai'))
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
 
     def _datasource_bindings(self, execution: InsightNsExecution) -> list[dict[str, Any]]:
         datasource_ids = [

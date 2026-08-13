@@ -20,6 +20,7 @@ from model import (  # noqa: E402
     InsightDatasource,
     InsightNamespace,
     InsightNsConversation,
+    InsightNsArtifact,
     InsightNsExecution,
     InsightNsTurn,
     InsightTaskDefinition,
@@ -77,8 +78,44 @@ def _source_execution(session):
         }),
         analysis_parameters_schema_json='{}',
         analysis_parameters_json='{}',
+        execution_seconds=860,
+        finished_at=datetime(2026, 8, 1, 1, 2, 3),
     )
     session.add(execution)
+    session.flush()
+    session.add_all([
+        InsightNsArtifact(
+            conversation_id=conversation.id,
+            turn_id=turn.id,
+            execution_id=execution.id,
+            artifact_type='report',
+            title='Annual contract report',
+            summary_text='Artifact report',
+            content_json=dump_json({'report_markdown': 'Artifact report'}),
+            metadata_json=dump_json({'evidence_refs': {'58': 'ev-contract-count'}}),
+            sort_no=0,
+        ),
+        InsightNsArtifact(
+            conversation_id=conversation.id,
+            turn_id=turn.id,
+            execution_id=execution.id,
+            artifact_type='chart',
+            title='Contract trend',
+            content_json=dump_json({'title': 'Contract trend', 'chart_type': 'line', 'chart_spec': {'series': []}}),
+            metadata_json=dump_json({'evidence_refs': {'series.0': 'ev-contract-count'}}),
+            sort_no=1,
+        ),
+        InsightNsArtifact(
+            conversation_id=conversation.id,
+            turn_id=turn.id,
+            execution_id=execution.id,
+            artifact_type='table',
+            title='Contract details',
+            content_json=dump_json({'title': 'Contract details', 'columns': [{'field': 'count'}], 'rows': [{'count': 58}]}),
+            metadata_json=dump_json({'evidence_refs': {'count': 'ev-contract-count'}}),
+            sort_no=101,
+        ),
+    ])
     session.commit()
     return execution
 
@@ -138,8 +175,27 @@ def test_task_snapshot_is_private_and_fixed_parameter_analysis_is_runnable():
         assert task['revision']['snapshot']['datasource_bindings'][0]['datasource_name'] == 'Annual contracts'
         assert task['revision']['snapshot']['query_criteria'][0]['query_key'] == 'annual_contracts'
         assert 'code' not in task['revision']['snapshot']
+        assert task['run_count'] == 1
+        assert task['latest_run']['trigger_type'] == 'initial'
+        assert task['latest_run']['status'] == 'success'
+        assert len(task['runs']) == 1
+        initial_run = service.get_run(
+            username='owner',
+            task_id=task['task_id'],
+            run_id=task['runs'][0]['run_id'],
+        )
+        assert initial_run['trigger_type'] == 'initial'
+        assert initial_run['execution_id'] == execution.id
+        assert initial_run['analysis_report'] == 'Artifact report'
+        assert initial_run['result_payload']['charts'][0]['title'] == 'Contract trend'
+        assert initial_run['result_payload']['charts'][0]['evidence_refs']['series.0'] == 'ev-contract-count'
+        assert initial_run['result_payload']['tables'][0]['rows'][0]['count'] == 58
+        assert initial_run['result_payload']['report_evidence_refs']['58'] == 'ev-contract-count'
+        assert initial_run['execution_seconds'] == 860
+        assert initial_run['scheduled_for'] == '2026-07-31T17:02:03Z'
         assert session.query(InsightTaskDefinition).count() == 1
         assert session.query(InsightTaskRevision).count() == 1
+        assert session.query(InsightTaskRun).count() == 1
     finally:
         session.close()
 
@@ -209,7 +265,7 @@ def test_manual_run_uses_shared_runtime_and_persists_independent_history():
         assert result['result_payload']['charts'][0]['title'] == '合同趋势'
         assert result['result_payload']['query_snapshots']['annual_contracts']['execution']['row_count'] == 58
         assert result['execution_principal'] == 'DataInsight-Server'
-        assert session.query(InsightTaskRun).count() == 1
+        assert session.query(InsightTaskRun).count() == 2
         audit = session.query(InsightNsExecution).filter(InsightNsExecution.id == result['execution_id']).first()
         assert audit.content_enabled == 0
         original_turn = session.query(InsightNsTurn).filter(InsightNsTurn.id == execution.turn_id).first()
@@ -420,8 +476,8 @@ def test_run_history_is_pageable():
         for _ in range(3):
             service.enqueue_manual_run(username='owner', task_id=task['task_id'], parameters={})
         page = service.list_runs_page(username='owner', task_id=task['task_id'], page_no=2, page_size=2)
-        assert page['total'] == 3
-        assert len(page['items']) == 1
+        assert page['total'] == 4
+        assert len(page['items']) == 2
         assert page['has_more'] is False
     finally:
         session.close()
@@ -450,7 +506,7 @@ def test_due_schedule_is_enqueued_once_and_advanced():
 
         assert len(first) == 1
         assert second == []
-        assert session.query(InsightTaskRun).count() == 1
+        assert session.query(InsightTaskRun).count() == 2
         session.refresh(task)
         assert task.next_run_at > datetime(2026, 1, 1, 1, 0)
     finally:

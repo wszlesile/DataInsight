@@ -3353,7 +3353,19 @@ class LineageIndexer:
                             resolve(item),
                         ))
                         sequence += 1
-        return [expression for _, _, expression in sorted(events, key=lambda item: (item[0], item[1]))]
+        expressions: list[ast.AST] = []
+        seen: set[tuple[int, int, str]] = set()
+        for _, _, expression in sorted(events, key=lambda item: (item[0], item[1])):
+            identity = (
+                int(getattr(expression, "lineno", 0) or 0),
+                int(getattr(expression, "col_offset", 0) or 0),
+                ast.dump(expression, include_attributes=False),
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            expressions.append(expression)
+        return expressions
 
     @staticmethod
     def _dict_value(expression: ast.AST, key: str) -> ast.AST | None:
@@ -3399,9 +3411,64 @@ class LineageIndexer:
 
     @classmethod
     def _table_data_sources(cls, tree: ast.AST) -> list[dict[str, str]]:
+        wrapper_contracts: dict[str, dict[str, Any]] = {}
+        for function in (
+            item for item in ast.walk(tree) if isinstance(item, ast.FunctionDef)
+        ):
+            parameter_names = [item.arg for item in function.args.args]
+            for call in (
+                item for item in ast.walk(function) if isinstance(item, ast.Call)
+            ):
+                function_name = (
+                    call.func.id
+                    if isinstance(call.func, ast.Name)
+                    else call.func.attr
+                    if isinstance(call.func, ast.Attribute)
+                    else ""
+                )
+                if function_name != "build_table_result":
+                    continue
+                data_expression = next(
+                    (
+                        keyword.value
+                        for keyword in call.keywords
+                        if keyword.arg in {"rows", "data"}
+                    ),
+                    call.args[0] if call.args else None,
+                )
+                if not (
+                    isinstance(data_expression, ast.Name)
+                    and data_expression.id in parameter_names
+                ):
+                    continue
+                wrapper_contracts[function.name] = {
+                    "data_parameter": data_expression.id,
+                    "data_parameter_index": parameter_names.index(data_expression.id),
+                }
+                break
+
         sources: list[dict[str, str]] = []
         for expression in cls._table_artifact_expressions(tree):
             rows_expression = cls._table_rows_expression(expression)
+            if (
+                rows_expression is None
+                and isinstance(expression, ast.Call)
+                and isinstance(expression.func, ast.Name)
+                and expression.func.id in wrapper_contracts
+            ):
+                contract = wrapper_contracts[expression.func.id]
+                parameter_name = str(contract["data_parameter"])
+                parameter_index = int(contract["data_parameter_index"])
+                rows_expression = next(
+                    (
+                        keyword.value
+                        for keyword in expression.keywords
+                        if keyword.arg == parameter_name
+                    ),
+                    expression.args[parameter_index]
+                    if parameter_index < len(expression.args)
+                    else None,
+                )
             source = ""
             if isinstance(rows_expression, ast.ListComp):
                 source = cls._list_comprehension_source_frame(rows_expression)
@@ -4311,9 +4378,198 @@ class LineageIndexer:
         mapping_field_origins: dict[str, dict[str, dict[str, set[str]]]] = {}
         mapping_alias_sources: dict[str, str] = {}
         function_frame_summaries: dict[str, dict[str, Any]] = {}
+
+        def function_default_strings(function: ast.FunctionDef) -> dict[str, str]:
+            positional = [item.arg for item in function.args.args]
+            defaults = list(function.args.defaults)
+            offset = len(positional) - len(defaults)
+            result: dict[str, str] = {}
+            for index, default in enumerate(defaults, start=offset):
+                if (
+                    0 <= index < len(positional)
+                    and isinstance(default, ast.Constant)
+                    and isinstance(default.value, str)
+                ):
+                    result[positional[index]] = str(default.value)
+            return result
+
+        def frame_transform_summary(
+            function: ast.FunctionDef,
+        ) -> dict[str, Any] | None:
+            parameter_names = [item.arg for item in function.args.args]
+            if not parameter_names:
+                return None
+            defaults = function_default_strings(function)
+            alias_sources = {name: name for name in parameter_names}
+            scalar_dependencies: dict[str, dict[str, Any]] = {}
+            derived_fields: dict[str, dict[str, Any]] = {}
+
+            def static_field(node: ast.Subscript) -> str:
+                if isinstance(node.slice, ast.Constant) and isinstance(
+                    node.slice.value, str
+                ):
+                    return str(node.slice.value)
+                if isinstance(node.slice, ast.Name):
+                    if node.slice.id in parameter_names:
+                        return f"@parameter:{node.slice.id}"
+                    return ""
+                return ""
+
+            def expression_dependencies(
+                node: ast.AST | None,
+                source_parameter: str,
+            ) -> dict[str, Any]:
+                source_fields: list[str] = []
+                operation_ids: list[str] = []
+                if node is None:
+                    return {"source_fields": [], "operation_ids": []}
+                for item in ast.walk(node):
+                    if (
+                        isinstance(item, ast.Subscript)
+                        and isinstance(item.value, ast.Name)
+                        and alias_sources.get(item.value.id) == source_parameter
+                    ):
+                        field = static_field(item)
+                        if field:
+                            source_fields.append(field)
+                    elif isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load):
+                        dependency = scalar_dependencies.get(item.id)
+                        if dependency and dependency.get(
+                            "source_parameter"
+                        ) == source_parameter:
+                            source_fields.extend(dependency["source_fields"])
+                            operation_ids.extend(dependency["operation_ids"])
+                return {
+                    "source_fields": list(dict.fromkeys(source_fields)),
+                    "operation_ids": list(dict.fromkeys(operation_ids)),
+                }
+
+            statements = sorted(
+                (
+                    item
+                    for item in ast.walk(function)
+                    if isinstance(item, (ast.Assign, ast.AnnAssign))
+                ),
+                key=lambda item: int(getattr(item, "lineno", 0) or 0),
+            )
+            for statement in statements:
+                value = getattr(statement, "value", None)
+                targets = (
+                    list(statement.targets)
+                    if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+                simple_targets = [
+                    target.id for target in targets if isinstance(target, ast.Name)
+                ]
+                if len(simple_targets) == 1:
+                    target_name = simple_targets[0]
+                    source_alias = cls._expression_base_frame(value)
+                    if source_alias in alias_sources:
+                        alias_sources[target_name] = alias_sources[source_alias]
+                    dependency_sources = {
+                        alias_sources[item.value.id]
+                        for item in ast.walk(value) if value is not None
+                        if isinstance(item, ast.Subscript)
+                        and isinstance(item.value, ast.Name)
+                        and item.value.id in alias_sources
+                    }
+                    dependency_source = (
+                        next(iter(dependency_sources))
+                        if len(dependency_sources) == 1
+                        else ""
+                    )
+                    dependencies = expression_dependencies(
+                        value,
+                        dependency_source,
+                    )
+                    operation = operation_for(statement)
+                    operation_id = str(
+                        (operation or {}).get("operation_node_id") or ""
+                    )
+                    if (
+                        operation_id
+                        and (operation or {}).get("semantic_kind")
+                        in {"aggregation", "formula", "ranking", "projection"}
+                    ):
+                        dependencies["operation_ids"].append(operation_id)
+                    if dependencies["source_fields"]:
+                        scalar_dependencies[target_name] = {
+                            "source_parameter": dependency_source,
+                            "source_fields": list(dict.fromkeys(
+                                dependencies["source_fields"]
+                            )),
+                            "operation_ids": list(dict.fromkeys(
+                                dependencies["operation_ids"]
+                            )),
+                        }
+
+                for target in targets:
+                    if not (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id in alias_sources
+                    ):
+                        continue
+                    source_parameter = alias_sources[target.value.id]
+                    field = static_field(target)
+                    if not field:
+                        continue
+                    dependencies = expression_dependencies(value, source_parameter)
+                    operation = operation_for(statement)
+                    operation_id = str(
+                        (operation or {}).get("operation_node_id") or ""
+                    )
+                    if (
+                        operation_id
+                        and (operation or {}).get("semantic_kind")
+                        in {"aggregation", "formula", "ranking", "projection"}
+                    ):
+                        dependencies["operation_ids"].append(operation_id)
+                    if dependencies["source_fields"]:
+                        derived_fields[field] = {
+                            "source_parameter": source_parameter,
+                            "source_fields": list(dict.fromkeys(
+                                dependencies["source_fields"]
+                            )),
+                            "operation_ids": list(dict.fromkeys(
+                                dependencies["operation_ids"]
+                            )),
+                        }
+
+            returned_source_parameters = {
+                alias_sources.get(cls._expression_base_frame(item.value), "")
+                for item in ast.walk(function)
+                if isinstance(item, ast.Return)
+            }
+            returned_source_parameters.discard("")
+            eligible_parameters = {
+                str(item.get("source_parameter") or "")
+                for item in derived_fields.values()
+            }.intersection(returned_source_parameters)
+            if not derived_fields or len(eligible_parameters) != 1:
+                return None
+            source_parameter = next(iter(eligible_parameters))
+            return {
+                "kind": "frame_transform",
+                "parameter_index": parameter_names.index(source_parameter),
+                "parameter_name": source_parameter,
+                "parameter_names": parameter_names,
+                "parameter_defaults": defaults,
+                "derived_fields": {
+                    field: item
+                    for field, item in derived_fields.items()
+                    if item.get("source_parameter") == source_parameter
+                },
+            }
+
         for function in (
             item for item in ast.walk(tree) if isinstance(item, ast.FunctionDef)
         ):
+            transform_summary = frame_transform_summary(function)
+            if transform_summary is not None:
+                function_frame_summaries[function.name] = transform_summary
+                continue
             parameter_names = [item.arg for item in function.args.args]
             if not parameter_names:
                 continue
@@ -4800,12 +5056,89 @@ class LineageIndexer:
                 ):
                     summary = function_frame_summaries[value.func.id]
                     parameter_index = int(summary.get("parameter_index") or 0)
-                    source_frame = (
-                        frame_name_from_expression(value.args[parameter_index])
+                    parameter_name = str(summary.get("parameter_name") or "")
+                    source_expression = next(
+                        (
+                            keyword.value
+                            for keyword in value.keywords
+                            if keyword.arg == parameter_name
+                        ),
+                        value.args[parameter_index]
                         if parameter_index < len(value.args)
-                        else ""
+                        else None,
                     )
+                    source_frame = frame_name_from_expression(source_expression)
                     if source_frame:
+                        if summary.get("kind") == "frame_transform":
+                            copy_frame(target, source_frame)
+                            parameter_names = list(
+                                summary.get("parameter_names") or []
+                            )
+                            parameter_bindings = dict(
+                                summary.get("parameter_defaults") or {}
+                            )
+                            for index, argument in enumerate(value.args):
+                                if (
+                                    index < len(parameter_names)
+                                    and isinstance(argument, ast.Constant)
+                                    and isinstance(argument.value, str)
+                                ):
+                                    parameter_bindings[parameter_names[index]] = str(
+                                        argument.value
+                                    )
+                            for keyword in value.keywords:
+                                if (
+                                    keyword.arg
+                                    and isinstance(keyword.value, ast.Constant)
+                                    and isinstance(keyword.value.value, str)
+                                ):
+                                    parameter_bindings[keyword.arg] = str(
+                                        keyword.value.value
+                                    )
+                            for output_field, field_summary in (
+                                summary.get("derived_fields") or {}
+                            ).items():
+                                source_fields = [
+                                    parameter_bindings.get(
+                                        field.removeprefix("@parameter:"),
+                                        "",
+                                    )
+                                    if field.startswith("@parameter:")
+                                    else field
+                                    for field in (
+                                        (field_summary or {}).get("source_fields") or []
+                                    )
+                                ]
+                                source_fields = [
+                                    field for field in source_fields if field
+                                ]
+                                origin = merge_origins(*(
+                                    (frame_columns.get(target) or {}).get(field)
+                                    for field in source_fields
+                                ))
+                                if not origin.get("queries"):
+                                    continue
+                                operation_ids = {
+                                    str(item)
+                                    for item in (
+                                        (field_summary or {}).get("operation_ids") or []
+                                    )
+                                    if str(item) in operation_by_id
+                                }
+                                origin["operations"].update(operation_ids)
+                                if operation_ids:
+                                    origin["boundaries"] = operation_ids
+                                frame_columns.setdefault(target, {})[
+                                    str(output_field)
+                                ] = origin
+                            frame_positions[target] = [
+                                frame_columns[target][field]
+                                for field in frame_columns[target]
+                            ]
+                            scalar_origins[target] = merge_origins(
+                                *frame_columns[target].values()
+                            )
+                            continue
                         output_columns: dict[str, dict[str, set[str]]] = {}
                         operation_id = str(summary.get("operation_id") or "")
                         for output_field, field_summary in (

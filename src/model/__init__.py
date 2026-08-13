@@ -514,7 +514,7 @@ class InsightTaskRun(Base):
     run_id = Column(String(64), nullable=False, unique=True, comment='Public run id')
     task_definition_id = Column(Integer, nullable=False, comment='Task definition id')
     revision_id = Column(Integer, nullable=False, comment='Revision id used by this run')
-    trigger_type = Column(String(32), nullable=False, default='scheduled', comment='scheduled or manual')
+    trigger_type = Column(String(32), nullable=False, default='scheduled', comment='initial, scheduled or manual')
     scheduled_for = Column(DateTime, nullable=False, comment='Logical scheduled time in UTC')
     status = Column(String(32), nullable=False, default='queued', comment='Run lifecycle status')
     dispatch_attempts = Column(Integer, nullable=False, default=0, comment='Gateway dispatch attempt count')

@@ -659,7 +659,7 @@
                     type="button"
                     @click="selectInsightTaskRun(run)"
                   >
-                    <span>{{ run.trigger_type === 'manual' ? '手动执行' : '定时执行' }}</span>
+                    <span>{{ formatTaskRunTrigger(run.trigger_type) }}</span>
                     <span class="detail-pill" :class="{ muted: run.status !== 'success' }">{{ run.status }}</span>
                     <span>{{ formatDateTime(run.scheduled_for) }}</span>
                     <span>{{ run.execution_seconds ? `${(run.execution_seconds / 1000).toFixed(1)}s` : '-' }}</span>
@@ -2532,6 +2532,12 @@ const formatTaskSchedule = (schedule = {}) => {
   if (frequency === 'monthly') return `每月 ${schedule.day_of_month || 1} 日 ${schedule.time || '09:00'}`
   const weekdayLabels = (schedule.weekdays || []).map((item) => weekdayOptions.find((option) => option.value === item)?.label || item)
   return `每周 ${weekdayLabels.join('、')} ${schedule.time || '09:00'}`
+}
+
+const formatTaskRunTrigger = (triggerType) => {
+  if (triggerType === 'initial') return '初次执行'
+  if (triggerType === 'manual') return '手动执行'
+  return '定时执行'
 }
 
 const normalizeLlmModels = (items = []) =>

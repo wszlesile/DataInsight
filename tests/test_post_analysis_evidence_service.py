@@ -4078,6 +4078,160 @@ def test_query_reachable_fields_include_derived_dataframe_columns():
     assert "missing_amount" not in fields
 
 
+def test_table_wrapper_and_frame_transform_keep_derived_column_lineage():
+    code = '''
+sql_domain = "SELECT batch_count, sample_count, oos_count, alarm_count FROM quality"
+domain = load_data_with_sql(sql=sql_domain)
+
+def risk_metrics(df, denominator="batch_count"):
+    result = df.copy()
+    result["oos_rate"] = result["oos_count"] / result[denominator] * 100
+    alarm_rate = result["alarm_count"] / result[denominator]
+    result["alarm_rate"] = alarm_rate
+    return result
+
+def business_table(data, columns, labels, title):
+    return build_table_result(
+        title=title,
+        columns=[{"key": key, "label": label} for key, label in zip(columns, labels)],
+        data=data,
+    )
+
+domain = risk_metrics(domain, denominator="sample_count")
+tables = [business_table(
+    domain.head(5),
+    ["batch_count", "oos_rate", "alarm_rate"],
+    ["Batches", "OOS rate", "Alarms per batch"],
+    "Quality risk",
+)]
+'''
+    snapshot = _snapshot(
+        code=code,
+        query_snapshots={
+            "q_quality": _query_snapshot(
+                "SELECT batch_count, sample_count, oos_count, alarm_count FROM quality",
+                columns=["batch_count", "sample_count", "oos_count", "alarm_count"],
+            ),
+        },
+        tables=[{
+            "title": "Quality risk",
+            "columns": [
+                {"key": "batch_count", "label": "Batches"},
+                {"key": "oos_rate", "label": "OOS rate"},
+                {"key": "alarm_rate", "label": "Alarms per batch"},
+            ],
+            "rows": [{"batch_count": 10, "oos_rate": 20.0, "alarm_rate": 0.3}],
+        }],
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    outputs = {
+        item["field"]: item
+        for item in lineage["output_nodes"]
+        if item.get("artifact_type") == "table"
+    }
+
+    assert outputs["oos_rate"]["source_frame"] == "domain"
+    assert outputs["oos_rate"]["candidate_query_node_ids"] == ["q_quality"]
+    assert outputs["oos_rate"]["structured_origin"] is True
+    assert outputs["oos_rate"]["boundary_operation_node_ids"]
+    assert outputs["alarm_rate"]["candidate_query_node_ids"] == ["q_quality"]
+    assert outputs["alarm_rate"]["structured_origin"] is True
+
+    bundle = PostAnalysisEvidenceCompiler(
+        planner=lambda _: EvidencePlan(),
+    ).compile(snapshot)
+    refs = {
+        item["column_key"]: item["evidence_key"]
+        for item in bundle["table_trace_refs"]
+    }
+    definitions = {
+        item["evidence_key"]: item
+        for item in bundle["evidence_definitions"]
+    }
+
+    assert bundle["status"] == "complete"
+    assert set(refs) == {"batch_count", "oos_rate", "alarm_rate"}
+    assert set(
+        definitions[refs["oos_rate"]]["calculation"]["metric_fields"]
+    ) == {"sample_count", "oos_count"}
+    assert set(
+        definitions[refs["alarm_rate"]]["calculation"]["metric_fields"]
+    ) == {"sample_count", "alarm_count"}
+    assert refs["oos_rate"] != refs["alarm_rate"]
+
+
+def test_same_derived_table_column_keeps_distinct_query_boundaries():
+    code = '''
+sql_product = "SELECT total_count, issue_count FROM product_quality"
+sql_team = "SELECT total_count, issue_count FROM team_quality"
+product = load_data_with_sql(sql=sql_product)
+team = load_data_with_sql(sql=sql_team)
+
+def with_issue_rate(df):
+    result = df.copy()
+    result["issue_rate"] = result["issue_count"] / result["total_count"] * 100
+    return result
+
+def business_table(data, title):
+    return build_table_result(
+        title=title,
+        columns=[{"key": "issue_rate", "label": "Issue rate"}],
+        data=data,
+    )
+
+product = with_issue_rate(product)
+team = with_issue_rate(team)
+tables = [
+    business_table(product, "Product quality"),
+    business_table(team, "Team quality"),
+]
+'''
+    snapshot = _snapshot(
+        code=code,
+        query_snapshots={
+            "q_product": _query_snapshot(
+                "SELECT total_count, issue_count FROM product_quality",
+                columns=["total_count", "issue_count"],
+            ),
+            "q_team": _query_snapshot(
+                "SELECT total_count, issue_count FROM team_quality",
+                columns=["total_count", "issue_count"],
+            ),
+        },
+        tables=[
+            {
+                "title": "Product quality",
+                "columns": [{"key": "issue_rate", "label": "Issue rate"}],
+                "rows": [{"issue_rate": 10.0}],
+            },
+            {
+                "title": "Team quality",
+                "columns": [{"key": "issue_rate", "label": "Issue rate"}],
+                "rows": [{"issue_rate": 20.0}],
+            },
+        ],
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(
+        planner=lambda _: EvidencePlan(),
+    ).compile(snapshot)
+    definitions = {
+        item["evidence_key"]: item
+        for item in bundle["evidence_definitions"]
+    }
+    refs = sorted(
+        bundle["table_trace_refs"],
+        key=lambda item: item["table_index"],
+    )
+
+    assert bundle["status"] == "complete"
+    assert len(refs) == 2
+    assert refs[0]["evidence_key"] != refs[1]["evidence_key"]
+    assert definitions[refs[0]["evidence_key"]]["query_refs"] == ["q_product"]
+    assert definitions[refs[1]["evidence_key"]]["query_refs"] == ["q_team"]
+
+
 def test_attested_derived_field_is_not_rejected_by_static_candidate_field_list():
     candidate = {
         "calculation_id": "report_semantic_scope",

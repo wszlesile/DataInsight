@@ -138,7 +138,7 @@ POST /api/insight/tasks/internal/runs/{run_id}/execute
 ```ts
 type InsightTaskStatus = 'enabled' | 'paused'
 type InsightTaskRunStatus = 'queued' | 'running' | 'success' | 'failed' | 'cancelled'
-type InsightTaskTriggerType = 'manual' | 'scheduled'
+type InsightTaskTriggerType = 'initial' | 'manual' | 'scheduled'
 
 interface InsightTaskSchedule {
   frequency: 'daily' | 'weekdays' | 'weekly' | 'monthly'
@@ -452,9 +452,9 @@ const runStatusLabels = {
 GET /api/insight/tasks/{task_id}/runs?page_no=2&page_size=50
 ```
 
-列表按 `scheduled_for` 倒序展示：
+列表按 `scheduled_for` 倒序展示。任务创建时已包含一条来源会话分析结果对应的成功记录，触发方式为 `initial`，前端显示为“初次执行”，因此新任务的报告与执行记录都不为空。
 
-- 触发方式：手动执行或定时执行。
+- 触发方式：初次执行、手动执行或定时执行。
 - 运行状态。
 - 计划执行时间。
 - 执行耗时。
