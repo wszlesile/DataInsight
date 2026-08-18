@@ -962,20 +962,6 @@ def _stream_analysis_preparation(
 
 
 def _resolve_runtime_context_mode(runtime: ConversationRunContext, user_message: str) -> str:
-    if runtime.is_rerun and _rerun_has_prior_analysis_activity(runtime):
-        context_mode = classify_analysis_context_mode(user_message)
-        if context_mode == 'general':
-            context_mode = 'fresh_analysis'
-        runtime.context_mode = context_mode
-        logger.info(
-            "Resolved analysis context mode for prior analysis rerun locally: "
-            "conversation_id=%s turn_id=%s mode=%s",
-            getattr(runtime.conversation, 'id', ''),
-            getattr(runtime.turn, 'id', ''),
-            context_mode,
-        )
-        return context_mode
-
     classification = resolve_context_mode_with_llm(runtime, user_message)
     runtime.context_mode = classification.mode
     logger.info(
@@ -991,8 +977,6 @@ def _resolve_runtime_context_mode(runtime: ConversationRunContext, user_message:
 
 
 def _is_analysis_request_expected(runtime: ConversationRunContext, user_message: str) -> bool:
-    if runtime.is_rerun and _rerun_has_prior_analysis_activity(runtime):
-        return True
     if _is_regenerate_request(user_message):
         return True
     context_mode = getattr(runtime, 'context_mode', '') or classify_analysis_context_mode(user_message)
@@ -1417,44 +1401,6 @@ def _build_followup_anchor_instruction_lines(runtime: ConversationRunContext) ->
     return lines
 
 
-def _rerun_has_prior_analysis_activity(runtime: ConversationRunContext) -> bool:
-    """Return whether the original turn already entered the analysis execution path."""
-    if not runtime.is_rerun:
-        return False
-
-    cache = getattr(runtime, 'short_term_memory', None)
-    if not isinstance(cache, dict):
-        cache = {}
-        runtime.short_term_memory = cache
-    cache_key = 'rerun_has_prior_analysis_activity'
-    if cache_key in cache:
-        return bool(cache[cache_key])
-
-    from model import InsightNsArtifact, InsightNsExecution
-
-    def _has_prior(session):
-        started_at = getattr(runtime.turn, 'started_at', None)
-        execution_query = session.query(InsightNsExecution.id).filter(
-            InsightNsExecution.conversation_id == runtime.conversation.id,
-            InsightNsExecution.turn_id == runtime.turn.id,
-            InsightNsExecution.is_deleted == 0,
-        )
-        artifact_query = session.query(InsightNsArtifact.id).filter(
-            InsightNsArtifact.conversation_id == runtime.conversation.id,
-            InsightNsArtifact.turn_id == runtime.turn.id,
-            InsightNsArtifact.is_deleted == 0,
-        )
-        if started_at is not None:
-            execution_query = execution_query.filter(InsightNsExecution.created_at < started_at)
-            artifact_query = artifact_query.filter(InsightNsArtifact.created_at < started_at)
-        return execution_query.first() is not None or artifact_query.first() is not None
-
-    with session_scope(expire_on_commit=False) as session:
-        result = _has_prior(session)
-    cache[cache_key] = result
-    return result
-
-
 def _rerun_has_prior_analysis_result(
     service: ConversationContextService,
     runtime: ConversationRunContext,
@@ -1498,6 +1444,8 @@ def _should_require_rerun_analysis_execution(
 ) -> bool:
     """刷新时只有存在分析链路证据，才强制必须完成 execute_python 产物闭环。"""
     if not runtime.is_rerun:
+        return False
+    if getattr(runtime, 'context_mode', '') == 'general':
         return False
     if analysis_flow_started:
         return True
@@ -2631,6 +2579,12 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 agent_response.get('messages', [])
             )
 
+            # A general answer has no execution or artifact contract. In
+            # particular, stale executions from an earlier failed run of the
+            # same turn must not pull a rerun into the analysis repair loop.
+            if not analysis_request_expected:
+                break
+
             entered_analysis_flow = _did_enter_analysis_flow(
                 service=service,
                 runtime=runtime,
@@ -3031,6 +2985,12 @@ def _stream_with_runtime(
 
             if tool_result_ready:
                 analysis_flow_started = True
+                break
+
+            # A general answer has no execution or artifact contract. In
+            # particular, stale executions from an earlier failed run of the
+            # same turn must not pull a rerun into the analysis repair loop.
+            if not analysis_request_expected:
                 break
 
             entered_analysis_flow = _did_enter_analysis_flow(

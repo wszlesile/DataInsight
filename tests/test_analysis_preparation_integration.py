@@ -282,11 +282,19 @@ def test_streaming_general_conversation_skips_preparation(monkeypatch):
         ),
     )
     monkeypatch.setattr(invoker, "_build_agent_context", lambda *_args, **_kwargs: SimpleNamespace())
-    monkeypatch.setattr(invoker, "_did_enter_analysis_flow", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        invoker,
+        "_did_enter_analysis_flow",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("general conversation must not inspect analysis executions")
+        ),
+    )
     monkeypatch.setattr(
         invoker,
         "_resolve_analysis_outputs",
-        lambda **kwargs: (kwargs["analysis_report"], kwargs["charts"] or [], kwargs["tables"] or []),
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("general conversation must not resolve analysis artifacts")
+        ),
     )
     monkeypatch.setattr(
         invoker,
@@ -311,20 +319,18 @@ def test_streaming_general_conversation_skips_preparation(monkeypatch):
     assert not any(event["type"] == "error" for event in events)
 
 
-def test_rerun_with_prior_analysis_activity_remains_an_analysis_request(monkeypatch):
+def test_rerun_failed_analysis_activity_does_not_override_general_mode(monkeypatch):
     runtime = _runtime(_snapshot(11))
     runtime.is_rerun = True
     runtime.context_mode = "general"
-    monkeypatch.setattr(invoker, "_rerun_has_prior_analysis_activity", lambda _runtime: True)
 
-    assert invoker._is_analysis_request_expected(runtime, "历史问题文本")
+    assert not invoker._is_analysis_request_expected(runtime, "历史问题文本")
 
 
 def test_rerun_without_prior_analysis_activity_respects_general_mode(monkeypatch):
     runtime = _runtime(_snapshot())
     runtime.is_rerun = True
     runtime.context_mode = "general"
-    monkeypatch.setattr(invoker, "_rerun_has_prior_analysis_activity", lambda _runtime: False)
 
     assert not invoker._is_analysis_request_expected(runtime, "你好")
 
@@ -332,7 +338,6 @@ def test_rerun_without_prior_analysis_activity_respects_general_mode(monkeypatch
 def test_rerun_without_prior_analysis_activity_uses_intent_classifier(monkeypatch):
     runtime = _runtime(_snapshot())
     runtime.is_rerun = True
-    monkeypatch.setattr(invoker, "_rerun_has_prior_analysis_activity", lambda _runtime: False)
     monkeypatch.setattr(
         invoker,
         "resolve_context_mode_with_llm",
@@ -347,10 +352,49 @@ def test_rerun_without_prior_analysis_activity_uses_intent_classifier(monkeypatc
     assert invoker._resolve_runtime_context_mode(runtime, "你好") == "general"
 
 
-def test_prior_analysis_rerun_does_not_downgrade_ambiguous_question(monkeypatch):
+def test_rerun_intent_classifier_is_authoritative_despite_prior_failed_activity(monkeypatch):
     runtime = _runtime(_snapshot(11))
     runtime.is_rerun = True
-    monkeypatch.setattr(invoker, "_rerun_has_prior_analysis_activity", lambda _runtime: True)
-    monkeypatch.setattr(invoker, "classify_analysis_context_mode", lambda _message: "general")
+    monkeypatch.setattr(
+        invoker,
+        "resolve_context_mode_with_llm",
+        lambda *_args: SimpleNamespace(
+            mode="general",
+            source="llm",
+            confidence=0.98,
+            reason="产品能力咨询",
+        ),
+    )
+
+    assert invoker._resolve_runtime_context_mode(runtime, "你最多支持多少数据源") == "general"
+
+
+def test_rerun_analysis_intent_still_uses_analysis_agent(monkeypatch):
+    runtime = _runtime(_snapshot(11))
+    runtime.is_rerun = True
+    monkeypatch.setattr(
+        invoker,
+        "resolve_context_mode_with_llm",
+        lambda *_args: SimpleNamespace(
+            mode="fresh_analysis",
+            source="llm",
+            confidence=0.99,
+            reason="请求分析合同情况",
+        ),
+    )
 
     assert invoker._resolve_runtime_context_mode(runtime, "年费合同情况如何") == "fresh_analysis"
+    assert invoker._is_analysis_request_expected(runtime, "年费合同情况如何")
+
+
+def test_general_rerun_does_not_require_prior_analysis_result_execution(monkeypatch):
+    runtime = _runtime(_snapshot(11))
+    runtime.is_rerun = True
+    runtime.context_mode = "general"
+    monkeypatch.setattr(
+        invoker,
+        "_rerun_has_prior_analysis_result",
+        lambda *_args: True,
+    )
+
+    assert not invoker._should_require_rerun_analysis_execution(None, runtime, False)
