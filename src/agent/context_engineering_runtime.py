@@ -155,7 +155,7 @@ def _prune_analysis_state_payload(payload: dict[str, Any], mode: str) -> dict[st
         if isinstance(item, dict) and item.get("execution_status") == "success"
     ]
 
-    if mode == 'fresh_analysis':
+    if mode in {'fresh_analysis', 'general'}:
         sanitized["recent_execution_summaries"] = successful_summaries[-2:]
         latest_execution = payload.get("latest_execution") or {}
         if isinstance(latest_execution, dict) and latest_execution.get("execution_status") == "success":
@@ -353,6 +353,7 @@ def get_datasource_message(
     namespace_id: int,
     conversation_id: int,
     snapshot_override: dict[str, Any] | None = None,
+    context_mode: str = "analysis",
 ) -> SystemMessage | None:
     namespace_id_int = to_int(namespace_id, 0)
     conversation_id_int = to_int(conversation_id, 0)
@@ -389,6 +390,11 @@ def get_datasource_message(
         payload: dict[str, Any] = {"datasources": [], "selected_datasource_ids": []}
         if namespace_id_int > 0:
             payload["namespace_id"] = namespace_id_int
+        if context_mode == "general":
+            return SystemMessage(
+                "当前会话数据源上下文：当前没有关联任何可用数据源。\n"
+                f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+            )
         return SystemMessage(
             "当前会话没有关联任何可直接使用的数据源。\n"
             "- 如果用户当前是在发起数据分析、统计、绘图、报表或依赖数据源内容的问题，不要调用 `execute_python`，不要生成 Python 代码。\n"
@@ -397,16 +403,49 @@ def get_datasource_message(
         )
 
     semantic_context = snapshot.get("analysis_semantic_context")
-    payload: dict[str, Any] = {
-        "runtime_capabilities": {
-            "query_execution": copy.deepcopy(QUERY_EXECUTION_CAPABILITIES),
-        },
-    }
     selected_ids = [
         to_int(item, 0)
         for item in snapshot.get('selected_datasource_ids', [])
         if to_int(item, 0) > 0
     ]
+    if context_mode == "general":
+        general_items: list[dict[str, Any]] = []
+        selected_id_set = set(selected_ids)
+        for item in datasource_items:
+            datasource_id = to_int(item.get("datasource_id"), 0)
+            general_item = {
+                "datasource_id": datasource_id or item.get("datasource_id"),
+                "datasource_name": item.get("datasource_name"),
+                "datasource_type": item.get("datasource_type"),
+                "metadata_schema": copy.deepcopy(item.get("metadata_schema") or {}),
+            }
+            datasource_identifier = item.get("datasource_identifier")
+            if datasource_identifier:
+                general_item["datasource_identifier"] = datasource_identifier
+            sheet_name = item.get("sheet_name")
+            if sheet_name:
+                general_item["sheet_name"] = sheet_name
+            if selected_id_set:
+                general_item["selected_for_current_context"] = datasource_id in selected_id_set
+            general_items.append(general_item)
+
+        general_payload: dict[str, Any] = {"datasources": general_items}
+        if namespace_id_int > 0:
+            general_payload["namespace_id"] = namespace_id_int
+        return SystemMessage(
+            "当前会话数据源上下文：\n"
+            "- `datasources` 提供当前会话可用于理解问题的数据源名称、类型和完整 Schema。\n"
+            "- `metadata_schema.properties` 中的字段名、展示名和说明可用于解释数据结构与字段语义。\n"
+            "- `selected_for_current_context=true` 表示该数据源属于当前已选范围；未提供该标记时，表示系统没有额外声明选择范围。\n"
+            "- `datasource_id` 和 `datasource_identifier` 只用于定位，不代表业务含义；除非用户明确询问技术标识，否则使用 `datasource_name` 对外表述。\n"
+            f"{json.dumps(general_payload, ensure_ascii=False, indent=2)}"
+        )
+
+    payload: dict[str, Any] = {
+        "runtime_capabilities": {
+            "query_execution": copy.deepcopy(QUERY_EXECUTION_CAPABILITIES),
+        },
+    }
     if isinstance(semantic_context, dict) and semantic_context:
         # Put the semantic handoff before the large Schema payload.  The runtime
         # still owns queries, metrics and narrative, but it must first see every

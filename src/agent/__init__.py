@@ -28,6 +28,7 @@ from utils.token_budget import describe_budget_split, estimate_message_tokens, e
 
 MessageT = TypeVar("MessageT", bound=BaseMessage, covariant=True)
 SYS_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "runtime" / "sys_prompt.md"
+GENERAL_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "runtime" / "general_chat.md"
 
 
 class CustomAgentState(AgentState):
@@ -59,8 +60,15 @@ def load_system_prompt() -> str:
     return SYS_PROMPT_PATH.read_text(encoding='utf-8').strip()
 
 
+@lru_cache(maxsize=1)
+def load_general_system_prompt() -> str:
+    """Load the tool-free prompt used for ordinary conversation."""
+    return GENERAL_PROMPT_PATH.read_text(encoding='utf-8').strip()
+
+
 AGENT_CACHE_MAX_SIZE = 8
 _AGENT_CACHE: OrderedDict[str, Any] = OrderedDict()
+_GENERAL_AGENT_CACHE: OrderedDict[str, Any] = OrderedDict()
 
 
 def create_data_insight_model(runtime_config: LlmRuntimeConfig | None = None):
@@ -78,8 +86,19 @@ def create_data_insight_agent(runtime_config: LlmRuntimeConfig | None = None):
     )
 
 
+def create_general_conversation_agent(runtime_config: LlmRuntimeConfig | None = None):
+    """Create a tool-free agent for product questions and ordinary conversation."""
+    return create_agent(
+        model=create_data_insight_model(runtime_config),
+        state_schema=CustomAgentState,
+        context_schema=CustomContext,
+        tools=[],
+    )
+
+
 def clear_data_insight_agent_cache() -> None:
     _AGENT_CACHE.clear()
+    _GENERAL_AGENT_CACHE.clear()
 
 
 def get_data_insight_agent(runtime_config: LlmRuntimeConfig | None = None):
@@ -100,6 +119,27 @@ def get_data_insight_agent(runtime_config: LlmRuntimeConfig | None = None):
     _AGENT_CACHE.move_to_end(cache_key)
     while len(_AGENT_CACHE) > AGENT_CACHE_MAX_SIZE:
         _AGENT_CACHE.popitem(last=False)
+    return agent
+
+
+def get_general_conversation_agent(runtime_config: LlmRuntimeConfig | None = None):
+    """Lazy-create and reuse tool-free conversation agents by model config."""
+    runtime_config = runtime_config or create_runtime_config()
+    cache_key = runtime_config.cache_key
+    cached = _GENERAL_AGENT_CACHE.get(cache_key)
+    if cached is not None:
+        _GENERAL_AGENT_CACHE.move_to_end(cache_key)
+        return cached
+
+    try:
+        agent = create_general_conversation_agent(runtime_config)
+    except Exception as exc:
+        logger.error("General conversation Agent initialization failed: %s", exc, exc_info=True)
+        raise
+    _GENERAL_AGENT_CACHE[cache_key] = agent
+    _GENERAL_AGENT_CACHE.move_to_end(cache_key)
+    while len(_GENERAL_AGENT_CACHE) > AGENT_CACHE_MAX_SIZE:
+        _GENERAL_AGENT_CACHE.popitem(last=False)
     return agent
 
 
@@ -383,6 +423,97 @@ def get_input(
             context_mode=context_mode,
         )
     )
+
+
+def build_general_prompt_messages(
+    user_message: str,
+    namespace_id: int = 0,
+    conversation_id: int = 0,
+    history_turn_limit: int | None = None,
+    datasource_snapshot_override: dict[str, Any] | None = None,
+) -> list[BaseMessage]:
+    """Build the normal conversation context while excluding analysis execution APIs."""
+    base_system_messages: list[BaseMessage] = [SystemMessage(load_general_system_prompt())]
+    conversation_prompt = _build_conversation_prompt_message(namespace_id, conversation_id)
+    if conversation_prompt is not None:
+        base_system_messages.append(conversation_prompt)
+    base_system_messages.append(_build_runtime_environment_message())
+
+    current_system_messages: list[BaseMessage] = []
+    datasource_message = get_datasource_message(
+        namespace_id=namespace_id,
+        conversation_id=conversation_id,
+        snapshot_override=datasource_snapshot_override,
+        context_mode="general",
+    )
+    if datasource_message is not None:
+        current_system_messages.append(datasource_message)
+    current_system_messages.append(_build_user_visible_language_message())
+
+    user_tail_message = HumanMessage(user_message)
+    mandatory_system_content = _merge_system_messages(
+        base_system_messages,
+        current_system_messages,
+    )
+    mandatory_messages: list[BaseMessage] = [SystemMessage(mandatory_system_content), user_tail_message]
+    budget_split = describe_budget_split(
+        max_prompt_tokens=Config.CONTEXT_COMPRESSION_PROMPT_MAX_TOKENS,
+        fixed_tokens=estimate_messages_tokens(mandatory_messages),
+        history_ratio=Config.CONTEXT_COMPRESSION_HISTORY_TOKEN_RATIO,
+        min_history_tokens=Config.CONTEXT_COMPRESSION_MIN_HISTORY_TOKENS,
+        min_memory_tokens=Config.CONTEXT_COMPRESSION_MIN_MEMORY_TOKENS,
+    )
+
+    memory_messages = get_memory_messages(
+        conversation_id,
+        user_message=user_message,
+        max_turn_no=history_turn_limit,
+        active_snapshot_override=datasource_snapshot_override,
+        token_budget=budget_split["memory_budget"],
+        context_mode='general',
+    ) if budget_split["memory_budget"] > 0 else []
+    memory_messages = _fit_optional_messages_within_budget(
+        memory_messages,
+        budget_split["memory_budget"],
+    )
+
+    system_content = _merge_system_messages(
+        base_system_messages,
+        memory_messages,
+        current_system_messages,
+    )
+    messages: list[BaseMessage] = [SystemMessage(system_content)]
+    if budget_split["history_budget"] > 0:
+        history_messages = get_history_messages(
+            conversation_id,
+            max_turn_no=history_turn_limit,
+            user_message=user_message,
+            token_budget=budget_split["history_budget"],
+            context_mode='general',
+        )
+        messages.extend(_fit_optional_messages_within_budget(
+            history_messages,
+            budget_split["history_budget"],
+        ))
+    messages.append(user_tail_message)
+    return messages
+
+
+def get_general_input(
+    message: str,
+    namespace_id: int = 0,
+    conversation_id: int = 0,
+    history_turn_limit: int | None = None,
+    datasource_snapshot_override: dict[str, Any] | None = None,
+) -> Any:
+    """Build the input payload for a tool-free ordinary conversation turn."""
+    return InputMessage(messages=build_general_prompt_messages(
+        user_message=message,
+        namespace_id=namespace_id,
+        conversation_id=conversation_id,
+        history_turn_limit=history_turn_limit,
+        datasource_snapshot_override=datasource_snapshot_override,
+    ))
 
 
 EXPLICIT_YEAR_PATTERN = re.compile(r'(?<!\d)((?:19|20)\d{2})(?!\d)')

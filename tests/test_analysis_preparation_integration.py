@@ -260,13 +260,27 @@ def test_streaming_general_conversation_skips_preparation(monkeypatch):
             }
 
     monkeypatch.setattr(invoker, "_resolve_agent_runtime_config", lambda _request: SimpleNamespace())
-    monkeypatch.setattr(invoker, "get_data_insight_agent", lambda _config: FakeAgent())
+    monkeypatch.setattr(invoker, "get_general_conversation_agent", lambda _config: FakeAgent())
+    monkeypatch.setattr(
+        invoker,
+        "get_data_insight_agent",
+        lambda _config: (_ for _ in ()).throw(
+            AssertionError("general conversation must not use the analysis agent")
+        ),
+    )
     monkeypatch.setattr(
         invoker,
         "_stream_analysis_preparation",
         lambda **_kwargs: (_ for _ in ()).throw(AssertionError("general conversation must skip Preparation")),
     )
-    monkeypatch.setattr(invoker, "_build_agent_input_with_runtime_instruction", lambda **_kwargs: {})
+    monkeypatch.setattr(invoker, "get_general_input", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        invoker,
+        "_build_agent_input_with_runtime_instruction",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("general conversation must not build analysis context")
+        ),
+    )
     monkeypatch.setattr(invoker, "_build_agent_context", lambda *_args, **_kwargs: SimpleNamespace())
     monkeypatch.setattr(invoker, "_did_enter_analysis_flow", lambda **_kwargs: False)
     monkeypatch.setattr(

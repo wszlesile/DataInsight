@@ -51,6 +51,38 @@ class LlmRuntimeConfigTestCase(unittest.TestCase):
         self.assertIs(first, second)
         self.assertEqual(factory.call_count, 1)
 
+    def test_general_agent_cache_is_separate_from_analysis_agent(self) -> None:
+        import agent
+        from utils.llm_model_factory import LlmRuntimeConfig
+
+        agent.clear_data_insight_agent_cache()
+        runtime_config = LlmRuntimeConfig(
+            provider="supos_llm_gateway",
+            model_id="model-b",
+            base_url="http://supos.example/os/llm-gateway/v1",
+            api_key="app-key",
+            temperature=0.2,
+            adapter="openai",
+        )
+
+        with patch("agent.create_general_conversation_agent", side_effect=lambda _config: object()) as factory:
+            first = agent.get_general_conversation_agent(runtime_config)
+            second = agent.get_general_conversation_agent(runtime_config)
+
+        self.assertIs(first, second)
+        self.assertEqual(factory.call_count, 1)
+
+    def test_general_agent_has_no_analysis_tools(self) -> None:
+        import agent
+
+        with (
+            patch("agent.create_data_insight_model", return_value=object()),
+            patch("agent.create_agent", return_value=object()) as factory,
+        ):
+            agent.create_general_conversation_agent()
+
+        self.assertEqual(factory.call_args.kwargs["tools"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

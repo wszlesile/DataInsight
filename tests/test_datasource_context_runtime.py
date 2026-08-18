@@ -213,6 +213,111 @@ def test_datasource_query_contract_localizes_verified_key_cardinality(monkeypatc
     }]
 
 
+def test_general_datasource_context_keeps_schema_without_analysis_execution_contract(monkeypatch):
+    properties = {
+        "contract_amount": {
+            "type": "number",
+            "displayName": "合同金额",
+            "description": "合同含税金额",
+        },
+        "customer_name": {
+            "type": "string",
+            "displayName": "客户名称",
+        },
+    }
+    snapshot = {
+        "selected_datasource_ids": [78],
+        "selected_datasource_snapshot": [{
+            "datasource_id": 78,
+            "datasource_name": "合同事实",
+            "datasource_type": "table",
+            "datasource_identifier": "dw.contract",
+            "metadata_schema": {
+                "properties": properties,
+                "required": ["contract_amount", "customer_name"],
+            },
+            "field_capabilities": {
+                "queryable_fields": ["contract_amount", "customer_name"],
+            },
+        }],
+        "analysis_semantic_context": {"analysis_goal": "分析合同情况"},
+    }
+    monkeypatch.setattr(runtime_context, "_load_conversation", lambda _: None)
+
+    message = runtime_context.get_datasource_message(
+        namespace_id=6,
+        conversation_id=99,
+        snapshot_override=snapshot,
+        context_mode="general",
+    )
+
+    payload = json.loads(message.content[message.content.index("{"):])
+    datasource = payload["datasources"][0]
+    assert datasource["metadata_schema"]["properties"] == properties
+    assert datasource["selected_for_current_context"] is True
+    assert datasource["datasource_name"] == "合同事实"
+    assert "runtime_capabilities" not in payload
+    assert "analysis_semantic_context" not in payload
+    assert "query_contract" not in datasource
+    assert "field_capabilities" not in datasource
+    assert "execute_python" not in message.content
+    assert "Probe" not in message.content
+
+
+def test_general_datasource_context_handles_empty_scope_without_analysis_instructions(monkeypatch):
+    monkeypatch.setattr(runtime_context, "_load_conversation", lambda _: None)
+    monkeypatch.setattr(runtime_context, "_load_conversation_datasources", lambda _: [])
+
+    message = runtime_context.get_datasource_message(
+        namespace_id=6,
+        conversation_id=99,
+        snapshot_override={"namespace_id": 6},
+        context_mode="general",
+    )
+
+    assert "当前没有关联任何可用数据源" in message.content
+    assert "execute_python" not in message.content
+    assert "生成 Python" not in message.content
+
+
+def test_general_memory_keeps_success_facts_without_failed_execution_noise():
+    payload = {
+        "recent_execution_summaries": [
+            {
+                "execution_id": 1,
+                "execution_status": "failed",
+                "analysis_report_preview": "失败结果",
+            },
+            {
+                "execution_id": 2,
+                "turn_id": 3,
+                "title": "合同分析",
+                "description": "分析合同情况",
+                "execution_status": "success",
+                "used_datasource_ids": [78],
+                "analysis_report_preview": "合同总数为 149 份",
+                "generated_code": "print('internal')",
+            },
+        ],
+        "latest_execution": {
+            "execution_id": 2,
+            "turn_id": 3,
+            "title": "合同分析",
+            "description": "分析合同情况",
+            "execution_status": "success",
+            "used_datasource_ids": [78],
+            "analysis_report_preview": "合同总数为 149 份",
+            "generated_code": "print('internal')",
+        },
+    }
+
+    pruned = runtime_context._prune_analysis_state_payload(payload, mode="general")
+
+    assert [item["execution_id"] for item in pruned["recent_execution_summaries"]] == [2]
+    assert pruned["latest_execution"]["analysis_report_preview"] == "合同总数为 149 份"
+    assert "generated_code" not in pruned["latest_execution"]
+
+
 def test_current_semantic_context_closes_merged_system_message(monkeypatch):
     monkeypatch.setattr(agent, "load_system_prompt", lambda: "CORE_RULES")
     monkeypatch.setattr(agent, "_build_conversation_prompt_message", lambda *_: None)
@@ -251,6 +356,51 @@ def test_current_semantic_context_closes_merged_system_message(monkeypatch):
     )
 
 
+def test_general_prompt_context_keeps_datasource_schema_and_analysis_memory(monkeypatch):
+    datasource_call = {}
+
+    def fake_get_datasource_message(**kwargs):
+        datasource_call.update(kwargs)
+        return SystemMessage("CURRENT_DATASOURCE_SCHEMA")
+
+    monkeypatch.setattr(agent, "load_general_system_prompt", lambda: "GENERAL_RULES")
+    monkeypatch.setattr(
+        agent,
+        "_build_runtime_environment_message",
+        lambda: SystemMessage("RUNTIME_ENVIRONMENT"),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_build_user_visible_language_message",
+        lambda: SystemMessage("LANGUAGE_RULES"),
+    )
+    monkeypatch.setattr(
+        agent,
+        "get_datasource_message",
+        fake_get_datasource_message,
+    )
+    monkeypatch.setattr(agent, "_build_conversation_prompt_message", lambda *_: None)
+    monkeypatch.setattr(
+        agent,
+        "get_memory_messages",
+        lambda *_, **__: [SystemMessage("RECENT_ANALYSIS_MEMORY")],
+    )
+    monkeypatch.setattr(agent, "get_history_messages", lambda *_, **__: [])
+
+    messages = agent.build_general_prompt_messages(
+        "你最多支持一次性分析多少数据源",
+        conversation_id=15,
+        history_turn_limit=2,
+    )
+
+    assert messages[0].content == (
+        "GENERAL_RULES\n\nRUNTIME_ENVIRONMENT\n\nRECENT_ANALYSIS_MEMORY\n\n"
+        "CURRENT_DATASOURCE_SCHEMA\n\nLANGUAGE_RULES"
+    )
+    assert messages[-1].content == "你最多支持一次性分析多少数据源"
+    assert datasource_call["context_mode"] == "general"
+
+
 def test_user_visible_language_contract_covers_sse_and_final_outputs():
     content = agent._build_user_visible_language_message().content
 
@@ -259,3 +409,40 @@ def test_user_visible_language_contract_covers_sse_and_final_outputs():
     assert "最终回答、分析报告、图表标题、表格标题和业务说明" in content
     assert "SSE" not in content
     assert "内部思维链" not in content
+
+
+def test_analysis_prompt_does_not_repeat_general_conversation_routing():
+    content = agent.load_system_prompt()
+
+    assert "## 正式分析执行边界" in content
+    assert "## 意图分流规则" not in content
+    assert "### B. 不属于数据分析任务" not in content
+    assert "无数据源例外" not in content
+    assert "普通问答或产品咨询" in content
+    assert "知识库上下文（预留）" not in content
+    assert "{user_input}" not in content
+    assert "## 技术栈参考" not in content
+    assert "本文档版本" not in content
+    assert "最后更新" not in content
+
+
+def test_general_prompt_carries_ordinary_answer_capabilities_without_runtime_protocol():
+    content = agent.load_general_system_prompt()
+
+    assert "普通问答" in content
+    assert "通用概念解释" in content
+    assert "产品使用与能力咨询" in content
+    assert "历史对话用于理解" in content
+    assert "最近成功执行摘要" in content
+    assert "完整 Schema" in content
+    assert "已有结果" in content
+    assert "MinIO 远程文件" in content
+    assert "HTTP API 数据源" in content
+    assert "内部类型 `table` 对外称为 UNS 文件" in content
+    assert "折线图、柱状图、饼图、散点图和箱线图" in content
+    assert "趋势、对比、异常、业务含义与可操作建议" in content
+    assert "10000 行" in content
+    assert "execute_python" not in content
+    assert "load_data_with_sql" not in content
+    assert "request_retry" not in content
+    assert "QuerySnapshot" not in content

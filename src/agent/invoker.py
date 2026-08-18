@@ -12,7 +12,13 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy.exc import SQLAlchemyError
 
-from agent import CustomContext, get_data_insight_agent, get_input
+from agent import (
+    CustomContext,
+    get_data_insight_agent,
+    get_general_conversation_agent,
+    get_general_input,
+    get_input,
+)
 from agent.analysis_preparation import (
     BusinessFactCoverageContract,
     BusinessFactRequirementContract,
@@ -667,6 +673,36 @@ def _build_agent_input_with_runtime_instruction(
             else runtime.active_datasource_snapshot
         ),
         context_mode=getattr(runtime, 'context_mode', None),
+    )
+
+
+def _get_runtime_agent(runtime_config, *, analysis_request_expected: bool):
+    if analysis_request_expected:
+        return get_data_insight_agent(runtime_config)
+    return get_general_conversation_agent(runtime_config)
+
+
+def _build_runtime_agent_input(
+    *,
+    agent_request: AgentRequest,
+    runtime: ConversationRunContext,
+    analysis_request_expected: bool,
+    runtime_instruction: str = '',
+    preparation: PreparationResult | None = None,
+):
+    if not analysis_request_expected:
+        return get_general_input(
+            agent_request.user_message,
+            namespace_id=runtime.conversation.insight_namespace_id,
+            conversation_id=runtime.conversation.id,
+            history_turn_limit=runtime.history_turn_limit,
+            datasource_snapshot_override=runtime.active_datasource_snapshot,
+        )
+    return _build_agent_input_with_runtime_instruction(
+        agent_request=agent_request,
+        runtime=runtime,
+        runtime_instruction=runtime_instruction,
+        preparation=preparation,
     )
 
 
@@ -2538,7 +2574,10 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 allow_report_only=allow_report_only,
             )
 
-        agent = get_data_insight_agent(runtime_config)
+        agent = _get_runtime_agent(
+            runtime_config,
+            analysis_request_expected=analysis_request_expected,
+        )
 
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
             _raise_if_analysis_task_cancelled(runtime)
@@ -2573,9 +2612,10 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 runtime_instruction = _build_analysis_start_instruction(agent_request.user_message)
 
             agent_response = agent.invoke(
-                _build_agent_input_with_runtime_instruction(
+                _build_runtime_agent_input(
                     agent_request=agent_request,
                     runtime=runtime,
+                    analysis_request_expected=analysis_request_expected,
                     runtime_instruction=runtime_instruction,
                     preparation=preparation,
                 ),
@@ -2818,7 +2858,10 @@ def _stream_with_runtime(
             )
             return
 
-        agent = get_data_insight_agent(runtime_config)
+        agent = _get_runtime_agent(
+            runtime_config,
+            analysis_request_expected=analysis_request_expected,
+        )
 
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
             _raise_if_analysis_task_cancelled(runtime)
@@ -2871,9 +2914,10 @@ def _stream_with_runtime(
                 )
 
             for stream_mode, chunk in agent.stream(
-                _build_agent_input_with_runtime_instruction(
+                _build_runtime_agent_input(
                     agent_request=agent_request,
                     runtime=runtime,
+                    analysis_request_expected=analysis_request_expected,
                     runtime_instruction=runtime_instruction,
                     preparation=preparation,
                 ),
