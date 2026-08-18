@@ -185,6 +185,11 @@ class Logger:
         kwargs.setdefault('stacklevel', 3)
         self._log('error', message, *args, **kwargs)
 
+    def exception(self, message: str, *args, **kwargs):
+        kwargs.setdefault('stacklevel', 3)
+        kwargs.setdefault('exc_info', True)
+        self._log('exception', message, *args, **kwargs)
+
     def critical(self, message: str, *args, **kwargs):
         kwargs.setdefault('stacklevel', 3)
         self._log('critical', message, *args, **kwargs)

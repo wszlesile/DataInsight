@@ -249,3 +249,13 @@ def test_current_semantic_context_closes_merged_system_message(monkeypatch):
     assert system_text.index("CURRENT_SCHEMA_AND_SEMANTIC_CONTEXT") < system_text.index(
         "CURRENT_REPAIR_INSTRUCTION"
     )
+
+
+def test_user_visible_language_contract_covers_sse_and_final_outputs():
+    content = agent._build_user_visible_language_message().content
+
+    assert "根据当前用户问题及最近对话自动判断本轮主要自然语言" in content
+    assert "工具调用前的中间分析、思考或规划说明" in content
+    assert "最终回答、分析报告、图表标题、表格标题和业务说明" in content
+    assert "SSE" not in content
+    assert "内部思维链" not in content

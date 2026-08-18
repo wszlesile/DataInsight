@@ -159,6 +159,17 @@ def _build_runtime_environment_message() -> SystemMessage:
     )
 
 
+def _build_user_visible_language_message() -> SystemMessage:
+    """Keep intermediate and final model output in the user's conversation language."""
+    return SystemMessage(
+        "用户可见输出语言契约：\n"
+        "- 根据当前用户问题及最近对话自动判断本轮主要自然语言；用户明确指定输出语言时，以用户指定为准。当前问题过短或语言特征不明显时，沿用最近对话的主要语言。\n"
+        "- 所有面向用户的自然语言文本必须保持该语言一致，包括工具调用前的中间分析、思考或规划说明，以及最终回答、分析报告、图表标题、表格标题和业务说明。\n"
+        "- 代码、Schema 字段名、API 名称和必要的技术标识保持原样。\n"
+        "- 执行错误修复不得翻译或切换已经形成的用户可见内容语言。"
+    )
+
+
 def _load_conversation_prompt_content(namespace_id: int, conversation_id: int) -> str:
     try:
         namespace_id_int = int(namespace_id or 0)
@@ -287,10 +298,7 @@ def build_prompt_messages(
     current_system_messages: list[BaseMessage] = []
     if datasource_message is not None:
         current_system_messages.append(datasource_message)
-    current_system_messages.append(SystemMessage(
-        "本轮输出语言契约：除非用户明确指定另一种语言，最终分析报告、图表标题、表格标题与业务说明"
-        "必须沿用当前用户问题的主要自然语言；执行错误修复不得翻译或切换已经形成的报告语言。"
-    ))
+    current_system_messages.append(_build_user_visible_language_message())
     current_system_messages.extend(runtime_messages)
 
     mandatory_system_messages = [*base_system_messages, *current_system_messages]

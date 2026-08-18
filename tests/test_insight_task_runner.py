@@ -10,6 +10,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from insight_task.runner import InsightTaskRunner  # noqa: E402
+from insight_task.dispatcher import InsightTaskDispatchError  # noqa: E402
 
 
 def test_local_runner_executes_in_process_with_local_dual_token_context():
@@ -57,3 +58,25 @@ def test_production_runner_keeps_gateway_dispatch():
         assert runner._dispatch_one('run-2') is True
 
     dispatch.assert_called_once_with('run-2')
+
+
+def test_production_runner_records_dispatch_failure_without_exiting():
+    runner = InsightTaskRunner()
+    failed_session = MagicMock()
+    failed_service = MagicMock()
+    dispatch_error = InsightTaskDispatchError('gateway unavailable', retryable=True)
+
+    with (
+        patch('insight_task.runner.Config.PROFILE', 'prod'),
+        patch.object(runner.dispatcher, 'dispatch', side_effect=dispatch_error),
+        patch('insight_task.runner.SessionLocal', return_value=failed_session),
+        patch('insight_task.runner.InsightTaskService', return_value=failed_service),
+    ):
+        assert runner._dispatch_one('run-3') is False
+
+    failed_service.record_dispatch_failure.assert_called_once_with(
+        run_id='run-3',
+        error_message='gateway unavailable',
+        retryable=True,
+    )
+    failed_session.close.assert_called_once()

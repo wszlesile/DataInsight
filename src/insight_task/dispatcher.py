@@ -27,6 +27,9 @@ class InsightTaskDispatcher:
             method='POST',
             headers={
                 'Authorization': authorization,
+                # Gateway replaces Authorization with the service JWT. Preserve
+                # the AppKey as the platform credential used by auth middleware.
+                'origin-token': authorization,
                 'Content-Type': 'application/json',
                 'X-Insight-Task-Run-ID': run_id,
             },
