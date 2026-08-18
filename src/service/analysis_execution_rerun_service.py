@@ -6,7 +6,13 @@ from sqlalchemy.orm import Session
 from agent.tools import run_generated_code_locally
 from analysis_runtime import AnalysisExecutionSnapshot, LocalAnalysisRuntime
 from analysis_runtime.parameters import normalize_parameter_schema, validate_analysis_parameters
-from model import InsightNsArtifact, InsightNsConversation, InsightNsExecution, InsightNsTurn
+from model import (
+    InsightDatasource,
+    InsightNsArtifact,
+    InsightNsConversation,
+    InsightNsExecution,
+    InsightNsTurn,
+)
 from service.analysis_task_service import AnalysisTaskService
 from utils.datasource_utils import dump_json, safe_json_loads, to_int
 
@@ -41,6 +47,7 @@ class AnalysisExecutionRerunService:
 
         schema = normalize_parameter_schema(safe_json_loads(original.analysis_parameters_schema_json, {}))
         normalized_parameters = validate_analysis_parameters(schema, analysis_parameters)
+        used_datasource_ids = safe_json_loads(original.used_datasource_ids_json, [])
         snapshot = AnalysisExecutionSnapshot(
             source_execution_id=original.id,
             conversation_id=conversation.id,
@@ -48,7 +55,8 @@ class AnalysisExecutionRerunService:
             code=original.generated_code,
             title=original.title,
             description=original.description,
-            used_datasource_ids=safe_json_loads(original.used_datasource_ids_json, []),
+            used_datasource_ids=used_datasource_ids,
+            datasource_bindings=self._datasource_bindings(used_datasource_ids),
             query_snapshots=(safe_json_loads(original.result_payload_json, {}) or {}).get('query_snapshots') or {},
             parameter_schema=schema,
             default_parameters=safe_json_loads(original.analysis_parameters_json, {}),
@@ -171,6 +179,29 @@ class AnalysisExecutionRerunService:
             InsightNsExecution.turn_id == turn.id,
             InsightNsExecution.is_deleted == 0,
         ).first()
+
+    def _datasource_bindings(self, datasource_ids: list[Any]) -> list[dict[str, Any]]:
+        normalized_ids = [
+            to_int(item, 0)
+            for item in datasource_ids
+            if to_int(item, 0) > 0
+        ]
+        if not normalized_ids:
+            return []
+        rows = self.session.query(InsightDatasource).filter(
+            InsightDatasource.id.in_(normalized_ids),
+            InsightDatasource.is_deleted == 0,
+        ).all()
+        by_id = {row.id: row for row in rows}
+        return [
+            {
+                'datasource_id': datasource_id,
+                'datasource_name': by_id[datasource_id].datasource_name,
+                'datasource_type': by_id[datasource_id].datasource_type,
+            }
+            for datasource_id in normalized_ids
+            if datasource_id in by_id
+        ]
 
     def _load_execution_dict(self, execution_id: Any) -> dict[str, Any] | None:
         execution_id_int = to_int(execution_id, 0)

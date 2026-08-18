@@ -11018,6 +11018,13 @@ def run_generated_code_locally(
         )
         return {'execution_id': execution_id, 'status': 'invalid', 'error_message': error_message}
 
+    from service.report_presentation_service import normalize_report_presentation
+
+    exec_result.analysis_report = normalize_report_presentation(
+        exec_result.analysis_report,
+        runtime_payload.get('datasource_bindings'),
+    )
+
     result_schema = exec_result.analysis_parameters_schema or analysis_parameters_schema or {}
     result_parameters = exec_result.analysis_parameters or analysis_parameters or {}
     _update_execution_record(
@@ -11510,8 +11517,13 @@ def execute_python(
     exec_result = _deserialize_exec_result(worker_result.get('exec_result') or {})
     exec_result = _deserialize_exec_result(worker_payload.get('exec_result') or {})
     if isinstance(exec_result, StructuredResult):
+        from service.report_presentation_service import normalize_report_presentation
         from service.table_presentation_service import normalize_table_column_labels
 
+        exec_result.analysis_report = normalize_report_presentation(
+            exec_result.analysis_report,
+            selected_datasource_snapshot,
+        )
         label_normalization = normalize_table_column_labels(
             exec_result.tables,
             selected_datasource_snapshot,

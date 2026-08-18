@@ -27,6 +27,8 @@ class LocalAnalysisRuntime:
         effective_values = dict(snapshot.default_parameters)
         effective_values.update(analysis_parameters or {})
         normalized_parameters = validate_analysis_parameters(schema, effective_values)
+        execution_context = dict(runtime_user_context or {})
+        execution_context.setdefault('datasource_bindings', snapshot.datasource_bindings)
         result = self.execute_code(
             conversation_id=snapshot.conversation_id,
             turn_id=snapshot.turn_id,
@@ -35,7 +37,7 @@ class LocalAnalysisRuntime:
             title=snapshot.title,
             description=snapshot.description,
             used_datasource_ids=snapshot.used_datasource_ids,
-            runtime_user_context=runtime_user_context or {},
+            runtime_user_context=execution_context,
             analysis_task_id=analysis_task_id,
             parent_execution_id=snapshot.source_execution_id,
             execution_source=execution_source,

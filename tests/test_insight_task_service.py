@@ -312,7 +312,15 @@ def test_manual_run_executes_with_current_user_context_and_is_not_runner_work():
         assert result['execution_principal'] == 'owner'
         assert result['worker_id'] == 'api:manual'
         call = execute_code.call_args.kwargs
-        assert call['runtime_user_context'] == runtime_context
+        assert call['runtime_user_context'] == {
+            **runtime_context,
+            'datasource_bindings': [{
+                'datasource_id': 1,
+                'datasource_name': 'Annual contracts',
+                'datasource_type': 'postgresql',
+            }],
+        }
+        assert 'datasource_bindings' not in runtime_context
         assert call['execution_source'] == 'manual_task'
 
         queued_manual = service.enqueue_manual_run(
