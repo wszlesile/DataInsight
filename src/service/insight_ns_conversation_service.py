@@ -895,6 +895,15 @@ class InsightNsConversationService:
         return " / ".join(visible) + suffix
 
     @staticmethod
+    def _stringify_metric_fields(values: Any, *, limit: int = 6) -> str:
+        """Render an unordered field set without making it look like a formula."""
+        if not isinstance(values, list):
+            return str(values) if values not in (None, '') else ''
+        visible = [str(item) for item in values[:limit] if item not in (None, '')]
+        suffix = f" 等 {len(values)} 项" if len(values) > limit else ''
+        return "、".join(visible) + suffix
+
+    @staticmethod
     def _relevant_source_refs(source_refs: Any, query_refs: list[str], queries: list[Any]) -> list[dict[str, Any]]:
         if not isinstance(source_refs, list):
             return []
@@ -1004,7 +1013,10 @@ class InsightNsConversationService:
                     items.append({"label": "类型", "value": InsightNsConversationService._friendly_datasource_type(source.get('datasource_type'))})
                 break
         if metric_fields:
-            items.append({"label": "关键字段", "value": InsightNsConversationService._stringify_list(metric_fields)})
+            items.append({
+                "label": "参与计算字段",
+                "value": InsightNsConversationService._stringify_metric_fields(metric_fields),
+            })
         return items
 
     @staticmethod
@@ -1125,19 +1137,23 @@ class InsightNsConversationService:
     @staticmethod
     def _describe_calculation_method(calculation: dict[str, Any], derivation: dict[str, Any]) -> str:
         metric_fields = calculation.get('metric_fields')
-        metric_text = InsightNsConversationService._stringify_list(metric_fields) if metric_fields else '指标字段'
+        metric_text = (
+            InsightNsConversationService._stringify_metric_fields(metric_fields)
+            if metric_fields
+            else '指标字段'
+        )
         aggregation = str(calculation.get('aggregation') or '').strip()
         friendly_aggregation = InsightNsConversationService._friendly_aggregation(aggregation) if aggregation else ''
         mode = str((derivation or {}).get('mode') or '').strip()
         description = str((derivation or {}).get('description') or '').strip()
+        if calculation.get('formula'):
+            return f"按公式 {calculation.get('formula')} 计算。"
         if mode == 'algorithm':
             return f"使用算法计算：{description or calculation.get('formula') or metric_text}"
         if friendly_aggregation:
             return f"对 {metric_text} 执行{friendly_aggregation}计算。"
         if description:
             return description
-        if calculation.get('formula'):
-            return f"按公式 {calculation.get('formula')} 计算。"
         return "根据查询结果计算基础指标。"
 
     @staticmethod
@@ -1176,7 +1192,10 @@ class InsightNsConversationService:
             items.append({"label": "生成方式", "value": InsightNsConversationService._friendly_derivation_mode(derivation.get('mode'))})
         metric_fields = calculation.get('metric_fields')
         if metric_fields:
-            items.append({"label": "指标字段", "value": InsightNsConversationService._stringify_list(metric_fields)})
+            items.append({
+                "label": "参与计算字段",
+                "value": InsightNsConversationService._stringify_metric_fields(metric_fields),
+            })
         if calculation.get('aggregation'):
             items.append({"label": "计算方式", "value": InsightNsConversationService._friendly_aggregation(calculation.get('aggregation'))})
         if calculation.get('group_by'):

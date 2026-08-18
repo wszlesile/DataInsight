@@ -3165,6 +3165,38 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     assert len(bundle["report_trace_refs"]) == 1
 
 
+def test_report_ratio_materializes_verified_formula_in_evidence_definition():
+    sql = "SELECT gross_profit, sales_revenue FROM product_profit"
+    code = r'''
+sql = "SELECT gross_profit, sales_revenue FROM product_profit"
+data = load_data_with_sql(sql=sql)
+total_profit = data["gross_profit"].sum()
+total_sales = data["sales_revenue"].sum()
+gross_margin = total_profit / total_sales * 100 if total_sales else 0.0
+analysis_report = f"Gross margin: {gross_margin:.2f}%."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Gross margin: 71.48%.",
+        query_snapshots={
+            "q_profit": _query_snapshot(
+                sql,
+                columns=["gross_profit", "sales_revenue"],
+            ),
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    definition = bundle["evidence_definitions"][0]
+    assert definition["derivation"]["mode"] == "formula"
+    assert definition["calculation"]["formula"] == (
+        "(SUM(gross_profit) ÷ SUM(sales_revenue)) × 100"
+    )
+
+
 def test_report_fragment_augmented_with_fstrings_keeps_numeric_lineage():
     sql = "SELECT status, COUNT(*) AS contract_count FROM contracts GROUP BY status"
     code = r'''

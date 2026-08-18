@@ -12631,6 +12631,148 @@ class PostAnalysisEvidenceCompiler:
             )
         return list(dict.fromkeys(mentioned_fields))
 
+    @staticmethod
+    def _operation_formula(
+        operation_ids: list[str],
+        operation_by_id: dict[str, dict[str, Any]],
+        *,
+        boundary_operation_ids: list[str] | None = None,
+    ) -> str:
+        """Render a verified formula operation as a concise business expression."""
+        operations = sorted(
+            (
+                operation_by_id[operation_id]
+                for operation_id in operation_ids
+                if operation_id in operation_by_id
+            ),
+            key=lambda item: int(item.get("line") or 0),
+        )
+        boundary_ids = set(boundary_operation_ids or operation_ids)
+        formula_operations = [
+            operation
+            for operation in operations
+            if str(operation.get("operation_node_id") or "") in boundary_ids
+            if operation.get("semantic_kind") == "formula"
+        ]
+        if not formula_operations:
+            return ""
+
+        assignments: dict[str, ast.AST] = {}
+        field_aliases: dict[str, str] = {}
+        parsed_operations: list[tuple[dict[str, Any], ast.AST]] = []
+        for operation in operations:
+            try:
+                tree = ast.parse(str(operation.get("source") or ""))
+            except SyntaxError:
+                continue
+            parsed_operations.append((operation, tree))
+            for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+                if not isinstance(call.func, ast.Attribute) or call.func.attr != "agg":
+                    continue
+                for keyword in call.keywords:
+                    if not keyword.arg or not isinstance(keyword.value, (ast.Tuple, ast.List)):
+                        continue
+                    values = list(keyword.value.elts)
+                    if (
+                        values
+                        and isinstance(values[0], ast.Constant)
+                        and isinstance(values[0].value, str)
+                    ):
+                        field_aliases[str(keyword.arg)] = str(values[0].value)
+            for statement in tree.body:
+                if isinstance(statement, ast.Assign):
+                    for target in statement.targets:
+                        if isinstance(target, ast.Name):
+                            assignments[target.id] = statement.value
+                elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+                    assignments[statement.target.id] = statement.value
+
+        formula_expression: ast.AST | None = None
+        formula_operation_ids = {
+            str(operation.get("operation_node_id") or "")
+            for operation in formula_operations
+        }
+        for operation, tree in parsed_operations:
+            if str(operation.get("operation_node_id") or "") not in formula_operation_ids:
+                continue
+            for statement in tree.body:
+                if isinstance(statement, ast.Assign):
+                    formula_expression = statement.value
+                elif isinstance(statement, ast.AnnAssign):
+                    formula_expression = statement.value
+                elif isinstance(statement, ast.Expr):
+                    formula_expression = statement.value
+            if formula_expression is not None:
+                break
+        if formula_expression is None:
+            return ""
+
+        binary_symbols = {
+            ast.Add: "+",
+            ast.Sub: "-",
+            ast.Mult: "×",
+            ast.Div: "÷",
+            ast.FloorDiv: "//",
+            ast.Mod: "%",
+            ast.Pow: "^",
+        }
+        aggregate_names = {
+            "sum": "SUM",
+            "mean": "AVG",
+            "avg": "AVG",
+            "min": "MIN",
+            "max": "MAX",
+            "count": "COUNT",
+            "nunique": "DISTINCT_COUNT",
+        }
+
+        class FormulaRenderError(ValueError):
+            pass
+
+        def render(node: ast.AST, resolving: frozenset[str] = frozenset()) -> str:
+            if isinstance(node, ast.IfExp):
+                return render(node.body, resolving)
+            if isinstance(node, ast.Name):
+                if node.id in assignments and node.id not in resolving:
+                    return render(assignments[node.id], resolving | {node.id})
+                if "_" not in node.id and not node.id.isascii():
+                    return node.id
+                raise FormulaRenderError(f"unresolved formula variable: {node.id}")
+            if isinstance(node, ast.Constant):
+                return str(node.value)
+            if isinstance(node, ast.Subscript):
+                key = node.slice
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    field = str(key.value)
+                    return field_aliases.get(field, field)
+                raise FormulaRenderError("dynamic formula field")
+            if isinstance(node, ast.BinOp):
+                symbol = binary_symbols.get(type(node.op))
+                if not symbol:
+                    raise FormulaRenderError("unsupported formula operator")
+                return f"({render(node.left, resolving)} {symbol} {render(node.right, resolving)})"
+            if isinstance(node, ast.UnaryOp):
+                symbol = "-" if isinstance(node.op, ast.USub) else "+"
+                return f"{symbol}{render(node.operand, resolving)}"
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Attribute):
+                    function_name = aggregate_names.get(node.func.attr.lower())
+                    if function_name:
+                        return f"{function_name}({render(node.func.value, resolving)})"
+                if isinstance(node.func, ast.Name) and node.func.id in {"abs", "round"}:
+                    arguments = "、".join(render(argument, resolving) for argument in node.args)
+                    return f"{node.func.id.upper()}({arguments})"
+                raise FormulaRenderError("unsupported formula function")
+            raise FormulaRenderError(f"unsupported formula syntax: {type(node).__name__}")
+
+        try:
+            formula = render(formula_expression).strip()
+        except FormulaRenderError:
+            return ""
+        if formula.startswith("(") and formula.endswith(")"):
+            formula = formula[1:-1]
+        return formula[:500]
+
     def _compile_plan(
         self,
         snapshot: AnalysisExecutionSnapshot,
@@ -12734,7 +12876,26 @@ class PostAnalysisEvidenceCompiler:
             for output_id in output_ids:
                 output_claims[output_id] = signature
             if signature not in definitions_by_signature:
-                boundary = operation_by_id.get(candidate_operation_ids[0]) or {}
+                boundary_operation_ids = list(dict.fromkeys([
+                    str(operation_id)
+                    for output in selected_outputs
+                    for operation_id in output.get("boundary_operation_node_ids") or []
+                    if str(operation_id) in operation_by_id
+                ]))
+                if not boundary_operation_ids:
+                    boundary_operation_ids = [
+                        str(operation_id)
+                        for operation_id in candidate.get("boundary_operation_node_ids") or []
+                        if str(operation_id) in operation_by_id
+                    ]
+                if not boundary_operation_ids:
+                    boundary_operation_ids = candidate_operation_ids[:1]
+                boundary = operation_by_id.get(boundary_operation_ids[0]) or {}
+                formula = self._operation_formula(
+                    operation_ids,
+                    operation_by_id,
+                    boundary_operation_ids=boundary_operation_ids,
+                )
                 definitions_by_signature[signature] = {
                     "evidence_key": evidence_key,
                     "metric_name": metric.business_name.strip() or metric.metric_key,
@@ -12747,6 +12908,7 @@ class PostAnalysisEvidenceCompiler:
                     },
                     "calculation": {
                         "metric_fields": metric_fields,
+                        "formula": formula,
                         "calculation_signature": signature,
                         "operation_node_ids": operation_ids,
                         "lineage_verification": metric.lineage_verification,
