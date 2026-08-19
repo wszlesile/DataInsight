@@ -1230,10 +1230,10 @@ class InsightNsRelDatasourceService:
         uns_data_type: int = UNS_TIME_SERIES_DATA_TYPE,
     ) -> dict[str, Any]:
         normalized_ts_query_source = normalize_ts_query_source(ts_query_source)
-        time_field = 'timeStamp'
+        time_field = 'ts' if normalized_ts_query_source == 'vxbase' else 'timeStamp'
         value_fields = self._extract_time_series_value_fields(
             detail,
-            excluded_fields={'timeStamp', 'status'},
+            excluded_fields={'timeStamp', 'ts', 'status'},
         )
         payload = {
             "database_name": lake_rds_database_name,
@@ -1671,7 +1671,8 @@ class InsightNsRelDatasourceService:
                 f"时序数据源“{detail.get('name') or datasource_name}”，ts_query_source 为 vxbase。"
                 "查询时应通过 ts_query('vxbase', '<内部 SQL>') 访问。"
             )
-        add_property('timeStamp', 'string', '时序数据时间字段')
+        time_field = 'ts' if normalized_ts_query_source == 'vxbase' else 'timeStamp'
+        add_property(time_field, 'string', '时序数据物理查询与返回时间字段')
         add_property('status', 'integer', '时序数据质量码，通常 0 表示好值')
 
         schema = DataSourceSchema(

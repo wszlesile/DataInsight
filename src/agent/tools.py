@@ -93,6 +93,27 @@ TIME_SERIES_EMPTY_SOURCE_ERROR_MARKERS = (
     'unknown tag',
     'no results',
 )
+TIME_SERIES_QUERY_MODES = {'raw', 'sample', 'aggregate'}
+TIME_SERIES_INTERPOLATION_MODES = {'none', 'previous', 'linear'}
+TIME_SERIES_AGGREGATION_METHOD_ALIASES = {
+    'mean': 'avg',
+    'average': 'avg',
+    'avg': 'avg',
+    'maximum': 'max',
+    'max': 'max',
+    'minimum': 'min',
+    'min': 'min',
+    'first': 'first',
+    'last': 'last',
+    'sum': 'sum',
+    'count': 'count',
+    'variance': 'var',
+    'var': 'var',
+}
+TIME_SERIES_RAW_MAX_RANGE_SECONDS = max(
+    int(os.environ.get('TIME_SERIES_RAW_MAX_RANGE_SECONDS', '86400') or 86400),
+    1,
+)
 REPORT_CHART_DUMP_OBJECT_MARKERS = (
     "{'version':",
     '{"version":',
@@ -540,6 +561,75 @@ def _extract_code_filter_literals(code: str) -> list[dict[str, str]]:
     return matches
 
 
+def _normalize_time_series_aggregation_method(value: Any) -> str:
+    return TIME_SERIES_AGGREGATION_METHOD_ALIASES.get(
+        str(value or '').strip().lower(),
+        '',
+    )
+
+
+def _validate_time_series_query_schema(value: Any) -> list[str]:
+    if not isinstance(value, dict):
+        return ['time_series_query 必须是 dict。']
+
+    errors: list[str] = []
+    mode = str(value.get('mode') or '').strip().lower()
+    if mode not in TIME_SERIES_QUERY_MODES:
+        errors.append('time_series_query.mode 必须是 raw、sample 或 aggregate。')
+
+    window = value.get('window')
+    if mode in {'sample', 'aggregate'}:
+        if not isinstance(window, str) or not window.strip():
+            errors.append(f'time_series_query.mode={mode} 时必须提供非空 window。')
+        elif _parse_time_series_window_seconds(window) is None:
+            errors.append(
+                'time_series_query.window 必须使用可解析的时长，例如 1m、5min、1 hour。'
+            )
+    elif window is not None and not isinstance(window, str):
+        errors.append('time_series_query.window 必须是字符串。')
+
+    interpolation = value.get('interpolation')
+    if interpolation is not None:
+        normalized_interpolation = str(interpolation or '').strip().lower()
+        if normalized_interpolation not in TIME_SERIES_INTERPOLATION_MODES:
+            errors.append(
+                'time_series_query.interpolation 必须是 none、previous 或 linear。'
+            )
+        elif mode != 'sample' and normalized_interpolation != 'none':
+            errors.append('只有 time_series_query.mode=sample 才能声明插值方式。')
+
+    aggregations = value.get('aggregations')
+    if mode == 'aggregate':
+        if not isinstance(aggregations, list) or not aggregations:
+            errors.append('time_series_query.mode=aggregate 时必须提供 aggregations。')
+        else:
+            for index, item in enumerate(aggregations):
+                if not isinstance(item, dict):
+                    errors.append(f'time_series_query.aggregations[{index}] 必须是 dict。')
+                    continue
+                if not isinstance(item.get('field'), str) or not str(item.get('field') or '').strip():
+                    errors.append(
+                        f'time_series_query.aggregations[{index}].field 必须是非空字符串。'
+                    )
+                if not _normalize_time_series_aggregation_method(item.get('method')):
+                    errors.append(
+                        f'time_series_query.aggregations[{index}].method 不受支持。'
+                    )
+    elif aggregations not in (None, []):
+        errors.append('只有 time_series_query.mode=aggregate 才能声明 aggregations。')
+
+    decision_source = value.get('decision_source')
+    if decision_source is not None and str(decision_source or '').strip().lower() not in {
+        'explicit_user',
+        'system_policy',
+        'analysis_choice',
+    }:
+        errors.append(
+            'time_series_query.decision_source 必须是 explicit_user、system_policy 或 analysis_choice。'
+        )
+    return errors
+
+
 def _validate_query_constraints_schema(query_constraints: Any) -> list[str]:
     if not isinstance(query_constraints, dict):
         return ['query_constraints 必须是 dict。']
@@ -602,6 +692,11 @@ def _validate_query_constraints_schema(query_constraints: Any) -> list[str]:
                 errors.append('aggregation.grain 必须是字符串。')
             if aggregation.get('metric') is not None and not isinstance(aggregation.get('metric'), str):
                 errors.append('aggregation.metric 必须是字符串。')
+
+    if 'time_series_query' in query_constraints:
+        errors.extend(
+            _validate_time_series_query_schema(query_constraints.get('time_series_query'))
+        )
 
     if query_constraints.get('notes') is not None and not isinstance(query_constraints.get('notes'), str):
         errors.append('notes 必须是字符串。')
@@ -1048,6 +1143,291 @@ def _extract_vxbase_limit_issue(code: str) -> str | None:
     return None
 
 
+TIME_SERIES_WINDOW_UNIT_SECONDS = {
+    'ms': 0.001,
+    'millisecond': 0.001,
+    'milliseconds': 0.001,
+    's': 1,
+    'sec': 1,
+    'second': 1,
+    'seconds': 1,
+    'm': 60,
+    'min': 60,
+    'minute': 60,
+    'minutes': 60,
+    'h': 3600,
+    'hr': 3600,
+    'hour': 3600,
+    'hours': 3600,
+    'd': 86400,
+    'day': 86400,
+    'days': 86400,
+}
+
+
+def _parse_time_series_window_seconds(value: Any) -> float | None:
+    text = str(value or '').strip().lower()
+    match = re.fullmatch(
+        r'(?P<amount>\d+(?:\.\d+)?)\s*(?P<unit>milliseconds?|ms|seconds?|sec|s|minutes?|min|m|hours?|hr|h|days?|d)',
+        text,
+    )
+    if not match:
+        return None
+    return float(match.group('amount')) * TIME_SERIES_WINDOW_UNIT_SECONDS[match.group('unit')]
+
+
+def _parse_time_series_datetime(value: Any) -> datetime | None:
+    text = str(value or '').strip()
+    if not text:
+        return None
+    if text.endswith('Z'):
+        text = f'{text[:-1]}+00:00'
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            return datetime.fromisoformat(f'{text}T00:00:00')
+        except ValueError:
+            return None
+
+
+def _time_series_range_seconds(query_constraints: dict[str, Any]) -> float | None:
+    time_range = query_constraints.get('time_range')
+    if not isinstance(time_range, dict):
+        return None
+    start = _parse_time_series_datetime(time_range.get('start'))
+    end = _parse_time_series_datetime(time_range.get('end'))
+    if start is None or end is None:
+        return None
+    try:
+        return (end - start).total_seconds()
+    except TypeError:
+        return None
+
+
+def _time_series_native_window_seconds(code: str, source: str) -> float | None:
+    if source == 'vxbase':
+        pattern = r'\binterval\s*\(\s*[\'\"](?P<window>[^\'\"]+)[\'\"]'
+    else:
+        pattern = (
+            r'\b(?:time_bucket|time_bucket_gapfill|date_bin)\s*\(\s*'
+            r'(?:interval\s*)?[\'\"](?P<window>[^\'\"]+)[\'\"]'
+        )
+    match = re.search(pattern, code, re.IGNORECASE)
+    if not match:
+        return None
+    return _parse_time_series_window_seconds(match.group('window'))
+
+
+def _time_series_aggregation_present(code: str, *, method: str, field: str) -> bool:
+    normalized_method = _normalize_time_series_aggregation_method(method)
+    if not normalized_method:
+        return False
+    escaped_field = re.escape(str(field or '').strip())
+    if not escaped_field:
+        return False
+    return re.search(
+        rf'\b{normalized_method}\s*\(\s*[\"`]?{escaped_field}[\"`]?(?:\s*,[^)]*)?\)',
+        code,
+        re.IGNORECASE,
+    ) is not None
+
+
+def _time_series_interpolation_present(code: str, *, source: str, method: str) -> bool:
+    normalized_method = str(method or '').strip().lower()
+    if normalized_method == 'none':
+        return True
+    if source == 'vxbase':
+        return re.search(
+            rf'\binterpolation\s*\(\s*[\'\"]{re.escape(normalized_method)}[\'\"]\s*\)',
+            code,
+            re.IGNORECASE,
+        ) is not None
+    if normalized_method == 'previous':
+        return re.search(r'\blocf\s*\(', code, re.IGNORECASE) is not None
+    if normalized_method == 'linear':
+        return re.search(r'\binterpolate\s*\(', code, re.IGNORECASE) is not None
+    return False
+
+
+def _validate_time_series_query_contract(
+    query_constraints: dict[str, Any],
+    *,
+    source: str,
+    code: str,
+) -> list[dict[str, Any]]:
+    contract = query_constraints.get('time_series_query')
+    if not isinstance(contract, dict):
+        return []
+
+    mode = str(contract.get('mode') or '').strip().lower()
+    issues: list[dict[str, Any]] = []
+    range_seconds = _time_series_range_seconds(query_constraints)
+    has_interval = re.search(r'\binterval\s*\(', code, re.IGNORECASE) is not None
+    has_native_bucket = (
+        has_interval
+        if source == 'vxbase'
+        else re.search(
+            r'\b(?:time_bucket|time_bucket_gapfill|date_bin)\s*\(',
+            code,
+            re.IGNORECASE,
+        ) is not None
+    )
+    has_statistical_aggregation = re.search(
+        r'\b(?:max|min|sum|avg|var|count)\s*\(',
+        code,
+        re.IGNORECASE,
+    ) is not None
+    has_point_selector = re.search(
+        r'\b(?:first|last)\s*\(',
+        code,
+        re.IGNORECASE,
+    ) is not None
+    has_any_aggregation = has_statistical_aggregation or has_point_selector
+
+    if mode == 'raw':
+        if has_native_bucket or has_any_aggregation:
+            issues.append(_build_query_constraint_error(
+                'query_constraint_violation',
+                'time_series_query.mode=raw，但当前时序 SQL 使用了采样窗口或统计聚合函数。',
+                diagnostics={
+                    'violated_constraint': 'time_series_query_mode',
+                    'mode': mode,
+                    'ts_query_source': source,
+                },
+            ))
+        if range_seconds is not None and range_seconds > TIME_SERIES_RAW_MAX_RANGE_SECONDS:
+            issues.append(_build_query_constraint_error(
+                'query_constraint_violation',
+                '时序原始值查询范围超过安全阈值，应使用时序库原生采样或统计查询。',
+                diagnostics={
+                    'violated_constraint': 'time_series_raw_range',
+                    'mode': mode,
+                    'ts_query_source': source,
+                    'range_seconds': range_seconds,
+                    'max_raw_range_seconds': TIME_SERIES_RAW_MAX_RANGE_SECONDS,
+                },
+            ))
+        return issues
+
+    if mode in {'sample', 'aggregate'} and not has_native_bucket:
+        issues.append(_build_query_constraint_error(
+            'query_constraint_violation',
+            f'time_series_query.mode={mode} 必须在 {source} 内部 SQL 中使用原生时间窗口能力。',
+            diagnostics={
+                'violated_constraint': 'time_series_native_window',
+                'mode': mode,
+                'ts_query_source': source,
+                'window': contract.get('window'),
+            },
+        ))
+        return issues
+
+    expected_window_seconds = _parse_time_series_window_seconds(contract.get('window'))
+    observed_window_seconds = _time_series_native_window_seconds(code, source)
+    if (
+        expected_window_seconds is not None
+        and observed_window_seconds is not None
+        and not math.isclose(expected_window_seconds, observed_window_seconds)
+    ):
+        issues.append(_build_query_constraint_error(
+            'query_constraint_violation',
+            '时序 SQL 的原生窗口与 time_series_query.window 不一致。',
+            diagnostics={
+                'violated_constraint': 'time_series_query_window',
+                'mode': mode,
+                'ts_query_source': source,
+                'expected_window': contract.get('window'),
+                'observed_window_seconds': observed_window_seconds,
+            },
+        ))
+
+    if mode == 'sample':
+        if has_statistical_aggregation or (source == 'vxbase' and has_point_selector):
+            issues.append(_build_query_constraint_error(
+                'query_constraint_violation',
+                'time_series_query.mode=sample 只应使用原生采样，不应混入统计聚合函数。',
+                diagnostics={
+                    'violated_constraint': 'time_series_query_mode',
+                    'mode': mode,
+                    'ts_query_source': source,
+                },
+            ))
+        interpolation = str(contract.get('interpolation') or '').strip().lower()
+        if interpolation and not _time_series_interpolation_present(
+            code,
+            source=source,
+            method=interpolation,
+        ):
+            issues.append(_build_query_constraint_error(
+                'query_constraint_violation',
+                '时序采样 SQL 没有落实 time_series_query.interpolation 声明的插值方式。',
+                diagnostics={
+                    'violated_constraint': 'time_series_query_interpolation',
+                    'mode': mode,
+                    'ts_query_source': source,
+                    'interpolation': interpolation,
+                },
+            ))
+        return issues
+
+    missing_aggregations = [
+        {
+            'field': str(item.get('field') or '').strip(),
+            'method': _normalize_time_series_aggregation_method(item.get('method')),
+        }
+        for item in contract.get('aggregations') or []
+        if isinstance(item, dict) and not _time_series_aggregation_present(
+            code,
+            method=str(item.get('method') or ''),
+            field=str(item.get('field') or ''),
+        )
+    ]
+    if missing_aggregations:
+        issues.append(_build_query_constraint_error(
+            'query_constraint_violation',
+            '时序统计 SQL 没有在时序库内部落实 time_series_query.aggregations。',
+            diagnostics={
+                'violated_constraint': 'time_series_native_aggregation',
+                'mode': mode,
+                'ts_query_source': source,
+                'missing_aggregations': missing_aggregations,
+            },
+        ))
+    return issues
+
+
+def _time_series_query_repair_instructions(issue: dict[str, Any]) -> list[str]:
+    diagnostics = issue.get('diagnostics') if isinstance(issue.get('diagnostics'), dict) else {}
+    violated = str(diagnostics.get('violated_constraint') or '')
+    source = str(diagnostics.get('ts_query_source') or 'time-series')
+    mode = str(diagnostics.get('mode') or '')
+    if violated == 'time_series_native_window':
+        return [
+            f'保持 time_series_query.mode={mode} 和 window 不变，改为使用 {source} 原生时间窗口语法。',
+            '不要查询原始点后用 pandas floor/resample/groupby 替代时序库采样或统计。',
+        ]
+    if violated == 'time_series_native_aggregation':
+        return [
+            f'保持统计字段、方法和窗口不变，把缺失的聚合函数写入 {source} 内部 SQL。',
+            '只有 interval/time_bucket 而没有 avg/max/min/sum/count 等指定函数，不算完成统计查询。',
+        ]
+    if violated == 'time_series_raw_range':
+        return [
+            '保持原始时间范围不变，改用时序库原生采样或统计并选择能控制返回点数的窗口。',
+            '不要用 LIMIT 截断冒充长时间范围降采样。',
+        ]
+    if violated in {
+        'time_series_query_mode',
+        'time_series_query_window',
+        'time_series_query_interpolation',
+    }:
+        return [
+            '保持用户声明的 raw/sample/aggregate 语义不变，使内部 SQL 的查询模式和窗口与 time_series_query 完全一致。',
+        ]
+    return []
+
+
 def _validate_vxbase_fragment(query_constraints: dict[str, Any], fragment: dict[str, Any]) -> list[dict[str, Any]]:
     code = _fragment_text(fragment)
     issues: list[dict[str, Any]] = []
@@ -1166,6 +1546,11 @@ def _validate_time_series_fragment(query_constraints: dict[str, Any], fragment: 
             diagnostics={'fragment': fragment},
         ))
         return issues
+    issues.extend(_validate_time_series_query_contract(
+        query_constraints,
+        source=source,
+        code=code,
+    ))
     if source == 'timescale':
         issues.extend(_validate_timescale_fragment(query_constraints, fragment))
     elif source == 'vxbase':
@@ -1593,6 +1978,7 @@ def load_data_with_sql(
     try:
         data = _load_data_with_fed_query(sql=sql, params=params)
         data = _restore_sql_projection_column_names(sql, data)
+        data = _normalize_time_series_aggregate_result_columns(data)
         explicit_numeric_columns = list(dict.fromkeys(
             str(item) for item in (numeric_columns or []) if str(item)
         ))
@@ -1746,6 +2132,57 @@ def _restore_sql_projection_column_names(sql: str, data: Any) -> Any:
             continue
         rename_map[actual] = declared
         claimed_targets.add(declared)
+    return data.rename(columns=rename_map) if rename_map else data
+
+
+TIME_SERIES_AGGREGATE_RESULT_COLUMN_PATTERN = re.compile(
+    r'^\s*(?P<method>avg|max|min|sum|count|var)\s*\('
+    r'\s*["`]?(?P<field>[^,"`)]+)["`]?(?:\s*,[^)]*)?\s*\)\s*$',
+    re.IGNORECASE,
+)
+
+
+def _normalize_time_series_aggregate_result_columns(data: Any) -> Any:
+    """Give native time-series aggregate columns a stable DataFrame contract.
+
+    vxbase returns expression labels such as ``avg(value)``. A single
+    aggregation of a source field keeps that source-field name; multiple
+    methods on the same field use ``<field>_<method>``. QuerySnapshot still
+    retains the native SQL expression, so this presentation normalization does
+    not weaken calculation lineage.
+    """
+    columns = [str(item) for item in getattr(data, 'columns', [])]
+    if not columns:
+        return data
+
+    parsed: list[tuple[str, str, str]] = []
+    for column in columns:
+        match = TIME_SERIES_AGGREGATE_RESULT_COLUMN_PATTERN.fullmatch(column)
+        if not match:
+            continue
+        field = str(match.group('field') or '').strip()
+        if not field or field == '*':
+            continue
+        parsed.append((column, field, match.group('method').lower()))
+    if not parsed:
+        return data
+
+    method_count_by_field: dict[str, int] = {}
+    for _, field, _ in parsed:
+        method_count_by_field[field] = method_count_by_field.get(field, 0) + 1
+
+    occupied = set(columns)
+    rename_map: dict[str, str] = {}
+    for column, field, method in parsed:
+        target = (
+            field
+            if method_count_by_field[field] == 1
+            else f'{field}_{method}'
+        )
+        if target in occupied and target != column:
+            continue
+        rename_map[column] = target
+        occupied.add(target)
     return data.rename(columns=rename_map) if rename_map else data
 
 
@@ -2022,6 +2459,11 @@ def _normalize_query_scope(
     if "aggregation" not in scope:
         constraints = query_constraints if isinstance(query_constraints, dict) else {}
         scope["aggregation"] = _copy_jsonable(constraints.get("aggregation"), None)
+    if "time_series_query" not in scope:
+        constraints = query_constraints if isinstance(query_constraints, dict) else {}
+        time_series_query = constraints.get("time_series_query")
+        if isinstance(time_series_query, dict):
+            scope["time_series_query"] = _copy_jsonable(time_series_query, {})
     for key in ("fact_ids", "datasource_ids"):
         value = scope.get(key)
         if isinstance(value, list):
@@ -2956,6 +3398,51 @@ def _extract_query_constraints_literal(tree: ast.AST) -> Any:
     if isinstance(assigned, dict):
         return assigned
     return _extract_validate_query_constraints_literal(tree)
+
+
+def _static_assignment_dict_keys(tree: ast.AST, name: str) -> set[str] | None:
+    for node in getattr(tree, 'body', []):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
+            continue
+        if not isinstance(node.value, ast.Dict):
+            return None
+        return {
+            str(key.value)
+            for key in node.value.keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        }
+    return None
+
+
+def _static_query_constraints_keys(tree: ast.AST) -> set[str] | None:
+    keys = _static_assignment_dict_keys(tree, 'query_constraints')
+    if keys is not None:
+        return keys
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Name) or func.id != 'validate_query_constraints':
+            continue
+        for keyword in node.keywords or []:
+            if keyword.arg != 'query_constraints' or not isinstance(keyword.value, ast.Dict):
+                continue
+            return {
+                str(key.value)
+                for key in keyword.value.keys
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            }
+    return None
+
+
+def _tree_contains_ts_query_sql(tree: ast.AST) -> bool:
+    return any(
+        re.search(r'\bts_query\s*\(', node.value, re.IGNORECASE) is not None
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    )
 
 
 def _called_function_names(tree: ast.AST) -> set[str]:
@@ -5556,6 +6043,26 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
                 ],
             )
 
+        static_query_constraint_keys = _static_query_constraints_keys(tree)
+        if (
+            _tree_contains_ts_query_sql(tree)
+            and static_query_constraint_keys is not None
+            and 'time_series_query' not in static_query_constraint_keys
+        ):
+            return request_retry(
+                retry_type='invalid_query_constraints',
+                message='时序 analysis 代码必须声明 time_series_query，明确使用原始值、采样或统计查询。',
+                diagnostics={
+                    'violated_contract': 'missing_time_series_query_contract',
+                    'required_key': 'time_series_query',
+                },
+                repair_instructions=[
+                    '在现有 query_constraints 中补充 time_series_query，不要改写用户时间范围、数据源或分析内容。',
+                    '原始值使用 mode=raw；采样使用 mode=sample 并声明 window；统计使用 mode=aggregate，并声明 window 与 aggregations。',
+                    '采样和统计必须由时序库内部 SQL 实现，不能查询原始点后再用 pandas 替代。',
+                ],
+            )
+
         unfinished_report = _find_static_unfinished_report_call(tree)
         if unfinished_report is not None:
             report_call, report_value = unfinished_report
@@ -5752,12 +6259,14 @@ def validate_query_constraints(
     )
     if fragment_issues:
         issue = fragment_issues[0]
+        time_series_repair = _time_series_query_repair_instructions(issue)
         return request_retry(
             retry_type=str(issue.get('error_type') or 'query_constraint_violation'),
             message=str(issue.get('error_message') or '当前 SQL 片段没有满足 query_constraints 声明的查询约束。'),
             diagnostics=issue.get('diagnostics') if isinstance(issue.get('diagnostics'), dict) else {},
             repair_instructions=[
                 '保持 query_constraints 不变，按数据源片段分别修正关系型 SQL 与时序 inner_sql。',
+                *time_series_repair,
                 '时序 SQL 应把 inner_sql 放入 sql_context.fragments，并带上 ts_query_source、datasource_identifier、time_field、quality_field 和 value_fields。',
                 '混合关系型与时序查询时，外层 SQL 应保留明确 JOIN 和 ON 条件。',
             ],
@@ -6245,6 +6754,12 @@ def _build_no_data_feedback(
                 'target_filters': _copy_jsonable(analysis_scope.get('target_filters') or [], []),
                 'aggregation': _copy_jsonable(
                     query_scope.get('aggregation') or query_constraints.get('aggregation') or {},
+                    {},
+                ),
+                'time_series_query': _copy_jsonable(
+                    query_scope.get('time_series_query')
+                    or query_constraints.get('time_series_query')
+                    or {},
                     {},
                 ),
             },

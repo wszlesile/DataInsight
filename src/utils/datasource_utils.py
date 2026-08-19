@@ -122,9 +122,12 @@ def build_table_runtime_metadata(config_json: dict[str, Any] | None) -> dict[str
     if table_engine == TABLE_ENGINE_TIME_SERIES:
         backend = normalize_ts_query_source(config.get('ts_query_source'))
         value_fields = _normalize_string_list(config.get('value_fields') or [])
+        physical_time_field = 'ts' if backend == 'vxbase' else 'timeStamp'
         payload.update({
             'ts_query_source': backend,
-            'time_field': str(config.get('time_field') or '').strip(),
+            # Existing datasource records may still carry timeStamp for vxbase.
+            # Runtime metadata describes the physical query/result contract.
+            'time_field': physical_time_field,
             'value_fields': value_fields,
             'quality_field': str(config.get('quality_field') or 'status').strip(),
         })

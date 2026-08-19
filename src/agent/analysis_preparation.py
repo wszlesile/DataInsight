@@ -39,6 +39,46 @@ PROMPT_ROOT = Path(__file__).resolve().parent / "prompts" / "preparation"
 QUERY_PROMPT_ROOT = Path(__file__).resolve().parent / "prompts" / "query_capabilities"
 
 
+def _normalize_time_series_datasource_snapshot(
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    """Align advisory Schema fields with each time-series backend's query API."""
+    normalized = copy.deepcopy(snapshot)
+    rows = normalized.get('selected_datasource_snapshot')
+    if not isinstance(rows, list):
+        return normalized
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        backend = str(item.get('ts_query_source') or '').strip().lower()
+        is_time_series = (
+            str(item.get('table_engine') or '').strip().lower() == 'time_series'
+            or backend in {'vxbase', 'timescale'}
+        )
+        if not is_time_series:
+            continue
+        physical_time_field = 'ts' if backend == 'vxbase' else 'timeStamp'
+        stale_time_field = 'timeStamp' if physical_time_field == 'ts' else 'ts'
+        item['time_field'] = physical_time_field
+        schema = item.get('metadata_schema')
+        if not isinstance(schema, dict):
+            continue
+        properties = schema.get('properties')
+        if not isinstance(properties, dict):
+            continue
+        stale_definition = properties.pop(stale_time_field, None)
+        definition = properties.get(physical_time_field)
+        if not isinstance(definition, dict):
+            definition = (
+                copy.deepcopy(stale_definition)
+                if isinstance(stale_definition, dict)
+                else {'type': 'string'}
+            )
+            properties[physical_time_field] = definition
+        definition['description'] = '时序数据物理查询与返回时间字段'
+    return normalized
+
+
 def _requires_datasource_shortlist(catalog: list[dict[str, Any]]) -> bool:
     trigger_count = max(
         int(
@@ -2441,7 +2481,9 @@ class AnalysisPreparationWorkflow:
         self.user_query = user_query
         self.context_mode = context_mode
         self.expected_time_range = expected_time_range
-        self.datasource_snapshot = datasource_snapshot
+        self.datasource_snapshot = _normalize_time_series_datasource_snapshot(
+            datasource_snapshot
+        )
         self.conversation_context = conversation_context or {}
         self.runtime_config = runtime_config
         self.execution_context = dict(execution_context or {})
@@ -3512,7 +3554,10 @@ class AnalysisPreparationWorkflow:
                     self.execution_context.get("database_conn_info") or {}
                 ),
             )
-            catalog = build_datasource_catalog(semantic_result.datasource_snapshot)
+            semantic_snapshot = _normalize_time_series_datasource_snapshot(
+                semantic_result.datasource_snapshot
+            )
+            catalog = build_datasource_catalog(semantic_snapshot)
             if not catalog:
                 raise SemanticDatasourceSelectionError(
                     "semantic selection returned no usable datasource candidates"
@@ -3543,7 +3588,7 @@ class AnalysisPreparationWorkflow:
                 if datasource_id not in semantic_reference_ids
             ]
             selected_snapshot = filter_datasource_snapshot(
-                semantic_result.datasource_snapshot,
+                semantic_snapshot,
                 selection.selected_datasource_ids,
             )
             selected_snapshot = enrich_snapshot_with_semantic_relationships(

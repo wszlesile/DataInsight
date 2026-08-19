@@ -213,11 +213,30 @@ def _build_datasource_prompt_item(item: dict[str, Any]) -> dict[str, Any]:
             for value in capabilities["queryable_fields"]
             if str(value).strip()
         ]
+    if str(payload.get("table_engine") or "").lower() == "time_series":
+        backend = str(payload.get("ts_query_source") or "").lower()
+        physical_time_field = "ts" if backend == "vxbase" else "timeStamp"
+        value_fields = [
+            str(value)
+            for value in payload.get("value_fields") or []
+            if str(value).strip()
+        ]
+        quality_field = str(payload.get("quality_field") or "status").strip()
+        queryable_fields = list(dict.fromkeys([
+            physical_time_field,
+            "name",
+            quality_field,
+            *value_fields,
+        ]))
+        payload["time_field"] = physical_time_field
     query_contract = {
         "datasource_id": payload.get("datasource_id"),
         "datasource_identifier": payload.get("datasource_identifier"),
         "allowed_fields": queryable_fields,
     }
+    if str(payload.get("table_engine") or "").lower() == "time_series":
+        query_contract["physical_time_field"] = payload.get("time_field")
+        query_contract["ts_query_source"] = payload.get("ts_query_source")
     known_key_cardinalities: list[dict[str, Any]] = []
     seen_key_cardinalities: set[tuple[tuple[str, ...], int]] = set()
     for relationship in schema.get("relationships") or []:

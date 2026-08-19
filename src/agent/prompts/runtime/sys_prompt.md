@@ -151,12 +151,20 @@ data = load_data_with_sql(
 
 时序表通用规则：
 
+- 每条正式时序查询都必须在 `query_constraints` 中声明 `time_series_query`，先明确查询语义，再编写对应数据库方言：
+  - 原始值：`{"mode": "raw", "decision_source": "analysis_choice"}`
+  - 采样：`{"mode": "sample", "window": "1m", "interpolation": "previous", "decision_source": "explicit_user"}`
+  - 统计：`{"mode": "aggregate", "window": "1m", "aggregations": [{"field": "value", "method": "avg"}], "decision_source": "explicit_user"}`
+  - `decision_source` 只能取一个值：用户明确要求用 `explicit_user`，长时间范围策略自动选择用 `system_policy`，分析过程主动选择用 `analysis_choice`。
+- 查询模式按以下统一语义决定：用户明确要求“原始值/raw”时使用 `raw`；明确要求“采样/插值/降采样”和窗口时使用 `sample`；明确要求均值、最大值、最小值等统计方法时使用 `aggregate`。短时间范围内只要求“历史趋势/曲线/明细”而未要求采样或统计时，保持 `raw`，不要自行增加采样窗口或均值口径；只有超过 1 天的范围才由系统降采样策略覆盖。
+- 用户明确要求采样、插值、均值、最大值、最小值或其他时序统计时，必须使用时序库原生能力完成；不要查询全部原始点后再用 pandas 的 `floor/resample/groupby/mean/max/min` 替代数据库采样或统计。
+- 时间范围超过 1 天时，默认使用原生采样或统计查询并选择能控制返回点数的窗口；不要用 `LIMIT` 截断冒充降采样。图表和报告应披露实际窗口与统计方法。
 - 必须显式设置时间范围，不要生成无时间边界的时序查询。
 - `query_constraints.time_range` 中声明的开始和结束时间必须体现在 `ts_query(...)` 的内部 SQL 中；不要先全量读取时序表，再在 pandas 中过滤时间。
 - 时序查询的时间字面量必须带业务时区偏移，默认使用 Asia/Shanghai，即 `+08:00`。不要生成以 `Z` 结尾的 UTC 时间字面量；例如使用 `2026-05-21T14:49:55+08:00`，不要使用 `2026-05-21T14:49:55Z`。
 - 只查询分析需要的字段；关系型表和 timescale 原始明细查询应加 `LIMIT`。vxbase 内部 SQL 必须通过 `ts` 时间条件缩小结果集；原始数据、趋势图和探测查询的内部 SQL 使用 `SELECT *`，如需限制条数只使用 `limit N`，不要使用 `limit offset,count` 或 `LIMIT ... OFFSET ...`。
 - 内部 SQL 的表名使用 `datasource_identifier`，时序表标识通常不带 `public.` 这类 schema 前缀。timescale 标识如果包含大写字母、`$` 或其他特殊字符，必须用双引号按原样引用，例如 `"__Do_xxx"`、`"_0_I_xxx"`、`"$xxx"`；不要把这类标识写成未加引号的表名。
-- 优先在内部查询里完成时间过滤、聚合和排序，再把结果交给外层 SQL；vxbase 内部 SQL 不支持 `ORDER BY ts` 这类排序写法，不能在 vxbase 内部查询中生成 `ORDER BY ts`。
+- 必须在内部查询里完成时间过滤以及用户要求的采样或统计，再把结果交给外层 SQL；vxbase 内部 SQL 不支持 `ORDER BY ts` 这类排序写法，不能在 vxbase 内部查询中生成 `ORDER BY ts`。
 - 时间字段优先使用 `time_field`，质量字段优先使用 `quality_field`。
 - 时序数据可能有多个值字段；应根据用户问题从 `value_fields` 里选择一个或多个指标生成 SQL。不要假设存在单一主值字段，也不要只默认分析第一个值字段。
 - 好值过滤通常使用质量字段等于 `0`；如果用户明确要分析坏值或全部质量状态，才放宽该条件。`timescale` 的质量字段过滤写在内部 SQL 中，例如 `AND status = 0`；`vxbase` 例外，质量字段等非 `ts` 字段过滤必须放到 `ts_query(...)` 外层 SQL 中，不能写进 vxbase 内部 SQL。
@@ -172,6 +180,8 @@ data = load_data_with_sql(
 - timescale 的字段过滤、质量过滤、排序和聚合都优先写进内部 SQL。不要把 `status = 0` 放到 `ts_query('timescale', ...)` 外层；如果外层需要继续过滤，内部 SQL 必须先 `SELECT` 出该字段。
 - 原始趋势查询的常用内部 SQL 形态是：`SELECT "timeStamp", value, status FROM "<datasource_identifier>" WHERE "timeStamp" >= '<start+08:00>' AND "timeStamp" < '<end+08:00>' AND status = 0 ORDER BY "timeStamp" ASC`。
 - 可以使用 PostgreSQL/Timescale 常见时间函数和聚合函数，例如 `time_bucket(...)`、`time_bucket_gapfill(...)`、`locf(...)`、`first(value, "timeStamp")`、`last(value, "timeStamp")`、`date_trunc(...)`。
+- 采样查询必须在内部 SQL 使用 `time_bucket(...)`、`time_bucket_gapfill(...)` 或 `date_bin(...)` 形成时间窗口，并使用 `first/last/locf/interpolate` 等点值选择或补点能力；不要把原始点全部加载到 pandas 后采样。
+- 统计查询必须在内部 SQL 同时使用时间窗口和用户指定的 `AVG/MAX/MIN/SUM/COUNT` 等聚合函数，并按时间窗口分组。例如一分钟均值使用 `time_bucket('1 minute', "timeStamp")`、`AVG(value)` 和对应 `GROUP BY`。
 - 当内部 SQL 字符串中包含单引号时，放到外层 SQL 里要写成两个单引号转义。
 - 推荐先构造 `inner_sql`，再执行 `escaped_inner_sql = inner_sql.replace("'", "''")`，最后用 `escaped_inner_sql` 拼接外层 `ts_query(...)`。不要把包含时间字面量单引号的 `inner_sql` 原样拼进外层 SQL。
 
@@ -194,13 +204,24 @@ SELECT * FROM ts_query('timescale', 'SELECT "timeStamp", value, status FROM "__D
 - 时间字段在 vxbase 内部查询中使用 `ts`；数值字段和质量字段以当前数据源上下文中的 `value_fields`、`quality_field` 为准。vxbase 示例中字段名通常不加双引号。
 - vxbase `SELECT *` 返回的 DataFrame 时间列仍为 `ts`。正式代码应使用 `data["ts"]` 做时间转换、排序和图表分类字段，不要沿用 timescale 的 `timeStamp` 列名。
 - 指定时间戳查询：可以使用 `ts in (...)` 或 `ts = ...`；如果指定时刻没有原始点，可使用 `interpolation("previous")` 或 `interpolation("linear")`。
-- 采样查询：在 `ts` 时间范围后使用 `interval("1m", "10s")` 描述采样间隔和偏移；需要补点时再配合 `interpolation("previous")` 或 `interpolation("linear")`。
-- 统计查询：可使用 `max(value)`、`min(value)`、`first(value)`、`last(value)`、`sum(value)`、`sum(value, "event")`、`sum(value, "time")`、`avg(value)`、`avg(value, "event")`、`avg(value, "time")`、`VAR(value)`、`VAR(value, "event")`、`VAR(value, "time")`、`count(value)` 等函数；统计查询不要再额外使用 `interpolation(...)`。
+- 采样查询：在 `ts` 时间范围后使用 `interval("1m", "10s")` 描述采样间隔和偏移；需要补点时再配合 `interpolation("previous")` 或 `interpolation("linear")`。完整形态为 `SELECT * FROM <identifier> WHERE ts >= "..." AND ts < "..." interval("1m", "10s") interpolation("previous")`。
+- 统计查询：必须把统计函数写入 vxbase 内部 SQL 的 `SELECT`，并使用 `interval(...)` 定义统计窗口。例如一分钟均值应写成 `SELECT name, ts, status, avg(value) FROM <identifier> WHERE ts >= "..." AND ts < "..." interval("1m", "10s")`，不能只写 `SELECT * ... interval(...)`。可使用 `max(value)`、`min(value)`、`first(value)`、`last(value)`、`sum(value)`、`sum(value, "event")`、`sum(value, "time")`、`avg(value)`、`avg(value, "event")`、`avg(value, "time")`、`VAR(value)`、`VAR(value, "event")`、`VAR(value, "time")`、`count(value)` 等函数；统计查询不要再额外使用 `interpolation(...)`。
+- `load_data_with_sql(...)` 会把 vxbase 返回的单一聚合表达式列（例如 `avg(value)`）规范为原字段名 `value`；同一字段同时使用多个统计方法时规范为 `value_avg`、`value_max` 等。后续 pandas、图表和报告必须消费这些稳定字段名，不要猜测 `avg` 或直接依赖 `avg(value)`。
 
 ```sql
+-- 原始值
 SELECT *
 FROM ts_query('vxbase', 'SELECT * FROM vxba_xxx WHERE ts >= "2026-05-01T00:00:00+08:00" AND ts < "2026-05-02T00:00:00+08:00" limit 200')
 WHERE status = 0
+
+-- 一分钟采样
+SELECT *
+FROM ts_query('vxbase', 'SELECT * FROM vxba_xxx WHERE ts >= "2026-05-01T00:00:00+08:00" AND ts < "2026-05-02T00:00:00+08:00" interval("1m", "10s") interpolation("previous")')
+WHERE status = 0
+
+-- 一分钟均值统计
+SELECT *
+FROM ts_query('vxbase', 'SELECT name, ts, status, avg(value) FROM vxba_xxx WHERE ts >= "2026-05-01T00:00:00+08:00" AND ts < "2026-05-02T00:00:00+08:00" interval("1m", "10s")')
 ```
 
 ### 本地大文件加载策略
@@ -340,7 +361,7 @@ execution_intent = "probe"     # 数据探测
 
 - `execution_intent = "analysis"`：正式分析代码必须先声明 `analysis_parameters_schema` 和 `analysis_parameters = get_analysis_parameters(analysis_parameters_schema["defaults"])`，再基于 `analysis_parameters` 声明 `query_constraints`，先生成 SQL / pandas / 文件筛选实现，再调用 `validate_query_constraints(query_key=..., ...)`；只有当校验返回 `None` 时，才继续真实数据加载与分析，最终必须将 `save_analysis_result(...)` 的返回值赋给 `result`。禁止先调用 `load_data_with_sql(...)` 执行 SQL，再补做 `validate_query_constraints(...)`。
 - `execution_intent = "probe"`：仅在上一版正式分析已经因无数据、值格式、时间边界或明确运行错误返回诊断后使用；探测代码只负责轻量纠偏，并将 `request_retry(retry_type="probe_feedback", ...)` 的返回值赋给 `result`。探测代码不要生成 `query_constraints`，也不要调用 `validate_query_constraints(...)`，不得重新发现或改写 Business Context 已定稿的跨源关系。
-- `query_constraints` 只属于正式 `analysis` 代码，是当前分析所采用的时间范围、目标筛选和聚合粒度的显式契约；它必须从 `analysis_parameters` 派生，不能和 `analysis_parameters` 写成两套互相独立的口径。
+- `query_constraints` 只属于正式 `analysis` 代码，是当前分析所采用的时间范围、目标筛选、聚合粒度和时序查询模式的显式契约；它必须从 `analysis_parameters` 派生，不能和 `analysis_parameters` 写成两套互相独立的口径。凡是使用 `ts_query(...)`，都必须声明 `time_series_query`。
 - `query_constraints` 必须是真实 Python `dict`，不能只是注释或自然语言说明。
 - `query_constraints.target_filters` 应沉淀可结构化展示的过滤规则：每条过滤项必须使用稳定 schema（`semantic_role`、`field_hint`、`value`、`match_mode`）；`notes` 只写整体口径总结，不要用 notes 替代具体过滤规则。
 - 正式分析代码在声明 `query_constraints` 后，不能跳过 `validate_query_constraints(...)`，且应传入稳定 `query_key`，供后端记录本轮真实查询事实。
@@ -560,7 +581,7 @@ analysis_parameters = get_analysis_parameters(analysis_parameters_schema["defaul
 3. **声明分析约束** - 正式 `analysis` 代码基于 `analysis_parameters` 声明 `query_constraints = {...}`；`probe` 不声明 `query_constraints`
 4. **生成实现并校验** - `analysis` 代码先基于 `analysis_parameters` 构造 SQL / pandas 过滤表达式 / `sql_context.fragments`，再调用 `validate_query_constraints(query_key=..., ...)`；`query_key` 必须稳定且能区分本轮不同逻辑查询
 5. **数据加载** - 只有 `validate_query_constraints(...)` 返回 `None` 后，才使用上下文传入的加载工具函数加载数据
-6. **数据处理** - 使用 pandas 进行数据清洗、转换、聚合等；所有可变筛选、分组、排序、TopN、采样和展示上限都应来自 `analysis_parameters`
+6. **数据处理** - 使用 pandas 进行轻量清洗、转换和结果整理；关系型或文件数据可按问题需要聚合，但时序采样与时序统计必须先由时序库原生查询完成。所有可变筛选、分组、排序、TopN、采样和展示上限都应来自 `analysis_parameters`
 7. **可视化** - 已支持的图表类型必须使用后端 chart helper 生成图表；图表标题、描述中的时间范围、筛选对象、指标、粒度应与 `analysis_parameters` 一致
 8. **构造结构化结果** - 默认生成一个或多个结构化图表，必要时附带结构化表格；报告正文必须说明本次实际采用的关键查询口径
 9. **保存分析结果或返回探测反馈** - `analysis` 代码调用 `save_analysis_result(..., analysis_parameters_schema=analysis_parameters_schema, analysis_parameters=analysis_parameters)`；`probe` 代码调用 `request_retry()`
@@ -1485,6 +1506,10 @@ query_constraints = {
     "aggregation": {
         "grain": "raw",
         "metrics": ["value"],
+    },
+    "time_series_query": {
+        "mode": "raw",
+        "decision_source": "analysis_choice",
     },
 }
 
