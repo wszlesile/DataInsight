@@ -1089,8 +1089,10 @@ class InsightNsRelDatasourceService:
                 owner_by_ref_id[ref_id] = owner_id
                 reference_ids.append(ref_id)
 
-        if not reference_ids or failed_rows:
-            return {}, failed_rows
+        if failed_rows:
+            return reference_detail_by_id, failed_rows
+        if not reference_ids:
+            return reference_detail_by_id, []
 
         for result in self._fetch_uns_details_in_parallel(reference_ids, authorization):
             ref_id = str(result.get("id") or (result.get("detail") or {}).get("id") or "").strip()
