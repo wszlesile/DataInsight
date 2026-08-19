@@ -256,6 +256,7 @@ def test_intent_contract_plans_business_facts_without_execution_semantics():
     assert question_properties == {
         "question_id",
         "business_question",
+        "subject_scope",
         "required_business_facts",
     }
 
@@ -290,6 +291,28 @@ def test_source_free_intent_canonicalizes_selection_facts_to_explicit_questions(
     assert facts[0].fact_id == "question_1_fact_1"
     assert facts[0].business_fact == "年费合同情况如何"
     assert canonical.analytical_facets == ["规模", "状态", "趋势"]
+
+
+def test_source_free_intent_preserves_current_datasource_set_scope():
+    intent = IntentContract(
+        business_goal="查看当前数据源趋势",
+        business_subjects=["当前数据源"],
+        analytical_facets=["趋势"],
+        business_questions=[BusinessQuestionContract(
+            question_id="question_1",
+            business_question="当前数据源近十分钟的历史趋势如何",
+            subject_scope="current_datasource_set",
+            required_business_facts=[BusinessFactRequirementContract(
+                fact_id="question_1_fact_1",
+                business_fact="当前数据源近十分钟的历史趋势",
+                semantic_definition="当前会话中各个匹配数据源的独立时间序列趋势",
+            )],
+        )],
+    )
+
+    canonical = prep._canonicalize_intent_selection_facts(intent)
+
+    assert canonical.business_questions[0].subject_scope == "current_datasource_set"
 
 
 def test_fact_recall_keeps_dimension_source_omitted_by_llm_shortlist():

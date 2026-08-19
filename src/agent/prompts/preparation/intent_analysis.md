@@ -8,6 +8,7 @@
   "business_questions": [{
     "question_id": "question_1",
     "business_question": "围绕目标必须回答的自然业务问题",
+    "subject_scope": "specific|current_datasource_set",
     "required_business_facts": [{
       "fact_id": "question_1_fact_1",
       "business_fact": "与 business_question 相同的自然业务问题",
@@ -24,6 +25,7 @@
 - `analysis_as_of_date` 是本轮分析基准日。用户询问尚未结束的当前年、季度或月份时，实际发生类事实应定义为“截至可用数据截止日的累计事实”，不能预设未来尚未发生的数据已经形成；若规划同比或环比事实，必须要求与基期使用相同完成周期。
 - `expected_time_range` 是从用户原问题确定出的唯一显式时间范围。它为空时，不得自行把“当前年度、近12个月、最近季度”等观察窗口写进必需事实；是否采用趋势观察窗口由正式分析决定，且不能改变总体人口径。
 - 用户明确并列多个对象或口径时，每个对象或口径都必须在 business_questions 中得到覆盖，不能合并后遗漏。
+- `subject_scope` 只描述用户要求覆盖的业务对象范围，不规划数据源：用户点名某个对象、点位或数据源时用 `specific`；用户以“当前数据源、这些数据源、各数据源、所有数据源”等方式泛指当前会话中的数据源集合，且没有把范围限定到其中某一个时，用 `current_datasource_set`。后者表示集合中的每个匹配对象都要被回答，不能在后续选源时把它们当成可互换来源只保留一个。
 - followup 时结合 conversation_context 承接上一轮仍然有效的业务对象和语义；当前问题明确改变的内容优先。
 - 本阶段不选择数据源，不判断字段是否存在，不生成结论和建议。`analytical_facets` 不得回流成为 Selection 的必选事实；具体查询、指标、图表、表格和报告表达由正式分析根据已选 Schema 自主决定。
 - `question_id` 在本轮内唯一且稳定，按 `question_1`、`question_2` 的形式编号。

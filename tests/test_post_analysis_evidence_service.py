@@ -4791,6 +4791,28 @@ def test_rendered_report_compact_date_range_is_not_a_metric_candidate():
     assert metric_texts == ["33"]
 
 
+def test_rendered_report_iso_datetime_range_is_not_a_metric_candidate():
+    report = (
+        "数据源在 2026-08-19T17:55:12+08:00 至 "
+        "2026-08-19T18:05:12+08:00 的 10 分钟窗口内有 600 个数据点。"
+    )
+
+    candidates = LineageIndexer._locate_report_numeric_candidates(
+        report,
+        occupied=set(),
+    )
+    metric_texts = [
+        item["text"]
+        for item in candidates
+        if PostAnalysisEvidenceCompiler._is_report_metric_output(
+            item,
+            {"operation_nodes": []},
+        )
+    ]
+
+    assert metric_texts == ["10", "600"]
+
+
 def test_rendered_report_unitless_comparison_cutoff_is_not_a_metric_candidate():
     report = "关联多物料批次（≥3）涉及 33 个批次。"
 

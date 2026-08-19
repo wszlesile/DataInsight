@@ -125,6 +125,7 @@ class BusinessQuestionContract(BaseModel):
 
     question_id: str = Field(min_length=1)
     business_question: str = Field(min_length=1)
+    subject_scope: Literal["specific", "current_datasource_set"] = "specific"
     required_business_facts: list[BusinessFactRequirementContract] = Field(
         min_length=1
     )

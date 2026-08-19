@@ -22,6 +22,7 @@
 
 - 选源中心是 `intent_context` 中的完整业务意图，不是先找一张主表再沿相邻关系扩展。
 - 逐个覆盖全部 `business_question` 及其 `required_business_facts`。`question_id` 和 `fact_id` 必须原样使用，不得重命名、遗漏或新增。
+- 当 business question 的 `subject_scope=current_datasource_set` 时，当前候选 Schema 中每个能够直接承载该问题的来源都是用户要求覆盖的独立分析对象，必须共同保留在该事实的 `datasource_ids` 中；不能套用“同一事实优先保留一个最优来源”的规则把集合收缩成单一来源。`subject_scope=specific` 时仍按明确对象和事实语义选择最合适的来源。
 - `analytical_facets` 只用于理解开放问题希望保留的分析张力，不是必须逐项覆盖的事实清单。只有候选 Schema 对某个 facet 有直接、清晰的业务支撑时，才可把它作为相关性依据；不得为了 facet 引入弱相关表、代理字段或未经证实的分母总体。
 - 支撑来源必须对必需事实提供直接且可验证的补充。只因另一个业务域里存在名称相似的合同号、客户名、日期或金额字段，不能把它选为辅助来源；跨域关联字段和关系未由 Schema 明确支撑时，应保持缺口，不以“可能关联”扩大选源。
 - `datasource_ids` 是直接承载事实事件或度量的来源。
