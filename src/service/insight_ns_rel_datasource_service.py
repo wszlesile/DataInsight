@@ -2177,6 +2177,8 @@ class InsightNsRelDatasourceService:
                 workbook = load_workbook(file_path, read_only=True, data_only=True)
                 try:
                     worksheet = workbook[sheet_name] if sheet_name else workbook.worksheets[0]
+                    if worksheet.max_row is None:
+                        worksheet.calculate_dimension(force=True)
                     return max(int(worksheet.max_row or 0) - 1, 0)
                 finally:
                     workbook.close()

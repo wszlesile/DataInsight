@@ -4,6 +4,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 from uuid import uuid4
 
 import pandas as pd
@@ -41,6 +43,27 @@ class ExcelMultiSheetDatasourceBackendTestCase(unittest.TestCase):
 
     def tearDown(self):
         self.session.close()
+
+    def test_excel_row_count_calculates_missing_read_only_dimension(self):
+        class Worksheet:
+            max_row = None
+
+            def calculate_dimension(self, force=False):
+                self.max_row = 8001
+                return 'A1:K8001'
+
+        worksheet = Worksheet()
+        workbook = SimpleNamespace(
+            worksheets=[worksheet],
+            __getitem__=lambda _self, _name: worksheet,
+            close=lambda: None,
+        )
+        service = InsightNsRelDatasourceService(self.session)
+
+        with patch('openpyxl.load_workbook', return_value=workbook):
+            total_rows = service._count_excel_data_rows(Path('sample.xlsx'))
+
+        self.assertEqual(total_rows, 8000)
 
     def _build_excel_upload(self) -> FileStorage:
         buffer = io.BytesIO()
