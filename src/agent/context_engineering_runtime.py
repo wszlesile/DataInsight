@@ -430,6 +430,13 @@ def get_datasource_message(
     if context_mode == "general":
         general_items: list[dict[str, Any]] = []
         selected_id_set = set(selected_ids)
+        datasource_type_counts: dict[str, int] = {}
+        selection_origin_counts: dict[str, int] = {}
+        snapshot_item_by_id = {
+            to_int(row.get("datasource_id") or row.get("id"), 0): row
+            for row in snapshot_items
+            if isinstance(row, dict)
+        }
         for item in datasource_items:
             datasource_id = to_int(item.get("datasource_id"), 0)
             general_item = {
@@ -448,11 +455,26 @@ def get_datasource_message(
                 general_item["selected_for_current_context"] = datasource_id in selected_id_set
             general_items.append(general_item)
 
-        general_payload: dict[str, Any] = {"datasources": general_items}
+            if not selected_id_set or datasource_id in selected_id_set:
+                datasource_type = str(item.get("datasource_type") or "unknown")
+                datasource_type_counts[datasource_type] = datasource_type_counts.get(datasource_type, 0) + 1
+                original_item = snapshot_item_by_id.get(datasource_id, {})
+                selection_origin = str(original_item.get("selection_origin") or "unknown")
+                selection_origin_counts[selection_origin] = selection_origin_counts.get(selection_origin, 0) + 1
+
+        general_payload: dict[str, Any] = {
+            "datasource_selection_summary": {
+                "selected_count": len(selected_ids) if selected_ids else len(general_items),
+                "datasource_type_counts": datasource_type_counts,
+                "selection_origin_counts": selection_origin_counts,
+            },
+            "datasources": general_items,
+        }
         if namespace_id_int > 0:
             general_payload["namespace_id"] = namespace_id_int
         return SystemMessage(
             "当前会话数据源上下文：\n"
+            "- `datasource_selection_summary` 是后端根据当前会话快照计算的权威选择状态；询问已选数据源数量或构成时直接使用它，不要自行遍历 Schema 计数，也不要沿用历史轮次中的旧数量。\n"
             "- `datasources` 提供当前会话可用于理解问题的数据源名称、类型和完整 Schema。\n"
             "- `metadata_schema.properties` 中的字段名、展示名和说明可用于解释数据结构与字段语义。\n"
             "- `selected_for_current_context=true` 表示该数据源属于当前已选范围；未提供该标记时，表示系统没有额外声明选择范围。\n"

@@ -253,6 +253,11 @@ def test_general_datasource_context_keeps_schema_without_analysis_execution_cont
 
     payload = json.loads(message.content[message.content.index("{"):])
     datasource = payload["datasources"][0]
+    assert payload["datasource_selection_summary"] == {
+        "selected_count": 1,
+        "datasource_type_counts": {"table": 1},
+        "selection_origin_counts": {"unknown": 1},
+    }
     assert datasource["metadata_schema"]["properties"] == properties
     assert datasource["selected_for_current_context"] is True
     assert datasource["datasource_name"] == "合同事实"
@@ -262,6 +267,47 @@ def test_general_datasource_context_keeps_schema_without_analysis_execution_cont
     assert "field_capabilities" not in datasource
     assert "execute_python" not in message.content
     assert "Probe" not in message.content
+
+
+def test_general_datasource_context_reports_large_selection_without_llm_counting(monkeypatch):
+    snapshot_rows = [
+        {
+            "datasource_id": 1,
+            "datasource_name": "成本文件",
+            "datasource_type": "local_file",
+            "selection_origin": "external",
+            "metadata_schema": {"properties": {"cost": {"type": "number"}}},
+        }
+    ] + [
+        {
+            "datasource_id": datasource_id,
+            "datasource_name": f"UNS-{datasource_id}",
+            "datasource_type": "table",
+            "selection_origin": "uns",
+            "metadata_schema": {"properties": {"value": {"type": "number"}}},
+        }
+        for datasource_id in range(2, 277)
+    ]
+    snapshot = {
+        "selected_datasource_ids": list(range(1, 277)),
+        "selected_datasource_snapshot": snapshot_rows,
+    }
+    monkeypatch.setattr(runtime_context, "_load_conversation", lambda _: None)
+
+    message = runtime_context.get_datasource_message(
+        namespace_id=1,
+        conversation_id=5,
+        snapshot_override=snapshot,
+        context_mode="general",
+    )
+
+    payload = json.loads(message.content[message.content.index("{"):])
+    assert payload["datasource_selection_summary"] == {
+        "selected_count": 276,
+        "datasource_type_counts": {"local_file": 1, "table": 275},
+        "selection_origin_counts": {"external": 1, "uns": 275},
+    }
+    assert len(payload["datasources"]) == 276
 
 
 def test_general_datasource_context_handles_empty_scope_without_analysis_instructions(monkeypatch):
