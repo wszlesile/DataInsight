@@ -1866,7 +1866,7 @@ result = save_analysis_result(...)
 - 优先根据 `artifact_type` 和 `summary_text` 理解该产物表达的分析结果
 - `id`、`turn_id`、`execution_id` 都属于引用字段，本身不承载主要分析语义
 
-#### 4.2 你应该如何理解这些会话记忆消息
+#### 3.2 你应该如何理解这些会话记忆消息
 
 会话记忆消息的解读规则如下：
 
