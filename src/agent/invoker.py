@@ -28,11 +28,15 @@ from agent.analysis_preparation import (
     DatasourceSelectionContract,
     IntentContract,
     PreparationResult,
+    ScopeClarificationResult,
     infer_query_capabilities,
     prepare_analysis,
 )
 from agent.context_engineering_runtime import classify_analysis_context_mode, is_analysis_like_request
-from agent.intent_classifier import resolve_context_mode_with_llm
+from agent.intent_classifier import (
+    PENDING_SCOPE_MEMORY_TYPE,
+    resolve_context_mode_with_llm,
+)
 from config import Config
 from config.database import session_scope
 from service.conversation_context_service import ConversationContextService, ConversationRunContext
@@ -716,10 +720,11 @@ def _prepare_analysis_context(
     agent_request: AgentRequest,
     runtime_config,
     stage_callback: Callable[[str], None] | None = None,
-) -> PreparationResult:
+) -> PreparationResult | ScopeClarificationResult:
     """Select and enrich datasource Schema without owning insight semantics."""
     cached = runtime.short_term_memory.get("preparation_result")
     if isinstance(cached, PreparationResult):
+        _clear_consumed_scope_clarification(runtime)
         return cached
 
     user_query = getattr(runtime.turn, "user_query", "") or agent_request.user_message
@@ -803,6 +808,7 @@ def _prepare_analysis_context(
                 business_questions=[BusinessQuestionContract(
                     question_id="question_1",
                     business_question=user_query or "完成本轮数据洞察分析",
+                    subject_scope="specific",
                     required_business_facts=[BusinessFactRequirementContract(
                         fact_id="question_1_fact_1",
                         business_fact=user_query or "完成本轮数据洞察分析",
@@ -834,6 +840,9 @@ def _prepare_analysis_context(
             query_capabilities=infer_query_capabilities(source_snapshot),
             explicit_time_range=expected_time_range or None,
         )
+    if isinstance(result, ScopeClarificationResult):
+        return result
+    _clear_consumed_scope_clarification(runtime)
     source_ids = {
         int(item.get('datasource_id') or item.get('id') or 0)
         for item in source_snapshot.get('selected_datasource_snapshot') or []
@@ -862,6 +871,7 @@ def _prepare_analysis_context(
 
 PREPARATION_STAGE_MESSAGES = {
     "intent_analysis": "正在理解业务问题，明确本轮需要分析的业务范围。",
+    "scope_capacity": "正在结合当前数据源规模确认合理的分析范围。",
     "semantic_selection": "正在从语义中心检索与业务问题相关的数据源。",
     "select_datasources": "正在核对候选数据源，确认其对业务问题的覆盖情况。",
     "business_context": "正在梳理已选数据源之间的业务关系与可分析事实。",
@@ -950,30 +960,90 @@ def _stream_analysis_preparation(
             )
         result = future.result()
 
-    yield _build_progress_event(
-        'status',
-        conversation_id=runtime.conversation.id,
-        turn_id=runtime.turn.id,
-        stage='preparation:complete',
-        level='success',
-        message='分析范围和数据关系已准备完成，开始执行洞察分析。',
-    )
+    if isinstance(result, ScopeClarificationResult):
+        yield _build_progress_event(
+            'status',
+            conversation_id=runtime.conversation.id,
+            turn_id=runtime.turn.id,
+            stage='preparation:scope_clarification',
+            level='info',
+            message='当前全范围分析规模较大，需要补充更具体的分析范围。',
+        )
+    else:
+        yield _build_progress_event(
+            'status',
+            conversation_id=runtime.conversation.id,
+            turn_id=runtime.turn.id,
+            stage='preparation:complete',
+            level='success',
+            message='分析范围和数据关系已准备完成，开始执行洞察分析。',
+        )
     return result
 
 
 def _resolve_runtime_context_mode(runtime: ConversationRunContext, user_message: str) -> str:
     classification = resolve_context_mode_with_llm(runtime, user_message)
     runtime.context_mode = classification.mode
+    clarification_relation = getattr(
+        classification,
+        'clarification_relation',
+        'none',
+    )
+    runtime.short_term_memory['scope_clarification_relation'] = clarification_relation
+    if clarification_relation in {'new_request', 'cancel'}:
+        _clear_pending_scope_clarification(runtime)
     logger.info(
-        "Resolved analysis context mode: conversation_id=%s turn_id=%s mode=%s source=%s confidence=%s reason=%s",
+        "Resolved analysis context mode: conversation_id=%s turn_id=%s mode=%s source=%s confidence=%s clarification_relation=%s reason=%s",
         getattr(runtime.conversation, 'id', ''),
         getattr(runtime.turn, 'id', ''),
         classification.mode,
         classification.source,
         classification.confidence,
+        clarification_relation,
         classification.reason,
     )
     return classification.mode
+
+
+def _clear_pending_scope_clarification(runtime: ConversationRunContext) -> None:
+    with session_scope(expire_on_commit=False) as session:
+        ConversationContextService(session).clear_memory(
+            runtime.conversation.id,
+            PENDING_SCOPE_MEMORY_TYPE,
+        )
+        session.commit()
+
+
+def _clear_consumed_scope_clarification(runtime: ConversationRunContext) -> None:
+    if runtime.short_term_memory.get('scope_clarification_relation') != 'answer':
+        return
+    _clear_pending_scope_clarification(runtime)
+    runtime.short_term_memory['scope_clarification_relation'] = 'none'
+
+
+def _persist_scope_clarification(
+    runtime: ConversationRunContext,
+    clarification: ScopeClarificationResult,
+) -> None:
+    payload = clarification.memory_payload()
+    payload.update({
+        'conversation_id': int(runtime.conversation.id or 0),
+        'turn_id': int(runtime.turn.id or 0),
+        'turn_no': int(runtime.turn.turn_no or 0),
+        'selected_datasource_ids': list(
+            (runtime.active_datasource_snapshot or {}).get(
+                'selected_datasource_ids',
+                [],
+            )
+        ),
+    })
+    with session_scope(expire_on_commit=False) as session:
+        ConversationContextService(session).set_memory(
+            runtime.conversation.id,
+            PENDING_SCOPE_MEMORY_TYPE,
+            payload,
+        )
+        session.commit()
 
 
 def _is_analysis_request_expected(runtime: ConversationRunContext, user_message: str) -> bool:
@@ -2522,6 +2592,22 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 allow_report_only=allow_report_only,
             )
 
+        if isinstance(preparation, ScopeClarificationResult):
+            _persist_scope_clarification(runtime, preparation)
+            assistant_message = preparation.assistant_message()
+            allow_report_only = True
+            return _finalize_run_with_fresh_session(
+                runtime=runtime,
+                username=agent_request.username,
+                user_message=agent_request.user_message,
+                analysis_flow_started=False,
+                assistant_message=assistant_message,
+                analysis_report='',
+                charts=[],
+                tables=[],
+                allow_report_only=allow_report_only,
+            )
+
         agent = _get_runtime_agent(
             runtime_config,
             analysis_request_expected=analysis_request_expected,
@@ -2803,6 +2889,35 @@ def _stream_with_runtime(
                 analysis_report=analysis_report,
                 charts=charts,
                 tables=tables,
+                allow_report_only=allow_report_only,
+            )
+            yield _build_progress_event(
+                'done',
+                conversation_id=runtime.conversation.id,
+                turn_id=runtime.turn.id,
+            )
+            return
+
+        if isinstance(preparation, ScopeClarificationResult):
+            _persist_scope_clarification(runtime, preparation)
+            assistant_message = preparation.assistant_message()
+            allow_report_only = True
+            yield _build_progress_event(
+                'assistant',
+                conversation_id=runtime.conversation.id,
+                turn_id=runtime.turn.id,
+                stage='scope_clarification',
+                message=assistant_message,
+            )
+            _finalize_run_with_fresh_session(
+                runtime=runtime,
+                username=agent_request.username,
+                user_message=agent_request.user_message,
+                analysis_flow_started=False,
+                assistant_message=assistant_message,
+                analysis_report='',
+                charts=[],
+                tables=[],
                 allow_report_only=allow_report_only,
             )
             yield _build_progress_event(

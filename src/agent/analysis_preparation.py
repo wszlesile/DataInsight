@@ -125,7 +125,7 @@ class BusinessQuestionContract(BaseModel):
 
     question_id: str = Field(min_length=1)
     business_question: str = Field(min_length=1)
-    subject_scope: Literal["specific", "current_datasource_set"] = "specific"
+    subject_scope: Literal["specific", "current_datasource_set"]
     required_business_facts: list[BusinessFactRequirementContract] = Field(
         min_length=1
     )
@@ -1040,6 +1040,45 @@ class PreparationResult:
             "insight_lineage": runtime_lineage,
         }
         return snapshot
+
+
+@dataclass(frozen=True)
+class ScopeClarificationResult:
+    """A successful Preparation outcome that asks a later turn to narrow scope."""
+
+    intent: IntentContract
+    original_user_query: str
+    reason_code: Literal[
+        "full_scope_exceeds_direct_capacity",
+        "full_scope_without_bound_datasource",
+    ]
+    datasource_count: int
+    direct_analysis_limit: int
+
+    def assistant_message(self) -> str:
+        if self.reason_code == "full_scope_without_bound_datasource":
+            return (
+                "当前会话尚未关联具体数据源，而本次问题要求分析全部数据源。"
+                "语义中心可以按业务主题检索相关来源，但无法把整个平台的数据源作为无边界分析范围。"
+                "请补充希望分析的业务主题、数据源目录或具体对象，我会在下一轮继续完成分析。"
+            )
+        return (
+            f"当前会话关联了 {self.datasource_count} 个数据源，超过一次直接全范围分析的"
+            f"合理规模（{self.direct_analysis_limit} 个）。为避免执行时间过长、结果过于分散，"
+            "请补充希望分析的业务主题、数据源目录、类型或具体数据源范围，我会在下一轮继续完成分析。"
+        )
+
+    def memory_payload(self) -> dict[str, Any]:
+        return {
+            "kind": "full_scope_capacity",
+            "status": "pending",
+            "reason_code": self.reason_code,
+            "datasource_count": self.datasource_count,
+            "direct_analysis_limit": self.direct_analysis_limit,
+            "original_user_query": self.original_user_query,
+            "original_intent": self.intent.model_dump(),
+            "question": self.assistant_message(),
+        }
 
 
 def _apply_probe_field_profiles(
@@ -2461,6 +2500,8 @@ class AnalysisPreparationState(TypedDict, total=False):
     business_context: BusinessContextContract
     probe_observations: tuple[dict[str, Any], ...]
     query_capabilities: tuple[str, ...]
+    scope_route: Literal["selection", "full_scope", "clarification"]
+    scope_clarification: ScopeClarificationResult
 
 
 class AnalysisPreparationWorkflow:
@@ -2504,6 +2545,7 @@ class AnalysisPreparationWorkflow:
             business_questions=[BusinessQuestionContract(
                 question_id="question_1",
                 business_question=query,
+                subject_scope="specific",
                 required_business_facts=[BusinessFactRequirementContract(
                     fact_id="question_1_fact_1",
                     business_fact=query,
@@ -2511,6 +2553,121 @@ class AnalysisPreparationWorkflow:
                 )],
             )],
         )
+
+    @staticmethod
+    def _full_scope_selection(
+        catalog: list[dict[str, Any]],
+        intent: IntentContract,
+    ) -> DatasourceSelectionContract:
+        datasource_ids = [
+            int(item.get("datasource_id") or 0)
+            for item in catalog
+            if int(item.get("datasource_id") or 0) > 0
+        ]
+        if not datasource_ids:
+            raise ValueError("full datasource scope requires bound datasources")
+        return DatasourceSelectionContract(
+            selected_datasource_ids=datasource_ids,
+            question_coverage=[
+                BusinessQuestionCoverageContract(
+                    question_id=question.question_id,
+                    datasource_ids=datasource_ids,
+                    fact_coverage=[
+                        BusinessFactCoverageContract(
+                            fact_id=fact.fact_id,
+                            coverage_status="direct",
+                            datasource_ids=datasource_ids,
+                            coverage_reason=(
+                                "用户要求覆盖当前数据源集合，完整保留全部已关联来源"
+                            ),
+                        )
+                        for fact in question.required_business_facts
+                    ],
+                    coverage_reason="当前问题要求覆盖完整数据源集合",
+                )
+                for question in intent.business_questions
+            ],
+            selection_reason=(
+                "全范围分析规模可控，按用户要求确定性保留全部已关联数据源"
+            ),
+        )
+
+    def scope_capacity(
+        self,
+        state: AnalysisPreparationState,
+        *,
+        provider: str,
+    ) -> AnalysisPreparationState:
+        """Route only collection-wide requests by real datasource capacity."""
+        self._start_stage("scope_capacity")
+        intent = state["intent"]
+        is_full_scope = any(
+            question.subject_scope == "current_datasource_set"
+            for question in intent.business_questions
+        )
+        logger.info(
+            "analysis scope resolved scopes=%s full_scope=%s",
+            [
+                {
+                    "question_id": question.question_id,
+                    "subject_scope": question.subject_scope,
+                }
+                for question in intent.business_questions
+            ],
+            is_full_scope,
+        )
+        if not is_full_scope:
+            return {"scope_route": "selection"}
+
+        catalog = state.get("catalog") or []
+        datasource_count = len(catalog)
+        direct_limit = max(
+            int(
+                getattr(
+                    Config,
+                    "FULL_SCOPE_DIRECT_ANALYSIS_MAX_DATASOURCES",
+                    10,
+                )
+                or 10
+            ),
+            1,
+        )
+        if datasource_count == 0 and provider == "semantic_center":
+            return {
+                "scope_route": "clarification",
+                "scope_clarification": ScopeClarificationResult(
+                    intent=intent,
+                    original_user_query=self.user_query,
+                    reason_code="full_scope_without_bound_datasource",
+                    datasource_count=0,
+                    direct_analysis_limit=direct_limit,
+                ),
+            }
+        if datasource_count > direct_limit:
+            return {
+                "scope_route": "clarification",
+                "scope_clarification": ScopeClarificationResult(
+                    intent=intent,
+                    original_user_query=self.user_query,
+                    reason_code="full_scope_exceeds_direct_capacity",
+                    datasource_count=datasource_count,
+                    direct_analysis_limit=direct_limit,
+                ),
+            }
+
+        selection = self._full_scope_selection(catalog, intent)
+        selected_snapshot = dict(self.datasource_snapshot)
+        return {
+            "scope_route": "full_scope",
+            "selection": selection,
+            "selected_snapshot": selected_snapshot,
+            "selected_schemas": (
+                compact_datasource_snapshot(selected_snapshot)
+                .get("selected_datasource_snapshot")
+                or []
+            ),
+            "query_capabilities": infer_query_capabilities(selected_snapshot),
+        }
 
     @staticmethod
     def _fallback_selection(
@@ -3522,6 +3679,7 @@ class AnalysisPreparationWorkflow:
                 {
                     "question_id": item.question_id,
                     "business_question": item.business_question,
+                    "subject_scope": item.subject_scope,
                     "required_business_facts": item.required_business_facts,
                 }
                 for item in intent.business_questions
@@ -4012,20 +4170,34 @@ class AnalysisPreparationWorkflow:
         graph = StateGraph(AnalysisPreparationState)
         graph.add_node("business_context", self.business_context)
         graph.add_node("intent_analysis", self.intent_analysis)
+        graph.add_node(
+            "scope_capacity",
+            lambda state: self.scope_capacity(state, provider=provider),
+        )
         if provider == "semantic_center":
             graph.add_node("semantic_selection", self.semantic_selection)
             graph.add_edge(START, "intent_analysis")
-            graph.add_edge("intent_analysis", "semantic_selection")
+            selection_node = "semantic_selection"
             graph.add_edge("semantic_selection", "business_context")
         else:
             graph.add_node("select_datasources", self.select_datasources)
             graph.add_edge(START, "intent_analysis")
-            graph.add_edge("intent_analysis", "select_datasources")
+            selection_node = "select_datasources"
             graph.add_edge("select_datasources", "business_context")
+        graph.add_edge("intent_analysis", "scope_capacity")
+        graph.add_conditional_edges(
+            "scope_capacity",
+            lambda state: state.get("scope_route") or "selection",
+            {
+                "selection": selection_node,
+                "full_scope": "business_context",
+                "clarification": END,
+            },
+        )
         graph.add_edge("business_context", END)
         return graph.compile()
 
-    def run(self) -> PreparationResult:
+    def run(self) -> PreparationResult | ScopeClarificationResult:
         provider = DatasourceSelectionProviderRouter.resolve(self.datasource_snapshot)
         try:
             state = self.compile(provider=provider).invoke({
@@ -4045,6 +4217,9 @@ class AnalysisPreparationWorkflow:
             state = self.compile(provider="local").invoke({
                 "catalog": build_datasource_catalog(self.datasource_snapshot),
             })
+        clarification = state.get("scope_clarification")
+        if isinstance(clarification, ScopeClarificationResult):
+            return clarification
         return PreparationResult(
             intent=state["intent"],
             selection=state["selection"],
@@ -4069,7 +4244,7 @@ def prepare_analysis(
     execution_context: dict[str, Any] | None = None,
     cancelled: Callable[[], None] | None = None,
     stage_callback: Callable[[str], None] | None = None,
-) -> PreparationResult:
+) -> PreparationResult | ScopeClarificationResult:
     return AnalysisPreparationWorkflow(
         user_query=user_query,
         context_mode=context_mode,

@@ -15,6 +15,10 @@ from utils.datasource_utils import safe_json_loads, to_int
 from utils.llm_model_factory import create_data_insight_model
 
 VALID_CONTEXT_MODES = {'followup', 'fresh_analysis', 'general'}
+VALID_CLARIFICATION_RELATIONS = {
+    'none', 'answer', 'new_request', 'cancel', 'uncertain',
+}
+PENDING_SCOPE_MEMORY_TYPE = 'pending_scope_clarification'
 
 INTENT_CLASSIFIER_SYSTEM_PROMPT = """你是 DataInsight 的轻量级对话意图分类器。
 你判断当前请求是否需要执行新的数据分析，以及它与最近上下文的关系；不做数据分析，不写 SQL，不调用工具。
@@ -27,11 +31,18 @@ INTENT_CLASSIFIER_SYSTEM_PROMPT = """你是 DataInsight 的轻量级对话意图
 注意：
 - “生成/补充/整理/换一种图表/图表报告/可视化/报告”这类短句，如果语义上是在延续最近分析结果，通常是 followup。
 - “现在呢”“目前呢”这类省略表达要结合最近问题判断：承接会话状态查询时是 general，承接需要重新查询或计算的数据分析时才是 followup。上下文承接关系本身不等于需要数据分析。
+- 严格区分“查询数据源状态”与“以数据源为对象做分析”：只有询问已选/关联数据源的数量、名称、类型或列表才是 general；“分析/比较/计算/展示当前已选、已关联或全部数据源”仍是 fresh_analysis，不能因 selected_datasource_summary 为空或数量较大而改判为状态查询。
 - 如果当前问题显式指定了新数据范围、新数据源、新对象、新时间范围，应归为 fresh_analysis。
 - 最近执行记录中的 used_datasource_ids 只是判断上下文关系的参考，不代表当前必须沿用。
+- 当 `pending_scope_clarification.status=pending` 时，同时判断当前输入与待补充范围的关系：
+  - answer：直接补充了业务主题、目录、类型或具体数据源范围，应继续原分析；
+  - new_request：提出独立的新问题，不应拼接到原分析；
+  - cancel：明确取消或不再继续原分析；
+  - uncertain：既不能确认是范围补充，也不是明确的新问题。
+- 只有真正缩小或具体化分析范围才是 answer；“还是全部分析”没有解决容量问题，应为 uncertain。
 
 只输出 JSON，不要输出其他文字：
-{"mode":"followup|fresh_analysis|general","confidence":0.0-1.0,"reason":"不超过80字的中文理由"}"""
+{"mode":"followup|fresh_analysis|general","clarification_relation":"none|answer|new_request|cancel|uncertain","confidence":0.0-1.0,"reason":"不超过80字的中文理由"}"""
 
 
 @dataclass(frozen=True)
@@ -40,11 +51,23 @@ class IntentClassification:
     confidence: float
     reason: str = ''
     source: str = 'local_fallback'
+    clarification_relation: str = 'none'
 
 
 DATASOURCE_STATE_OBJECT_PATTERN = re.compile(r'(数据源|datasources?)', re.IGNORECASE)
 DATASOURCE_STATE_SELECTION_PATTERN = re.compile(r'(选中|已选|选择了|关联|绑定|接入)')
 DATASOURCE_STATE_REQUEST_PATTERN = re.compile(r'(多少|几个|数量|构成|哪些|列表|清单)')
+DATASOURCE_ANALYSIS_ACTION_PATTERN = re.compile(
+    r'(分析|洞察|比较|对比|计算|统计|汇总|评估|诊断|趋势|分布|异常|'
+    r'analy[sz]e|compare|calculate|summari[sz]e)',
+    re.IGNORECASE,
+)
+DATASOURCE_CAPABILITY_QUERY_PATTERN = re.compile(
+    r'(最多|上限|限制|一次性|支持.{0,8}(多少|几个|数量)|'
+    r'(多少|几个|数量).{0,8}支持)',
+    re.IGNORECASE,
+)
+DATASOURCE_CONCEPT_QUERY_PATTERN = re.compile(r'(是什么|什么意思|如何理解|请解释|介绍一下)')
 ELLIPTICAL_STATE_QUESTIONS = {
     '现在呢', '那现在呢', '目前呢', '那目前呢', '当前呢', '那当前呢',
 }
@@ -101,6 +124,23 @@ def _is_datasource_selection_state_text(text: str) -> bool:
         and DATASOURCE_STATE_SELECTION_PATTERN.search(normalized)
         and DATASOURCE_STATE_REQUEST_PATTERN.search(normalized)
     )
+
+
+def _is_explicit_datasource_analysis_request(text: str) -> bool:
+    """Identify an explicit command to analyze datasource contents.
+
+    Whether that scope is sufficiently narrow is deliberately left to
+    intent_analysis/scope_capacity. This boundary only separates an analysis
+    command from datasource state, capability, and concept questions.
+    """
+    normalized = re.sub(r'\s+', '', str(text or ''))
+    if not DATASOURCE_STATE_OBJECT_PATTERN.search(normalized):
+        return False
+    if DATASOURCE_CAPABILITY_QUERY_PATTERN.search(normalized):
+        return False
+    if DATASOURCE_CONCEPT_QUERY_PATTERN.search(normalized):
+        return False
+    return bool(DATASOURCE_ANALYSIS_ACTION_PATTERN.search(normalized))
 
 
 def _is_conversation_state_request(payload: dict[str, Any]) -> bool:
@@ -192,6 +232,7 @@ def _build_classifier_payload(runtime: ConversationRunContext, user_message: str
     previous_turn_no = max(int(getattr(runtime.turn, 'turn_no', 0) or 0) - 1, 0)
     recent_messages: list[dict[str, Any]] = []
     recent_executions: list[Any] = []
+    pending_scope_clarification: dict[str, Any] = {}
 
     try:
         with session_scope(expire_on_commit=False) as session:
@@ -216,6 +257,19 @@ def _build_classifier_payload(runtime: ConversationRunContext, user_message: str
                 max_turn_no=previous_turn_no,
                 terminal_only=True,
             )
+            pending_memory = service.get_memory(
+                runtime.conversation.id,
+                PENDING_SCOPE_MEMORY_TYPE,
+            )
+            pending_payload = safe_json_loads(
+                getattr(pending_memory, 'content_json', ''),
+                {},
+            )
+            if (
+                isinstance(pending_payload, dict)
+                and pending_payload.get('status') == 'pending'
+            ):
+                pending_scope_clarification = pending_payload
     except SQLAlchemyError:
         logger.warning(
             "LLM intent classifier failed to read recent context: conversation_id=%s turn_id=%s",
@@ -230,6 +284,7 @@ def _build_classifier_payload(runtime: ConversationRunContext, user_message: str
         'latest_successful_execution': _build_latest_execution_payload(recent_executions),
         'selected_datasource_summary': _selected_datasource_summary(runtime),
         'selected_datasources': _selected_datasource_payload(runtime),
+        'pending_scope_clarification': pending_scope_clarification,
     }
 
 
@@ -245,6 +300,22 @@ def resolve_context_mode_with_llm(
             confidence=1.0,
             reason='当前请求读取会话数据源选择状态，不需要执行数据分析',
             source='conversation_state',
+            clarification_relation=(
+                'new_request'
+                if payload.get('pending_scope_clarification')
+                else 'none'
+            ),
+        )
+    if (
+        not payload.get('pending_scope_clarification')
+        and _is_explicit_datasource_analysis_request(user_message)
+    ):
+        return IntentClassification(
+            mode='fresh_analysis',
+            confidence=1.0,
+            reason='当前请求明确要求分析数据源内容，范围完整性由后续准备阶段判断',
+            source='explicit_analysis_request',
+            clarification_relation='none',
         )
     try:
         response = create_data_insight_model().invoke([
@@ -258,12 +329,27 @@ def resolve_context_mode_with_llm(
         except (TypeError, ValueError):
             confidence = 0.0
         reason = str(parsed.get('reason') or '').strip()
+        clarification_relation = str(
+            parsed.get('clarification_relation') or 'none'
+        ).strip()
+        if clarification_relation not in VALID_CLARIFICATION_RELATIONS:
+            clarification_relation = 'none'
+        if not payload.get('pending_scope_clarification'):
+            clarification_relation = 'none'
+        elif clarification_relation == 'none':
+            clarification_relation = 'uncertain'
+            mode = 'general'
+        elif clarification_relation == 'answer':
+            mode = 'followup'
+        elif clarification_relation in {'cancel', 'uncertain'}:
+            mode = 'general'
         if mode in VALID_CONTEXT_MODES:
             return IntentClassification(
                 mode=mode,
                 confidence=max(0.0, min(confidence, 1.0)),
                 reason=reason,
                 source='llm',
+                clarification_relation=clarification_relation,
             )
         return _fallback_classification(
             user_message,
@@ -277,4 +363,12 @@ def resolve_context_mode_with_llm(
             exc,
             exc_info=True,
         )
+        if payload.get('pending_scope_clarification'):
+            return IntentClassification(
+                mode='general',
+                confidence=0.0,
+                reason='待补充范围存在，但当前无法可靠判断本轮输入与澄清问题的关系',
+                source='local_fallback',
+                clarification_relation='uncertain',
+            )
         return _fallback_classification(user_message)

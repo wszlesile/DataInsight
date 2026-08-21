@@ -108,6 +108,23 @@ class ConversationContextServiceTestCase(unittest.TestCase):
             is_deleted=0,
         ))
 
+    def test_public_memory_can_be_set_and_cleared_without_losing_key(self) -> None:
+        service = ConversationContextService(self.session)
+
+        service.set_memory(17, 'pending_scope_clarification', {'status': 'pending'})
+        self.session.commit()
+        memory = service.get_memory(17, 'pending_scope_clarification')
+
+        self.assertIsNotNone(memory)
+        self.assertEqual(memory.content_json, '{"status": "pending"}')
+
+        service.clear_memory(17, 'pending_scope_clarification')
+        self.session.commit()
+        cleared = service.get_memory(17, 'pending_scope_clarification')
+
+        self.assertIsNotNone(cleared)
+        self.assertEqual(cleared.content_json, '{}')
+
     def test_recent_prompt_messages_replays_plain_text_turn_without_execution_as_pair(self) -> None:
         self._add_turn_messages(
             turn_id=33,

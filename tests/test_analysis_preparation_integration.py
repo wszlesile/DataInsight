@@ -64,6 +64,7 @@ def _preparation(snapshot: dict) -> PreparationResult:
             business_questions=[BusinessQuestionContract(
                 question_id="question_1",
                 business_question="合同情况如何",
+                subject_scope="specific",
                 required_business_facts=[BusinessFactRequirementContract(
                     fact_id="question_1_fact_1",
                     business_fact="合同事实",
@@ -385,6 +386,68 @@ def test_rerun_analysis_intent_still_uses_analysis_agent(monkeypatch):
 
     assert invoker._resolve_runtime_context_mode(runtime, "年费合同情况如何") == "fresh_analysis"
     assert invoker._is_analysis_request_expected(runtime, "年费合同情况如何")
+
+
+def test_scope_clarification_answer_is_consumed_only_after_preparation(monkeypatch):
+    runtime = _runtime(_snapshot(11))
+    cleared = []
+    monkeypatch.setattr(
+        invoker,
+        "resolve_context_mode_with_llm",
+        lambda *_args: SimpleNamespace(
+            mode="followup",
+            source="llm",
+            confidence=0.99,
+            reason="用户补充了具体范围",
+            clarification_relation="answer",
+        ),
+    )
+    monkeypatch.setattr(
+        invoker,
+        "_clear_pending_scope_clarification",
+        lambda current_runtime: cleared.append(current_runtime.conversation.id),
+    )
+
+    assert invoker._resolve_runtime_context_mode(runtime, "只分析合同数据") == "followup"
+    assert cleared == []
+
+    monkeypatch.setattr(
+        invoker,
+        "prepare_analysis",
+        lambda **_kwargs: _preparation(_snapshot(11)),
+    )
+    invoker._prepare_analysis_context(
+        runtime=runtime,
+        agent_request=_request(),
+        runtime_config=SimpleNamespace(),
+    )
+
+    assert cleared == [runtime.conversation.id]
+    assert runtime.short_term_memory["scope_clarification_relation"] == "none"
+
+
+def test_independent_request_clears_pending_scope_before_preparation(monkeypatch):
+    runtime = _runtime(_snapshot(11))
+    cleared = []
+    monkeypatch.setattr(
+        invoker,
+        "resolve_context_mode_with_llm",
+        lambda *_args: SimpleNamespace(
+            mode="fresh_analysis",
+            source="llm",
+            confidence=0.99,
+            reason="用户提出了独立问题",
+            clarification_relation="new_request",
+        ),
+    )
+    monkeypatch.setattr(
+        invoker,
+        "_clear_pending_scope_clarification",
+        lambda current_runtime: cleared.append(current_runtime.conversation.id),
+    )
+
+    assert invoker._resolve_runtime_context_mode(runtime, "分析年费合同") == "fresh_analysis"
+    assert cleared == [runtime.conversation.id]
 
 
 def test_general_rerun_does_not_require_prior_analysis_result_execution(monkeypatch):

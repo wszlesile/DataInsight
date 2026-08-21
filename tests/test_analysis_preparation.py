@@ -25,6 +25,7 @@ from agent.analysis_preparation import (  # noqa: E402
     IntentContract,
     InsightLineageContract,
     PreparationResult,
+    ScopeClarificationResult,
     UnsupportedBusinessFieldBindingContract,
     UnresolvedBusinessFactContract,
     compact_datasource_snapshot,
@@ -78,6 +79,7 @@ def _intent():
         business_questions=[BusinessQuestionContract(
             question_id="question_1",
             business_question="合同当前呈现出哪些值得关注的业务特征",
+            subject_scope="specific",
         required_business_facts=[
             BusinessFactRequirementContract(
                 fact_id=f"question_1_fact_{index}",
@@ -242,6 +244,7 @@ def test_intent_contract_plans_business_facts_without_execution_semantics():
         business_questions=[BusinessQuestionContract(
             question_id="question_1",
             business_question="合同总体情况如何",
+            subject_scope="specific",
             required_business_facts=[BusinessFactRequirementContract(
                 fact_id="question_1_fact_1",
                 business_fact="合同总体情况",
@@ -269,6 +272,7 @@ def test_source_free_intent_canonicalizes_selection_facts_to_explicit_questions(
         business_questions=[BusinessQuestionContract(
             question_id="question_1",
             business_question="年费合同情况如何",
+            subject_scope="specific",
             required_business_facts=[
                 BusinessFactRequirementContract(
                     fact_id="invented_amount",
@@ -315,6 +319,132 @@ def test_source_free_intent_preserves_current_datasource_set_scope():
     assert canonical.business_questions[0].subject_scope == "current_datasource_set"
 
 
+def test_subject_scope_is_required_in_intent_contract():
+    with pytest.raises(ValueError):
+        BusinessQuestionContract.model_validate({
+            "question_id": "question_1",
+            "business_question": "分析下数据源",
+            "required_business_facts": [{
+                "fact_id": "question_1_fact_1",
+                "business_fact": "分析下数据源",
+                "semantic_definition": "当前问题要求理解的业务事实",
+            }],
+        })
+
+
+def test_full_scope_capacity_keeps_every_small_bound_datasource(monkeypatch):
+    workflow = prep.AnalysisPreparationWorkflow(
+        user_query="分析下这些数据源",
+        context_mode="fresh_analysis",
+        expected_time_range={},
+        datasource_snapshot=_snapshot(),
+        conversation_context={},
+        runtime_config=None,
+        execution_context={},
+        cancelled=None,
+        stage_callback=None,
+    )
+    intent = _intent().model_copy(update={
+        "business_questions": [
+            _intent().business_questions[0].model_copy(update={
+                "subject_scope": "current_datasource_set",
+            })
+        ],
+    })
+    monkeypatch.setattr(
+        prep.Config,
+        "FULL_SCOPE_DIRECT_ANALYSIS_MAX_DATASOURCES",
+        5,
+    )
+
+    state = workflow.scope_capacity(
+        {"intent": intent, "catalog": prep.build_datasource_catalog(_snapshot())},
+        provider="local",
+    )
+
+    assert state["scope_route"] == "full_scope"
+    assert state["selection"].selected_datasource_ids == [11, 12]
+    assert state["selected_snapshot"]["selected_datasource_ids"] == [11, 12]
+
+
+def test_full_scope_capacity_requests_narrowing_above_limit(monkeypatch):
+    snapshot = _snapshot()
+    snapshot["selected_datasource_ids"] = list(range(1, 7))
+    snapshot["selected_datasource_snapshot"] = [
+        {
+            "datasource_id": datasource_id,
+            "datasource_name": f"source-{datasource_id}",
+            "datasource_type": "table",
+            "datasource_identifier": f"dw.source_{datasource_id}",
+            "metadata_schema": {"fields": [{"name": "value", "type": "number"}]},
+        }
+        for datasource_id in range(1, 7)
+    ]
+    workflow = prep.AnalysisPreparationWorkflow(
+        user_query="分析下数据源",
+        context_mode="fresh_analysis",
+        expected_time_range={},
+        datasource_snapshot=snapshot,
+        conversation_context={},
+        runtime_config=None,
+        execution_context={},
+        cancelled=None,
+        stage_callback=None,
+    )
+    question = _intent().business_questions[0].model_copy(update={
+        "subject_scope": "current_datasource_set",
+    })
+    intent = _intent().model_copy(update={"business_questions": [question]})
+    monkeypatch.setattr(
+        prep.Config,
+        "FULL_SCOPE_DIRECT_ANALYSIS_MAX_DATASOURCES",
+        5,
+    )
+
+    state = workflow.scope_capacity(
+        {"intent": intent, "catalog": prep.build_datasource_catalog(snapshot)},
+        provider="local",
+    )
+
+    assert state["scope_route"] == "clarification"
+    clarification = state["scope_clarification"]
+    assert isinstance(clarification, ScopeClarificationResult)
+    assert clarification.datasource_count == 6
+    assert "6 个数据源" in clarification.assistant_message()
+
+
+def test_full_scope_without_bound_datasource_stops_before_semantic_retrieval():
+    workflow = prep.AnalysisPreparationWorkflow(
+        user_query="分析全部数据源",
+        context_mode="fresh_analysis",
+        expected_time_range={},
+        datasource_snapshot={
+            "selected_datasource_ids": [],
+            "selected_datasource_snapshot": [],
+        },
+        conversation_context={},
+        runtime_config=None,
+        execution_context={},
+        cancelled=None,
+        stage_callback=None,
+    )
+    question = _intent().business_questions[0].model_copy(update={
+        "subject_scope": "current_datasource_set",
+    })
+    intent = _intent().model_copy(update={"business_questions": [question]})
+
+    state = workflow.scope_capacity(
+        {"intent": intent, "catalog": []},
+        provider="semantic_center",
+    )
+
+    assert state["scope_route"] == "clarification"
+    assert (
+        state["scope_clarification"].reason_code
+        == "full_scope_without_bound_datasource"
+    )
+
+
 def test_fact_recall_keeps_dimension_source_omitted_by_llm_shortlist():
     intent = IntentContract(
         business_goal="分析收入结构",
@@ -322,6 +452,7 @@ def test_fact_recall_keeps_dimension_source_omitted_by_llm_shortlist():
         business_questions=[BusinessQuestionContract(
             question_id="question_1",
             business_question="各产品线收入贡献如何",
+            subject_scope="specific",
             required_business_facts=[BusinessFactRequirementContract(
                 fact_id="question_1_fact_1",
                 business_fact="各产品线营业收入",
@@ -2377,6 +2508,11 @@ def test_empty_semantic_selection_failure_does_not_run_local_selection(monkeypat
         prep.DatasourceSelectionProviderRouter,
         'resolve',
         lambda snapshot=None: 'semantic_center',
+    )
+    monkeypatch.setattr(
+        workflow,
+        'intent_analysis',
+        lambda state: {'intent': _intent()},
     )
     monkeypatch.setattr(
         prep.SemanticDatasourceSelectionService,

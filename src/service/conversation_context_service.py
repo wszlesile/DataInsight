@@ -744,6 +744,26 @@ class ConversationContextService:
             InsightNsMemory.is_deleted == 0,
         ).first()
 
+    def set_memory(
+        self,
+        conversation_id: Any,
+        memory_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        conversation_id_int = to_int(conversation_id, 0)
+        if conversation_id_int <= 0 or not memory_type.strip():
+            raise ValueError("conversation memory requires a conversation and type")
+        self._upsert_memory(conversation_id_int, memory_type.strip(), payload)
+
+    def clear_memory(self, conversation_id: Any, memory_type: str) -> None:
+        memory = self.get_memory(conversation_id, memory_type)
+        if memory is None:
+            return
+        memory.content_json = '{}'
+        memory.version = (memory.version or 0) + 1
+        memory.updated_at = _now()
+        self.session.flush()
+
     def build_runtime_summary_text(self, conversation_id: Any, max_turn_no: int | None = None) -> str:
         """实时根据当前有效轮次重建摘要，避免旧记忆污染当前 Prompt。"""
         conversation_id_int = to_int(conversation_id, 0)

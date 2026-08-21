@@ -176,6 +176,9 @@ class Config:
     DATASOURCE_SELECTION_SHORTLIST_TRIGGER_CHARS = int(
         os.environ.get('DATASOURCE_SELECTION_SHORTLIST_TRIGGER_CHARS', 24000)
     )
+    FULL_SCOPE_DIRECT_ANALYSIS_MAX_DATASOURCES = int(
+        os.environ.get('FULL_SCOPE_DIRECT_ANALYSIS_MAX_DATASOURCES', 10)
+    )
     # Platform Workload services are addressed as {group}-{component}:port.
     # Local development may override the platform default through env.local.
     SEMANTIC_BASE = os.environ.get(
