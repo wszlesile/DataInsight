@@ -3195,6 +3195,53 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     assert definition["calculation"]["formula"] == (
         "(SUM(gross_profit) ÷ SUM(sales_revenue)) × 100"
     )
+    assert definition["calculation"]["metric_fields"] == [
+        "gross_profit",
+        "sales_revenue",
+    ]
+
+
+def test_report_formula_fields_override_non_formula_planner_field():
+    sql = "SELECT month, gross_profit, sales_revenue FROM product_profit"
+    code = r'''
+sql = "SELECT month, gross_profit, sales_revenue FROM product_profit"
+data = load_data_with_sql(sql=sql)
+total_profit = data["gross_profit"].sum()
+total_sales = data["sales_revenue"].sum()
+gross_margin = total_profit / total_sales * 100 if total_sales else 0.0
+analysis_report = f"Gross margin: {gross_margin:.2f}%."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Gross margin: 71.48%.",
+        query_snapshots={
+            "q_profit": _query_snapshot(
+                sql,
+                columns=["month", "gross_profit", "sales_revenue"],
+            ),
+        },
+    )
+
+    def planner(payload: dict) -> EvidencePlan:
+        plan = _semantic_plan(payload)
+        metrics = [
+            metric.model_copy(update={"metric_source_fields": ["month"]})
+            for metric in plan.metrics
+        ]
+        return plan.model_copy(update={"metrics": metrics})
+
+    bundle = PostAnalysisEvidenceCompiler(planner=planner).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    definition = bundle["evidence_definitions"][0]
+    assert definition["calculation"]["formula"] == (
+        "(SUM(gross_profit) ÷ SUM(sales_revenue)) × 100"
+    )
+    assert definition["calculation"]["metric_fields"] == [
+        "gross_profit",
+        "sales_revenue",
+    ]
 
 
 def test_report_fragment_augmented_with_fstrings_keeps_numeric_lineage():

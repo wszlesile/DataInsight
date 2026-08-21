@@ -12647,6 +12647,20 @@ class PostAnalysisEvidenceCompiler:
         *,
         boundary_operation_ids: list[str] | None = None,
     ) -> str:
+        formula, _ = PostAnalysisEvidenceCompiler._operation_formula_details(
+            operation_ids,
+            operation_by_id,
+            boundary_operation_ids=boundary_operation_ids,
+        )
+        return formula
+
+    @staticmethod
+    def _operation_formula_details(
+        operation_ids: list[str],
+        operation_by_id: dict[str, dict[str, Any]],
+        *,
+        boundary_operation_ids: list[str] | None = None,
+    ) -> tuple[str, list[str]]:
         """Render a verified formula operation as a concise business expression."""
         operations = sorted(
             (
@@ -12664,7 +12678,7 @@ class PostAnalysisEvidenceCompiler:
             if operation.get("semantic_kind") == "formula"
         ]
         if not formula_operations:
-            return ""
+            return "", []
 
         assignments: dict[str, ast.AST] = {}
         field_aliases: dict[str, str] = {}
@@ -12714,7 +12728,7 @@ class PostAnalysisEvidenceCompiler:
             if formula_expression is not None:
                 break
         if formula_expression is None:
-            return ""
+            return "", []
 
         binary_symbols = {
             ast.Add: "+",
@@ -12738,6 +12752,8 @@ class PostAnalysisEvidenceCompiler:
         class FormulaRenderError(ValueError):
             pass
 
+        formula_fields: list[str] = []
+
         def render(node: ast.AST, resolving: frozenset[str] = frozenset()) -> str:
             if isinstance(node, ast.IfExp):
                 return render(node.body, resolving)
@@ -12753,7 +12769,9 @@ class PostAnalysisEvidenceCompiler:
                 key = node.slice
                 if isinstance(key, ast.Constant) and isinstance(key.value, str):
                     field = str(key.value)
-                    return field_aliases.get(field, field)
+                    resolved_field = field_aliases.get(field, field)
+                    formula_fields.append(resolved_field)
+                    return resolved_field
                 raise FormulaRenderError("dynamic formula field")
             if isinstance(node, ast.BinOp):
                 symbol = binary_symbols.get(type(node.op))
@@ -12777,10 +12795,10 @@ class PostAnalysisEvidenceCompiler:
         try:
             formula = render(formula_expression).strip()
         except FormulaRenderError:
-            return ""
+            return "", []
         if formula.startswith("(") and formula.endswith(")"):
             formula = formula[1:-1]
-        return formula[:500]
+        return formula[:500], list(dict.fromkeys(formula_fields))
 
     def _compile_plan(
         self,
@@ -12867,6 +12885,45 @@ class PostAnalysisEvidenceCompiler:
                 continue
             if any(item not in query_by_id for item in query_ids):
                 continue
+            boundary_operation_ids = list(dict.fromkeys([
+                str(operation_id)
+                for output in selected_outputs
+                for operation_id in output.get("boundary_operation_node_ids") or []
+                if str(operation_id) in operation_by_id
+            ]))
+            if not boundary_operation_ids:
+                boundary_operation_ids = [
+                    str(operation_id)
+                    for operation_id in candidate.get("boundary_operation_node_ids") or []
+                    if str(operation_id) in operation_by_id
+                ]
+            if not boundary_operation_ids:
+                boundary_operation_ids = candidate_operation_ids[:1]
+            formula, formula_fields = self._operation_formula_details(
+                operation_ids,
+                operation_by_id,
+                boundary_operation_ids=boundary_operation_ids,
+            )
+            query_field_names = {
+                str(target).strip()
+                for operation in operation_by_id.values()
+                if operation.get("kind") in {"query_projection", "source_field"}
+                and str(operation.get("query_node_id") or "") in query_ids
+                for target in operation.get("targets") or []
+                if str(target).strip()
+            }
+            formula_source_fields = [
+                field for field in formula_fields if field in query_field_names
+            ]
+            if formula_source_fields:
+                metric_fields = formula_source_fields
+                operation_ids = self._expand_operation_ids(
+                    candidate_operation_ids,
+                    query_ids,
+                    operation_by_id,
+                    available_operation_ids=list(candidate.get("operation_node_ids") or []),
+                    metric_fields=metric_fields,
+                )
             signature_payload = {
                 "queries": sorted(query_ids),
                 "operations": [operation_by_id[item]["source"] for item in sorted(operation_ids)],
@@ -12885,26 +12942,9 @@ class PostAnalysisEvidenceCompiler:
             for output_id in output_ids:
                 output_claims[output_id] = signature
             if signature not in definitions_by_signature:
-                boundary_operation_ids = list(dict.fromkeys([
-                    str(operation_id)
-                    for output in selected_outputs
-                    for operation_id in output.get("boundary_operation_node_ids") or []
-                    if str(operation_id) in operation_by_id
-                ]))
-                if not boundary_operation_ids:
-                    boundary_operation_ids = [
-                        str(operation_id)
-                        for operation_id in candidate.get("boundary_operation_node_ids") or []
-                        if str(operation_id) in operation_by_id
-                    ]
-                if not boundary_operation_ids:
-                    boundary_operation_ids = candidate_operation_ids[:1]
-                boundary = operation_by_id.get(boundary_operation_ids[0]) or {}
-                formula = self._operation_formula(
-                    operation_ids,
-                    operation_by_id,
-                    boundary_operation_ids=boundary_operation_ids,
-                )
+                boundary = {}
+                if boundary_operation_ids:
+                    boundary = operation_by_id.get(boundary_operation_ids[0]) or {}
                 definitions_by_signature[signature] = {
                     "evidence_key": evidence_key,
                     "metric_name": metric.business_name.strip() or metric.metric_key,
