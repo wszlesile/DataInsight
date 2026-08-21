@@ -5,7 +5,11 @@ from sqlalchemy.orm import Session
 
 from agent.tools import run_generated_code_locally
 from analysis_runtime import AnalysisExecutionSnapshot, LocalAnalysisRuntime
-from analysis_runtime.parameters import normalize_parameter_schema, validate_analysis_parameters
+from analysis_runtime.parameters import (
+    build_reusable_parameter_defaults,
+    normalize_parameter_schema,
+    validate_analysis_parameters,
+)
 from model import (
     InsightDatasource,
     InsightNsArtifact,
@@ -46,7 +50,8 @@ class AnalysisExecutionRerunService:
             raise ValueError('只能基于成功的执行记录进行本地复跑')
 
         schema = normalize_parameter_schema(safe_json_loads(original.analysis_parameters_schema_json, {}))
-        normalized_parameters = validate_analysis_parameters(schema, analysis_parameters)
+        parameter_overrides = dict(analysis_parameters or {})
+        validate_analysis_parameters(schema, parameter_overrides)
         used_datasource_ids = safe_json_loads(original.used_datasource_ids_json, [])
         snapshot = AnalysisExecutionSnapshot(
             source_execution_id=original.id,
@@ -59,7 +64,10 @@ class AnalysisExecutionRerunService:
             datasource_bindings=self._datasource_bindings(used_datasource_ids),
             query_snapshots=(safe_json_loads(original.result_payload_json, {}) or {}).get('query_snapshots') or {},
             parameter_schema=schema,
-            default_parameters=safe_json_loads(original.analysis_parameters_json, {}),
+            default_parameters=build_reusable_parameter_defaults(
+                schema,
+                safe_json_loads(original.analysis_parameters_json, {}),
+            ),
             logic_signature=original.analysis_logic_signature or '',
         )
 
@@ -85,7 +93,7 @@ class AnalysisExecutionRerunService:
             task_type='local_rerun',
             request_payload={
                 'source_execution_id': original.id,
-                'analysis_parameters': normalized_parameters,
+                'analysis_parameters': parameter_overrides,
             },
         )
         self.session.commit()
@@ -99,7 +107,7 @@ class AnalysisExecutionRerunService:
             runtime_user_context=runtime_user_context or {},
             analysis_task_id=task.id,
             execution_source='manual_param_rerun',
-            analysis_parameters=normalized_parameters,
+            analysis_parameters=parameter_overrides,
         )
         run_result = {
             'execution_id': runtime_result.execution_id,

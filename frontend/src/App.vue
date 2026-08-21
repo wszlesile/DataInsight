@@ -2417,10 +2417,28 @@ const getTaskQueryCriteria = (task, run) => {
 
 const uniqueCaliberValues = (values) => [...new Set(values.filter((item) => String(item || '').trim()).map((item) => String(item).trim()))]
 
+const formatRelativeTimeRange = (value) => {
+  if (!value || typeof value !== 'object' || value.kind !== 'relative_time_range') return ''
+  const unitLabels = {
+    minute: '分钟',
+    hour: '小时',
+    day: '天',
+    week: '周',
+    month: '个月',
+    year: '年'
+  }
+  const amount = Number(value.amount)
+  const unit = unitLabels[value.unit] || value.unit
+  if (!Number.isFinite(amount) || amount <= 0 || !unit) return ''
+  return `近 ${amount} ${unit}（随执行时间更新）`
+}
+
 const formatCaliberAtom = (value) => {
   if (value === null || value === undefined || value === '') return ''
   if (Array.isArray(value)) return value.map(formatCaliberAtom).filter(Boolean).join('、')
   if (typeof value === 'object') {
+    const relativeTimeRange = formatRelativeTimeRange(value)
+    if (relativeTimeRange) return relativeTimeRange
     return String(value.label || value.title || value.name || value.field || value.value || '').trim()
   }
   if (value === true) return '是'
@@ -2457,6 +2475,8 @@ const formatTaskTimeRange = (timeRange) => {
   if (!timeRange) return ''
   if (typeof timeRange === 'string') return timeRange
   if (typeof timeRange !== 'object') return formatCaliberAtom(timeRange)
+  const relativeTimeRange = formatRelativeTimeRange(timeRange)
+  if (relativeTimeRange) return relativeTimeRange
   const start = timeRange.start || timeRange.from || timeRange.start_time
   const end = timeRange.end || timeRange.to || timeRange.end_time
   if (!start && !end) return formatCaliberAtom(timeRange)

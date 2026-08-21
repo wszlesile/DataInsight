@@ -350,6 +350,21 @@ async function selectTask(taskId) {
 2. 否则使用 `task.revision.snapshot.query_criteria` 中的固化来源口径。
 3. 参数值优先使用 `run.parameters`，没有运行时使用 `revision.snapshot.default_parameters`。
 
+相对时间窗口会在任务版本中保存为运行时声明，而不是固化首次分析的绝对时间：
+
+```json
+{
+  "kind": "relative_time_range",
+  "amount": 10,
+  "unit": "minute",
+  "anchor": "execution_time",
+  "timezone": "Asia/Shanghai",
+  "end_exclusive": true
+}
+```
+
+前端应原样提交该值，后端会以本次手动或定时触发时间为锚点物化。任务尚未执行时显示为“近 10 分钟（随执行时间更新）”；执行完成后，`run.parameters` 和 `result_payload.analysis_parameters` 返回本次真实使用的绝对起止时间。
+
 建议展示字段：
 
 - 时间范围：`query_constraints.time_range`。

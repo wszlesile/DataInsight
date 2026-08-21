@@ -274,6 +274,90 @@ def test_manual_run_uses_shared_runtime_and_persists_independent_history():
         session.close()
 
 
+def test_task_relative_time_default_uses_each_run_trigger_time():
+    session = _session()
+    try:
+        execution = _source_execution(session)
+        execution.analysis_parameters_schema_json = dump_json({
+            'parameters': [{
+                'name': 'time_range',
+                'type': 'time_range',
+                'required': True,
+                'runtime_default': {
+                    'kind': 'relative_time_range',
+                    'amount': 10,
+                    'unit': 'minute',
+                    'anchor': 'execution_time',
+                    'timezone': 'Asia/Shanghai',
+                    'end_exclusive': True,
+                },
+            }],
+            'defaults': {
+                'time_range': {
+                    'start': '2026-08-19T17:49:56+08:00',
+                    'end': '2026-08-19T17:59:56+08:00',
+                    'end_exclusive': True,
+                },
+            },
+        })
+        execution.analysis_parameters_json = dump_json({
+            'time_range': {
+                'start': '2026-08-19T17:49:56+08:00',
+                'end': '2026-08-19T17:59:56+08:00',
+                'end_exclusive': True,
+            },
+        })
+        session.commit()
+
+        service = InsightTaskService(session)
+        task = service.create_task(
+            username='owner',
+            source_execution_id=execution.id,
+            name='近十分钟趋势',
+            description='',
+            schedule={'frequency': 'daily', 'time': '18:12', 'timezone': 'Asia/Shanghai'},
+        )
+        assert task['revision']['snapshot']['default_parameters']['time_range']['kind'] == 'relative_time_range'
+        initial = service.get_run(
+            username='owner',
+            task_id=task['task_id'],
+            run_id=task['runs'][0]['run_id'],
+        )
+        assert initial['parameters']['time_range']['start'] == '2026-08-19T17:49:56+08:00'
+
+        queued = service.enqueue_manual_run(username='owner', task_id=task['task_id'], parameters={})
+        run = session.query(InsightTaskRun).filter(InsightTaskRun.run_id == queued['run_id']).one()
+        run.scheduled_for = datetime(2026, 8, 21, 10, 12, 0)
+        session.commit()
+
+        def run_locally(**kwargs):
+            return {
+                'execution_id': 999,
+                'status': 'success',
+                'analysis_report': '近十分钟趋势正常',
+                'analysis_parameters_schema': kwargs['analysis_parameters_schema'],
+                'analysis_parameters': kwargs['analysis_parameters'],
+            }
+
+        with patch('insight_task.service.run_generated_code_locally', side_effect=run_locally) as execute_code:
+            result = service.execute_run(
+                run_id=queued['run_id'],
+                execution_principal='owner',
+                runtime_user_context={},
+                worker_id='test-worker',
+            )
+
+        expected_range = {
+            'start': '2026-08-21T18:02:00+08:00',
+            'end': '2026-08-21T18:12:00+08:00',
+            'end_exclusive': True,
+        }
+        assert execute_code.call_args.kwargs['analysis_parameters']['time_range'] == expected_range
+        assert result['parameters']['time_range'] == expected_range
+    finally:
+        session.close()
+
+
 def test_manual_run_executes_with_current_user_context_and_is_not_runner_work():
     session = _session()
     try:

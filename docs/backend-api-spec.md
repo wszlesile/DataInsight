@@ -2505,6 +2505,23 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 - 当前选择运行的参数值：运行详情 `parameters`。
 - 当前选择运行的真实查询快照：运行详情 `result_payload.query_snapshots`。
 
+`time_range` 若是随任务触发时间滚动的相对窗口，`revision.snapshot.default_parameters` 使用以下声明形式：
+
+```json
+{
+  "time_range": {
+    "kind": "relative_time_range",
+    "amount": 10,
+    "unit": "minute",
+    "anchor": "execution_time",
+    "timezone": "Asia/Shanghai",
+    "end_exclusive": true
+  }
+}
+```
+
+立即执行接口应原样提交该声明。后端会以本次 run 的 `scheduled_for` 为统一锚点物化绝对起止时间；执行完成后，运行记录 `parameters` 与 `result_payload.analysis_parameters` 均返回本次实际使用的绝对时间窗口。
+
 前端不得展示任务版本中的生成代码；详情响应也不会返回该代码。
 
 任务不存在或不属于当前用户时返回 HTTP `404`。

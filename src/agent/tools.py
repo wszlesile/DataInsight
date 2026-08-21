@@ -26,6 +26,10 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from agent.context_engineering_runtime import CustomContext
+from analysis_runtime.parameters import (
+    attach_relative_time_runtime_default,
+    strip_generated_runtime_parameter_metadata,
+)
 from api import supos_kernel_api
 from dto import DatabaseConnInfo
 from utils import (
@@ -6610,12 +6614,22 @@ def save_analysis_result(
         _normalize_table_items(tables=_copy_jsonable(tables or [], [])),
         [],
     )
+    generated_parameter_schema, generated_parameter_values = strip_generated_runtime_parameter_metadata(
+        _copy_jsonable(analysis_parameters_schema or {}, {}),
+        _copy_jsonable(analysis_parameters or {}, {}),
+    )
+    normalized_parameter_values = generated_parameter_values
+    normalized_parameter_schema = attach_relative_time_runtime_default(
+        generated_parameter_schema,
+        expected_time_range=_copy_jsonable(CURRENT_EXPECTED_TIME_RANGE.get() or {}, {}),
+        concrete_values=normalized_parameter_values,
+    )
     return StructuredResult(
         analysis_report=report_text,
         charts=normalized_charts,
         tables=normalized_tables,
-        analysis_parameters_schema=_copy_jsonable(analysis_parameters_schema or {}, {}),
-        analysis_parameters=_copy_jsonable(analysis_parameters or {}, {}),
+        analysis_parameters_schema=normalized_parameter_schema,
+        analysis_parameters=normalized_parameter_values,
         query_snapshots=_copy_jsonable(CURRENT_QUERY_SNAPSHOTS.get() or {}, {}),
     )
 

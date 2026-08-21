@@ -2,12 +2,14 @@ import inspect
 import math
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import agent.invoker as agent_invoker  # noqa: E402
 from agent.invoker import _build_expected_time_range_from_user_query  # noqa: E402
 from agent.tools import (  # noqa: E402
     CURRENT_ANALYSIS_PARAMETERS_OVERRIDE,
@@ -675,6 +677,30 @@ def test_expected_time_range_prefers_anchor_month_over_year():
     assert result["start"].endswith("-03-01")
     assert result["end"].endswith("-04-01")
     assert result["source"] == "今年3月"
+
+
+def test_turn_expected_time_range_is_frozen_across_stages(monkeypatch):
+    generated = [
+        {"start": "2026-08-22T00:00:00+08:00", "end": "2026-08-22T00:10:00+08:00"},
+        {"start": "2026-08-22T00:00:15+08:00", "end": "2026-08-22T00:10:15+08:00"},
+    ]
+    calls = []
+
+    def build(_query):
+        calls.append(_query)
+        return generated[len(calls) - 1]
+
+    monkeypatch.setattr(agent_invoker, "_build_expected_time_range_from_user_query", build)
+    runtime = SimpleNamespace(
+        turn=SimpleNamespace(id=91, user_query="展示近10分钟趋势"),
+        short_term_memory={},
+    )
+
+    preparation_range = agent_invoker._resolve_turn_expected_time_range(runtime, "展示近10分钟趋势")
+    runtime_range = agent_invoker._resolve_turn_expected_time_range(runtime, "展示近10分钟趋势")
+
+    assert runtime_range == preparation_range == generated[0]
+    assert calls == ["展示近10分钟趋势"]
 
 
 def test_month_grain_year_filter_satisfies_daily_time_range():

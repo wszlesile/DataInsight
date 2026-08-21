@@ -511,6 +511,32 @@ def _build_expected_time_range_from_user_query(user_query: str) -> dict[str, Any
     return {}
 
 
+def _resolve_turn_expected_time_range(
+    runtime: ConversationRunContext,
+    user_query: str,
+) -> dict[str, Any]:
+    """Freeze one time-range contract for every stage in the current turn."""
+    query = str(user_query or getattr(runtime.turn, 'user_query', '') or '').strip()
+    turn_id = int(getattr(runtime.turn, 'id', 0) or 0)
+    memory = runtime.short_term_memory
+    cached = memory.get('expected_time_range_contract')
+    if (
+        isinstance(cached, dict)
+        and int(cached.get('turn_id') or 0) == turn_id
+        and str(cached.get('user_query') or '') == query
+        and isinstance(cached.get('value'), dict)
+    ):
+        return dict(cached['value'])
+
+    expected = _build_expected_time_range_from_user_query(query)
+    memory['expected_time_range_contract'] = {
+        'turn_id': turn_id,
+        'user_query': query,
+        'value': dict(expected),
+    }
+    return expected
+
+
 def _date_text(value: Any) -> str:
     text = str(value or '').strip()
     match = re.search(r'\d{4}-\d{1,2}-\d{1,2}', text)
@@ -557,7 +583,10 @@ def _is_expected_time_no_data_execution(
     runtime: ConversationRunContext,
     user_message: str,
 ) -> bool:
-    expected_time_range = _build_expected_time_range_from_user_query(user_message or getattr(runtime.turn, 'user_query', ''))
+    expected_time_range = _resolve_turn_expected_time_range(
+        runtime,
+        user_message or getattr(runtime.turn, 'user_query', ''),
+    )
     if not expected_time_range:
         return False
 
@@ -604,7 +633,10 @@ def _build_expected_time_no_data_report(
         if executions:
             latest_error = (getattr(executions[-1], 'error_message', '') or '').strip()
 
-    expected_time_range = _build_expected_time_range_from_user_query(user_message or getattr(runtime.turn, 'user_query', ''))
+    expected_time_range = _resolve_turn_expected_time_range(
+        runtime,
+        user_message or getattr(runtime.turn, 'user_query', ''),
+    )
     start = str(expected_time_range.get('start') or '').strip()
     end = str(expected_time_range.get('display_end') or expected_time_range.get('end') or '').strip()
     source = str(expected_time_range.get('source') or '').strip()
@@ -632,7 +664,7 @@ def _build_agent_context(
         conversation_id=runtime.conversation.id,
         turn_id=runtime.turn.id,
         user_query=user_query,
-        expected_time_range=_build_expected_time_range_from_user_query(user_query),
+        expected_time_range=_resolve_turn_expected_time_range(runtime, user_query),
         platform_authorization=(
             getattr(agent_request, 'platform_authorization', '')
             or getattr(agent_request, 'auth_token', '')
@@ -746,7 +778,7 @@ def _prepare_analysis_context(
         ]
 
     source_snapshot = dict(runtime.active_datasource_snapshot or {})
-    expected_time_range = _build_expected_time_range_from_user_query(user_query)
+    expected_time_range = _resolve_turn_expected_time_range(runtime, user_query)
     try:
         result = prepare_analysis(
             user_query=user_query,

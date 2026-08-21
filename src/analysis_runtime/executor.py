@@ -1,8 +1,9 @@
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 
 from analysis_runtime.contracts import AnalysisExecutionSnapshot, AnalysisRuntimeResult
-from analysis_runtime.parameters import normalize_parameter_schema, validate_analysis_parameters
+from analysis_runtime.parameters import materialize_analysis_parameters, normalize_parameter_schema
 
 
 class LocalAnalysisRuntime:
@@ -20,13 +21,18 @@ class LocalAnalysisRuntime:
         runtime_user_context: dict[str, Any] | None = None,
         analysis_task_id: int | None = None,
         execution_source: str = 'manual_param_rerun',
+        execution_anchor_time: datetime | None = None,
     ) -> AnalysisRuntimeResult:
         if not snapshot.code.strip():
             raise ValueError('执行快照缺少可执行分析代码')
         schema = normalize_parameter_schema(snapshot.parameter_schema)
         effective_values = dict(snapshot.default_parameters)
         effective_values.update(analysis_parameters or {})
-        normalized_parameters = validate_analysis_parameters(schema, effective_values)
+        normalized_parameters = materialize_analysis_parameters(
+            schema,
+            effective_values,
+            anchor_time=execution_anchor_time,
+        )
         execution_context = dict(runtime_user_context or {})
         execution_context.setdefault('datasource_bindings', snapshot.datasource_bindings)
         result = self.execute_code(

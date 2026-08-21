@@ -10,7 +10,11 @@ from sqlalchemy.orm import Session
 
 from agent.tools import run_generated_code_locally
 from analysis_runtime import AnalysisExecutionSnapshot, LocalAnalysisRuntime
-from analysis_runtime.parameters import normalize_parameter_schema, validate_analysis_parameters
+from analysis_runtime.parameters import (
+    build_reusable_parameter_defaults,
+    normalize_parameter_schema,
+    validate_analysis_parameters,
+)
 from config import Config
 from model import (
     InsightNamespace,
@@ -80,7 +84,7 @@ class InsightTaskService:
             task=task,
             revision=revision,
             execution=execution,
-            default_parameters=snapshot.default_parameters,
+            default_parameters=safe_json_loads(execution.analysis_parameters_json, {}),
             username=username,
         )
         self.session.add(initial_run)
@@ -459,12 +463,15 @@ class InsightTaskService:
                 analysis_parameters=parameters,
                 runtime_user_context=runtime_user_context,
                 execution_source='scheduled_task' if run.trigger_type == 'scheduled' else 'manual_task',
+                execution_anchor_time=run.scheduled_for,
             )
         except Exception as exc:
             return self._finish_failed(run, str(exc) or '洞察任务执行异常', include_result=include_result)
         run.execution_id = runtime_result.execution_id or None
         self._disable_internal_execution(runtime_result.execution_id)
         run.execution_seconds = runtime_result.execution_seconds
+        if runtime_result.parameters:
+            run.parameters_json = dump_json(runtime_result.parameters)
         run.lease_until = None
         run.finished_at = utc_now()
         run.updated_at = run.finished_at
@@ -553,7 +560,7 @@ class InsightTaskService:
                 source_payload.get('query_snapshots') if isinstance(source_payload.get('query_snapshots'), dict) else {}
             ),
             parameter_schema=schema,
-            default_parameters=validate_analysis_parameters(
+            default_parameters=build_reusable_parameter_defaults(
                 schema,
                 safe_json_loads(execution.analysis_parameters_json, {}),
             ),
