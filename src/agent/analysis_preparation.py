@@ -125,7 +125,10 @@ class BusinessQuestionContract(BaseModel):
 
     question_id: str = Field(min_length=1)
     business_question: str = Field(min_length=1)
-    subject_scope: Literal["specific", "current_datasource_set"]
+    subject_scope: Literal[
+        "question_defined_scope",
+        "all_conversation_datasources",
+    ]
     required_business_facts: list[BusinessFactRequirementContract] = Field(
         min_length=1
     )
@@ -186,6 +189,124 @@ def _canonicalize_intent_selection_facts(intent: IntentContract) -> IntentContra
                 ),
             )],
         })
+        for question in intent.business_questions
+    ]
+    return intent.model_copy(update={"business_questions": questions})
+
+
+_FULL_SCOPE_DATASOURCE_CUES = (
+    "当前数据源",
+    "当前已选数据源",
+    "当前选中数据源",
+    "当前选中的数据源",
+    "当前会话关联的数据源",
+    "这些数据源",
+    "这批数据源",
+    "所有数据源",
+    "全部数据源",
+    "所有已选数据源",
+    "全部已选数据源",
+    "各数据源",
+    "各个数据源",
+    "每个已关联数据源",
+    "all selected datasources",
+    "all linked datasources",
+    "all selected data sources",
+    "all linked data sources",
+)
+_DATASOURCE_SUBSET_CUES = (
+    "相关的数据源",
+    "相关数据源",
+    "主要数据源",
+    "指定数据源",
+    "其中的数据源",
+    "其中数据源",
+    "these two datasources",
+    "these two data sources",
+    "relevant datasources",
+    "relevant data sources",
+)
+_BARE_FULL_SCOPE_REQUESTS = {
+    "分析数据源",
+    "分析下数据源",
+    "分析一下数据源",
+    "查看数据源",
+    "看看数据源",
+    "analyse datasources",
+    "analyze datasources",
+    "analyse data sources",
+    "analyze data sources",
+}
+_ELLIPTICAL_FULL_SCOPE_REQUESTS = {
+    "都分析",
+    "全部分析",
+    "分别看一下",
+    "分别看看",
+    "都看一下",
+    "都看看",
+}
+
+
+def _supports_all_conversation_datasources_scope(
+    user_query: str,
+    conversation_context: dict[str, Any] | None,
+) -> bool:
+    """Ground the high-impact full-collection route in explicit user language."""
+    normalized_query = re.sub(r"[，。！？、,.!?]", "", user_query).lower()
+    normalized_query = re.sub(r"\s+", " ", normalized_query).strip()
+    if any(cue in normalized_query for cue in _DATASOURCE_SUBSET_CUES):
+        return False
+    if normalized_query in _BARE_FULL_SCOPE_REQUESTS:
+        return True
+    if any(cue in normalized_query for cue in _FULL_SCOPE_DATASOURCE_CUES):
+        return True
+    if normalized_query not in _ELLIPTICAL_FULL_SCOPE_REQUESTS:
+        return False
+
+    recent_messages = (conversation_context or {}).get("recent_messages") or []
+    recent_text = " ".join(
+        str(item.get("content") or "")
+        for item in recent_messages
+        if isinstance(item, dict)
+    ).lower()
+    has_datasource_reference = "数据源" in recent_text or "data source" in recent_text
+    has_selected_collection = any(
+        cue in recent_text
+        for cue in (
+            "已关联",
+            "关联了",
+            "已选择",
+            "选择了",
+            "已选中",
+            "当前会话",
+            "selected",
+            "linked",
+        )
+    )
+    return has_datasource_reference and has_selected_collection
+
+
+def _ground_intent_subject_scope(
+    intent: IntentContract,
+    *,
+    user_query: str,
+    conversation_context: dict[str, Any] | None,
+) -> IntentContract:
+    supports_full_scope = _supports_all_conversation_datasources_scope(
+        user_query,
+        conversation_context,
+    )
+    if supports_full_scope and len(intent.business_questions) == 1:
+        question = intent.business_questions[0].model_copy(update={
+            "subject_scope": "all_conversation_datasources",
+        })
+        return intent.model_copy(update={"business_questions": [question]})
+    if supports_full_scope:
+        return intent
+    questions = [
+        question.model_copy(update={"subject_scope": "question_defined_scope"})
+        if question.subject_scope == "all_conversation_datasources"
+        else question
         for question in intent.business_questions
     ]
     return intent.model_copy(update={"business_questions": questions})
@@ -2545,7 +2666,7 @@ class AnalysisPreparationWorkflow:
             business_questions=[BusinessQuestionContract(
                 question_id="question_1",
                 business_question=query,
-                subject_scope="specific",
+                subject_scope="question_defined_scope",
                 required_business_facts=[BusinessFactRequirementContract(
                     fact_id="question_1_fact_1",
                     business_fact=query,
@@ -2602,7 +2723,7 @@ class AnalysisPreparationWorkflow:
         self._start_stage("scope_capacity")
         intent = state["intent"]
         is_full_scope = any(
-            question.subject_scope == "current_datasource_set"
+            question.subject_scope == "all_conversation_datasources"
             for question in intent.business_questions
         )
         logger.info(
@@ -3664,6 +3785,11 @@ class AnalysisPreparationWorkflow:
                 cancelled=self.cancelled,
             )
             intent = _canonicalize_intent_selection_facts(intent)
+            intent = _ground_intent_subject_scope(
+                intent,
+                user_query=self.user_query,
+                conversation_context=self.conversation_context,
+            )
         except AnalysisTaskCancelled:
             raise
         except Exception as exc:

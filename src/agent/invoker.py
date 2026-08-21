@@ -808,7 +808,7 @@ def _prepare_analysis_context(
                 business_questions=[BusinessQuestionContract(
                     question_id="question_1",
                     business_question=user_query or "完成本轮数据洞察分析",
-                    subject_scope="specific",
+                    subject_scope="question_defined_scope",
                     required_business_facts=[BusinessFactRequirementContract(
                         fact_id="question_1_fact_1",
                         business_fact=user_query or "完成本轮数据洞察分析",

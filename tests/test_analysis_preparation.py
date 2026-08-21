@@ -79,7 +79,7 @@ def _intent():
         business_questions=[BusinessQuestionContract(
             question_id="question_1",
             business_question="合同当前呈现出哪些值得关注的业务特征",
-            subject_scope="specific",
+            subject_scope="question_defined_scope",
         required_business_facts=[
             BusinessFactRequirementContract(
                 fact_id=f"question_1_fact_{index}",
@@ -244,7 +244,7 @@ def test_intent_contract_plans_business_facts_without_execution_semantics():
         business_questions=[BusinessQuestionContract(
             question_id="question_1",
             business_question="合同总体情况如何",
-            subject_scope="specific",
+            subject_scope="question_defined_scope",
             required_business_facts=[BusinessFactRequirementContract(
                 fact_id="question_1_fact_1",
                 business_fact="合同总体情况",
@@ -272,7 +272,7 @@ def test_source_free_intent_canonicalizes_selection_facts_to_explicit_questions(
         business_questions=[BusinessQuestionContract(
             question_id="question_1",
             business_question="年费合同情况如何",
-            subject_scope="specific",
+            subject_scope="question_defined_scope",
             required_business_facts=[
                 BusinessFactRequirementContract(
                     fact_id="invented_amount",
@@ -305,7 +305,7 @@ def test_source_free_intent_preserves_current_datasource_set_scope():
         business_questions=[BusinessQuestionContract(
             question_id="question_1",
             business_question="当前数据源近十分钟的历史趋势如何",
-            subject_scope="current_datasource_set",
+            subject_scope="all_conversation_datasources",
             required_business_facts=[BusinessFactRequirementContract(
                 fact_id="question_1_fact_1",
                 business_fact="当前数据源近十分钟的历史趋势",
@@ -316,7 +316,79 @@ def test_source_free_intent_preserves_current_datasource_set_scope():
 
     canonical = prep._canonicalize_intent_selection_facts(intent)
 
-    assert canonical.business_questions[0].subject_scope == "current_datasource_set"
+    assert canonical.business_questions[0].subject_scope == "all_conversation_datasources"
+
+
+@pytest.mark.parametrize(
+    "user_query",
+    [
+        "年费合同情况如何",
+        "分析所有合同的状态构成",
+        "对比产品生产成本与产品月度利润两个数据源",
+        "分析主要数据源",
+        "展示近10分钟历史趋势",
+    ],
+)
+def test_full_scope_requires_explicit_conversation_datasource_evidence(user_query):
+    intent = _intent().model_copy(update={
+        "business_questions": [
+            _intent().business_questions[0].model_copy(update={
+                "subject_scope": "all_conversation_datasources",
+            })
+        ],
+    })
+
+    grounded = prep._ground_intent_subject_scope(
+        intent,
+        user_query=user_query,
+        conversation_context={},
+    )
+
+    assert grounded.business_questions[0].subject_scope == "question_defined_scope"
+
+
+@pytest.mark.parametrize(
+    "user_query",
+    [
+        "分析下数据源",
+        "分析当前已选数据源",
+        "当前选中的数据源分别有什么异常",
+        "对比各数据源的核心指标",
+        "把这批数据源逐个分析",
+    ],
+)
+def test_explicit_conversation_datasource_scope_remains_full(user_query):
+    intent = _intent()
+
+    grounded = prep._ground_intent_subject_scope(
+        intent,
+        user_query=user_query,
+        conversation_context={},
+    )
+
+    assert grounded.business_questions[0].subject_scope == "all_conversation_datasources"
+
+
+def test_elliptical_full_scope_is_grounded_by_selected_datasource_context():
+    intent = _intent().model_copy(update={
+        "business_questions": [
+            _intent().business_questions[0].model_copy(update={
+                "subject_scope": "all_conversation_datasources",
+            })
+        ],
+    })
+
+    grounded = prep._ground_intent_subject_scope(
+        intent,
+        user_query="分别看一下",
+        conversation_context={
+            "recent_messages": [
+                {"role": "user", "content": "我已经选择了两个时序数据源"},
+            ],
+        },
+    )
+
+    assert grounded.business_questions[0].subject_scope == "all_conversation_datasources"
 
 
 def test_subject_scope_is_required_in_intent_contract():
@@ -347,7 +419,7 @@ def test_full_scope_capacity_keeps_every_small_bound_datasource(monkeypatch):
     intent = _intent().model_copy(update={
         "business_questions": [
             _intent().business_questions[0].model_copy(update={
-                "subject_scope": "current_datasource_set",
+                "subject_scope": "all_conversation_datasources",
             })
         ],
     })
@@ -392,7 +464,7 @@ def test_full_scope_capacity_requests_narrowing_above_limit(monkeypatch):
         stage_callback=None,
     )
     question = _intent().business_questions[0].model_copy(update={
-        "subject_scope": "current_datasource_set",
+        "subject_scope": "all_conversation_datasources",
     })
     intent = _intent().model_copy(update={"business_questions": [question]})
     monkeypatch.setattr(
@@ -429,7 +501,7 @@ def test_full_scope_without_bound_datasource_stops_before_semantic_retrieval():
         stage_callback=None,
     )
     question = _intent().business_questions[0].model_copy(update={
-        "subject_scope": "current_datasource_set",
+        "subject_scope": "all_conversation_datasources",
     })
     intent = _intent().model_copy(update={"business_questions": [question]})
 
@@ -452,7 +524,7 @@ def test_fact_recall_keeps_dimension_source_omitted_by_llm_shortlist():
         business_questions=[BusinessQuestionContract(
             question_id="question_1",
             business_question="各产品线收入贡献如何",
-            subject_scope="specific",
+            subject_scope="question_defined_scope",
             required_business_facts=[BusinessFactRequirementContract(
                 fact_id="question_1_fact_1",
                 business_fact="各产品线营业收入",

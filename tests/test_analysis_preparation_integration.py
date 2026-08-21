@@ -64,7 +64,7 @@ def _preparation(snapshot: dict) -> PreparationResult:
             business_questions=[BusinessQuestionContract(
                 question_id="question_1",
                 business_question="合同情况如何",
-                subject_scope="specific",
+                subject_scope="question_defined_scope",
                 required_business_facts=[BusinessFactRequirementContract(
                     fact_id="question_1_fact_1",
                     business_fact="合同事实",
