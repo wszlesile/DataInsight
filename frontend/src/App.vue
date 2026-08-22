@@ -577,6 +577,7 @@
               </div>
               <div class="detail-list-actions">
                 <button class="action-btn" type="button" @click="selectInsightTask(selectedInsightTask)">刷新结果</button>
+                <button class="action-btn" type="button" @click="openEditInsightTask(selectedInsightTask)">编辑</button>
                 <button
                   class="action-btn"
                   type="button"
@@ -686,16 +687,21 @@
       </div>
     </el-drawer>
 
-    <el-dialog v-model="createInsightTaskVisible" title="加入洞察任务" width="520px" destroy-on-close>
+    <el-dialog
+      v-model="insightTaskEditorVisible"
+      :title="insightTaskEditorMode === 'edit' ? '编辑洞察任务' : '加入洞察任务'"
+      width="520px"
+      destroy-on-close
+    >
       <el-form label-position="top">
         <el-form-item label="任务名称">
-          <el-input v-model="createInsightTaskForm.name" maxlength="260" show-word-limit />
+          <el-input v-model="insightTaskEditorForm.name" maxlength="260" show-word-limit />
         </el-form-item>
         <el-form-item label="任务描述">
-          <el-input v-model="createInsightTaskForm.description" type="textarea" :rows="3" maxlength="1000" show-word-limit />
+          <el-input v-model="insightTaskEditorForm.description" type="textarea" :rows="3" maxlength="1000" show-word-limit />
         </el-form-item>
         <el-form-item label="任务频率">
-          <el-select v-model="createInsightTaskForm.frequency" style="width: 100%">
+          <el-select v-model="insightTaskEditorForm.frequency" style="width: 100%">
             <el-option label="每天" value="daily" />
             <el-option label="工作日" value="weekdays" />
             <el-option label="每周" value="weekly" />
@@ -703,21 +709,23 @@
           </el-select>
         </el-form-item>
         <el-form-item label="执行时间">
-          <el-time-picker v-model="createInsightTaskForm.time" format="HH:mm" value-format="HH:mm" style="width: 100%" />
+          <el-time-picker v-model="insightTaskEditorForm.time" format="HH:mm" value-format="HH:mm" style="width: 100%" />
         </el-form-item>
-        <el-form-item v-if="createInsightTaskForm.frequency === 'weekly'" label="执行星期">
-          <el-checkbox-group v-model="createInsightTaskForm.weekdays">
+        <el-form-item v-if="insightTaskEditorForm.frequency === 'weekly'" label="执行星期">
+          <el-checkbox-group v-model="insightTaskEditorForm.weekdays">
             <el-checkbox v-for="item in weekdayOptions" :key="item.value" :value="item.value">{{ item.label }}</el-checkbox>
           </el-checkbox-group>
         </el-form-item>
-        <el-form-item v-if="createInsightTaskForm.frequency === 'monthly'" label="执行日期">
-          <el-input-number v-model="createInsightTaskForm.dayOfMonth" :min="1" :max="31" controls-position="right" />
+        <el-form-item v-if="insightTaskEditorForm.frequency === 'monthly'" label="执行日期">
+          <el-input-number v-model="insightTaskEditorForm.dayOfMonth" :min="1" :max="31" controls-position="right" />
           <span class="task-schedule-hint">当月没有该日期时，在当月最后一天执行</span>
         </el-form-item>
       </el-form>
       <template #footer>
-        <button class="action-btn" type="button" @click="createInsightTaskVisible = false">取消</button>
-        <el-button type="primary" :loading="createInsightTaskLoading" @click="submitCreateInsightTask">创建任务</el-button>
+        <button class="action-btn" type="button" @click="insightTaskEditorVisible = false">取消</button>
+        <el-button type="primary" :loading="insightTaskEditorLoading" @click="submitInsightTaskEditor">
+          {{ insightTaskEditorMode === 'edit' ? '保存修改' : '创建任务' }}
+        </el-button>
       </template>
     </el-dialog>
 
@@ -1131,10 +1139,12 @@ const insightTaskRunSubmitting = ref(false)
 let insightTaskPollTimer = null
 let insightTaskDetailRequestId = 0
 let insightTaskRunRequestId = 0
-const createInsightTaskVisible = ref(false)
-const createInsightTaskLoading = ref(false)
-const createInsightTaskSource = ref(null)
-const createInsightTaskForm = ref({
+const insightTaskEditorVisible = ref(false)
+const insightTaskEditorLoading = ref(false)
+const insightTaskEditorMode = ref('create')
+const insightTaskEditorSource = ref(null)
+const insightTaskEditorTask = ref(null)
+const insightTaskEditorForm = ref({
   name: '',
   description: '',
   frequency: 'daily',
@@ -2121,56 +2131,109 @@ const getTaskDisabledReason = (execution) => {
   return '将当前分析逻辑保存为洞察任务'
 }
 
+const buildInsightTaskEditorForm = ({ name = '', description = '', schedule = {} } = {}) => {
+  const frequency = ['daily', 'weekdays', 'weekly', 'monthly'].includes(schedule?.frequency)
+    ? schedule.frequency
+    : 'daily'
+  const weekdays = Array.isArray(schedule?.weekdays)
+    ? schedule.weekdays.map(Number).filter((item) => item >= 1 && item <= 7)
+    : []
+  return {
+    name: String(name || '').slice(0, 260),
+    description: String(description || ''),
+    frequency,
+    time: schedule?.time || '09:00',
+    weekdays: weekdays.length ? weekdays : [1],
+    dayOfMonth: Math.min(31, Math.max(1, Number(schedule?.day_of_month) || 1))
+  }
+}
+
+const buildInsightTaskSchedule = (form) => {
+  const schedule = {
+    frequency: form.frequency,
+    time: form.time || '09:00'
+  }
+  if (form.frequency === 'weekly') schedule.weekdays = [...form.weekdays]
+  if (form.frequency === 'monthly') schedule.day_of_month = form.dayOfMonth || 1
+  return schedule
+}
+
+const validateInsightTaskEditor = (form) => {
+  if (!String(form.name || '').trim()) {
+    ElMessage.warning('请输入任务名称')
+    return false
+  }
+  if (form.frequency === 'weekly' && !form.weekdays.length) {
+    ElMessage.warning('请至少选择一个执行星期')
+    return false
+  }
+  return true
+}
+
 const openCreateTask = (item) => {
   const execution = item?.latestExecution
   if (!hasTaskRunnableExecution(execution)) {
     ElMessage.warning(getTaskDisabledReason(execution))
     return
   }
-  createInsightTaskSource.value = execution
-  createInsightTaskForm.value = {
+  insightTaskEditorMode.value = 'create'
+  insightTaskEditorSource.value = execution
+  insightTaskEditorTask.value = null
+  insightTaskEditorForm.value = buildInsightTaskEditorForm({
     name: String(item?.question || execution.title || '洞察任务').slice(0, 260),
     description: execution.description || '',
-    frequency: 'daily',
-    time: '09:00',
-    weekdays: [1],
-    dayOfMonth: 1
-  }
-  createInsightTaskVisible.value = true
+    schedule: { frequency: 'daily', time: '09:00' }
+  })
+  insightTaskEditorVisible.value = true
 }
 
-const submitCreateInsightTask = async () => {
-  const execution = createInsightTaskSource.value
-  const form = createInsightTaskForm.value
-  if (!hasTaskRunnableExecution(execution)) return
-  if (!String(form.name || '').trim()) {
-    ElMessage.warning('请输入任务名称')
-    return
-  }
-  if (form.frequency === 'weekly' && !form.weekdays.length) {
-    ElMessage.warning('请至少选择一个执行星期')
-    return
-  }
-  createInsightTaskLoading.value = true
+const openEditInsightTask = (task) => {
+  if (!task?.task_id) return
+  insightTaskEditorMode.value = 'edit'
+  insightTaskEditorSource.value = null
+  insightTaskEditorTask.value = task
+  insightTaskEditorForm.value = buildInsightTaskEditorForm(task)
+  insightTaskEditorVisible.value = true
+}
+
+const submitInsightTaskEditor = async () => {
+  const form = insightTaskEditorForm.value
+  if (!validateInsightTaskEditor(form)) return
+  insightTaskEditorLoading.value = true
   try {
-    const schedule = { frequency: form.frequency }
-    schedule.time = form.time || '09:00'
-    if (form.frequency === 'weekly') schedule.weekdays = [...form.weekdays]
-    if (form.frequency === 'monthly') schedule.day_of_month = form.dayOfMonth || 1
-    const response = await createInsightTask({
-      source_execution_id: execution.id,
+    const payload = {
       name: form.name.trim(),
       description: form.description.trim(),
-      schedule
+      schedule: buildInsightTaskSchedule(form)
+    }
+    if (insightTaskEditorMode.value === 'edit') {
+      const task = insightTaskEditorTask.value
+      if (!task?.task_id) return
+      const response = await updateInsightTask(task.task_id, payload)
+      if (!response.data?.success) throw new Error(response.data?.message || '更新任务失败')
+      selectedInsightTask.value = response.data.data
+      insightTaskEditorVisible.value = false
+      ElMessage.success('洞察任务已更新')
+      await fetchInsightTasks({ silent: true })
+      scheduleInsightTaskPolling()
+      return
+    }
+
+    const execution = insightTaskEditorSource.value
+    if (!hasTaskRunnableExecution(execution)) throw new Error('当前执行记录不可复用')
+    const response = await createInsightTask({
+      source_execution_id: execution.id,
+      ...payload
     })
     if (!response.data?.success) throw new Error(response.data?.message || '创建任务失败')
-    createInsightTaskVisible.value = false
+    insightTaskEditorVisible.value = false
     ElMessage.success('洞察任务已创建')
     await fetchInsightTasks()
   } catch (error) {
-    ElMessage.error(error?.response?.data?.message || error?.message || '创建任务失败')
+    const fallback = insightTaskEditorMode.value === 'edit' ? '更新任务失败' : '创建任务失败'
+    ElMessage.error(error?.response?.data?.message || error?.message || fallback)
   } finally {
-    createInsightTaskLoading.value = false
+    insightTaskEditorLoading.value = false
   }
 }
 

@@ -7,6 +7,7 @@
 洞察任务用于把一次成功分析固化为可重复执行的本地任务，并支持：
 
 - 从分析结果创建任务。
+- 创建后编辑任务名称、描述和调度周期。
 - 每天、工作日、每周、每月定时执行。
 - 所有任务均支持立即执行。
 - 暂停、恢复和删除任务。
@@ -312,6 +313,29 @@ await createInsightTask({
 2. 提示“洞察任务已创建”。
 3. 刷新任务列表。
 4. 不改变来源会话和轮次的当前结果。
+
+### 5.3 编辑任务
+
+任务详情操作区提供“编辑”入口，并复用创建任务表单。打开编辑弹窗时，从任务详情回填：
+
+- `name`：任务名称。
+- `description`：任务描述。
+- `schedule.frequency`：执行频率。
+- `schedule.time`：执行时间。
+- `schedule.weekdays`：每周任务的执行星期。
+- `schedule.day_of_month`：每月任务的执行日期。
+
+保存时调用：
+
+```js
+await updateInsightTask(task.task_id, {
+  name: form.name.trim(),
+  description: form.description.trim(),
+  schedule
+})
+```
+
+编辑只更新任务定义，不创建新任务版本，也不改变已固化的分析逻辑、统计口径、历史执行记录或启停状态。调度周期更新后，后端会重新计算 `next_run_at`。
 
 ## 6. 加载任务详情
 
