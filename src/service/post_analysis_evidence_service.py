@@ -112,6 +112,11 @@ Additional posthoc report-candidate rules:
     display limits are non-metric even when they appear beside a query-derived
     expression. Only a value that states an observed or calculated business
     result may be included in metric.report_candidate_ids.
+19. A candidate with runtime_iteration_boundary_required=true is a numeric
+    expression rendered once for each independently queried runtime member.
+    Candidates under different headings are different calculation boundaries
+    even when they use the same source expression and display the same value.
+    Never merge those headings into one metric.
 
 The JSON object may include report_candidate_ids and calculation_source_refs on
 each metric and a top-level non_metric_report_candidate_ids array.
@@ -437,7 +442,7 @@ class LineageIndexer:
     _OPERATION_CALLS = {
         "groupby", "agg", "aggregate", "sum", "mean", "count", "nunique", "min", "max",
         "value_counts", "sort_values", "head", "tail", "rank", "pct_change", "rolling",
-        "resample", "cumsum", "cumcount", "quantile", "merge", "join", "melt", "pivot", "pivot_table",
+        "resample", "cumsum", "cumcount", "quantile", "describe", "merge", "join", "melt", "pivot", "pivot_table",
         "len", "size", "idxmin", "idxmax", "to_numeric", "astype", "fillna", "dropna",
         "replace", "rename", "drop_duplicates", "copy",
         "sorted", "dataframe",
@@ -486,6 +491,7 @@ class LineageIndexer:
             table_sources=table_sources,
             table_metric_fields=table_metric_fields,
         )
+        outputs = self._attach_runtime_output_query_identity(outputs, snapshot)
         outputs = self._attach_structured_output_origins(
             outputs,
             code=snapshot.generated_code,
@@ -496,7 +502,11 @@ class LineageIndexer:
             outputs,
             code=snapshot.generated_code,
         )
-        outputs = self._attach_output_lineage(outputs, operations)
+        outputs = self._attach_output_lineage(
+            outputs,
+            operations,
+            code=snapshot.generated_code,
+        )
         outputs = self._mark_mapping_metric_mixtures(
             outputs,
             code=snapshot.generated_code,
@@ -1664,13 +1674,14 @@ class LineageIndexer:
 
     @staticmethod
     def _lineage_query_snapshots(query_snapshots: dict[str, Any]) -> dict[str, Any]:
-        successful = {
+        materialized = {
             str(key): value
             for key, value in query_snapshots.items()
             if isinstance(value, dict)
-            and str((value.get("execution") or {}).get("status") or "") == "success"
+            and str((value.get("execution") or {}).get("status") or "")
+            in {"success", "no_data"}
         }
-        return successful or query_snapshots
+        return materialized or query_snapshots
 
     @staticmethod
     def _query_operation_nodes(query_snapshots: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1701,6 +1712,35 @@ class LineageIndexer:
                 "targets": [],
                 "source": source[:6000],
             })
+            execution = (
+                snapshot.get("execution")
+                if isinstance(snapshot.get("execution"), dict)
+                else {}
+            )
+            row_count = execution.get("row_count")
+            if (
+                isinstance(row_count, int)
+                and not isinstance(row_count, bool)
+                and str(execution.get("status") or "") in {"success", "no_data"}
+            ):
+                row_count_identity = _stable_json({
+                    "query_key": str(query_key),
+                    "metric": "query_result_row_count",
+                })
+                nodes.append({
+                    "operation_node_id": (
+                        f"op_query_row_count_{_digest(row_count_identity, 12)}"
+                    ),
+                    "line": 0,
+                    "kind": "query_result_row_count",
+                    "semantic_kind": "aggregation",
+                    "projection_role": "measure",
+                    "query_node_id": str(query_key),
+                    "targets": [f"query_result[{query_key!r}]['row_count']"],
+                    "loads": [],
+                    "source": "QuerySnapshot.execution.row_count",
+                    "observed_value": row_count,
+                })
             sql_projection_nodes = LineageIndexer._sql_projection_nodes(
                 query_key=str(query_key),
                 sql=str(implementation.get("sql") or ""),
@@ -1718,7 +1758,6 @@ class LineageIndexer:
                 for field in operation.get("targets") or []
                 if str(field)
             }
-            execution = snapshot.get("execution") if isinstance(snapshot.get("execution"), dict) else {}
             for index, field in enumerate(execution.get("columns") or []):
                 field_name = str(field or "").strip()
                 if not field_name or field_name in projected_fields:
@@ -3410,7 +3449,15 @@ class LineageIndexer:
         return ""
 
     @classmethod
-    def _table_data_sources(cls, tree: ast.AST) -> list[dict[str, str]]:
+    def _table_data_sources(cls, tree: ast.AST) -> list[dict[str, Any]]:
+        loop_ranges = [
+            (
+                int(getattr(item, "lineno", 0) or 0),
+                int(getattr(item, "end_lineno", 0) or 0),
+            )
+            for item in ast.walk(tree)
+            if isinstance(item, (ast.For, ast.AsyncFor, ast.While))
+        ]
         wrapper_contracts: dict[str, dict[str, Any]] = {}
         for function in (
             item for item in ast.walk(tree) if isinstance(item, ast.FunctionDef)
@@ -3447,7 +3494,7 @@ class LineageIndexer:
                 }
                 break
 
-        sources: list[dict[str, str]] = []
+        sources: list[dict[str, Any]] = []
         for expression in cls._table_artifact_expressions(tree):
             rows_expression = cls._table_rows_expression(expression)
             if (
@@ -3485,8 +3532,260 @@ class LineageIndexer:
                 )
                 if isinstance(title_node, ast.Constant) and isinstance(title_node.value, str):
                     title = str(title_node.value)
-            sources.append({"source_frame": source, "title": title})
+            expression_line = int(getattr(expression, "lineno", 0) or 0)
+            sources.append({
+                "source_frame": source,
+                "title": title,
+                "reusable": any(
+                    start <= expression_line <= end
+                    for start, end in loop_ranges
+                    if start and end
+                ),
+            })
         return sources
+
+    @classmethod
+    def _artifact_datasource_query_node_id(
+        cls,
+        snapshot: AnalysisExecutionSnapshot,
+        artifact_title: str,
+    ) -> str:
+        """Resolve a runtime artifact to one successful physical query.
+
+        A single chart/table declaration can execute once per datasource in a
+        loop.  The rendered artifact title then carries the runtime datasource
+        identity even though the static source expression is shared.  Match
+        that identity to the selected datasource and then to the successful
+        query implementation.  Ambiguous matches deliberately remain empty.
+        """
+        normalized_title = str(artifact_title or "").strip().casefold()
+        if not normalized_title:
+            return ""
+
+        datasource_matches: list[dict[str, Any]] = []
+        for datasource in snapshot.selected_datasource_snapshot:
+            if not isinstance(datasource, dict):
+                continue
+            labels = list(dict.fromkeys(
+                str(datasource.get(key) or "").strip()
+                for key in (
+                    "datasource_name", "display_name", "displayName", "name",
+                )
+                if str(datasource.get(key) or "").strip()
+            ))
+            if any(
+                normalized_title == label.casefold()
+                or bool(re.match(
+                    rf"^{re.escape(label.casefold())}(?:\s|[-_:/（(【[])",
+                    normalized_title,
+                ))
+                for label in labels
+            ):
+                datasource_matches.append(datasource)
+        if len(datasource_matches) != 1:
+            return ""
+
+        datasource = datasource_matches[0]
+        identifiers = list(dict.fromkeys(
+            str(datasource.get(key) or "").strip()
+            for key in ("datasource_identifier", "identifier", "alias")
+            if str(datasource.get(key) or "").strip()
+        ))
+        if not identifiers:
+            return ""
+
+        query_matches: list[str] = []
+        for query_id, raw_snapshot in cls._lineage_query_snapshots(
+            snapshot.query_snapshots
+        ).items():
+            query_snapshot = raw_snapshot if isinstance(raw_snapshot, dict) else {}
+            implementation = (
+                query_snapshot.get("implementation")
+                if isinstance(query_snapshot.get("implementation"), dict)
+                else {}
+            )
+            implementation_text = _stable_json(implementation).casefold()
+            identifier_tokens = list(dict.fromkeys(
+                token
+                for identifier in identifiers
+                for token in (
+                    identifier.casefold(),
+                    identifier.rsplit(".", 1)[-1].casefold(),
+                )
+                if token
+            ))
+            if any(
+                re.search(
+                    rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])",
+                    implementation_text,
+                )
+                for token in identifier_tokens
+            ):
+                query_matches.append(str(query_id))
+        return query_matches[0] if len(query_matches) == 1 else ""
+
+    @classmethod
+    def _attach_runtime_output_query_identity(
+        cls,
+        outputs: list[dict[str, Any]],
+        snapshot: AnalysisExecutionSnapshot,
+    ) -> list[dict[str, Any]]:
+        """Attach query identity carried by the rendered runtime artifact.
+
+        Static AST lineage cannot distinguish iterations of one shared loop
+        variable.  A rendered chart/table title or report section heading can,
+        provided it uniquely names one selected datasource and that datasource
+        uniquely appears in one successful physical query.
+        """
+        enriched: list[dict[str, Any]] = []
+        for raw_output in outputs:
+            output = dict(raw_output)
+            if str(output.get("source_query_node_id") or "").strip():
+                enriched.append(output)
+                continue
+            artifact_type = str(output.get("artifact_type") or "")
+            artifact_index = int(output.get("artifact_index") or 0)
+            title = ""
+            if artifact_type == "report":
+                title = str(
+                    (output.get("display_context") or {}).get("heading") or ""
+                ).strip()
+            elif artifact_type == "chart" and 0 <= artifact_index < len(snapshot.charts):
+                title = str(snapshot.charts[artifact_index].get("title") or "").strip()
+            elif artifact_type == "table" and 0 <= artifact_index < len(snapshot.tables):
+                title = str(snapshot.tables[artifact_index].get("title") or "").strip()
+            query_node_id = cls._artifact_datasource_query_node_id(snapshot, title)
+            if query_node_id:
+                output["source_query_node_id"] = query_node_id
+                output["runtime_artifact_query_identity"] = True
+            expression_query_ids = cls._report_expression_query_node_ids(
+                snapshot,
+                output,
+            )
+            if expression_query_ids:
+                output["runtime_expression_query_node_ids"] = expression_query_ids
+            enriched.append(output)
+        return enriched
+
+    @classmethod
+    def _report_expression_query_node_ids(
+        cls,
+        snapshot: AnalysisExecutionSnapshot,
+        output: dict[str, Any],
+    ) -> list[str]:
+        """Resolve symbolic runtime selectors used by a report expression.
+
+        For example, ``m1 -> df1 -> all_results[names[0]]`` cannot be linked
+        to a physical query by static variable names alone.  The rendered
+        f-string bindings retain the concrete value of ``names[0]``; combining
+        that value with the selected datasource/query identity yields a
+        deterministic query boundary for ``m1`` without interpreting prose.
+        """
+        if output.get("artifact_type") != "report":
+            return []
+        expression_text = str(output.get("field") or "").strip()
+        bindings = output.get("rendered_slot_bindings") or {}
+        if not expression_text or not isinstance(bindings, dict) or not bindings:
+            return []
+        try:
+            code_tree = ast.parse(snapshot.generated_code or "")
+            expression_tree = ast.parse(expression_text, mode="eval")
+        except SyntaxError:
+            return []
+
+        assignments: dict[str, list[tuple[int, ast.AST]]] = {}
+        for node in ast.walk(code_tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = getattr(node, "value", None)
+            if value is None:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    assignments.setdefault(target.id, []).append((
+                        int(getattr(node, "lineno", 0) or 0),
+                        value,
+                    ))
+        for values in assignments.values():
+            values.sort(key=lambda item: item[0])
+
+        source_line = int(output.get("source_line") or 0) or 10**9
+        query_ids: list[str] = []
+        visited: set[tuple[str, int]] = set()
+
+        def visit(node: ast.AST, before_line: int) -> None:
+            for subscript in (
+                item for item in ast.walk(node) if isinstance(item, ast.Subscript)
+            ):
+                try:
+                    selector = ast.unparse(subscript.slice).strip()
+                except Exception:
+                    selector = ""
+                rendered_datasource = str(bindings.get(selector) or "").strip()
+                if not rendered_datasource:
+                    continue
+                query_id = cls._artifact_datasource_query_node_id(
+                    snapshot,
+                    rendered_datasource,
+                )
+                if query_id:
+                    query_ids.append(query_id)
+            loaded_names = {
+                item.id
+                for item in ast.walk(node)
+                if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load)
+            }
+            for name in loaded_names:
+                assignment = next(
+                    (
+                        (line, value)
+                        for line, value in reversed(assignments.get(name, []))
+                        if line <= before_line
+                    ),
+                    None,
+                )
+                if assignment is None or (name, assignment[0]) in visited:
+                    continue
+                visited.add((name, assignment[0]))
+                visit(assignment[1], assignment[0])
+
+        visit(expression_tree, source_line)
+        return list(dict.fromkeys(query_ids))
+
+    @classmethod
+    def _table_row_datasource_query_node_ids(
+        cls,
+        snapshot: AnalysisExecutionSnapshot,
+        table: dict[str, Any],
+    ) -> list[str]:
+        """Return physical queries named by a table's datasource dimension.
+
+        Multi-source summaries commonly append one record per datasource into
+        a shared table.  The metric Evidence remains column-scoped, while the
+        datasource-name column provides deterministic runtime provenance for
+        every row contributing to that column.
+        """
+        rows = [
+            row for row in table.get("rows") or []
+            if isinstance(row, dict)
+        ]
+        if not rows:
+            return []
+        candidate_fields = set(rows[0])
+        for row in rows[1:]:
+            candidate_fields.intersection_update(row)
+        for field in candidate_fields:
+            values = [str(row.get(field) or "").strip() for row in rows]
+            if not all(values):
+                continue
+            query_ids = [
+                cls._artifact_datasource_query_node_id(snapshot, value)
+                for value in values
+            ]
+            if all(query_ids):
+                return list(dict.fromkeys(query_ids))
+        return []
 
     @classmethod
     def _table_structured_metric_fields(cls, tree: ast.AST) -> list[set[str]]:
@@ -3545,7 +3844,7 @@ class LineageIndexer:
             return "formula"
         if called.intersection({
             "sum", "mean", "count", "nunique", "min", "max", "len", "size",
-            "agg", "aggregate", "value_counts", "quantile", "cumsum", "cumcount",
+            "agg", "aggregate", "value_counts", "quantile", "describe", "cumsum", "cumcount",
         }):
             return "aggregation"
         if called.intersection({"sort_values", "head", "tail", "rank", "idxmin", "idxmax"}):
@@ -4071,7 +4370,7 @@ class LineageIndexer:
         *,
         column_aliases: dict[str, dict[str, str]],
         chart_sources: list[dict[str, Any]],
-        table_sources: list[dict[str, str]],
+        table_sources: list[dict[str, Any]],
         table_metric_fields: list[set[str]],
     ) -> list[dict[str, Any]]:
         outputs: list[dict[str, Any]] = []
@@ -4161,20 +4460,37 @@ class LineageIndexer:
             contract_index = next(
                 (
                     index for index, contract in enumerate(table_sources)
-                    if index not in matched_table_contracts
+                    if (index not in matched_table_contracts or contract.get("reusable"))
                     and actual_title
                     and str(contract.get("title") or "").strip() == actual_title
                 ),
                 -1,
             )
+            if contract_index < 0:
+                reusable_contracts = [
+                    index
+                    for index, contract in enumerate(table_sources)
+                    if contract.get("reusable")
+                ]
+                if len(reusable_contracts) == 1:
+                    contract_index = reusable_contracts[0]
             if contract_index < 0 and len(table_sources) == len(snapshot.tables):
                 contract_index = table_index
-            if contract_index >= 0:
-                matched_table_contracts.add(contract_index)
-            source_frame = (
-                str(table_sources[contract_index].get("source_frame") or "")
+            matched_contract = (
+                table_sources[contract_index]
                 if 0 <= contract_index < len(table_sources)
-                else ""
+                else {}
+            )
+            if contract_index >= 0 and not matched_contract.get("reusable"):
+                matched_table_contracts.add(contract_index)
+            source_frame = str(matched_contract.get("source_frame") or "")
+            source_query_node_id = self._artifact_datasource_query_node_id(
+                snapshot,
+                actual_title,
+            )
+            row_query_node_ids = self._table_row_datasource_query_node_ids(
+                snapshot,
+                table,
             )
             structured_metric_fields = (
                 table_metric_fields[contract_index]
@@ -4210,6 +4526,8 @@ class LineageIndexer:
                         or self._explicit_display_unit(label)
                         or ""
                     ),
+                    "source_query_node_id": source_query_node_id,
+                    "runtime_row_query_node_ids": row_query_node_ids,
                     "source_frame": source_frame,
                     "lineage_fields": [source_field] if source_field else [key],
                     # Kept only while the local compiler resolves a possible
@@ -4331,6 +4649,12 @@ class LineageIndexer:
             str(item.get("operation_node_id")): item
             for item in operations
             if str(item.get("operation_node_id") or "")
+        }
+        query_row_count_operations = {
+            str(item.get("query_node_id") or ""): item
+            for item in operations
+            if item.get("kind") == "query_result_row_count"
+            and str(item.get("query_node_id") or "")
         }
         operations_by_line: dict[int, list[dict[str, Any]]] = {}
         for operation in operation_by_id.values():
@@ -6476,6 +6800,47 @@ class LineageIndexer:
                         origin["boundaries"] = {operation_id}
                 except SyntaxError:
                     origin = None
+            if not (
+                origin
+                and origin.get("queries")
+                and origin.get("boundaries")
+            ) and output.get("artifact_type") == "table":
+                runtime_query_ids = [
+                    str(item)
+                    for item in output.get("runtime_row_query_node_ids") or []
+                    if str(item)
+                ]
+                sample_values = output.get("sample_values") or []
+                row_count_operations = [
+                    query_row_count_operations.get(query_id)
+                    for query_id in runtime_query_ids
+                ]
+                if (
+                    runtime_query_ids
+                    and len(runtime_query_ids) == len(sample_values)
+                    and all(row_count_operations)
+                    and all(
+                        isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and float(value) == float(operation.get("observed_value"))
+                        for value, operation in zip(
+                            sample_values,
+                            row_count_operations,
+                        )
+                    )
+                ):
+                    operation_ids = {
+                        str(operation.get("operation_node_id") or "")
+                        for operation in row_count_operations
+                        if str(operation.get("operation_node_id") or "")
+                    }
+                    origin = {
+                        "queries": set(runtime_query_ids),
+                        "operations": operation_ids,
+                        "boundaries": operation_ids,
+                        "dimension_boundaries": set(),
+                    }
+                    output["lineage_fields"] = ["query_result_row_count"]
             if origin and origin.get("queries") and origin.get("boundaries"):
                 boundary_ids = sorted(origin["boundaries"])
                 families = {
@@ -6651,6 +7016,8 @@ class LineageIndexer:
         cls,
         outputs: list[dict[str, Any]],
         operations: list[dict[str, Any]],
+        *,
+        code: str = "",
     ) -> list[dict[str, Any]]:
         operation_by_id = {
             str(item.get("operation_node_id")): item
@@ -7014,6 +7381,27 @@ class LineageIndexer:
                 output_producers,
                 runtime_query_sources,
             )
+            runtime_expression_query_ids = list(dict.fromkeys(
+                str(query_id)
+                for query_id in output.get(
+                    "runtime_expression_query_node_ids"
+                ) or []
+                if str(query_id)
+            ))
+            if runtime_expression_query_ids:
+                # The rendered selector resolves the concrete iteration that
+                # produced this expression; the wider static mapping closure
+                # contains sibling iterations and must not be merged back in.
+                query_ids = runtime_expression_query_ids
+            else:
+                query_ids = list(dict.fromkeys([
+                    *(
+                        str(query_id)
+                        for query_id in output.get("runtime_row_query_node_ids") or []
+                        if str(query_id)
+                    ),
+                    *query_ids,
+                ]))
             if source_query_node_id:
                 query_ids = list(dict.fromkeys([source_query_node_id, *query_ids]))
             output["direct_operation_node_ids"] = direct
@@ -7022,11 +7410,38 @@ class LineageIndexer:
             output["boundary_operation_node_ids"] = boundaries
             resolved.append(output)
 
-        # A dynamic report template can render one numeric loop variable many
-        # times. Only after the complete local lineage pass can we distinguish
-        # genuinely unresolved occurrences from ordinary DataFrame iteration.
-        # Expose the former as independent semantic candidates rather than one
-        # unverifiable source anchor; locally proven outputs stay untouched.
+        # A dynamic report template can render one numeric expression against
+        # several independently queried frames. Static name-flow can reach the
+        # shared loop variable but cannot identify which runtime iteration
+        # produced each rendered occurrence. Keep those occurrences separate
+        # for semantic resolution instead of silently assigning every section
+        # to the first query reached through the loop container.
+        mapping_iteration_ranges: list[tuple[int, int]] = []
+        try:
+            code_tree = ast.parse(code or "")
+        except SyntaxError:
+            code_tree = None
+        if code_tree is not None:
+            for loop in (
+                node for node in ast.walk(code_tree) if isinstance(node, ast.For)
+            ):
+                iterator = loop.iter
+                if not (
+                    isinstance(iterator, ast.Call)
+                    and isinstance(iterator.func, ast.Attribute)
+                    and iterator.func.attr == "items"
+                ):
+                    continue
+                mapping_iteration_ranges.append((
+                    int(getattr(loop, "lineno", 0) or 0),
+                    int(getattr(loop, "end_lineno", 0) or 0),
+                ))
+        available_query_ids = {
+            str(operation.get("query_node_id") or "")
+            for operation in operations
+            if str(operation.get("query_node_id") or "")
+        }
+
         report_outputs_by_anchor: dict[str, list[dict[str, Any]]] = {}
         for output in resolved:
             if output.get("artifact_type") != "report":
@@ -7042,10 +7457,38 @@ class LineageIndexer:
                 and not output.get("candidate_query_node_ids")
                 and not output.get("boundary_operation_node_ids")
             ]
-            if len(unresolved_occurrences) <= 1:
-                continue
-            for output in unresolved_occurrences:
-                output["ambiguous_calculation_boundary"] = True
+            if len(unresolved_occurrences) > 1:
+                for output in unresolved_occurrences:
+                    output["ambiguous_calculation_boundary"] = True
+
+            source_line = int(anchor_outputs[0].get("source_line") or 0)
+            in_mapping_iteration = any(
+                start <= source_line <= end
+                for start, end in mapping_iteration_ranges
+            )
+            headings = {
+                str((output.get("display_context") or {}).get("heading") or "").strip()
+                for output in anchor_outputs
+                if str((output.get("display_context") or {}).get("heading") or "").strip()
+            }
+            local_query_boundaries = {
+                tuple(sorted(
+                    str(query_id)
+                    for query_id in output.get("candidate_query_node_ids") or []
+                    if str(query_id)
+                ))
+                for output in anchor_outputs
+            }
+            if (
+                len(anchor_outputs) > 1
+                and in_mapping_iteration
+                and len(headings) > 1
+                and len(available_query_ids) > 1
+                and len(local_query_boundaries) == 1
+            ):
+                for output in anchor_outputs:
+                    output["ambiguous_calculation_boundary"] = True
+                    output["runtime_iteration_boundary_required"] = True
         return resolved
 
     @staticmethod
@@ -7419,6 +7862,11 @@ class LineageIndexer:
                 r"\d{4}-\d{1,2}(?:-\d{1,2})?",
                 r"\d{1,2}月(?:\d{1,2}日)?",
                 (
+                    r"(?<!\d)\d{1,2}[-/.]\d{1,2}[ T]"
+                    r"\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?"
+                    r"(?:Z|[+-]\d{2}:?\d{2})?(?!\d)"
+                ),
+                (
                     r"\d{4}-\d{1,2}-\d{1,2}[T\s]"
                     r"\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?"
                     r"(?:Z|[+-]\d{2}:?\d{2})?"
@@ -7450,6 +7898,25 @@ class LineageIndexer:
                     for pattern in compact_date_ranges
                     for match in re.finditer(pattern, line_text)
                 )
+            if not temporal:
+                relative_time_scope = (
+                    r"(?:近|最近|过去|前)\s*\d+(?:\.\d+)?\s*"
+                    r"(?:秒|分钟|分|小时|时|天|日|周|星期|月|季度|季|年)"
+                )
+                temporal = any(
+                    match.start() <= token_start and token_end <= match.end()
+                    for match in re.finditer(relative_time_scope, line_text)
+                )
+            if not temporal:
+                window_grain = (
+                    r"\d+(?:\.\d+)?\s*"
+                    r"(?:秒|分钟|分|小时|时|天|日|周|星期|月|季度|季|年)"
+                    r"\s*(?:窗口|粒度|间隔|步长)"
+                )
+                temporal = any(
+                    match.start() <= token_start and token_end <= match.end()
+                    for match in re.finditer(window_grain, line_text)
+                )
             prefix = line_text[max(0, token_start - 24):token_start]
             suffix = line_text[token_end:min(len(line_text), token_end + 24)]
             comparison_threshold = bool(
@@ -7458,6 +7925,15 @@ class LineageIndexer:
                     prefix,
                 )
             )
+            if not comparison_threshold:
+                # Query/filter disclosures such as ``status=0`` describe a
+                # selection condition, not an observed report metric.  Limit
+                # this grammar to machine-style identifiers so ordinary prose
+                # statements remain eligible for Evidence discovery.
+                comparison_threshold = bool(re.search(
+                    r"[A-Za-z_][A-Za-z0-9_.]*\s*(?:={1,2}|!=)\s*$",
+                    prefix,
+                ))
             if not comparison_threshold:
                 # A labelled interval such as ``20%~50%（medium）`` defines a
                 # presentation bucket.  Its endpoints are cutoffs; the count
@@ -7495,6 +7971,14 @@ class LineageIndexer:
             formula_coefficient = bool(
                 re.search(r"(?:[×*/xX]\s*|\bcoef(?:ficient)?\s*=\s*)$", prefix)
                 or re.match(r"\s*[×*/xX+]", suffix)
+                or (
+                    re.search(r"(?:±|\+/-)\s*$", prefix)
+                    and re.match(
+                        r"\s*(?:σ|sigma\b|倍(?:标准差|方差)?)",
+                        suffix,
+                        flags=re.IGNORECASE,
+                    )
+                )
             )
             identifier_start = token_start
             identifier_end = token_end
@@ -8125,6 +8609,7 @@ class PostAnalysisEvidenceCompiler:
                 if compiled["evidence_definitions"]
                 and not unresolved_output_ids
                 and not missing_compiled_output_ids
+                and not plan_unresolved_output_ids
                 else "partial"
             )
             return compiled
@@ -8644,15 +9129,50 @@ class PostAnalysisEvidenceCompiler:
                     producers,
                 )
             }
-            output_local_boundary_proven = bool(output_ids) and all(
-                {
-                    str(query_id)
-                    for query_id in (output_by_id.get(output_id) or {}).get(
-                        "candidate_query_node_ids"
-                    ) or []
-                    if str(query_id)
-                }.intersection(query_ids)
+            runtime_iteration_boundary = any(
+                bool((output_by_id.get(output_id) or {}).get(
+                    "runtime_iteration_boundary_required"
+                ))
                 for output_id in output_ids
+            )
+            runtime_identity_query_ids = {
+                str(query_id)
+                for output_id in output_ids
+                if (output_by_id.get(output_id) or {}).get(
+                    "runtime_artifact_query_identity"
+                )
+                for query_id in (output_by_id.get(output_id) or {}).get(
+                    "candidate_query_node_ids"
+                ) or []
+                if str(query_id)
+            }
+            # A nested report string can hide the runtime loop occurrence from
+            # static name-flow.  When the rendered heading uniquely proves a
+            # physical query and that identity conflicts with the static
+            # closure, the closure is capability-limited rather than a valid
+            # contradiction.  Keep query/field attestation mandatory instead
+            # of accepting either side without verification.
+            runtime_identity_conflict = bool(
+                runtime_identity_query_ids
+                and query_ids
+                and not runtime_identity_query_ids.issubset(set(query_ids))
+            )
+            ambiguous_output_boundary = bool(
+                runtime_iteration_boundary or runtime_identity_conflict
+            )
+            output_local_boundary_proven = (
+                bool(output_ids)
+                and not ambiguous_output_boundary
+                and all(
+                    {
+                        str(query_id)
+                        for query_id in (output_by_id.get(output_id) or {}).get(
+                            "candidate_query_node_ids"
+                        ) or []
+                        if str(query_id)
+                    }.intersection(query_ids)
+                    for output_id in output_ids
+                )
             )
             explicit_operation_boundary_proven = bool(
                 metric.operation_node_ids and query_ids
@@ -8665,6 +9185,7 @@ class PostAnalysisEvidenceCompiler:
                 )
                 and selected_operations
                 and query_ids
+                and not ambiguous_output_boundary
                 and (
                     output_local_boundary_proven
                     or explicit_operation_boundary_proven
@@ -8687,6 +9208,7 @@ class PostAnalysisEvidenceCompiler:
                 and claimed_query_ids
                 and not output_verified_query_ids.issubset(set(claimed_query_ids))
                 and not locally_resolved_query_boundary
+                and not ambiguous_output_boundary
             ):
                 source_ref_errors.append(
                     "LLM query claim contradicts locally verified query dependencies."
@@ -8696,6 +9218,7 @@ class PostAnalysisEvidenceCompiler:
                 and claimed_query_ids
                 and not set(query_ids).issubset(set(claimed_query_ids))
                 and not locally_resolved_query_boundary
+                and not ambiguous_output_boundary
             ):
                 source_ref_errors.append(
                     "Planner source locator does not support the declared query boundary."
@@ -9048,9 +9571,14 @@ class PostAnalysisEvidenceCompiler:
             )
             for operation in candidate_operations
         )
-        if parameter_controlled and not any(
-            str(operation.get("query_node_id") or "")
-            for operation in candidate_operations
+        if (
+            parameter_controlled
+            and not output.get("candidate_query_node_ids")
+            and not output.get("runtime_iteration_boundary_required")
+            and not any(
+                str(operation.get("query_node_id") or "")
+                for operation in candidate_operations
+            )
         ):
             return False
         # Report output nodes only exist for numeric values located through an
@@ -10226,6 +10754,7 @@ class PostAnalysisEvidenceCompiler:
             lineage_index,
             generated_code=snapshot.generated_code,
             query_snapshots=snapshot.query_snapshots,
+            selected_datasource_snapshot=snapshot.selected_datasource_snapshot,
         )
         if referenced_query_ids:
             query_catalog = [
@@ -10632,6 +11161,7 @@ class PostAnalysisEvidenceCompiler:
         *,
         generated_code: str = "",
         query_snapshots: dict[str, Any] | None = None,
+        selected_datasource_snapshot: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Expose executed query semantics without duplicating SQL already present in code."""
         result_bindings: dict[str, list[dict[str, Any]]] = {}
@@ -10676,8 +11206,36 @@ class PostAnalysisEvidenceCompiler:
                 if isinstance(scope.get("implementation"), dict)
                 else {}
             )
+            implementation_text = _stable_json(implementation).casefold()
+            datasource_matches = [
+                datasource
+                for datasource in selected_datasource_snapshot or []
+                if isinstance(datasource, dict)
+                and str(datasource.get("datasource_identifier") or "").strip()
+                and str(datasource.get("datasource_identifier") or "")
+                .strip()
+                .casefold() in implementation_text
+            ]
+            datasource_identity = (
+                {
+                    "datasource_id": (
+                        datasource_matches[0].get("datasource_id")
+                        or datasource_matches[0].get("id")
+                    ),
+                    "datasource_name": (
+                        datasource_matches[0].get("datasource_name")
+                        or datasource_matches[0].get("display_name")
+                        or datasource_matches[0].get("displayName")
+                        or datasource_matches[0].get("name")
+                        or ""
+                    ),
+                }
+                if len(datasource_matches) == 1
+                else {}
+            )
             catalog.append({
                 "query_node_id": query_node_id,
+                **datasource_identity,
                 "columns": list(dict.fromkeys(
                     str(field)
                     for field in scope.get("execution_columns") or []
@@ -10807,6 +11365,15 @@ class PostAnalysisEvidenceCompiler:
                     if len(outputs) > 1
                     else "report_span"
                 ),
+                "runtime_iteration_boundary_required": bool(
+                    representative.get("runtime_iteration_boundary_required")
+                ),
+                "candidate_query_node_ids": list(dict.fromkeys(
+                    str(query_id)
+                    for output in outputs
+                    for query_id in output.get("candidate_query_node_ids") or []
+                    if str(query_id)
+                )),
             })
         return catalog
 
@@ -11089,6 +11656,7 @@ class PostAnalysisEvidenceCompiler:
                 lineage_index,
                 generated_code=snapshot.generated_code,
                 query_snapshots=snapshot.query_snapshots,
+                selected_datasource_snapshot=snapshot.selected_datasource_snapshot,
             )
             if str(item.get("query_node_id") or "") in referenced_query_ids
         ]
@@ -11096,6 +11664,8 @@ class PostAnalysisEvidenceCompiler:
             query_catalog = [
                 {
                     "query_node_id": item.get("query_node_id"),
+                    "datasource_id": item.get("datasource_id"),
+                    "datasource_name": item.get("datasource_name") or "",
                     "data_access": item.get("data_access") or {},
                     "columns": item.get("columns") or [],
                     "result_bindings": item.get("result_bindings") or [],
@@ -11964,6 +12534,19 @@ class PostAnalysisEvidenceCompiler:
                 previous = classified.get(f"candidate:{candidate_id}")
                 if not previous:
                     classified[f"candidate:{candidate_id}"] = owner
+            runtime_headings = {
+                str(report_candidates.get(str(candidate_id), {}).get("heading") or "").strip()
+                for candidate_id in metric.report_candidate_ids
+                if report_candidates.get(str(candidate_id), {}).get(
+                    "runtime_iteration_boundary_required"
+                )
+                and str(report_candidates.get(str(candidate_id), {}).get("heading") or "").strip()
+            }
+            if len(runtime_headings) > 1:
+                errors.append(
+                    f"{owner} merges independent runtime query occurrences under "
+                    f"different headings: {sorted(runtime_headings)}"
+                )
             for operation_id in metric.operation_node_ids:
                 if str(operation_id) not in valid_operation_ids:
                     errors.append(f"{owner} references unknown operation: {operation_id}")
@@ -12014,6 +12597,14 @@ class PostAnalysisEvidenceCompiler:
             candidate_id = str(candidate_id)
             if candidate_id not in valid_report_candidate_ids:
                 errors.append(f"non_metric references unknown report candidate: {candidate_id}")
+                continue
+            if report_candidates.get(candidate_id, {}).get(
+                "runtime_iteration_boundary_required"
+            ):
+                errors.append(
+                    "query-backed runtime report candidate cannot be classified "
+                    f"as non-metric: {candidate_id}"
+                )
                 continue
             previous = classified.get(f"candidate:{candidate_id}")
             if not previous:

@@ -2036,8 +2036,23 @@ def load_data_with_sql(
                 lambda value: "" if value is None else str(value).strip()
             )
         population_diagnostics = _inspect_zero_population_aggregate(sql, data)
-    except Exception:
-        _mark_latest_query_snapshot_execution(status='failed', duration_ms=int((time.time() - start_time) * 1000))
+    except Exception as exc:
+        error_type = _classify_execution_error(exc, str(exc))
+        if error_type == 'no_data_found':
+            _mark_latest_query_snapshot_execution(
+                status='no_data',
+                duration_ms=int((time.time() - start_time) * 1000),
+                row_count=0,
+                diagnostics={
+                    'effective_no_data': True,
+                    'error_type': error_type,
+                },
+            )
+        else:
+            _mark_latest_query_snapshot_execution(
+                status='failed',
+                duration_ms=int((time.time() - start_time) * 1000),
+            )
         raise
     _mark_latest_query_snapshot_execution(
         status='success',
@@ -7253,7 +7268,10 @@ def _raise_if_all_query_snapshots_no_data() -> None:
         execution = snapshot.get('execution')
         if not isinstance(implementation, dict) or not implementation.get('physical_execution'):
             continue
-        if not isinstance(execution, dict) or execution.get('status') != 'success':
+        if (
+            not isinstance(execution, dict)
+            or execution.get('status') not in {'success', 'no_data'}
+        ):
             continue
         executions.append((implementation, execution))
     if not executions:
@@ -9015,7 +9033,10 @@ def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -
         for item in payload.get('datasource_numeric_fields') or []
         if isinstance(item, dict)
     ])
-    CURRENT_QUERY_SNAPSHOTS.set({})
+    CURRENT_QUERY_SNAPSHOTS.set(_copy_jsonable(
+        payload.get('initial_query_snapshots') or {},
+        {},
+    ))
     CURRENT_LAST_QUERY_KEY.set('')
     CURRENT_EXECUTION_INTENT.set('')
     CURRENT_CONFIRMED_NO_DATA_RESULT.set(bool(payload.get('confirmed_no_data_result')))
@@ -9854,6 +9875,10 @@ def _execute_generated_code_worker(
                 'stdout_text': _sanitize_tool_output(stdout_buffer.getvalue()),
                 'stderr_text': _sanitize_tool_output(stderr_buffer.getvalue()),
                 'exec_result': _serialize_exec_result(exec_result),
+                'query_snapshots': _copy_jsonable(
+                    CURRENT_QUERY_SNAPSHOTS.get() or {},
+                    {},
+                ),
             })
             result_queue.put({
                 'status': 'success',
@@ -9894,6 +9919,10 @@ def _execute_generated_code_worker(
                 'code_error_context': code_error_context,
                 'repair_instructions': repair_instructions,
                 'diagnostics': diagnostics,
+                'query_snapshots': _copy_jsonable(
+                    CURRENT_QUERY_SNAPSHOTS.get() or {},
+                    {},
+                ),
                 'stdout_text': _sanitize_tool_output(stdout_buffer.getvalue()),
                 'stderr_text': _sanitize_tool_output(
                     '\n'.join(item for item in [stderr_buffer.getvalue(), full_traceback] if item)
@@ -11122,6 +11151,93 @@ def _count_probe_no_data_failures(turn_id: int, current_execution_id: int) -> in
         session.close()
 
 
+def _extract_confirmed_no_data_query_snapshots(
+    previous_executions: list[Any],
+) -> dict[str, Any]:
+    """Recover physically executed empty-query facts from prior attempts.
+
+    Probe and analysis attempts run in isolated subprocesses. A final no-data
+    report therefore has to inherit the successful zero-row QuerySnapshots
+    explicitly; otherwise it retains only its own validation shell and the
+    Evidence compiler has no executed fact to materialize.
+    """
+    recovered: dict[str, Any] = {}
+    for execution in reversed(previous_executions):
+        try:
+            payload = json.loads(
+                getattr(execution, 'result_payload_json', '') or '{}'
+            )
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        snapshots = payload.get('query_snapshots')
+        if not isinstance(snapshots, dict):
+            continue
+        execution_id = int(getattr(execution, 'id', 0) or 0)
+        for query_key, raw_snapshot in snapshots.items():
+            if not isinstance(raw_snapshot, dict):
+                continue
+            implementation = raw_snapshot.get('implementation')
+            query_execution = raw_snapshot.get('execution')
+            if not isinstance(implementation, dict) or not isinstance(query_execution, dict):
+                continue
+            if not implementation.get('physical_execution'):
+                continue
+            if str(query_execution.get('status') or '').lower() not in {
+                'success', 'no_data',
+            }:
+                continue
+            if not (
+                query_execution.get('effective_no_data') is True
+                or query_execution.get('row_count') == 0
+            ):
+                continue
+            inherited_key = _normalize_query_key(
+                f'confirmed_no_data_{execution_id}_{query_key}'
+            )
+            inherited = _copy_jsonable(raw_snapshot, {})
+            inherited['query_key'] = inherited_key
+            query_scope = inherited.get('query_scope')
+            if isinstance(query_scope, dict):
+                inherited['query_scope'] = {
+                    **query_scope,
+                    'query_key': inherited_key,
+                }
+            recovered[inherited_key] = inherited
+    return dict(list(recovered.items())[-12:])
+
+
+def _load_confirmed_no_data_query_snapshots(
+    *,
+    turn_id: int,
+    current_execution_id: int,
+) -> dict[str, Any]:
+    if turn_id <= 0 or current_execution_id <= 0:
+        return {}
+
+    from config.database import SessionLocal
+    from model import InsightNsExecution, InsightNsTurn
+
+    session = SessionLocal()
+    try:
+        turn = session.query(InsightNsTurn).filter(InsightNsTurn.id == turn_id).first()
+        query = session.query(InsightNsExecution).filter(
+            InsightNsExecution.turn_id == turn_id,
+            InsightNsExecution.id < current_execution_id,
+            InsightNsExecution.is_deleted == 0,
+            InsightNsExecution.execution_status != 'success',
+        )
+        if turn is not None and turn.started_at is not None:
+            query = query.filter(InsightNsExecution.created_at >= turn.started_at)
+        previous_executions = query.order_by(
+            InsightNsExecution.id.desc()
+        ).limit(20).all()
+        return _extract_confirmed_no_data_query_snapshots(previous_executions)
+    finally:
+        session.close()
+
+
 def _apply_probe_no_data_retry_limit(
     *,
     turn_id: int,
@@ -11841,13 +11957,21 @@ def execute_python(
     result_queue: mp.Queue = mp.Queue()
     runtime_user_context = _serialize_runtime_user_context(runtime.context)
     runtime_user_context['time_range_guard_active'] = time_range_guard_active
+    runtime_turn_id = int(getattr(runtime.context, 'turn_id', 0) or 0)
     runtime_user_context['confirmed_no_data_result'] = (
         _count_probe_no_data_failures(
-            turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+            turn_id=runtime_turn_id,
             current_execution_id=max(execution_id - 1, 0),
         )
         >= PROBE_NO_DATA_RETRY_LIMIT
     )
+    if runtime_user_context['confirmed_no_data_result']:
+        runtime_user_context['initial_query_snapshots'] = (
+            _load_confirmed_no_data_query_snapshots(
+                turn_id=runtime_turn_id,
+                current_execution_id=execution_id,
+            )
+        )
     process = mp.Process(
         target=_execute_generated_code_worker,
         args=(code, getattr(runtime.context, 'username', 'anonymous'), runtime_user_context, result_queue),
@@ -12092,6 +12216,7 @@ def execute_python(
                 'error_message': error_message,
                 'error_signature': error_signature,
                 'diagnostics': worker_diagnostics,
+                'query_snapshots': worker_payload.get('query_snapshots') or {},
                 'code_error_context': code_error_context,
                 'repair_instructions': repair_instructions,
             }, ensure_ascii=False),
@@ -12197,11 +12322,19 @@ def execute_python(
             turn_id=turn_id,
             current_execution_id=execution_id,
         )
+        retry_result_payload = exec_result.model_dump()
+        retry_result_payload['query_snapshots'] = (
+            worker_payload.get('query_snapshots') or {}
+        )
         _update_execution_record(
             execution_id,
             execution_status='failed',
             analysis_report=exec_result.analysis_report,
-            result_payload_json=exec_result.model_dump_json(),
+            result_payload_json=json.dumps(
+                retry_result_payload,
+                ensure_ascii=False,
+                default=str,
+            ),
             stdout_text=stdout_text,
             stderr_text=stderr_text,
             execution_seconds=execution_seconds,

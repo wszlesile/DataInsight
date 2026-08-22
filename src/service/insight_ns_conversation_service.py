@@ -764,6 +764,7 @@ class InsightNsConversationService:
         mapping = {
             'count': '命中记录数',
             'record_count': '命中记录数',
+            'query_result_row_count': '查询命中记录数',
             'sum': '合计值',
             'avg': '平均值',
             'average': '平均值',
@@ -899,8 +900,16 @@ class InsightNsConversationService:
     def _stringify_metric_fields(values: Any, *, limit: int = 6) -> str:
         """Render an unordered field set without making it look like a formula."""
         if not isinstance(values, list):
-            return str(values) if values not in (None, '') else ''
-        visible = [str(item) for item in values[:limit] if item not in (None, '')]
+            return (
+                InsightNsConversationService._friendly_metric(values)
+                if values not in (None, '')
+                else ''
+            )
+        visible = [
+            InsightNsConversationService._friendly_metric(item)
+            for item in values[:limit]
+            if item not in (None, '')
+        ]
         suffix = f" 等 {len(values)} 项" if len(values) > limit else ''
         return "、".join(visible) + suffix
 

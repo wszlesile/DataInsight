@@ -51,6 +51,16 @@ def test_metric_fields_are_presented_as_an_unordered_field_set() -> None:
     assert all("销售收入_元 / 毛利_元" not in str(item.get("value")) for item in items)
 
 
+def test_query_snapshot_row_count_protocol_name_is_not_exposed() -> None:
+    items = InsightNsConversationService._calculation_items(
+        {"metric_fields": ["query_result_row_count"]},
+        [],
+    )
+
+    assert {"label": "参与计算字段", "value": "查询命中记录数"} in items
+    assert "query_result_row_count" not in str(items)
+
+
 def test_read_data_step_uses_the_same_metric_field_semantics() -> None:
     items = InsightNsConversationService._source_items(
         [{"datasource_name": "产品月度利润_公司产线", "datasource_type": "local_file"}],

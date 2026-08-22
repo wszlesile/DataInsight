@@ -4311,6 +4311,156 @@ tables = [
     assert definitions[refs[1]["evidence_key"]]["query_refs"] == ["q_team"]
 
 
+def test_runtime_loop_tables_resolve_each_datasource_query_boundary():
+    code = r'''
+datasources = [
+    {"name": "Float_2", "identifier": "float_signal"},
+    {"name": "Int32_1", "identifier": "integer_signal"},
+]
+all_results = {}
+for datasource in datasources:
+    sql = f"SELECT ts, value FROM {datasource['identifier']}"
+    all_results[datasource["name"]] = load_data_with_sql(sql=sql)
+
+tables = []
+for datasource_name, frame in all_results.items():
+    display = frame[["ts", "value"]].copy()
+    tables.append(build_table_result(
+        title=f"{datasource_name} hourly details",
+        columns=[
+            {"key": "ts", "label": "Time"},
+            {"key": "value", "label": "Hourly mean"},
+        ],
+        data=display[["ts", "value"]],
+    ))
+result = save_analysis_result(analysis_report="Hourly details.", charts=[], tables=tables)
+'''
+    snapshot = replace(
+        _snapshot(
+            code=code,
+            report="Hourly details.",
+            tables=[
+                {
+                    "title": "Float_2 hourly details",
+                    "columns": [
+                        {"key": "ts", "label": "Time"},
+                        {"key": "value", "label": "Hourly mean"},
+                    ],
+                    "rows": [{"ts": "2026-08-21T01:00:00+08:00", "value": 1.5}],
+                },
+                {
+                    "title": "Int32_1 hourly details",
+                    "columns": [
+                        {"key": "ts", "label": "Time"},
+                        {"key": "value", "label": "Hourly mean"},
+                    ],
+                    "rows": [{"ts": "2026-08-21T01:00:00+08:00", "value": 2.0}],
+                },
+            ],
+            query_snapshots={
+                "q_float": _query_snapshot(
+                    "SELECT ts, value FROM float_signal",
+                    columns=["ts", "value"],
+                ),
+                "q_integer": _query_snapshot(
+                    "SELECT ts, value FROM integer_signal",
+                    columns=["ts", "value"],
+                ),
+            },
+        ),
+        selected_datasource_snapshot=[
+            {
+                "datasource_id": 29,
+                "datasource_name": "Float_2",
+                "datasource_identifier": "float_signal",
+            },
+            {
+                "datasource_id": 32,
+                "datasource_name": "Int32_1",
+                "datasource_identifier": "integer_signal",
+            },
+        ],
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    outputs = sorted(
+        (
+            item for item in lineage["output_nodes"]
+            if item.get("artifact_type") == "table"
+            and item.get("field") == "value"
+        ),
+        key=lambda item: item["artifact_index"],
+    )
+
+    assert len(outputs) == 2
+    assert [item["source_frame"] for item in outputs] == ["display", "display"]
+    assert [item["source_query_node_id"] for item in outputs] == [
+        "q_float", "q_integer",
+    ]
+    assert [item["candidate_query_node_ids"] for item in outputs] == [
+        ["q_float"], ["q_integer"],
+    ]
+
+
+def test_multi_source_summary_table_keeps_column_scope_with_all_row_queries():
+    code = r'''
+source_a = load_data_with_sql(sql="SELECT value FROM source_a")
+source_b = load_data_with_sql(sql="SELECT value FROM source_b")
+all_results = {"Source A": source_a, "Source B": source_b}
+rows = []
+for datasource_name, frame in all_results.items():
+    mean_value = frame["value"].mean()
+    rows.append({"Datasource": datasource_name, "Mean": mean_value})
+tables = [build_table_result(title="Source summary", data=rows)]
+result = save_analysis_result(analysis_report="Source summary.", charts=[], tables=tables)
+'''
+    snapshot = replace(
+        _snapshot(
+            code=code,
+            report="Source summary.",
+            tables=[{
+                "title": "Source summary",
+                "columns": [
+                    {"key": "Datasource", "label": "Datasource"},
+                    {"key": "Mean", "label": "Mean"},
+                ],
+                "rows": [
+                    {"Datasource": "Source A", "Mean": 10.5},
+                    {"Datasource": "Source B", "Mean": 20.5},
+                ],
+            }],
+            query_snapshots={
+                "q_a": _query_snapshot(
+                    "SELECT value FROM source_a", columns=["value"]
+                ),
+                "q_b": _query_snapshot(
+                    "SELECT value FROM source_b", columns=["value"]
+                ),
+            },
+        ),
+        selected_datasource_snapshot=[
+            {
+                "datasource_name": "Source A",
+                "datasource_identifier": "source_a",
+            },
+            {
+                "datasource_name": "Source B",
+                "datasource_identifier": "source_b",
+            },
+        ],
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    mean_output = next(
+        output for output in lineage["output_nodes"]
+        if output.get("artifact_type") == "table"
+        and output.get("field") == "Mean"
+    )
+
+    assert mean_output["runtime_row_query_node_ids"] == ["q_a", "q_b"]
+    assert mean_output["candidate_query_node_ids"] == ["q_a", "q_b"]
+
+
 def test_attested_derived_field_is_not_rejected_by_static_candidate_field_list():
     candidate = {
         "calculation_id": "report_semantic_scope",
@@ -4838,7 +4988,7 @@ def test_rendered_report_compact_date_range_is_not_a_metric_candidate():
     assert metric_texts == ["33"]
 
 
-def test_rendered_report_iso_datetime_range_is_not_a_metric_candidate():
+def test_rendered_report_iso_datetime_range_and_window_are_not_metric_candidates():
     report = (
         "数据源在 2026-08-19T17:55:12+08:00 至 "
         "2026-08-19T18:05:12+08:00 的 10 分钟窗口内有 600 个数据点。"
@@ -4857,7 +5007,7 @@ def test_rendered_report_iso_datetime_range_is_not_a_metric_candidate():
         )
     ]
 
-    assert metric_texts == ["10", "600"]
+    assert metric_texts == ["600"]
 
 
 def test_rendered_report_unitless_comparison_cutoff_is_not_a_metric_candidate():
@@ -5990,6 +6140,360 @@ def test_verified_report_completion_leaves_ambiguous_loop_output_for_planner():
     )
 
     assert plan.metrics == []
+
+
+def test_query_backed_report_metric_is_not_downgraded_by_analysis_parameters():
+    sql = "SELECT value FROM measurements"
+    code = r'''
+params = get_analysis_parameters()
+window = params.get("window", "7d")
+data = load_data_with_sql(sql="SELECT value FROM measurements")
+mean_value = data["value"].mean()
+analysis_report = f"{window} mean: {mean_value:.2f}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="7d mean: 49.94.",
+        query_snapshots={
+            "q_measurements": _query_snapshot(sql, columns=["value"]),
+        },
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    metric_output = next(
+        output
+        for output in lineage["output_nodes"]
+        if output.get("artifact_type") == "report"
+        and output.get("text") == "49.94"
+    )
+    candidates = PostAnalysisEvidenceCompiler._build_calculation_candidates(lineage)
+
+    assert PostAnalysisEvidenceCompiler._is_report_metric_output(
+        metric_output, lineage,
+    )
+    assert any(
+        metric_output["output_node_id"] in candidate["output_node_ids"]
+        for candidate in candidates.values()
+    )
+
+
+def test_compact_datetimes_and_relative_time_scope_are_not_report_metrics():
+    report = (
+        "近7天内共 98 个1小时窗口。\n"
+        "峰值窗口出现在 08-20 02:00（均值 51.10），"
+        "低值窗口出现在 08-21 03:00（均值 48.77）。"
+    )
+
+    outputs = LineageIndexer._locate_report_numeric_candidates(
+        report,
+        occupied=set(),
+    )
+    metric_texts = [
+        output["text"]
+        for output in outputs
+        if PostAnalysisEvidenceCompiler._is_report_metric_output(
+            output,
+            {"operation_nodes": []},
+        )
+    ]
+
+    assert metric_texts == ["98", "51.10", "48.77"]
+
+
+def test_machine_field_filter_literal_is_not_a_report_metric():
+    report = "有效数据点 600 个，仅保留正常质量（status=0）的数据。"
+
+    outputs = LineageIndexer._locate_report_numeric_candidates(
+        report,
+        occupied=set(),
+    )
+    metric_texts = [
+        output["text"]
+        for output in outputs
+        if PostAnalysisEvidenceCompiler._is_report_metric_output(
+            output,
+            {"operation_nodes": []},
+        )
+    ]
+
+    assert metric_texts == ["600"]
+
+
+def test_sigma_rule_coefficient_is_not_a_report_metric():
+    report = "检测到 2 个异常点，超出均值±3σ区间（44.05～57.43）。"
+
+    outputs = LineageIndexer._locate_report_numeric_candidates(
+        report,
+        occupied=set(),
+    )
+    metric_texts = [
+        output["text"]
+        for output in outputs
+        if PostAnalysisEvidenceCompiler._is_report_metric_output(
+            output,
+            {"operation_nodes": []},
+        )
+    ]
+
+    assert metric_texts == ["2", "44.05", "57.43"]
+
+
+def test_multi_query_mapping_loop_exposes_each_rendered_metric_for_resolution():
+    sql_a = "SELECT value FROM source_a"
+    sql_b = "SELECT value FROM source_b"
+    code = r'''
+source_a = load_data_with_sql(sql="SELECT value FROM source_a")
+source_b = load_data_with_sql(sql="SELECT value FROM source_b")
+all_results = {"Source A": source_a, "Source B": source_b}
+sections = []
+for name, df in all_results.items():
+    total = len(df)
+    mean_value = df["value"].mean()
+    sections.append(f"### {name}")
+    sections.append(f"- Total {total}; mean {mean_value:.2f}.")
+analysis_report = "\n".join(sections)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report=(
+            "### Source A\n- Total 4; mean 10.50.\n"
+            "### Source B\n- Total 6; mean 20.50."
+        ),
+        query_snapshots={
+            "q_a": _query_snapshot(sql_a, columns=["value"]),
+            "q_b": _query_snapshot(sql_b, columns=["value"]),
+        },
+    )
+    compiler = PostAnalysisEvidenceCompiler()
+    lineage = LineageIndexer().build(snapshot)
+    report_outputs = [
+        output
+        for output in lineage["output_nodes"]
+        if output.get("artifact_type") == "report"
+        and output.get("source_anchor_id")
+    ]
+
+    assert {output["text"] for output in report_outputs} == {
+        "4", "10.50", "6", "20.50",
+    }
+    assert all(
+        output.get("runtime_iteration_boundary_required")
+        and output.get("ambiguous_calculation_boundary")
+        for output in report_outputs
+    )
+
+    calculations = compiler._build_calculation_candidates(lineage)
+    semantic = compiler._build_report_semantic_candidates(lineage, calculations)
+    verified = compiler._build_verified_report_completion_plan(
+        EvidencePlan(), calculations, lineage,
+    )
+    payload = compiler._planner_fact_payload(
+        snapshot,
+        lineage,
+        semantic,
+        recovery_only=True,
+        excluded_output_ids={
+            output_id
+            for metric in verified.metrics
+            for output_id in metric.output_node_ids
+        },
+    )
+
+    assert verified.metrics == []
+    assert len(payload["report_candidate_catalog"]) == 4
+    assert {item["heading"] for item in payload["report_candidate_catalog"]} == {
+        "Source A", "Source B",
+    }
+
+
+def test_runtime_report_headings_resolve_unique_datasource_query_identity():
+    sql_a = "SELECT value FROM source_a"
+    sql_b = "SELECT value FROM source_b"
+    code = r'''
+source_a = load_data_with_sql(sql="SELECT value FROM source_a")
+source_b = load_data_with_sql(sql="SELECT value FROM source_b")
+all_results = {"Source A": source_a, "Source B": source_b}
+sections = []
+for name, df in all_results.items():
+    mean_value = df["value"].mean()
+    sections.append(f"### {name}")
+    sections.append(f"- Mean {mean_value:.2f}.")
+analysis_report = "\n".join(sections)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = replace(
+        _snapshot(
+            code=code,
+            report="### Source A\n- Mean 10.50.\n### Source B\n- Mean 20.50.",
+            query_snapshots={
+                "q_a": _query_snapshot(sql_a, columns=["value"]),
+                "q_b": _query_snapshot(sql_b, columns=["value"]),
+            },
+        ),
+        selected_datasource_snapshot=[
+            {
+                "datasource_name": "Source A",
+                "datasource_identifier": "source_a",
+            },
+            {
+                "datasource_name": "Source B",
+                "datasource_identifier": "source_b",
+            },
+        ],
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    report_outputs = sorted(
+        (
+            output for output in lineage["output_nodes"]
+            if output.get("artifact_type") == "report"
+            and output.get("source_anchor_id")
+        ),
+        key=lambda output: int(output["start"]),
+    )
+
+    assert [output["candidate_query_node_ids"] for output in report_outputs] == [
+        ["q_a"], ["q_b"],
+    ]
+    assert all(
+        output.get("runtime_artifact_query_identity")
+        for output in report_outputs
+    )
+    assert not any(
+        output.get("runtime_iteration_boundary_required")
+        for output in report_outputs
+    )
+    query_catalog = PostAnalysisEvidenceCompiler._planner_query_catalog(
+        lineage,
+        generated_code=snapshot.generated_code,
+        query_snapshots=snapshot.query_snapshots,
+        selected_datasource_snapshot=snapshot.selected_datasource_snapshot,
+    )
+    assert {
+        item["query_node_id"]: item.get("datasource_name")
+        for item in query_catalog
+    } == {"q_a": "Source A", "q_b": "Source B"}
+
+
+def test_report_comparison_uses_rendered_mapping_selectors_for_query_boundaries():
+    code = r'''
+source_a = load_data_with_sql(sql="SELECT value FROM source_a")
+source_b = load_data_with_sql(sql="SELECT value FROM source_b")
+all_results = {"Source A": source_a, "Source B": source_b}
+names = list(all_results.keys())
+df1 = all_results[names[0]]
+df2 = all_results[names[1]]
+m1 = df1["value"].mean()
+m2 = df2["value"].mean()
+analysis_report = (
+    f"### Comparison\n- {names[0]} mean {m1:.2f}; "
+    f"{names[1]} mean {m2:.2f}; difference {abs(m1 - m2):.2f}."
+)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = replace(
+        _snapshot(
+            code=code,
+            report=(
+                "### Comparison\n- Source A mean 10.50; "
+                "Source B mean 20.50; difference 10.00."
+            ),
+            query_snapshots={
+                "q_a": _query_snapshot(
+                    "SELECT value FROM source_a", columns=["value"]
+                ),
+                "q_b": _query_snapshot(
+                    "SELECT value FROM source_b", columns=["value"]
+                ),
+            },
+        ),
+        selected_datasource_snapshot=[
+            {
+                "datasource_name": "Source A",
+                "datasource_identifier": "source_a",
+            },
+            {
+                "datasource_name": "Source B",
+                "datasource_identifier": "source_b",
+            },
+        ],
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    outputs = {
+        output["field"]: output
+        for output in lineage["output_nodes"]
+        if output.get("artifact_type") == "report"
+        and output.get("field") in {"m1", "m2", "abs(m1 - m2)"}
+    }
+
+    assert outputs["m1"]["candidate_query_node_ids"] == ["q_a"]
+    assert outputs["m2"]["candidate_query_node_ids"] == ["q_b"]
+    assert set(outputs["abs(m1 - m2)"]["candidate_query_node_ids"]) == {
+        "q_a", "q_b",
+    }
+
+
+def test_runtime_iteration_candidates_cannot_merge_distinct_query_headings():
+    payload = {
+        "report_candidate_catalog": [
+            {
+                "candidate_id": "rc1",
+                "heading": "Source A",
+                "runtime_iteration_boundary_required": True,
+            },
+            {
+                "candidate_id": "rc2",
+                "heading": "Source B",
+                "runtime_iteration_boundary_required": True,
+            },
+        ],
+        "source_anchor_catalog": [],
+        "operation_catalog": [{"operation_node_id": "op_mean"}],
+        "query_catalog": [
+            {"query_node_id": "q_a"},
+            {"query_node_id": "q_b"},
+        ],
+    }
+    plan = EvidencePlan(metrics=[PlannedMetric(
+        calculation_id="report_semantic_scope",
+        report_candidate_ids=["rc1", "rc2"],
+        operation_node_ids=["op_mean"],
+        claimed_query_node_ids=["q_a", "q_b"],
+        metric_key="mean_value",
+        business_name="Mean value",
+        business_explanation="Mean value by source.",
+    )])
+
+    errors = PostAnalysisEvidenceCompiler._discovery_plan_reference_errors(
+        plan,
+        payload,
+    )
+
+    assert any("merges independent runtime query occurrences" in error for error in errors)
+
+
+def test_runtime_iteration_candidate_cannot_be_declared_non_metric():
+    payload = {
+        "report_candidate_catalog": [{
+            "candidate_id": "rc1",
+            "heading": "Source A",
+            "runtime_iteration_boundary_required": True,
+        }],
+        "source_anchor_catalog": [],
+        "operation_catalog": [],
+        "query_catalog": [],
+    }
+    plan = EvidencePlan(non_metric_report_candidate_ids=["rc1"])
+
+    errors = PostAnalysisEvidenceCompiler._discovery_plan_reference_errors(
+        plan,
+        payload,
+    )
+
+    assert any("cannot be classified as non-metric" in error for error in errors)
 
 
 def test_ambiguous_template_occurrences_are_independent_semantic_candidates():
@@ -7676,6 +8180,113 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     }
     assert outputs["revenue"]["display_unit_hint"] == "元"
     assert outputs["margin"]["display_unit_hint"] == "%"
+
+
+def test_describe_statistics_are_query_backed_report_metrics():
+    sql = "SELECT version FROM schema_migrations"
+    code = r'''
+data = load_data_with_sql(sql="SELECT version FROM schema_migrations")
+stats = data["version"].describe()
+version_min = int(stats["min"])
+version_max = int(stats["max"])
+analysis_report = f"Version range: {version_min} to {version_max}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Version range: 7 to 9.",
+        query_snapshots={"q_versions": _query_snapshot(sql, columns=["version"])},
+    )
+
+    index = LineageIndexer().build(snapshot)
+    outputs = [
+        item for item in index["output_nodes"]
+        if item.get("artifact_type") == "report"
+    ]
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert {item["field"] for item in outputs} == {"version_min", "version_max"}
+    assert all(
+        PostAnalysisEvidenceCompiler._is_report_metric_output(item, index)
+        for item in outputs
+    )
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert [item["text"] for item in bundle["report_trace_refs"]] == ["7", "9"]
+
+
+def test_no_data_summary_table_uses_query_snapshot_row_count_boundary():
+    code = r'''
+rows = [
+    {"datasource": "double1", "data_points": 0},
+    {"datasource": "double10", "data_points": 0},
+]
+table = build_table_result(title="Availability", data=rows)
+analysis_report = "No data was found in the confirmed time window."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[table])
+'''
+    snapshots = {
+        "q_double1": {
+            "query_key": "q_double1",
+            "implementation": {
+                "physical_execution": True,
+                "datasource_identifier": "ts_double1",
+                "sql": "SELECT value FROM ts_double1",
+            },
+            "execution": {"status": "no_data", "row_count": 0},
+        },
+        "q_double10": {
+            "query_key": "q_double10",
+            "implementation": {
+                "physical_execution": True,
+                "datasource_identifier": "ts_double10",
+                "sql": "SELECT value FROM ts_double10",
+            },
+            "execution": {"status": "no_data", "row_count": 0},
+        },
+    }
+    snapshot = replace(
+        _snapshot(
+            code=code,
+            report="No data was found in the confirmed time window.",
+            tables=[{
+                "title": "Availability",
+                "columns": [
+                    {"key": "datasource", "label": "Datasource"},
+                    {"key": "data_points", "label": "Data points"},
+                ],
+                "rows": [
+                    {"datasource": "double1", "data_points": 0},
+                    {"datasource": "double10", "data_points": 0},
+                ],
+            }],
+            query_snapshots=snapshots,
+        ),
+        selected_datasource_snapshot=[
+            {
+                "datasource_id": 1,
+                "datasource_name": "double1",
+                "datasource_identifier": "ts_double1",
+                "metadata_schema": {"properties": {"value": {"type": "number"}}},
+            },
+            {
+                "datasource_id": 2,
+                "datasource_name": "double10",
+                "datasource_identifier": "ts_double10",
+                "metadata_schema": {"properties": {"value": {"type": "number"}}},
+            },
+        ],
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert len(bundle["table_trace_refs"]) == 1
+    assert len(bundle["evidence_definitions"]) == 1
+    definition = bundle["evidence_definitions"][0]
+    assert definition["calculation"]["metric_fields"] == [
+        "query_result_row_count"
+    ]
+    assert set(definition["query_refs"]) == {"q_double1", "q_double10"}
 
 
 def test_evidence_detail_does_not_invent_formula_from_metric_name():

@@ -1,6 +1,8 @@
+import json
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -23,6 +25,7 @@ from agent.tools import (  # noqa: E402
     _build_no_data_feedback,
     _classify_execution_error,
     _extract_error_signature,
+    _extract_confirmed_no_data_query_snapshots,
     _inspect_zero_population_aggregate,
     raise_no_data_error,
     load_data_with_sql,
@@ -148,6 +151,29 @@ class ExecutePythonNoDataRetryTestCase(unittest.TestCase):
         finally:
             CURRENT_EXECUTION_INTENT.reset(token)
         self.assertEqual(diagnostics, {})
+
+    def test_time_series_no_results_is_persisted_as_no_data_query_fact(self) -> None:
+        intent_token = CURRENT_EXECUTION_INTENT.set("probe")
+        snapshot_token = CURRENT_QUERY_SNAPSHOTS.set({})
+        try:
+            with patch(
+                "agent.tools._load_data_with_fed_query",
+                side_effect=RuntimeError(
+                    'Failed to fetch result for query "SELECT * FROM vxbase_query(...)": no results'
+                ),
+            ):
+                with self.assertRaises(RuntimeError):
+                    load_data_with_sql("SELECT * FROM ts_query('vxbase', 'SELECT * FROM source')")
+            snapshots = CURRENT_QUERY_SNAPSHOTS.get()
+        finally:
+            CURRENT_QUERY_SNAPSHOTS.reset(snapshot_token)
+            CURRENT_EXECUTION_INTENT.reset(intent_token)
+
+        self.assertEqual(len(snapshots), 1)
+        query_execution = next(iter(snapshots.values()))["execution"]
+        self.assertEqual(query_execution["status"], "no_data")
+        self.assertEqual(query_execution["row_count"], 0)
+        self.assertTrue(query_execution["effective_no_data"])
 
     def test_nonzero_population_does_not_enter_no_data_flow(self) -> None:
         token = CURRENT_EXECUTION_INTENT.set("analysis")
@@ -278,6 +304,41 @@ class ExecutePythonNoDataRetryTestCase(unittest.TestCase):
             CURRENT_CONFIRMED_NO_DATA_RESULT.reset(confirmed_token)
             CURRENT_EXECUTION_INTENT.reset(intent_token)
         self.assertIn("No records matched", result.analysis_report)
+
+    def test_confirmed_no_data_reuses_only_executed_empty_query_facts(self) -> None:
+        previous = SimpleNamespace(
+            id=42,
+            result_payload_json=json.dumps({
+                "query_snapshots": {
+                    "q_empty": {
+                        "query_key": "q_empty",
+                        "query_scope": {"query_key": "q_empty"},
+                        "implementation": {
+                            "physical_execution": True,
+                            "sql": "SELECT * FROM readings WHERE ts >= :start",
+                        },
+                        "execution": {"status": "no_data", "row_count": 0},
+                    },
+                    "q_available": {
+                        "implementation": {"physical_execution": True},
+                        "execution": {"status": "success", "row_count": 3},
+                    },
+                    "q_validated": {
+                        "implementation": {"physical_execution": False},
+                        "execution": {"status": "validated"},
+                    },
+                },
+            }),
+        )
+
+        snapshots = _extract_confirmed_no_data_query_snapshots([previous])
+
+        self.assertEqual(len(snapshots), 1)
+        query_key, snapshot = next(iter(snapshots.items()))
+        self.assertEqual(query_key, "confirmed_no_data_42_q_empty")
+        self.assertEqual(snapshot["query_key"], query_key)
+        self.assertEqual(snapshot["query_scope"]["query_key"], query_key)
+        self.assertEqual(snapshot["execution"]["row_count"], 0)
 
     def test_query_capacity_diagnostics_identify_failed_physical_query(self) -> None:
         snapshot_token = CURRENT_QUERY_SNAPSHOTS.set({
