@@ -159,6 +159,7 @@ def attach_relative_time_runtime_default(
         'unit': unit,
         'anchor': 'execution_time',
         'timezone': 'Asia/Shanghai',
+        'alignment': str(expected.get('alignment') or 'rolling'),
         'end_exclusive': bool(concrete_time_range.get('end_exclusive', True)),
     }
     return normalized_schema
@@ -211,7 +212,12 @@ def _materialize_parameter_value(value: Any, *, anchor_time: datetime | None) ->
     anchor = anchor_time or datetime.now(timezone.utc)
     if anchor.tzinfo is None:
         anchor = anchor.replace(tzinfo=timezone.utc)
-    end = anchor.astimezone(zone).replace(microsecond=0)
+    local_anchor = anchor.astimezone(zone)
+    if binding['alignment'] == 'calendar_day':
+        end_date = local_anchor.date() + timedelta(days=1)
+        end = datetime.combine(end_date, datetime.min.time(), tzinfo=zone)
+    else:
+        end = local_anchor.replace(microsecond=0)
     start = _subtract_relative_window(end, binding['amount'], binding['unit'])
     return {
         'start': start.isoformat(),
@@ -234,12 +240,18 @@ def _normalize_relative_time_range(value: dict[str, Any], parameter_name: str = 
         ZoneInfo(timezone_name)
     except Exception as exc:
         raise ValueError(f'分析参数 {parameter_name} 的时区无效') from exc
+    alignment = str(value.get('alignment') or 'rolling').strip()
+    if alignment not in {'rolling', 'calendar_day'}:
+        raise ValueError(f'分析参数 {parameter_name} 的相对时间对齐方式不受支持')
+    if alignment == 'calendar_day' and unit not in {'day', 'week', 'month', 'year'}:
+        raise ValueError(f'分析参数 {parameter_name} 的自然日对齐不支持当前时间单位')
     return {
         'kind': RELATIVE_TIME_RANGE_KIND,
         'amount': amount,
         'unit': unit,
         'anchor': 'execution_time',
         'timezone': timezone_name,
+        'alignment': alignment,
         'end_exclusive': bool(value.get('end_exclusive', True)),
     }
 

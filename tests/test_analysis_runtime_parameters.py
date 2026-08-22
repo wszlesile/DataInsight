@@ -69,6 +69,32 @@ def test_relative_time_range_materializes_from_logical_trigger_time():
     }
 
 
+def test_calendar_day_relative_range_preserves_natural_day_count():
+    schema = _schema()
+    schema['parameters'][0]['runtime_default'] = {
+        'kind': 'relative_time_range',
+        'amount': 7,
+        'unit': 'day',
+        'anchor': 'execution_time',
+        'timezone': 'Asia/Shanghai',
+        'alignment': 'calendar_day',
+        'end_exclusive': True,
+    }
+    values = build_reusable_parameter_defaults(schema, {})
+
+    materialized = materialize_analysis_parameters(
+        schema,
+        values,
+        anchor_time=datetime(2026, 8, 22, 10, 12, 0),
+    )
+
+    assert materialized['time_range'] == {
+        'start': '2026-08-16T00:00:00+08:00',
+        'end': '2026-08-23T00:00:00+08:00',
+        'end_exclusive': True,
+    }
+
+
 def test_explicit_absolute_time_range_overrides_relative_default():
     explicit = {
         'time_range': {

@@ -1,6 +1,7 @@
 import inspect
 import math
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -710,6 +711,25 @@ def test_expected_time_range_prefers_anchor_month_over_year():
     assert result["source"] == "今年3月"
 
 
+def test_recent_calendar_days_include_today_without_adding_an_extra_day(monkeypatch):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = cls(2026, 8, 22, 12, 0, 0)
+            return value.replace(tzinfo=tz) if tz is not None else value
+
+    monkeypatch.setattr(agent_invoker, "datetime", FrozenDateTime)
+
+    one_day = _build_expected_time_range_from_user_query("分析近1天小时均值")
+    seven_days = _build_expected_time_range_from_user_query("展示近7天历史趋势")
+
+    assert one_day["start"] == "2026-08-22"
+    assert one_day["end"] == "2026-08-23"
+    assert seven_days["start"] == "2026-08-16"
+    assert seven_days["end"] == "2026-08-23"
+    assert seven_days["alignment"] == "calendar_day"
+
+
 def test_turn_expected_time_range_is_frozen_across_stages(monkeypatch):
     generated = [
         {"start": "2026-08-22T00:00:00+08:00", "end": "2026-08-22T00:10:00+08:00"},
@@ -732,6 +752,31 @@ def test_turn_expected_time_range_is_frozen_across_stages(monkeypatch):
 
     assert runtime_range == preparation_range == generated[0]
     assert calls == ["展示近10分钟趋势"]
+
+
+def test_stale_time_range_contract_is_rebuilt(monkeypatch):
+    expected = {"start": "2026-08-22", "end": "2026-08-23"}
+    monkeypatch.setattr(
+        agent_invoker,
+        "_build_expected_time_range_from_user_query",
+        lambda _query: expected,
+    )
+    runtime = SimpleNamespace(
+        turn=SimpleNamespace(id=91, user_query="展示近1天趋势"),
+        short_term_memory={
+            "expected_time_range_contract": {
+                "version": 1,
+                "turn_id": 91,
+                "user_query": "展示近1天趋势",
+                "value": {"start": "2026-08-21", "end": "2026-08-23"},
+            }
+        },
+    )
+
+    assert agent_invoker._resolve_turn_expected_time_range(
+        runtime, "展示近1天趋势"
+    ) == expected
+    assert runtime.short_term_memory["expected_time_range_contract"]["version"] == 2
 
 
 def test_month_grain_year_filter_satisfies_daily_time_range():

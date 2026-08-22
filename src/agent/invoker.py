@@ -66,6 +66,7 @@ RELATIVE_DATE_TIME_PATTERN = re.compile(
     r"(近|最近|过去)\s*(?P<amount>\d+|[一二两三四五六七八九十]{1,3})\s*"
     r"(?P<unit>天|日|周|星期|月|个月|年)"
 )
+EXPECTED_TIME_RANGE_CONTRACT_VERSION = 2
 ANALYSIS_EXPLICIT_TIME_PATTERN = re.compile(
     r"(今天|昨天|前天|本周|上周|本月|上月|今年|去年|(?:近|最近|过去)\s*(?:\d+|[一二两三四五六七八九十]{1,3})\s*(?:天|日|周|星期|月|个月|年)|"
     r"\d{4}[-/年]\d{1,2}([-/月]\d{1,2})?|\d{1,2}月\d{1,2}日)"
@@ -352,26 +353,27 @@ def _shift_month(date_value: Any, months: int) -> Any:
 
 def _format_relative_date_time_range(amount: int, unit: str, label: str) -> dict[str, Any]:
     today = datetime.now(ZoneInfo('Asia/Shanghai')).date()
+    end = today + timedelta(days=1)
     normalized_unit = str(unit or '').strip()
     if normalized_unit in {'天', '日'}:
-        start = today - timedelta(days=amount)
+        start = end - timedelta(days=amount)
     elif normalized_unit in {'周', '星期'}:
-        start = today - timedelta(days=amount * 7)
+        start = end - timedelta(days=amount * 7)
     elif normalized_unit in {'月', '个月'}:
-        start = _shift_month(today, -amount)
+        start = _shift_month(end, -amount)
     elif normalized_unit == '年':
         try:
-            start = today.replace(year=today.year - amount)
+            start = end.replace(year=end.year - amount)
         except ValueError:
-            start = today.replace(year=today.year - amount, day=28)
+            start = end.replace(year=end.year - amount, day=28)
     else:
         return {}
-    end = today + timedelta(days=1)
     payload = _format_expected_time_range(start, end, label)
     payload.update({
         'relative_window': True,
         'amount': amount,
         'unit': normalized_unit,
+        'alignment': 'calendar_day',
     })
     return payload
 
@@ -522,6 +524,7 @@ def _resolve_turn_expected_time_range(
     cached = memory.get('expected_time_range_contract')
     if (
         isinstance(cached, dict)
+        and cached.get('version') == EXPECTED_TIME_RANGE_CONTRACT_VERSION
         and int(cached.get('turn_id') or 0) == turn_id
         and str(cached.get('user_query') or '') == query
         and isinstance(cached.get('value'), dict)
@@ -530,6 +533,7 @@ def _resolve_turn_expected_time_range(
 
     expected = _build_expected_time_range_from_user_query(query)
     memory['expected_time_range_contract'] = {
+        'version': EXPECTED_TIME_RANGE_CONTRACT_VERSION,
         'turn_id': turn_id,
         'user_query': query,
         'value': dict(expected),
