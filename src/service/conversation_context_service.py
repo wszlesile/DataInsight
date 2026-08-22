@@ -443,14 +443,17 @@ class ConversationContextService:
 
         if (
             turn.status == 'failed'
-            and (turn.final_answer or '').strip() == (error_message or '').strip()
+            and (turn.error_message or '').strip() == (error_message or '').strip()
         ):
             return
 
         if preserve_existing_results and self._turn_has_active_result(conversation, turn):
             self._archive_current_rerun_executions(conversation, turn)
-            turn.status = 'success'
-            turn.error_message = ''
+            # Keep the last valid result available, but do not report the failed
+            # rerun as a success. The task/turn state must describe the latest
+            # run; otherwise clients mistake the preserved report for fresh data.
+            turn.status = 'failed'
+            turn.error_message = error_message
             turn.finished_at = _now()
             conversation.status = 'active'
             conversation.last_message_at = _now()

@@ -578,6 +578,37 @@ def test_each_physical_sql_gets_an_independent_execution_snapshot():
     }
 
 
+def test_time_series_execution_snapshot_records_inner_vxbase_datasource():
+    CURRENT_QUERY_SNAPSHOTS.set({})
+    CURRENT_LAST_QUERY_KEY.set("")
+    identifier = "_7_d_3f745e57719dd764736b9429f6d664db"
+    inner_sql = (
+        f"SELECT name, ts, status, avg(value) FROM {identifier} "
+        'WHERE ts >= "2026-01-01T00:00:00+08:00" interval("1d", "10s")'
+    )
+    sql = f"SELECT * FROM ts_query('vxbase', '{inner_sql}')"
+
+    _begin_query_snapshot_execution(sql=sql)
+
+    snapshot = next(iter(CURRENT_QUERY_SNAPSHOTS.get().values()))
+    assert snapshot["implementation"]["datasource_identifier"] == identifier
+    assert snapshot["implementation"]["datasource_identifiers"] == [identifier]
+
+
+def test_time_series_execution_snapshot_records_quoted_timescale_datasource():
+    CURRENT_QUERY_SNAPSHOTS.set({})
+    CURRENT_LAST_QUERY_KEY.set("")
+    identifier = "Factory.Metric$Value"
+    inner_sql = f'SELECT "timeStamp", value FROM "{identifier}"'
+    sql = f"SELECT * FROM ts_query('timescale', '{inner_sql}')"
+
+    _begin_query_snapshot_execution(sql=sql)
+
+    snapshot = next(iter(CURRENT_QUERY_SNAPSHOTS.get().values()))
+    assert snapshot["implementation"]["datasource_identifier"] == identifier
+    assert snapshot["implementation"]["datasource_identifiers"] == [identifier]
+
+
 def test_paginated_sql_executions_share_one_implicit_logical_query_family():
     CURRENT_QUERY_SNAPSHOTS.set({})
     CURRENT_LAST_QUERY_KEY.set("")

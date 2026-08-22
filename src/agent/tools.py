@@ -2544,6 +2544,59 @@ def _register_query_snapshot(
     return None
 
 
+def _extract_physical_sql_datasource_identifiers(sql: str) -> set[str]:
+    """Return physical table identifiers, including tables inside ts_query."""
+
+    identifiers: set[str] = set()
+    pending = [str(sql or '')]
+    visited: set[str] = set()
+    while pending:
+        statement_sql = pending.pop()
+        if not statement_sql.strip() or statement_sql in visited:
+            continue
+        visited.add(statement_sql)
+        parsed = False
+        try:
+            from sqlglot import exp, parse
+
+            for statement in parse(statement_sql):
+                parsed = True
+                for table in statement.find_all(exp.Table):
+                    if isinstance(table.this, exp.Func):
+                        continue
+                    parts = [
+                        str(part).strip()
+                        for part in (table.catalog, table.db, table.name)
+                        if str(part).strip()
+                    ]
+                    if parts:
+                        identifiers.add('.'.join(parts).strip(chr(96) + '"[]'))
+                for function in statement.find_all(exp.Anonymous):
+                    if str(function.name or '').strip().lower() != 'ts_query':
+                        continue
+                    arguments = list(function.expressions or [])
+                    if len(arguments) < 2 or not isinstance(arguments[1], exp.Literal):
+                        continue
+                    if arguments[1].is_string:
+                        pending.append(str(arguments[1].this or ''))
+        except Exception:
+            parsed = False
+
+        if parsed:
+            continue
+        for match in re.finditer(
+            r'(?i)\b(?:from|join)\s+(?:"([^"]+)"|\[([^\]]+)\]|([A-Za-z_][\w$.:/-]*))',
+            statement_sql,
+        ):
+            identifier = next(
+                (str(value).strip() for value in match.groups() if str(value or '').strip()),
+                '',
+            )
+            if identifier:
+                identifiers.add(identifier)
+    return identifiers
+
+
 def _begin_query_snapshot_execution(*, sql: str, params: Any = None) -> None:
     """Bind one physical SQL execution to its own immutable query snapshot."""
     sql_text = str(sql or '')
@@ -2595,6 +2648,9 @@ def _begin_query_snapshot_execution(*, sql: str, params: Any = None) -> None:
     )
     family_hash = hashlib.sha256(family_sql.encode('utf-8')).hexdigest()
     query_key = _normalize_query_key(f'query_auto_{family_hash[:12]}')
+    physical_datasource_identifiers = sorted(
+        _extract_physical_sql_datasource_identifiers(sql_text)
+    )
     existing_family = snapshots.get(query_key)
     physical_executions: list[dict[str, Any]] = []
     if isinstance(existing_family, dict):
@@ -2654,6 +2710,12 @@ def _begin_query_snapshot_execution(*, sql: str, params: Any = None) -> None:
             'sql_family_hash': family_hash,
             'physical_executions': physical_executions,
             'physical_execution': True,
+            'datasource_identifiers': physical_datasource_identifiers,
+            'datasource_identifier': (
+                physical_datasource_identifiers[0]
+                if len(physical_datasource_identifiers) == 1
+                else ''
+            ),
         },
         'execution': {'status': 'running'},
     }
@@ -6008,6 +6070,14 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
             missing_items.append('validate_query_constraints(...)')
         if 'save_analysis_result' not in calls:
             missing_items.append('save_analysis_result(...)')
+        static_query_constraint_keys = _static_query_constraints_keys(tree)
+        missing_time_series_query = (
+            _tree_contains_ts_query_sql(tree)
+            and static_query_constraint_keys is not None
+            and 'time_series_query' not in static_query_constraint_keys
+        )
+        if missing_time_series_query:
+            missing_items.append('query_constraints.time_series_query')
         if missing_items:
             if missing_items == ['save_analysis_result(...)']:
                 return request_retry(
@@ -6029,42 +6099,38 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
                         '不要再次提交只打印“数据加载完成”“准备继续分析”或只生成中间 DataFrame 的 analysis 代码。',
                     ],
                 )
+            repair_instructions = [
+                '不要只在半成品代码上逐项补字段；请重写为完整 analysis 模板后再执行。',
+                'analysis 代码必须先声明 query_constraints，再生成 SQL 或 pandas/DataFrame 过滤表达式。',
+                'analysis 代码必须调用 validate_query_constraints(...)；只有返回 None 时才能继续加载数据、聚合、构造图表和调用 save_analysis_result(...)。',
+                'analysis 代码最终必须构造 analysis_report、charts 或 tables，并将 save_analysis_result(...) 的返回值赋给 result。',
+                '如果 validate_query_constraints(...) 返回 RetryResult，必须将其赋给 result 并结束当前尝试。',
+            ]
+            if missing_time_series_query:
+                repair_instructions.extend([
+                    '在现有 query_constraints 中补充 time_series_query，不要改写用户时间范围、数据源或分析内容。',
+                    '原始值使用 mode=raw；采样使用 mode=sample 并声明 window；统计使用 mode=aggregate，并声明 window 与 aggregations。',
+                    '采样和统计必须由时序库内部 SQL 实现，不能查询原始点后再用 pandas 替代。',
+                ])
             return request_retry(
-                retry_type="missing_query_constraints",
+                retry_type=(
+                    'invalid_query_constraints'
+                    if missing_items == ['query_constraints.time_series_query']
+                    else 'missing_query_constraints'
+                ),
                 message=f'正式 analysis 代码缺少必要契约：{", ".join(missing_items)}。',
                 diagnostics={
+                    'violated_contract': (
+                        'missing_time_series_query_contract'
+                        if missing_items == ['query_constraints.time_series_query']
+                        else 'incomplete_analysis_contract'
+                    ),
                     'execution_intent': execution_intent,
                     'has_query_constraints': has_query_constraints,
                     'called_functions': sorted(calls),
                     'missing_items': missing_items,
                 },
-                repair_instructions=[
-                    '不要只在半成品代码上逐项补字段；请重写为完整 analysis 模板后再执行。',
-                    'analysis 代码必须先声明 query_constraints，再生成 SQL 或 pandas/DataFrame 过滤表达式。',
-                    'analysis 代码必须调用 validate_query_constraints(...)；只有返回 None 时才能继续加载数据、聚合、构造图表和调用 save_analysis_result(...)。',
-                    'analysis 代码最终必须构造 analysis_report、charts 或 tables，并将 save_analysis_result(...) 的返回值赋给 result。',
-                    '如果 validate_query_constraints(...) 返回 RetryResult，必须将其赋给 result 并结束当前尝试。',
-                ],
-            )
-
-        static_query_constraint_keys = _static_query_constraints_keys(tree)
-        if (
-            _tree_contains_ts_query_sql(tree)
-            and static_query_constraint_keys is not None
-            and 'time_series_query' not in static_query_constraint_keys
-        ):
-            return request_retry(
-                retry_type='invalid_query_constraints',
-                message='时序 analysis 代码必须声明 time_series_query，明确使用原始值、采样或统计查询。',
-                diagnostics={
-                    'violated_contract': 'missing_time_series_query_contract',
-                    'required_key': 'time_series_query',
-                },
-                repair_instructions=[
-                    '在现有 query_constraints 中补充 time_series_query，不要改写用户时间范围、数据源或分析内容。',
-                    '原始值使用 mode=raw；采样使用 mode=sample 并声明 window；统计使用 mode=aggregate，并声明 window 与 aggregations。',
-                    '采样和统计必须由时序库内部 SQL 实现，不能查询原始点后再用 pandas 替代。',
-                ],
+                repair_instructions=repair_instructions,
             )
 
         unfinished_report = _find_static_unfinished_report_call(tree)
@@ -7385,7 +7451,9 @@ def _find_no_data_status_charts(charts: list[dict[str, Any]] | None) -> list[dic
 
 
 def _get_runtime_selected_datasource_snapshot(context: CustomContext) -> list[dict[str, Any]]:
-    snapshot = getattr(context, 'active_datasource_snapshot', {}) or {}
+    snapshot = getattr(context, 'execution_datasource_snapshot', {}) or {}
+    if not isinstance(snapshot, dict) or not snapshot:
+        snapshot = getattr(context, 'active_datasource_snapshot', {}) or {}
     if not isinstance(snapshot, dict):
         return []
     rows = snapshot.get('selected_datasource_snapshot') or []
@@ -7429,6 +7497,11 @@ def _query_snapshot_table_names(query_snapshots: dict[str, Any]) -> set[str]:
         if datasource_identifier:
             table_names.add(datasource_identifier)
             table_names.add(datasource_identifier.rsplit('.', 1)[-1])
+        for raw_identifier in implementation.get('datasource_identifiers') or []:
+            identifier = str(raw_identifier or '').strip().strip(chr(96) + '"[]').lower()
+            if identifier:
+                table_names.add(identifier)
+                table_names.add(identifier.rsplit('.', 1)[-1])
         sql = str(implementation.get('sql') or '').strip()
         if not sql:
             continue
@@ -8277,6 +8350,7 @@ def _validate_structured_result_contract(
                     "保留已经完成的查询、分析范围、有效图表表格和报告内容，只修正诊断列出的不可比计算边界。",
                     "同一个 value_field、数值列或排序值必须共享统计对象、单位、总体、粒度和计算方式；分类可以变化，指标定义不能随分类变化。",
                     "不同指标可以并列展示为独立 series/列，但不能仅因都能计数就按绝对数量形成共同优先级。确需排序时，先转换为同一总体上的覆盖率、发生率或有明确共同定义的标准化得分。",
+                    "若当前“类别”实际是物料成本、人工成本、制造费用等不同指标名称，不要继续使用“类别 + 统一数值列”的长表；改成同一统计粒度的一行多指标列，图表使用独立 value_fields/series，表格使用独立业务列，使每个指标保持自己的计算边界。",
                     "修复后保留各维度的独立事实与业务解释；不要删除图表、表格、数据源、报告章节或分析问题来绕过反馈。",
                     "为 unreadable_table_columns 中的每一列显式传入 columns=[{'key': 真实字段, 'label': 用户可读业务名称}]；只改展示标签，不重命名数据字段或改动计算。",
                 ],
@@ -10739,6 +10813,21 @@ def _validate_analysis_scope_against_execution_history(
     if _extract_static_string_assignment(current_tree, 'execution_intent') != 'analysis':
         return None
 
+    # The tool argument is a model declaration, while the generated source can
+    # already contain additional, statically identifiable physical accesses.
+    # Use both for the pre-execution repair check. After execution,
+    # QuerySnapshot remains the canonical source of truth and will reject or
+    # normalize any declaration that does not match the actual accesses.
+    effective_current_used_ids = _normalize_used_datasource_ids(
+        [
+            *current_used_datasource_ids,
+            *sorted(_statically_referenced_datasource_ids(
+                current_code,
+                selected_datasource_snapshot=selected_datasource_snapshot,
+            )),
+        ]
+    )
+
     for previous in previous_executions:
         try:
             previous_tree = ast.parse(getattr(previous, 'generated_code', '') or '')
@@ -10792,7 +10881,7 @@ def _validate_analysis_scope_against_execution_history(
             ]
         return _validate_scope_preserving_technical_repair(
             previous_used_datasource_ids=_normalize_used_datasource_ids(previous_used_ids),
-            current_used_datasource_ids=current_used_datasource_ids,
+            current_used_datasource_ids=effective_current_used_ids,
             previous_failure_payload=payload,
         )
     return None

@@ -83,6 +83,7 @@ class CustomContext(BaseModel):
     fedquery_authorization: str = ''
     database_conn_info: dict[str, Any] = Field(default_factory=dict)
     active_datasource_snapshot: dict[str, Any] = Field(default_factory=dict)
+    execution_datasource_snapshot: dict[str, Any] = Field(default_factory=dict)
     analysis_task_id: int | None = None
     analysis_parameters_override: dict[str, Any] = Field(default_factory=dict)
 

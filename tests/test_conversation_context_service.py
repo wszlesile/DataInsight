@@ -328,9 +328,9 @@ class ConversationContextServiceTestCase(unittest.TestCase):
         )
 
         turn = self.session.query(InsightNsTurn).filter_by(id=72).one()
-        self.assertEqual('success', turn.status)
+        self.assertEqual('failed', turn.status)
         self.assertEqual('legacy report', turn.final_answer)
-        self.assertEqual('', turn.error_message)
+        self.assertEqual('llm gateway timeout', turn.error_message)
 
     def test_start_rerun_refreshes_current_datasource_bindings(self) -> None:
         self.session.add(InsightNamespace(

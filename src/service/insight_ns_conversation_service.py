@@ -306,6 +306,7 @@ class InsightNsConversationService:
                 "latest_execution": self._build_execution_summary(turn_executions[-1]) if turn_executions else None,
                 "execution_count": len(turn_executions),
                 "status": turn.status,
+                "error_message": turn.error_message or '',
                 "started_at": turn.started_at.isoformat() if turn.started_at else None,
                 "finished_at": turn.finished_at.isoformat() if turn.finished_at else None,
             })

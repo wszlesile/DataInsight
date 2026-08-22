@@ -679,6 +679,11 @@ def _build_agent_context(
             if preparation is not None
             else runtime.active_datasource_snapshot or {}
         ),
+        execution_datasource_snapshot=dict(
+            preparation.selected_snapshot
+            if preparation is not None
+            else runtime.active_datasource_snapshot or {}
+        ),
         analysis_task_id=runtime.analysis_task_id,
     )
 

@@ -1358,6 +1358,33 @@ print("data loading complete; continue later")
             for item in retry.repair_instructions
         ))
 
+    def test_analysis_static_contract_reports_all_missing_timeseries_items_once(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"target_filters": [], "aggregation": {"grain": "day"}}
+sql = "SELECT * FROM ts_query('vxbase', 'SELECT * FROM signal LIMIT 100')"
+data = load_data_with_sql(sql=sql)
+result = save_analysis_result(analysis_report="report", charts=[], tables=[])
+'''
+
+        retry = _validate_generated_code_contract(code)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(retry.retry_type, "missing_query_constraints")
+        self.assertEqual(
+            retry.diagnostics["missing_items"],
+            ["validate_query_constraints(...)", "query_constraints.time_series_query"],
+        )
+        self.assertTrue(any(
+            "validate_query_constraints" in item
+            for item in retry.repair_instructions
+        ))
+        self.assertTrue(any(
+            "time_series_query" in item
+            for item in retry.repair_instructions
+        ))
+
     def test_probe_accepts_observations_accumulated_with_list_append(self) -> None:
         code = '''
 execution_intent = "probe"
@@ -2157,6 +2184,84 @@ charts = [build_chart_result(data=top_rows)]
         )
 
         self.assertIsNone(retry)
+
+    def test_technical_repair_accepts_sources_present_in_generated_query_code(self) -> None:
+        history = [SimpleNamespace(
+            generated_code='''execution_intent = "analysis"
+quality = load_data_with_sql(sql="SELECT * FROM warehouse.fact_quality")
+trend = load_data_with_sql(sql="SELECT * FROM vxbase.double_signal")
+result = save_analysis_result(...)
+''',
+            result_payload_json=json.dumps({
+                "retry_type": "invalid_query_constraints",
+                "diagnostics": {
+                    "violated_contract": "missing_time_series_query_contract",
+                    "scope_change_authorized": False,
+                },
+            }),
+            used_datasource_ids_json='[61, 62]',
+        )]
+
+        retry = _validate_analysis_scope_against_execution_history(
+            previous_executions=history,
+            current_used_datasource_ids=[61],
+            current_code='''execution_intent = "analysis"
+quality = load_data_with_sql(sql="SELECT * FROM warehouse.fact_quality")
+trend = load_data_with_sql(sql="SELECT * FROM vxbase.double_signal")
+result = save_analysis_result(...)
+''',
+            selected_datasource_snapshot=[
+                {
+                    "datasource_id": 61,
+                    "datasource_identifier": "warehouse.fact_quality",
+                },
+                {
+                    "datasource_id": 62,
+                    "datasource_identifier": "vxbase.double_signal",
+                },
+            ],
+        )
+
+        self.assertIsNone(retry)
+
+    def test_technical_repair_still_rejects_source_missing_from_declaration_and_code(self) -> None:
+        history = [SimpleNamespace(
+            generated_code='''execution_intent = "analysis"
+quality = load_data_with_sql(sql="SELECT * FROM warehouse.fact_quality")
+trend = load_data_with_sql(sql="SELECT * FROM vxbase.double_signal")
+result = save_analysis_result(...)
+''',
+            result_payload_json=json.dumps({
+                "retry_type": "invalid_query_constraints",
+                "diagnostics": {
+                    "violated_contract": "missing_time_series_query_contract",
+                    "scope_change_authorized": False,
+                },
+            }),
+            used_datasource_ids_json='[61, 62]',
+        )]
+
+        retry = _validate_analysis_scope_against_execution_history(
+            previous_executions=history,
+            current_used_datasource_ids=[61],
+            current_code='''execution_intent = "analysis"
+quality = load_data_with_sql(sql="SELECT * FROM warehouse.fact_quality")
+result = save_analysis_result(...)
+''',
+            selected_datasource_snapshot=[
+                {
+                    "datasource_id": 61,
+                    "datasource_identifier": "warehouse.fact_quality",
+                },
+                {
+                    "datasource_id": 62,
+                    "datasource_identifier": "vxbase.double_signal",
+                },
+            ],
+        )
+
+        self.assertIsNotNone(retry)
+        self.assertEqual(retry.diagnostics["missing_datasource_ids"], [62])
 
     def test_any_static_contract_repair_preserves_datasource_scope_by_default(self) -> None:
         retry = _validate_scope_preserving_technical_repair(

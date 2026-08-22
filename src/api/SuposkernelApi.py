@@ -247,13 +247,20 @@ class SuposKernelApi:
     def _initialize_database_conn_info(self, token: str) -> None:
         conn_info = DatabaseConnInfo()
         if Config.PROFILE == 'local':
-            conn_info.host = '192.168.18.226'
-            conn_info.port = '31432'
-            conn_info.user = 'fedquery'
-            conn_info.password = 'fedquery'
-            conn_info.lake_rds_database_name = 'fqe_uns'
+            conn_info.host = Config.SUPOS_FEDQUERY_HOST
+            conn_info.port = Config.SUPOS_FEDQUERY_PORT
+            conn_info.user = Config.SUPOS_FEDQUERY_USERNAME
+            conn_info.password = Config.SUPOS_FEDQUERY_PASSWORD
+            conn_info.lake_rds_database_name = Config.SUPOS_FEDQUERY_DATABASE
             conn_info.ts_query_source = normalize_ts_query_source(
                 os.environ.get('SUPOS_TS_QUERY_SOURCE', '')
+            )
+            logger.info(
+                '[SuposKernel] 本地 FedQuery 目标: host=%s port=%s database=%s ts_query_source=%s',
+                conn_info.host,
+                conn_info.port,
+                conn_info.lake_rds_database_name,
+                conn_info.ts_query_source or 'auto',
             )
         else:
             self._fill_kernel_database_conn_info(token, conn_info)

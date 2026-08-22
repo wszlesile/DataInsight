@@ -111,6 +111,27 @@ def test_database_connection_without_authorization_skips_set(monkeypatch):
     assert connection.commit_count == 0
 
 
+def test_local_database_connection_uses_configured_fedquery_target(monkeypatch):
+    monkeypatch.setattr('api.SuposkernelApi.Config.PROFILE', 'local')
+    monkeypatch.setattr('api.SuposkernelApi.Config.SUPOS_FEDQUERY_HOST', '127.0.0.1')
+    monkeypatch.setattr('api.SuposkernelApi.Config.SUPOS_FEDQUERY_PORT', '16432')
+    monkeypatch.setattr('api.SuposkernelApi.Config.SUPOS_FEDQUERY_USERNAME', 'local-user')
+    monkeypatch.setattr('api.SuposkernelApi.Config.SUPOS_FEDQUERY_PASSWORD', 'local-password')
+    monkeypatch.setattr('api.SuposkernelApi.Config.SUPOS_FEDQUERY_DATABASE', 'postgres')
+    monkeypatch.setenv('SUPOS_TS_QUERY_SOURCE', 'vxbase')
+    api = SuposKernelApi()
+
+    api._initialize_database_conn_info('Bearer platform-ticket')
+
+    info = api._database_conn_info
+    assert info.host == '127.0.0.1'
+    assert info.port == '16432'
+    assert info.user == 'local-user'
+    assert info.password == 'local-password'
+    assert info.lake_rds_database_name == 'postgres'
+    assert info.ts_query_source == 'vxbase'
+
+
 def test_platform_application_installation_uses_exact_kernel_resource(monkeypatch):
     captured = {}
 

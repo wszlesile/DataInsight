@@ -88,7 +88,7 @@ def _preparation(snapshot: dict) -> PreparationResult:
             selection_reason="合同事实来源",
         ),
         business_context=BusinessContextContract(),
-        selected_snapshot=_snapshot(11),
+        selected_snapshot=snapshot,
         query_capabilities=("sql",),
     )
 
@@ -105,6 +105,7 @@ def test_formal_context_uses_prepared_snapshot_without_mutating_conversation_sna
     )
 
     assert context.active_datasource_snapshot["selected_datasource_ids"] == [11]
+    assert context.execution_datasource_snapshot["selected_datasource_ids"] == [11, 12]
     assert runtime.active_datasource_snapshot["selected_datasource_ids"] == [11, 12]
 
 
