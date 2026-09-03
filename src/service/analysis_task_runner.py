@@ -80,6 +80,43 @@ class AnalysisTaskRunner:
                 analysis_task_id=analysis_task_id,
             ):
                 event.setdefault("task_id", task_id)
+                if event.get("type") == "clarification_required":
+                    clarification = (
+                        dict(event.get("clarification") or {})
+                        if isinstance(event.get("clarification"), dict)
+                        else {}
+                    )
+                    clarification.setdefault("clarification_id", uuid.uuid4().hex)
+                    resume_context = (
+                        event.pop("_resume_context", {})
+                        if isinstance(event.get("_resume_context"), dict)
+                        else {}
+                    )
+                    event["clarification"] = clarification
+                    if not self._mark_task_waiting_clarification(
+                        task_id=task_id,
+                        analysis_task_id=analysis_task_id,
+                        agent_request=agent_request,
+                        turn_id=turn_id,
+                        clarification=clarification,
+                        resume_context=resume_context,
+                    ):
+                        raise RuntimeError("analysis task could not enter waiting_clarification")
+                    try:
+                        queue.push_event(turn_id, event)
+                    except Exception:
+                        # The clarification request is already durable in the
+                        # task and turn. A transient stream failure must not
+                        # convert that suspended turn into a failed turn;
+                        # reconnecting clients recover the request from DB.
+                        logger.warning(
+                            "发布澄清事件失败，等待客户端从任务快照恢复: task_id=%s turn_id=%s",
+                            task_id,
+                            turn_id,
+                            exc_info=True,
+                        )
+                    final_status = "waiting_clarification"
+                    break
                 queue.push_event(turn_id, event)
                 self._heartbeat_task(task_id)
                 if self._is_task_cancelled(task_id):
@@ -89,7 +126,8 @@ class AnalysisTaskRunner:
                     error_message = str(event.get("message") or "")
                 elif event.get("type") == "done":
                     final_status = "success"
-            self._mark_task_finished(task_id, status=final_status, error_message=error_message)
+            if final_status != "waiting_clarification":
+                self._mark_task_finished(task_id, status=final_status, error_message=error_message)
         except AnalysisTaskCancelled:
             final_status = "cancelled"
             error_message = CANCELLED_MESSAGE
@@ -183,6 +221,36 @@ class AnalysisTaskRunner:
             AnalysisTaskService(session).mark_finished(task_id, status=status, error_message=error_message)
             session.commit()
 
+    def _mark_task_waiting_clarification(
+        self,
+        *,
+        task_id: str,
+        analysis_task_id: int | None,
+        agent_request: AgentRequest,
+        turn_id: int,
+        clarification: dict[str, Any],
+        resume_context: dict[str, Any],
+    ) -> bool:
+        from service.conversation_context_service import ConversationContextService
+
+        with session_scope(expire_on_commit=False) as session:
+            task_service = AnalysisTaskService(session)
+            marked = task_service.mark_waiting_clarification(
+                task_id,
+                clarification=clarification,
+                resume_context=resume_context,
+            )
+            if not marked:
+                return False
+            ConversationContextService(session).suspend_for_clarification(
+                conversation_id=int(agent_request.conversation_id or 0),
+                turn_id=int(turn_id or 0),
+                clarification=clarification,
+                analysis_task_id=analysis_task_id,
+            )
+            session.commit()
+            return True
+
     def _fail_turn_if_possible(
         self,
         agent_request: AgentRequest,
@@ -256,6 +324,7 @@ class AnalysisTaskRunner:
                 tables=tables,
                 replace_existing_results=bool(is_rerun),
                 analysis_task_id=analysis_task_id,
+                evidence_enabled=bool(agent_request.evidence_enabled),
             )
             AnalysisTaskService(recovery_session).mark_finished(task_id, status="success", error_message="")
             recovery_session.commit()

@@ -59,7 +59,10 @@ class Config:
     # 应用配置
     APP_NAME = "DataInsight App"
     VERSION = "1.0.0"
-    SCHEMA_VERSION = os.environ.get('DATA_INSIGHT_SCHEMA_VERSION', '1.7.0')
+    SCHEMA_VERSION = os.environ.get('DATA_INSIGHT_SCHEMA_VERSION', '1.8.0')
+    WORKFLOW_ANALYSIS_MAX_UNS_NODES = int(
+        os.environ.get('WORKFLOW_ANALYSIS_MAX_UNS_NODES', '100')
+    )
 
     # 用户系统配置
     USER_AUTH_ENDPOINT = '/os/inter-api/auth/v1/current-user/sessionInfo'

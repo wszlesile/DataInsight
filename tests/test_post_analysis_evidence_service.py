@@ -4,7 +4,7 @@ import hashlib
 from dataclasses import replace
 from pathlib import Path
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -21,6 +21,21 @@ from service.post_analysis_evidence_service import (  # noqa: E402
     UnresolvedEvidenceOutput,
 )
 from service.insight_ns_conversation_service import InsightNsConversationService  # noqa: E402
+from service.evidence_assembly_service import EvidenceAssemblyService  # noqa: E402
+
+
+def test_evidence_assembly_ignores_failed_execution():
+    session = MagicMock()
+    execution = type("Execution", (), {"id": 91, "execution_status": "failed"})()
+
+    EvidenceAssemblyService(session).assemble_for_execution(
+        conversation_id=1,
+        turn_id=2,
+        execution=execution,
+        artifacts=[],
+    )
+
+    session.query.assert_not_called()
 
 
 def _query_snapshot(sql: str, *, columns: list[str] | None = None) -> dict:
@@ -1162,6 +1177,76 @@ result = save_analysis_result(analysis_report=analysis_report, charts=charts, ta
     assert all(item["query_refs"] == ["q_file"] for item in bundle["evidence_definitions"])
 
 
+def test_composed_local_file_query_keeps_query_identity_for_structured_artifacts():
+    path = "C:/data/sales.csv"
+    code = r'''
+execution_intent = "analysis"
+constraints = {
+    "time_range": None,
+    "target_filters": [],
+    "aggregation": {"grain": "department", "metric": "sales_amount"},
+}
+data = query_local_file(
+    query_key="q_file",
+    query_constraints=constraints,
+    file_path="C:/data/sales.csv",
+)
+summary = data.groupby("department", as_index=False)["amount"].sum()
+chart = build_chart_result(
+    data=summary,
+    chart_kind="bar",
+    category_field="department",
+    value_field="amount",
+)
+table = build_table_result(
+    title="Department sales",
+    columns=[
+        {"key": "department", "label": "Department"},
+        {"key": "amount", "label": "Sales amount"},
+    ],
+    data=summary,
+)
+result = save_analysis_result(
+    analysis_report="Department sales have been summarized.",
+    charts=[chart],
+    tables=[table],
+)
+'''
+    snapshot = _snapshot(
+        code=code,
+        charts=[{
+            "title": "Department sales",
+            "chart_data_contract": {
+                "encoding": {
+                    "category_field": "department",
+                    "value_field": "amount",
+                },
+            },
+        }],
+        tables=[{
+            "title": "Department sales",
+            "columns": [
+                {"key": "department", "label": "Department"},
+                {"key": "amount", "label": "Sales amount"},
+            ],
+            "rows": [{"department": "A", "amount": 1280.5}],
+        }],
+        query_snapshots={
+            "q_file": _loader_snapshot(path, columns=["department", "amount"]),
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert len(bundle["chart_trace_refs"]) == 1
+    assert len(bundle["table_trace_refs"]) == 1
+    assert all(
+        definition["query_refs"] == ["q_file"]
+        for definition in bundle["evidence_definitions"]
+    )
+
+
 def test_timeseries_select_star_uses_actual_output_columns_for_lineage():
     sql = "SELECT * FROM ts_query('vxbase', 'SELECT * FROM sensor WHERE ts >= now()-1d')"
     code = r'''
@@ -2020,7 +2105,7 @@ result = save_analysis_result(analysis_report="", charts=[], tables=tables)
     assert len(bundle["table_trace_refs"]) == 3
 
 
-def test_heterogeneous_chart_value_column_is_not_bound_to_one_evidence():
+def test_heterogeneous_chart_value_column_uses_point_scoped_evidence():
     sql = "SELECT SUM(amount) AS amount, SUM(profit) AS profit, COUNT(*) AS contract_count FROM contracts"
     code = r'''
 sql = "SELECT SUM(amount) AS amount, SUM(profit) AS profit, COUNT(*) AS contract_count FROM contracts"
@@ -2042,15 +2127,82 @@ result = save_analysis_result(analysis_report="", charts=charts, tables=[])
     )
 
     lineage = LineageIndexer().build(snapshot)
-    output = next(item for item in lineage["output_nodes"] if item["artifact_type"] == "chart")
+    outputs = [
+        item for item in lineage["output_nodes"]
+        if item["artifact_type"] == "chart"
+    ]
     bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
 
-    assert output["ambiguous_calculation_boundary"] is True
-    assert bundle["chart_trace_refs"] == []
-    assert bundle["status"] == "partial"
+    assert len(outputs) == 3
+    assert all(output["ambiguous_calculation_boundary"] is False for output in outputs)
+    assert {tuple(item["point_selector"].items()) for item in outputs} == {
+        (("metric", "amount"),),
+        (("metric", "profit"),),
+        (("metric", "contract count"),),
+    }
+    assert {tuple(item["point_selector"].items()) for item in bundle["chart_trace_refs"]} == {
+        (("metric", "amount"),),
+        (("metric", "profit"),),
+        (("metric", "contract count"),),
+    }
+    assert bundle["status"] == "complete", bundle["diagnostics"]
 
 
-def test_parameterized_score_column_with_shared_calculation_ancestry_is_bound():
+def test_scalar_metric_variables_in_one_chart_series_keep_point_boundaries():
+    sql = "SELECT alarm_count, fault_count FROM risks"
+    code = r'''
+sql = "SELECT alarm_count, fault_count FROM risks"
+data = load_data_with_sql(sql=sql)
+total_alarms = int(data["alarm_count"].sum())
+total_faults = int(data["fault_count"].sum())
+chart_data = pd.DataFrame({
+    "signal": ["Alarms", "Faults"],
+    "count": [total_alarms, total_faults],
+})
+charts = [build_chart_result(
+    data=chart_data,
+    chart_kind="bar",
+    category_field="signal",
+    value_field="count",
+)]
+result = save_analysis_result(analysis_report="", charts=charts, tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        charts=[{
+            "title": "Risk signals",
+            "chart_data_contract": {
+                "encoding": {
+                    "category_field": "signal",
+                    "value_field": "count",
+                }
+            },
+        }],
+        query_snapshots={
+            "q_risks": _query_snapshot(
+                sql,
+                columns=["alarm_count", "fault_count"],
+            ),
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    refs = bundle["chart_trace_refs"]
+    assert {tuple(item["point_selector"].items()) for item in refs} == {
+        (("signal", "Alarms"),),
+        (("signal", "Faults"),),
+    }
+    metric_fields = {
+        field
+        for definition in bundle["evidence_definitions"]
+        for field in definition["calculation"]["metric_fields"]
+    }
+    assert {"alarm_count", "fault_count"}.issubset(metric_fields)
+
+
+def test_distinct_weighted_scores_use_point_scoped_evidence():
     sql = "SELECT cause, alarm_count, fault_count FROM risks"
     code = r'''
 sql = "SELECT cause, alarm_count, fault_count FROM risks"
@@ -2093,12 +2245,16 @@ result = save_analysis_result(analysis_report="", charts=charts, tables=[])
     )
 
     lineage = LineageIndexer().build(snapshot)
-    output = next(item for item in lineage["output_nodes"] if item["artifact_type"] == "chart")
+    outputs = [item for item in lineage["output_nodes"] if item["artifact_type"] == "chart"]
     bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
 
-    assert output["ambiguous_calculation_boundary"] is False
+    assert len(outputs) == 2
+    assert all(output["ambiguous_calculation_boundary"] is False for output in outputs)
     assert bundle["status"] == "complete", bundle["diagnostics"]
-    assert len(bundle["chart_trace_refs"]) == 1
+    assert {tuple(item["point_selector"].items()) for item in bundle["chart_trace_refs"]} == {
+        (("cause_type", "Alarm"),),
+        (("cause_type", "Fault"),),
+    }
 
 
 def test_partition_counts_with_remainder_share_one_chart_evidence():
@@ -2339,6 +2495,94 @@ result = save_analysis_result(analysis_report="", charts=[], tables=tables)
     assert {item["column_key"] for item in bundle["table_trace_refs"]} == set(outputs)
 
 
+def test_formatted_table_reuses_boundaries_already_proven_by_wide_chart():
+    vision_sql = (
+        "SELECT COUNT(*) AS total_cnt, "
+        "SUM(CASE WHEN check_status = 'fail' THEN 1 ELSE 0 END) AS fail_cnt "
+        "FROM vision_checks"
+    )
+    alarm_sql = "SELECT COUNT(*) AS alarm_cnt FROM process_samples WHERE alarm_flag = 1"
+    hours_sql = "SELECT total_hours FROM batch_hours"
+    code = r'''
+sql_vision = "SELECT COUNT(*) AS total_cnt, SUM(CASE WHEN check_status = 'fail' THEN 1 ELSE 0 END) AS fail_cnt FROM vision_checks"
+sql_alarm = "SELECT COUNT(*) AS alarm_cnt FROM process_samples WHERE alarm_flag = 1"
+sql_hours = "SELECT total_hours FROM batch_hours"
+vision_df = load_data_with_sql(sql=sql_vision)
+alarm_df = load_data_with_sql(sql=sql_alarm)
+hours_df = load_data_with_sql(sql=sql_hours)
+total_vision = int(vision_df.iloc[0]["total_cnt"])
+fail_vision = int(vision_df.iloc[0]["fail_cnt"])
+vision_fail_rate = fail_vision / total_vision if total_vision else 0.0
+alarm_count = int(alarm_df.iloc[0]["alarm_cnt"])
+total_hours = float(hours_df.iloc[0]["total_hours"])
+alarm_density = alarm_count / total_hours if total_hours else 0.0
+summary = pd.DataFrame({
+    "period": ["2026-07"],
+    "Vision failure rate (%)": [round(vision_fail_rate * 100, 2)],
+    "Alarm density": [round(alarm_density, 2)],
+})
+chart = build_multi_metric_chart_result(
+    data=summary,
+    chart_kind="bar",
+    category_field="period",
+    value_fields=["Vision failure rate (%)", "Alarm density"],
+)
+table = build_table_result(
+    title="Metric summary",
+    columns=[
+        {"key": "Vision failure rate", "label": "Vision failure rate (%)"},
+        {"key": "Alarm density", "label": "Alarm density"},
+    ],
+    rows=[{
+        "Vision failure rate": f"{vision_fail_rate * 100:.2f}",
+        "Alarm density": f"{alarm_density:.2f}",
+    }],
+)
+result = save_analysis_result(analysis_report="", charts=[chart], tables=[table])
+'''
+    snapshot = _snapshot(
+        code=code,
+        charts=[{
+            "title": "Metric summary chart",
+            "chart_data_contract": {"encoding": {
+                "category_field": "period",
+                "value_fields": ["Vision failure rate (%)", "Alarm density"],
+            }},
+        }],
+        tables=[{
+            "title": "Metric summary",
+            "columns": [
+                {"key": "Vision failure rate", "label": "Vision failure rate (%)"},
+                {"key": "Alarm density", "label": "Alarm density"},
+            ],
+            "rows": [{"Vision failure rate": "1.72", "Alarm density": "0.05"}],
+        }],
+        query_snapshots={
+            "q_vision": _query_snapshot(vision_sql, columns=["total_cnt", "fail_cnt"]),
+            "q_alarm": _query_snapshot(alarm_sql, columns=["alarm_cnt"]),
+            "q_hours": _query_snapshot(hours_sql, columns=["total_hours"]),
+        },
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    table_outputs = {
+        item["field"]: item
+        for item in lineage["output_nodes"]
+        if item.get("artifact_type") == "table"
+    }
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert table_outputs["Vision failure rate"]["candidate_query_node_ids"] == ["q_vision"]
+    assert table_outputs["Alarm density"]["candidate_query_node_ids"] == ["q_alarm", "q_hours"]
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert {item["value_field"] for item in bundle["chart_trace_refs"]} == {
+        "Vision failure rate (%)", "Alarm density",
+    }
+    assert {item["column_key"] for item in bundle["table_trace_refs"]} == {
+        "Vision failure rate", "Alarm density",
+    }
+
+
 def test_record_list_branches_share_parameterized_formula_boundary():
     sql = "SELECT batch_id, process_alarm_count, fault_count FROM quality_risk"
     code = r'''
@@ -2490,6 +2734,135 @@ result = save_analysis_result(analysis_report="", charts=[], tables=[table])
     assert {tuple(item["row_selector"].items()) for item in refs} == {
         (("candidate", "Process"),),
         (("candidate", "Device"),),
+    }
+    assert len({item["evidence_key"] for item in refs}) == 2
+
+
+def test_named_record_list_table_preserves_formatted_row_metric_boundaries():
+    quality_sql = "SELECT first_pass, first_total FROM quality_summary"
+    risk_sql = "SELECT oos_count, batch_count FROM risk_summary"
+    code = r'''
+quality = load_data_with_sql(sql="SELECT first_pass, first_total FROM quality_summary")
+risk = load_data_with_sql(sql="SELECT oos_count, batch_count FROM risk_summary")
+first_pass = int(quality.iloc[0]["first_pass"])
+first_total = int(quality.iloc[0]["first_total"])
+oos_count = int(risk.iloc[0]["oos_count"])
+batch_count = int(risk.iloc[0]["batch_count"])
+first_rate = first_pass / first_total if first_total else 0.0
+oos_rate = oos_count / batch_count if batch_count else 0.0
+result_rows = [
+    {"metric": "First pass rate", "value": f"{first_rate:.4f}", "counts": f"{first_pass}/{first_total}"},
+    {"metric": "OOS rate", "value": f"{oos_rate:.4f}", "counts": f"{oos_count}/{batch_count}"},
+]
+table = build_table_result(
+    title="Quality metrics",
+    columns=[
+        {"key": "metric", "label": "Metric"},
+        {"key": "value", "label": "Value"},
+        {"key": "counts", "label": "Numerator/denominator"},
+    ],
+    rows=result_rows,
+)
+result = save_analysis_result(analysis_report="", charts=[], tables=[table])
+'''
+    snapshot = _snapshot(
+        code=code,
+        tables=[{
+            "title": "Quality metrics",
+            "columns": [
+                {"key": "metric", "label": "Metric"},
+                {"key": "value", "label": "Value"},
+                {"key": "counts", "label": "Numerator/denominator"},
+            ],
+            "rows": [
+                {"metric": "First pass rate", "value": "0.9735", "counts": "2021/2076"},
+                {"metric": "OOS rate", "value": "0.0414", "counts": "31/748"},
+            ],
+        }],
+        query_snapshots={
+            "q_quality": _query_snapshot(
+                quality_sql,
+                columns=["first_pass", "first_total"],
+            ),
+            "q_risk": _query_snapshot(
+                risk_sql,
+                columns=["oos_count", "batch_count"],
+            ),
+        },
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    outputs = [
+        item for item in lineage["output_nodes"]
+        if item.get("artifact_type") == "table"
+        and item.get("field") in {"value", "counts"}
+    ]
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+    refs = [
+        item for item in bundle["table_trace_refs"]
+        if item.get("column_key") in {"value", "counts"}
+    ]
+
+    assert len(outputs) == 4
+    assert {tuple(item["row_selector"].items()) for item in outputs} == {
+        (("metric", "First pass rate"),),
+        (("metric", "OOS rate"),),
+    }
+    assert len(refs) == 4
+    assert all(item["row_scope"] == "selector" for item in refs)
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+
+
+def test_dataframe_column_lists_preserve_formatted_row_metric_boundaries():
+    quality_sql = "SELECT first_pass, first_total FROM quality_summary"
+    risk_sql = "SELECT oos_count, batch_count FROM risk_summary"
+    code = r'''
+quality = load_data_with_sql(sql="SELECT first_pass, first_total FROM quality_summary")
+risk = load_data_with_sql(sql="SELECT oos_count, batch_count FROM risk_summary")
+first_rate = quality.iloc[0]["first_pass"] / quality.iloc[0]["first_total"]
+oos_rate = risk.iloc[0]["oos_count"] / risk.iloc[0]["batch_count"]
+summary = pd.DataFrame({
+    "metric": ["First pass rate", "OOS rate"],
+    "value": [f"{first_rate:.2%}", f"{oos_rate:.2%}"],
+})
+table = build_table_result(title="Quality metrics", data=summary)
+result = save_analysis_result(analysis_report="", charts=[], tables=[table])
+'''
+    snapshot = _snapshot(
+        code=code,
+        tables=[{
+            "title": "Quality metrics",
+            "columns": [
+                {"key": "metric", "label": "Metric"},
+                {"key": "value", "label": "Value"},
+            ],
+            "rows": [
+                {"metric": "First pass rate", "value": "97.35%"},
+                {"metric": "OOS rate", "value": "4.14%"},
+            ],
+        }],
+        query_snapshots={
+            "q_quality": _query_snapshot(
+                quality_sql,
+                columns=["first_pass", "first_total"],
+            ),
+            "q_risk": _query_snapshot(
+                risk_sql,
+                columns=["oos_count", "batch_count"],
+            ),
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+    refs = [
+        item for item in bundle["table_trace_refs"]
+        if item.get("column_key") == "value"
+    ]
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert {tuple(item["row_selector"].items()) for item in refs} == {
+        (("metric", "First pass rate"),),
+        (("metric", "OOS rate"),),
     }
     assert len({item["evidence_key"] for item in refs}) == 2
 
@@ -2834,9 +3207,16 @@ result = save_analysis_result(analysis_report="", charts=charts, tables=[])
     )
 
     lineage = LineageIndexer().build(snapshot)
-    output = next(item for item in lineage["output_nodes"] if item["artifact_type"] == "chart")
+    outputs = [item for item in lineage["output_nodes"] if item["artifact_type"] == "chart"]
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
 
-    assert output["ambiguous_calculation_boundary"] is True
+    assert len(outputs) == 2
+    assert all(output["ambiguous_calculation_boundary"] is False for output in outputs)
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert {tuple(item["point_selector"].items()) for item in bundle["chart_trace_refs"]} == {
+        (("metric", "Amount"),),
+        (("metric", "Profit"),),
+    }
 
 
 def test_melted_same_boundary_metric_columns_keep_chart_evidence():
@@ -3199,6 +3579,84 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
         "gross_profit",
         "sales_revenue",
     ]
+
+
+def test_report_ratio_formula_unwraps_numeric_casts_around_query_fields():
+    sql = "SELECT total_batches, pass_first_batches FROM quality_summary"
+    code = r'''
+sql = "SELECT total_batches, pass_first_batches FROM quality_summary"
+data = load_data_with_sql(sql=sql)
+total_batches = int(data.iloc[0]["total_batches"])
+pass_first_batches = int(data.iloc[0]["pass_first_batches"])
+first_pass_rate = pass_first_batches / total_batches if total_batches else 0.0
+analysis_report = f"First-pass rate: {first_pass_rate:.2%}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="First-pass rate: 90.32%.",
+        query_snapshots={
+            "q_quality": _query_snapshot(
+                sql,
+                columns=["total_batches", "pass_first_batches"],
+            ),
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    definition = next(
+        item
+        for item in bundle["evidence_definitions"]
+        if item["calculation"]["formula"]
+    )
+    assert definition["calculation"]["formula"] == (
+        "pass_first_batches ÷ total_batches"
+    )
+    assert definition["calculation"]["metric_fields"] == [
+        "pass_first_batches",
+        "total_batches",
+    ]
+
+
+def test_attested_query_boundary_keeps_local_formula_explanation():
+    operations = {
+        "op_total": {
+            "operation_node_id": "op_total",
+            "line": 10,
+            "semantic_kind": "aggregation",
+            "source": 'total_batches = len(data)',
+        },
+        "op_oos": {
+            "operation_node_id": "op_oos",
+            "line": 11,
+            "semantic_kind": "aggregation",
+            "source": 'oos_batches = int(data["is_oos"].sum())',
+        },
+        "op_attested": {
+            "operation_node_id": "op_attested",
+            "line": 11,
+            "semantic_kind": "formula",
+            "planner_attested": True,
+            "source": '[{"expression":"rate = oos_batches / total_batches"}]',
+        },
+        "op_rate": {
+            "operation_node_id": "op_rate",
+            "line": 12,
+            "semantic_kind": "formula",
+            "source": 'rate = oos_batches / total_batches if total_batches else 0.0',
+        },
+    }
+
+    formula, fields = PostAnalysisEvidenceCompiler._operation_formula_details(
+        list(operations),
+        operations,
+        boundary_operation_ids=["op_attested", "op_rate"],
+    )
+
+    assert formula == 'SUM(is_oos) ÷ COUNT(记录)'
+    assert fields == ["is_oos"]
 
 
 def test_report_formula_fields_override_non_formula_planner_field():
@@ -4728,6 +5186,57 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     ) == ["q_quality"]
 
 
+def test_source_locator_resolves_inline_mapping_value_expression():
+    code = '''data = load_data_with_sql(sql="SELECT passed, total FROM quality")
+passed = int(data["passed"].sum())
+total = int(data["total"].sum())
+rate = passed / total if total else 0.0
+chart_data = pd.DataFrame({
+    "period": ["current"],
+    "pass_rate": [rate * 100],
+})
+table_data = {
+    "pass_rate": f"{rate:.2%}",
+}
+result = save_analysis_result(analysis_report="", charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        query_snapshots={
+            "q_quality": _query_snapshot(
+                "SELECT passed, total FROM quality",
+                columns=["passed", "total"],
+            ),
+        },
+    )
+    lineage = LineageIndexer().build(snapshot)
+
+    operation_ids, errors = (
+        PostAnalysisEvidenceCompiler._resolve_calculation_source_refs(
+            code,
+            lineage,
+            [
+                CalculationSourceRef(
+                    source_line=7,
+                    expression="pass_rate: [rate * 100]",
+                ),
+                CalculationSourceRef(
+                    source_line=10,
+                    expression='"pass_rate": f"{rate:.2%}"',
+                ),
+            ],
+        )
+    )
+
+    assert errors == []
+    assert len(operation_ids) == 2
+    operations = [
+        item for item in lineage["operation_nodes"]
+        if item["operation_node_id"] in operation_ids
+    ]
+    assert all(operation["loads"] == ["rate"] for operation in operations)
+
+
 def test_source_locator_prefers_exact_expression_over_nearby_same_target():
     code = '''data = load_data_with_sql(sql="SELECT amount FROM sales")
 value = data["amount"].sum()
@@ -5833,6 +6342,293 @@ result = save_analysis_result(analysis_report="", charts=charts, tables=[])
         }
         assert "mean_offset" in boundary_fields
         assert "batch_count" not in boundary_fields
+
+
+def test_inline_dataframe_structured_columns_keep_independent_calculation_boundaries():
+    sql = "SELECT total_count, pass_count, oos_count FROM quality_summary"
+    code = r'''
+sql = "SELECT total_count, pass_count, oos_count FROM quality_summary"
+data = load_data_with_sql(sql=sql)
+total_count = int(data.iloc[0]["total_count"])
+pass_count = int(data.iloc[0]["pass_count"])
+oos_count = int(data.iloc[0]["oos_count"])
+pass_rate = pass_count / total_count if total_count else 0.0
+oos_rate = oos_count / total_count if total_count else 0.0
+chart = build_multi_metric_chart_result(
+    data=pd.DataFrame({
+        "period": ["current"],
+        "pass rate": [pass_rate * 100],
+        "OOS rate": [oos_rate * 100],
+    }),
+    category_field="period",
+    value_fields=["pass rate", "OOS rate"],
+)
+table = build_table_result(
+    title="Quality summary",
+    data=pd.DataFrame([{
+        "period": "current",
+        "pass rate": f"{pass_rate:.2%}",
+        "OOS rate": f"{oos_rate:.2%}",
+    }]),
+)
+result = save_analysis_result(
+    analysis_report="",
+    charts=[chart],
+    tables=[table],
+)
+'''
+    snapshot = _snapshot(
+        code=code,
+        charts=[{
+            "title": "Quality rate comparison",
+            "chart_data_contract": {
+                "encoding": {
+                    "category_field": "period",
+                    "value_fields": ["pass rate", "OOS rate"],
+                }
+            },
+        }],
+        tables=[{
+            "title": "Quality summary",
+            "columns": [
+                {"key": "period", "label": "Period"},
+                {"key": "pass rate", "label": "Pass rate"},
+                {"key": "OOS rate", "label": "OOS rate"},
+            ],
+            "rows": [{
+                "period": "current",
+                "pass rate": "93.28%",
+                "OOS rate": "4.03%",
+            }],
+        }],
+        query_snapshots={
+            "q_quality": _query_snapshot(
+                sql,
+                columns=["total_count", "pass_count", "oos_count"],
+            )
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(
+        planner=lambda _: EvidencePlan()
+    ).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    chart_refs = {
+        item["value_field"]: item["evidence_key"]
+        for item in bundle["chart_trace_refs"]
+    }
+    table_refs = {
+        item["column_key"]: item["evidence_key"]
+        for item in bundle["table_trace_refs"]
+    }
+    assert chart_refs["pass rate"] != chart_refs["OOS rate"]
+    assert table_refs["pass rate"] == chart_refs["pass rate"]
+    assert table_refs["OOS rate"] == chart_refs["OOS rate"]
+
+
+def test_structured_recovery_keeps_attested_query_missing_from_partial_ast_lineage():
+    sql_first = "SELECT batch_id, quality_status FROM first_tests"
+    sql_batches = "SELECT batch_id FROM production_batches"
+    code = r'''
+first_tests = load_data_with_sql(sql="SELECT batch_id, quality_status FROM first_tests")
+batches = load_data_with_sql(sql="SELECT batch_id FROM production_batches")
+first_test_map = {}
+for _, row in first_tests.iterrows():
+    batch_id = row["batch_id"]
+    first_test_map.setdefault(batch_id, []).append(row["quality_status"])
+qualified_batches = sum(
+    1 for statuses in first_test_map.values()
+    if statuses and all(status == "pass" for status in statuses)
+)
+batch_total = len(batches)
+first_pass_rate = qualified_batches / batch_total if batch_total else 0.0
+chart = build_multi_metric_chart_result(
+    data=pd.DataFrame({
+        "period": ["current"],
+        "first pass rate": [first_pass_rate * 100],
+    }),
+    category_field="period",
+    value_fields=["first pass rate"],
+)
+result = save_analysis_result(analysis_report="", charts=[chart], tables=[])
+'''
+    code_lines = code.splitlines()
+    qualified_line = next(
+        index for index, line in enumerate(code_lines, 1)
+        if line.startswith("qualified_batches =")
+    )
+    rate_line = next(
+        index for index, line in enumerate(code_lines, 1)
+        if line.startswith("first_pass_rate =")
+    )
+    snapshot = _snapshot(
+        code=code,
+        charts=[{
+            "title": "First pass rate",
+            "chart_data_contract": {
+                "encoding": {
+                    "category_field": "period",
+                    "value_fields": ["first pass rate"],
+                }
+            },
+        }],
+        query_snapshots={
+            "q_first": _query_snapshot(
+                sql_first,
+                columns=["batch_id", "quality_status"],
+            ),
+            "q_batches": _query_snapshot(
+                sql_batches,
+                columns=["batch_id"],
+            ),
+        },
+    )
+
+    def recover(payload: dict) -> EvidencePlan:
+        output_ids = [
+            item["output_node_id"]
+            for item in payload["structured_output_catalog"]
+        ]
+        return EvidencePlan(metrics=[PlannedMetric(
+            calculation_id="structured_recovery",
+            output_node_ids=output_ids,
+            calculation_source_refs=[
+                CalculationSourceRef(
+                    source_line=qualified_line,
+                    expression=(
+                        "qualified_batches = sum(1 for statuses in "
+                        "first_test_map.values() if statuses and "
+                        "all(status == 'pass' for status in statuses))"
+                    ),
+                ),
+                CalculationSourceRef(
+                    source_line=rate_line,
+                    expression=(
+                        "first_pass_rate = qualified_batches / batch_total "
+                        "if batch_total else 0.0"
+                    ),
+                ),
+            ],
+            claimed_query_node_ids=["q_first", "q_batches"],
+            claimed_metric_fields=["batch_id", "quality_status"],
+            attestation_confidence="high",
+            metric_key="first_pass_rate",
+            business_name="First pass rate",
+            business_explanation="Qualified batches divided by production batches.",
+            value_type="percentage",
+            display_unit="%",
+        )])
+
+    bundle = PostAnalysisEvidenceCompiler(
+        planner=lambda _: EvidencePlan(),
+        structured_planner=recover,
+    ).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    definition = bundle["evidence_definitions"][0]
+    assert set(definition["query_refs"]) == {"q_first", "q_batches"}
+    assert definition["calculation"]["lineage_verification"] == "attested"
+
+
+def test_structured_recovery_does_not_publish_partial_query_boundary_at_medium_confidence():
+    sql_first = "SELECT batch_id, quality_status FROM first_tests"
+    sql_batches = "SELECT batch_id FROM production_batches"
+    code = r'''
+first_tests = load_data_with_sql(sql="SELECT batch_id, quality_status FROM first_tests")
+batches = load_data_with_sql(sql="SELECT batch_id FROM production_batches")
+first_test_map = {}
+for _, row in first_tests.iterrows():
+    batch_id = row["batch_id"]
+    first_test_map.setdefault(batch_id, []).append(row["quality_status"])
+qualified_batches = sum(
+    1 for statuses in first_test_map.values()
+    if statuses and all(status == "pass" for status in statuses)
+)
+batch_total = len(batches)
+first_pass_rate = qualified_batches / batch_total if batch_total else 0.0
+chart = build_multi_metric_chart_result(
+    data=pd.DataFrame({
+        "period": ["current"],
+        "first pass rate": [first_pass_rate * 100],
+    }),
+    category_field="period",
+    value_fields=["first pass rate"],
+)
+result = save_analysis_result(analysis_report="", charts=[chart], tables=[])
+'''
+    code_lines = code.splitlines()
+    qualified_line = next(
+        index for index, line in enumerate(code_lines, 1)
+        if line.startswith("qualified_batches =")
+    )
+    rate_line = next(
+        index for index, line in enumerate(code_lines, 1)
+        if line.startswith("first_pass_rate =")
+    )
+    snapshot = _snapshot(
+        code=code,
+        charts=[{
+            "title": "First pass rate",
+            "chart_data_contract": {
+                "encoding": {
+                    "category_field": "period",
+                    "value_fields": ["first pass rate"],
+                }
+            },
+        }],
+        query_snapshots={
+            "q_first": _query_snapshot(
+                sql_first,
+                columns=["batch_id", "quality_status"],
+            ),
+            "q_batches": _query_snapshot(
+                sql_batches,
+                columns=["batch_id"],
+            ),
+        },
+    )
+
+    def recover(payload: dict) -> EvidencePlan:
+        output_ids = [
+            item["output_node_id"]
+            for item in payload["structured_output_catalog"]
+        ]
+        return EvidencePlan(metrics=[PlannedMetric(
+            calculation_id="structured_recovery",
+            output_node_ids=output_ids,
+            calculation_source_refs=[
+                CalculationSourceRef(
+                    source_line=qualified_line,
+                    expression=(
+                        "qualified_batches = sum(1 for statuses in "
+                        "first_test_map.values() if statuses and "
+                        "all(status == 'pass' for status in statuses))"
+                    ),
+                ),
+                CalculationSourceRef(
+                    source_line=rate_line,
+                    expression="first_pass_rate = qualified_batches / batch_total if batch_total else 0.0",
+                ),
+            ],
+            claimed_query_node_ids=["q_first", "q_batches"],
+            claimed_metric_fields=["batch_id", "quality_status"],
+            attestation_confidence="medium",
+            metric_key="first_pass_rate",
+            business_name="First pass rate",
+            business_explanation="Qualified batches divided by production batches.",
+            value_type="percentage",
+            display_unit="%",
+        )])
+
+    bundle = PostAnalysisEvidenceCompiler(
+        planner=lambda _: EvidencePlan(),
+        structured_planner=recover,
+    ).compile(snapshot)
+
+    assert bundle["status"] == "partial"
+    assert bundle["evidence_definitions"] == []
+    assert bundle["diagnostics"]["unresolved_structured_output_node_ids"]
 
 
 def test_ranked_row_numeric_projection_remains_a_report_metric():
@@ -7482,6 +8278,76 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     )
     assert candidate["query_node_ids"] == ["q_signals"]
     assert candidate["boundary_operation_node_ids"]
+    assert target["candidate_query_node_ids"] == ["q_signals"]
+    assert target["boundary_operation_node_ids"]
+    assert set(target["boundary_operation_node_ids"]).issubset(
+        set(target["candidate_operation_node_ids"])
+    )
+
+
+def test_nested_mapping_report_metric_is_locally_completed_without_planner_classification():
+    sql = "SELECT process_alarm_count, nonconformance_count FROM root_cause_summary"
+    code = r'''
+sql = "SELECT process_alarm_count, nonconformance_count FROM root_cause_summary"
+data = load_data_with_sql(sql=sql)
+evidence_summary = {}
+for column in ["process_alarm_count", "nonconformance_count"]:
+    evidence_summary[column] = {
+        "sum": int(data[column].sum()),
+    }
+analysis_report = (
+    f"Process alarms: {evidence_summary['process_alarm_count']['sum']} times; "
+    f"nonconformance records: {evidence_summary['nonconformance_count']['sum']} cases."
+)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Process alarms: 3 times; nonconformance records: 7 cases.",
+        query_snapshots={
+            "q_root_cause": _query_snapshot(
+                sql,
+                columns=["process_alarm_count", "nonconformance_count"],
+            ),
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(
+        planner=lambda _: EvidencePlan()
+    ).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    refs = sorted(bundle["report_trace_refs"], key=lambda item: item["start"])
+    assert [item["text"] for item in refs] == ["3", "7"]
+    assert refs[0]["evidence_key"] != refs[1]["evidence_key"]
+    assert not bundle["diagnostics"]["resolver_unresolved_outputs"]
+    metric_names = {
+        item["metric_name"] for item in bundle["evidence_definitions"]
+    }
+    assert "Process alarms" in metric_names
+    assert "nonconformance records" in metric_names
+    assert all("[" not in name and "_" not in name for name in metric_names)
+    descriptions = {
+        item["derivation"]["description"]
+        for item in bundle["evidence_definitions"]
+    }
+    assert any("Process alarms" in item for item in descriptions)
+    assert all(
+        technical_term not in item
+        for item in descriptions
+        for technical_term in ("compiler", "query snapshot", "local verification")
+    )
+
+
+def test_report_display_unit_prefers_the_unit_adjacent_to_the_value():
+    assert (
+        LineageIndexer._explicit_display_unit(
+            "个 OOS 批次关联多个物料批次（来源集中度风险）"
+        )
+        == "个"
+    )
+    assert LineageIndexer._explicit_display_unit("（万元）") == "万元"
+    assert LineageIndexer._explicit_display_unit("（来源集中度风险）") == ""
 
 
 def test_semantic_planner_merged_mapping_fields_are_split_by_proven_boundaries():

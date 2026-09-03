@@ -44,11 +44,72 @@ class LlmRuntimeConfigTestCase(unittest.TestCase):
             adapter="openai",
         )
 
-        with patch("agent.create_data_insight_agent", side_effect=lambda _config: object()) as factory:
+        with patch(
+            "agent.create_data_insight_agent",
+            side_effect=lambda _config, **_kwargs: object(),
+        ) as factory:
             first = agent.get_data_insight_agent(runtime_config)
             second = agent.get_data_insight_agent(runtime_config)
 
         self.assertIs(first, second)
+        self.assertEqual(factory.call_count, 1)
+
+    def test_analysis_agent_cache_separates_clarification_modes(self) -> None:
+        import agent
+        from utils.llm_model_factory import LlmRuntimeConfig
+
+        agent.clear_data_insight_agent_cache()
+        runtime_config = LlmRuntimeConfig(
+            provider="supos_llm_gateway",
+            model_id="model-b",
+            base_url="http://supos.example/os/llm-gateway/v1",
+            api_key="app-key",
+            temperature=0.2,
+            adapter="openai",
+        )
+
+        with patch(
+            "agent.create_data_insight_agent",
+            side_effect=lambda _config, **_kwargs: object(),
+        ) as factory:
+            interactive = agent.get_data_insight_agent(
+                runtime_config,
+                clarification_mode="same_turn",
+            )
+            workflow = agent.get_data_insight_agent(
+                runtime_config,
+                clarification_mode="disabled",
+            )
+
+        self.assertIsNot(interactive, workflow)
+        self.assertEqual(factory.call_count, 2)
+
+    def test_analysis_agent_cache_reuses_the_same_capabilities_across_rounds(self) -> None:
+        import agent
+        from utils.llm_model_factory import LlmRuntimeConfig
+
+        agent.clear_data_insight_agent_cache()
+        runtime_config = LlmRuntimeConfig(
+            provider="supos_llm_gateway",
+            model_id="model-b",
+            base_url="http://supos.example/os/llm-gateway/v1",
+            api_key="app-key",
+            temperature=0.2,
+            adapter="openai",
+        )
+
+        with patch(
+            "agent.create_data_insight_agent",
+            side_effect=lambda _config, **_kwargs: object(),
+        ) as factory:
+            before_probe = agent.get_data_insight_agent(
+                runtime_config,
+            )
+            after_probe = agent.get_data_insight_agent(
+                runtime_config,
+            )
+
+        self.assertIs(before_probe, after_probe)
         self.assertEqual(factory.call_count, 1)
 
     def test_general_agent_cache_is_separate_from_analysis_agent(self) -> None:

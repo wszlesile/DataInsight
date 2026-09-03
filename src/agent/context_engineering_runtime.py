@@ -10,6 +10,8 @@ from config import Config
 from config.database import SessionLocal
 from model import InsightDatasource, InsightNsConversation, InsightNsExecution, InsightNsRelDatasource
 from service.conversation_context_service import ConversationContextService
+from agent.runtime_contract_registry import infer_query_capabilities_from_snapshot
+from utils import logger
 from utils.context_compression import clip_text
 from utils.datasource_utils import (
     build_table_runtime_metadata,
@@ -32,6 +34,7 @@ ANALYSIS_SIGNAL_PATTERN = re.compile(
 QUERY_EXECUTION_CAPABILITIES = {
     "max_rows_per_sql_result": 10000,
     "capacity_scope": "each physical load_data_with_sql execution",
+    "relational_sql_dialect": "mysql_compatible",
     "full_population_strategies": [
         "push filters, joins and final aggregation into the query",
         "use stable pagination and incrementally reduce each page",
@@ -86,6 +89,11 @@ class CustomContext(BaseModel):
     execution_datasource_snapshot: dict[str, Any] = Field(default_factory=dict)
     analysis_task_id: int | None = None
     analysis_parameters_override: dict[str, Any] = Field(default_factory=dict)
+    output_contract: dict[str, Any] = Field(
+        default_factory=lambda: {"type": "standard"}
+    )
+    clarification_mode: str = "same_turn"
+    evidence_enabled: bool = True
 
 
 def classify_analysis_context_mode(user_message: str) -> str:
@@ -203,6 +211,10 @@ def _build_datasource_prompt_item(item: dict[str, Any]) -> dict[str, Any]:
 
     properties = schema.get("properties")
     property_names = list(properties) if isinstance(properties, dict) else []
+    if isinstance(properties, dict):
+        for definition in properties.values():
+            if isinstance(definition, dict) and definition.get("example") is None:
+                definition.pop("example", None)
     queryable_fields = list(property_names)
     capabilities = payload.get("field_capabilities")
     if isinstance(capabilities, dict) and isinstance(
@@ -230,14 +242,20 @@ def _build_datasource_prompt_item(item: dict[str, Any]) -> dict[str, Any]:
             *value_fields,
         ]))
         payload["time_field"] = physical_time_field
-    query_contract = {
+    query_contract: dict[str, Any] = {
         "datasource_id": payload.get("datasource_id"),
         "datasource_identifier": payload.get("datasource_identifier"),
-        "allowed_fields": queryable_fields,
     }
+    if property_names and set(queryable_fields) == set(property_names):
+        query_contract["allowed_fields_ref"] = "metadata_schema.properties"
+        query_contract["all_schema_properties_allowed"] = True
+    else:
+        query_contract["allowed_fields"] = queryable_fields
     if str(payload.get("table_engine") or "").lower() == "time_series":
         query_contract["physical_time_field"] = payload.get("time_field")
         query_contract["ts_query_source"] = payload.get("ts_query_source")
+    elif payload.get("datasource_type") == "table":
+        query_contract["sql_dialect"] = QUERY_EXECUTION_CAPABILITIES["relational_sql_dialect"]
     known_key_cardinalities: list[dict[str, Any]] = []
     seen_key_cardinalities: set[tuple[tuple[str, ...], int]] = set()
     for relationship in schema.get("relationships") or []:
@@ -417,7 +435,7 @@ def get_datasource_message(
             )
         return SystemMessage(
             "当前会话没有关联任何可直接使用的数据源。\n"
-            "- 如果用户当前是在发起数据分析、统计、绘图、报表或依赖数据源内容的问题，不要调用 `execute_python`，不要生成 Python 代码。\n"
+            "- 如果用户当前是在发起数据分析、统计、绘图、报表或依赖数据源内容的问题，不要调用分析探测或正式程序工具，不要生成 Python 代码。\n"
             "- 请直接用自然语言告诉用户：当前会话还没有关联数据源，需要先关联相关数据源后再进行分析。\n"
             f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
         )
@@ -500,76 +518,54 @@ def get_datasource_message(
     payload["datasources"] = datasource_items
 
     instruction_lines = [
-        "当前洞察空间可用的数据源信息：",
-        "- `runtime_capabilities.query_execution` 是实际数据访问能力，不是建议；其中容量边界作用于每次物理查询，而不是只作用于第一条查询或总体分析口径。",
-        "- `datasources` 是当前会话可直接使用的数据源全集。",
-        "- `datasource_name` 只用于理解用户语义和展示，不等同于 SQL 表名、文件路径或接口地址。",
-        "- 每个数据源的 `query_contract` 是字段归属的执行边界：只能用其中的 `datasource_identifier` 访问该数据源，并且只能从该来源读取 `allowed_fields`；同名或相邻数据源的字段不能混用。",
-        "- 当用户提到的数据源名称能匹配当前 `datasources` 中的某个 `datasource_name` 时，生成代码必须使用该数据源的 `datasource_identifier` 访问数据；不要把 `datasource_name` 直接拼进 SQL。",
-        "- 如果当前 `datasources` 中没有匹配项，才可以进行有限探测；探测失败后应回到当前数据源快照重新选择，而不是继续猜更多表名。",
-        "- 如果 `local_file` 数据源包含 `recommended_loader`，必须优先遵守该推荐加载函数。",
-        "- `recommended_loader=load_local_file` 表示普通文件读取，返回完整 DataFrame；`recommended_loader=load_local_file_low_memory` 表示大文件分批读取，返回批次迭代器，必须用 `for chunk in ...` 逐批处理。",
+        "<runtime-context-instructions>",
+        "以下 JSON 是本轮完整分析上下文，包含原始 Schema、业务规则与带确认状态的准备信息，不是报告模板或指标计划：",
+        "- `datasources` 是 Preparation 选定的完整数据源上下文；每个 `metadata_schema.properties` 都是完整字段定义，没有按 Prompt 预算截断。",
+        "- `datasource_name` 是用户可读名称；`query_contract.datasource_identifier` 是物理访问标识。`allowed_fields` 是显式字段边界；若为 `allowed_fields_ref=metadata_schema.properties`，则完整 properties 键集合就是字段边界。",
+        "- `analysis_semantic_context` 是用户业务目标、开放式问题和已确认血缘的准备信息。Runtime 仍自主决定查询、指标、产物和叙事。",
+        "- Schema 中关系、observed_value_profile、requested_value_resolutions、aggregation_safety 等状态按其原始含义使用；unresolved/unknown 不等同于已确认事实。",
+        "- `runtime_capabilities.query_execution` 是当前执行环境的确定性容量与查询能力；容量边界作用于每次物理查询。具体 API 和方言由 Runtime Contract Pack 提供。",
     ]
     if selected_ids and semantic_context:
         instruction_lines.append(
-            f"- `selected_datasource_ids` 当前为 {selected_ids}，表示 Preparation 已围绕本轮完整业务意图确定的数据源语义空间；正式分析不再重新选源，也不能静默丢弃其中的业务问题。"
+            f"- `selected_datasource_ids` 当前为 {selected_ids}，表示 Preparation 围绕本轮业务意图选定的数据源语义空间；正式分析不再重新选源。"
         )
         instruction_lines.append(
-            "- `analysis_semantic_context` 说明业务目标和 Business Context 定稿后的洞察业务血缘。它不是 SQL、指标、图表或报告模板；查询、计算和洞察表达仍由正式分析根据真实数据自主完成。"
+            "- 逐项阅读 `analysis_semantic_context.business_questions`，保持用户明确要求的业务范围；它不规定具体指标和报告章节。"
         )
         instruction_lines.append(
-            "- 开始编写代码前，先逐项阅读 `analysis_semantic_context.business_questions`。它们共同构成用户要回答的业务范围：可以基于真实数据选择不同计算和表达方式，但不能把其中某一问题的便捷子集静默替换成全部问题。"
-        )
-        instruction_lines.append(
-            "- `analysis_semantic_context.analytical_facets` 是选源时识别的开放式洞察方向，用于保持完整业务意图。它不规定报告章节或结论；正式分析应根据 Schema 和实际查询结果选择有数据支撑、对回答问题有价值的方向，并对无法支持但会影响判断的重要缺口作业务化说明。"
-        )
-        instruction_lines.append(
-            "- `analysis_semantic_context.explicit_time_range` 是用户问题的时间口径，非空时必须保持；为 null 时表示用户没有限定时间。Intent 的自然语言定义和 Probe 观察范围都不能自行创造总体时间窗口，趋势观察应使用独立查询且不得截断总体基线。"
-        )
-        instruction_lines.append(
-            "- Schema 字段的 `observed_value_profile` 是 Preparation Probe 回写的字段语义结论，不包含样本行：`empty` 表示未观察到有效值，`opaque_identifier` 表示值仅适合作为关联标识；`requested_value_resolutions` 中的 exact/similar 是已核实的业务枚举映射，unresolved 不能直接用于精确筛选。"
-        )
-        instruction_lines.append(
-            "- Schema 关系的 `aggregation_safety` 按当前数据源方向描述连接后的度量可加性；`unsafe_repeated_by_join` 表示该侧度量会被另一侧多行展开。除非存在明确分摊规则或已确认函数依赖，不能把该侧度量归因到另一侧维度；整体值应在原事实粒度独立聚合。"
-        )
-        instruction_lines.append(
-            "- 计算主体被辅助明细覆盖的数量或比例时，遵守 `aggregation_safety.key_domain_coverage`：分子是主体键集合与辅助键集合的交集去重数，分母是主体人口键去重数。辅助表中的孤立键和一对多明细行都不能计入主体覆盖数。"
-        )
-        instruction_lines.append(
-            "- `partial/unresolved` 事实不得由相邻字段或代理指标冒充。`unsupported_field_bindings` 只用于排除错误字段映射，`business_impact` 是该缺口的业务边界；字段、关系和基数信息只用于实现查询与计算。正式 probe 只核实查询值格式、时间边界和无数据口径，不再重做跨源关系发现。`unknown/alignable/not_joinable` 关系不得当作已确认 JOIN。"
-        )
-        instruction_lines.append(
-            "- `used_datasource_ids` 仍只填写本轮代码真实访问的数据源。无需为了形式访问语义空间内每个来源，但必须完整回答业务问题并保留其事实边界。"
+            "- `analysis_semantic_context.analytical_facets` 是开放式洞察方向，不规定报告章节或结论。"
         )
     elif selected_ids:
         instruction_lines.append(
-            f"- `selected_datasource_ids` 当前为 {selected_ids}，表示这些数据源是当前会话已选候选范围，可从中选择本轮真正相关的数据源，不表示必须全部访问。"
-        )
-        instruction_lines.append(
-            "- 调用 `execute_python` 前，应结合当前问题、数据源名称与字段语义、最近成功执行的 `used_datasource_ids`、probe diagnostics、最近执行反馈和已有分析结果，先规划本轮代码应该实际读取或查询哪些数据源；代码必须真实访问这些数据源，并准确填写 `used_datasource_ids`。"
-        )
-        instruction_lines.append(
-            "- probe 阶段的 `used_datasource_ids` 表示 probe 实际验证过的数据源，是后续正式 analysis 规划的重要参考；正式 analysis 不要求机械继承 probe 的全部数据源，但如果 probe diagnostics 已经证明某个数据源与当前问题相关，下一版 analysis 不应无理由丢弃，若决定不使用，应有明确的数据、字段、关联或口径原因。"
-        )
-        instruction_lines.append(
-            "- 如果当前候选数据源中同时存在实际值口径和计划/目标/标准口径（例如“实际开机时间”和“计划开机时间”），且用户询问“情况、开机情况、运行情况、达成、完成、效率、率”等综合状态类问题，应优先联合这些数据源分析；正式代码实际查询了哪些数据源，就必须把对应 datasource_id 全部填入 `used_datasource_ids`。"
+            f"- `selected_datasource_ids` 当前为 {selected_ids}，表示当前会话已选候选范围。"
         )
     else:
         instruction_lines.append(
-            "- 当前没有显式选中的数据源；只有在 `selected_datasource_ids` 缺失或为空时，才需要判断是否向用户补充确认。"
+            "- 当前快照没有显式 selected_datasource_ids；以 `datasources` 中实际提供的完整来源为当前可用范围。"
         )
 
-    if any(str(item.get("sheet_name") or "").strip() for item in datasource_items):
-        instruction_lines.append(
-            "- 如果某个 `local_file` 数据源带有 `sheet_name`，它只代表该 Excel 的一个工作表；调用 `load_local_file(...)` 时必须显式传入同名 `sheet_name`。"
-        )
-        instruction_lines.append(
-            "- 同一个 Excel 文件可能拆成多个数据源，它们可以共享同一个 `datasource_identifier`，但会通过 `datasource_id`、`datasource_name` 和 `sheet_name` 区分不同工作表。"
-        )
-
+    payload_json = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(',', ':'),
+    )
+    logger.info(
+        "Runtime事实信封体积 semantic_chars=%s datasource_chars=%s capability_chars=%s total_chars=%s datasource_count=%s",
+        len(json.dumps(payload.get("analysis_semantic_context") or {}, ensure_ascii=False, separators=(',', ':'))),
+        len(json.dumps(payload.get("datasources") or [], ensure_ascii=False, separators=(',', ':'))),
+        len(json.dumps(payload.get("runtime_capabilities") or {}, ensure_ascii=False, separators=(',', ':'))),
+        len(payload_json),
+        len(payload.get("datasources") or []),
+    )
     return SystemMessage(
-        "\n".join(instruction_lines) + "\n"
-        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+        "\n".join(instruction_lines) + "\n</runtime-context-instructions>\n"
+        + payload_json,
+        additional_kwargs={
+            "runtime_query_capabilities": list(infer_query_capabilities_from_snapshot({
+                "selected_datasource_snapshot": datasource_items,
+            })),
+        },
     )
 
 

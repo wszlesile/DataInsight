@@ -6,6 +6,30 @@ import agent
 import agent.context_engineering_runtime as runtime_context
 
 
+def test_runtime_contracts_follow_delivered_sources_when_snapshot_is_loaded_internally(monkeypatch):
+    snapshot = {'selected_datasource_snapshot': [
+        {'datasource_id': 1, 'datasource_type': 'table', 'table_engine': 'time_series',
+         'ts_query_source': 'vxbase', 'datasource_identifier': 'sensor',
+         'metadata_schema': {'properties': {'value': {'type': 'number', 'description': 'full sensor meaning'}}}},
+        {'datasource_id': 2, 'datasource_type': 'local_file', 'datasource_identifier': '/data/cost.csv',
+         'metadata_schema': {'properties': {'cost': {'type': 'number', 'description': 'full cost meaning'}}}},
+    ]}
+    monkeypatch.setattr(runtime_context, '_load_conversation', lambda _: None)
+    original = runtime_context.get_datasource_message
+    # The caller has no explicit snapshot; the datasource loader supplies it.
+    monkeypatch.setattr(agent, 'get_datasource_message', lambda **_: original(1, 2, snapshot))
+    monkeypatch.setattr(agent, '_build_conversation_prompt_message', lambda *_: None)
+    monkeypatch.setattr(agent, 'get_memory_messages', lambda *_, **__: [])
+    monkeypatch.setattr(agent, 'get_history_messages', lambda *_, **__: [])
+    messages = agent.build_prompt_messages('Compare the available data', namespace_id=1, conversation_id=2)
+    prompt = messages[0].content
+    assert '# query.time_series' in prompt
+    assert '# query.local_file' in prompt
+    assert '# query.cross_source' in prompt
+    assert '# query.relational' not in prompt
+    assert 'full sensor meaning' in prompt and 'full cost meaning' in prompt
+
+
 def test_datasource_context_keeps_full_snapshot_for_preparation_to_narrow(monkeypatch):
     datasource_rows = [
         {
@@ -38,6 +62,7 @@ def test_datasource_context_keeps_full_snapshot_for_preparation_to_narrow(monkey
     assert payload["runtime_capabilities"]["query_execution"] == {
         "max_rows_per_sql_result": 10000,
         "capacity_scope": "each physical load_data_with_sql execution",
+        "relational_sql_dialect": "mysql_compatible",
         "full_population_strategies": [
             "push filters, joins and final aggregation into the query",
             "use stable pagination and incrementally reduce each page",
@@ -119,6 +144,8 @@ def test_datasource_context_preserves_preparation_semantic_handoff(monkeypatch):
     assert "开放式洞察方向" in message.content
     assert "不规定报告章节或结论" in message.content
     assert "已选候选范围" not in message.content
+    assert "未声明未解决业务事实，可直接进入正式分析" not in message.content
+    assert "带确认状态的准备信息" in message.content
 
 
 def test_datasource_context_compacts_only_redundant_schema_indexes(monkeypatch):
@@ -156,14 +183,16 @@ def test_datasource_context_compacts_only_redundant_schema_indexes(monkeypatch):
     assert datasource["query_contract"] == {
         "datasource_id": 78,
         "datasource_identifier": "dw.contract",
-        "allowed_fields": ["amount", "department"],
+        "allowed_fields_ref": "metadata_schema.properties",
+        "all_schema_properties_allowed": True,
+        "sql_dialect": "mysql_compatible",
     }
     assert datasource["metadata_schema"]["properties"] == properties
     assert datasource["metadata_schema"]["all_properties_required"] is True
     assert "required" not in datasource["metadata_schema"]
     assert datasource["field_capabilities"]["all_properties_queryable"] is True
     assert "queryable_fields" not in datasource["field_capabilities"]
-    assert "字段归属的执行边界" in message.content
+    assert "字段边界" in message.content
 
 
 def test_datasource_query_contract_localizes_verified_key_cardinality(monkeypatch):
@@ -365,7 +394,38 @@ def test_general_memory_keeps_success_facts_without_failed_execution_noise():
 
 
 def test_current_semantic_context_closes_merged_system_message(monkeypatch):
-    monkeypatch.setattr(agent, "load_system_prompt", lambda: "CORE_RULES")
+    prompt_call = {}
+
+    def fake_load_semantic_prompt(
+        query_capabilities=(),
+        context_mode="fresh_analysis",
+        output_format="standard",
+        clarification_mode="same_turn",
+    ):
+        prompt_call["semantic"] = (
+            query_capabilities,
+            context_mode,
+            output_format,
+            clarification_mode,
+        )
+        return "CORE_RULES"
+
+    def fake_load_contract_prompt(
+        query_capabilities=(),
+        context_mode="fresh_analysis",
+        output_format="standard",
+        clarification_mode="same_turn",
+    ):
+        prompt_call["contracts"] = (
+            query_capabilities,
+            context_mode,
+            output_format,
+            clarification_mode,
+        )
+        return "MECHANICAL_CONTRACTS"
+
+    monkeypatch.setattr(agent, "load_runtime_semantic_prompt", fake_load_semantic_prompt)
+    monkeypatch.setattr(agent, "load_runtime_contract_prompt", fake_load_contract_prompt)
     monkeypatch.setattr(agent, "_build_conversation_prompt_message", lambda *_: None)
     monkeypatch.setattr(
         agent,
@@ -390,16 +450,26 @@ def test_current_semantic_context_closes_merged_system_message(monkeypatch):
         namespace_id=6,
         conversation_id=20,
         extra_system_messages=["CURRENT_REPAIR_INSTRUCTION"],
+        context_mode="followup",
     )
 
     system_text = messages[0].content
-    assert system_text.index("CORE_RULES") < system_text.index("HISTORICAL_MEMORY")
     assert system_text.index("HISTORICAL_MEMORY") < system_text.index(
         "CURRENT_SCHEMA_AND_SEMANTIC_CONTEXT"
     )
     assert system_text.index("CURRENT_SCHEMA_AND_SEMANTIC_CONTEXT") < system_text.index(
+        "MECHANICAL_CONTRACTS"
+    )
+    assert system_text.index("MECHANICAL_CONTRACTS") < system_text.index(
+        "CORE_RULES"
+    )
+    assert system_text.index("CORE_RULES") < system_text.index(
         "CURRENT_REPAIR_INSTRUCTION"
     )
+    assert prompt_call == {
+        "semantic": ((), "followup", "standard", "same_turn"),
+        "contracts": ((), "followup", "standard", "same_turn"),
+    }
 
 
 def test_general_prompt_context_keeps_datasource_schema_and_analysis_memory(monkeypatch):

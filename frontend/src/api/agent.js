@@ -54,6 +54,10 @@ export function cancelAnalysisTask(taskId) {
   return api.post(`/agent/tasks/${taskId}/cancel`)
 }
 
+export function submitTaskClarification(taskId, payload) {
+  return api.post(`/agent/tasks/${taskId}/clarification`, payload)
+}
+
 export function listLlmModels() {
   return api.get('/llm/models')
 }

@@ -10,6 +10,11 @@ from config import Config
 
 
 ACTIVE_TASK_STATUSES = ("queued", "running")
+CONVERSATION_BLOCKING_TASK_STATUSES = (
+    "queued",
+    "running",
+    "waiting_clarification",
+)
 TERMINAL_TASK_STATUSES = ("success", "failed", "cancelled")
 
 
@@ -61,14 +66,14 @@ class AnalysisTaskService:
         return self.session.query(InsightAnalysisTask.id).filter(
             InsightAnalysisTask.username == (username or "anonymous"),
             InsightAnalysisTask.conversation_id == int(conversation_id or 0),
-            InsightAnalysisTask.status.in_(ACTIVE_TASK_STATUSES),
+            InsightAnalysisTask.status.in_(CONVERSATION_BLOCKING_TASK_STATUSES),
         ).first() is not None
 
     def get_running_turn(self, *, username: str, conversation_id: Any) -> dict[str, Any] | None:
         tasks = self.session.query(InsightAnalysisTask).filter(
             InsightAnalysisTask.username == (username or "anonymous"),
             InsightAnalysisTask.conversation_id == int(conversation_id or 0),
-            InsightAnalysisTask.status.in_(ACTIVE_TASK_STATUSES),
+            InsightAnalysisTask.status.in_(CONVERSATION_BLOCKING_TASK_STATUSES),
         ).order_by(
             InsightAnalysisTask.created_at.desc(),
             InsightAnalysisTask.id.desc(),
@@ -119,7 +124,7 @@ class AnalysisTaskService:
     def cancel_task(self, task_id: str, username: str | None = None, reason: str = "") -> InsightAnalysisTask | None:
         query = self.session.query(InsightAnalysisTask).filter(
             InsightAnalysisTask.task_id == task_id,
-            InsightAnalysisTask.status.in_(ACTIVE_TASK_STATUSES),
+            InsightAnalysisTask.status.in_(CONVERSATION_BLOCKING_TASK_STATUSES),
         )
         if username is not None:
             query = query.filter(InsightAnalysisTask.username == (username or "anonymous"))
@@ -169,6 +174,152 @@ class AnalysisTaskService:
         self.session.flush()
         return bool(updated)
 
+    def mark_waiting_clarification(
+        self,
+        task_id: str,
+        *,
+        clarification: dict[str, Any],
+        resume_context: dict[str, Any] | None = None,
+    ) -> bool:
+        task = self.session.query(InsightAnalysisTask).filter(
+            InsightAnalysisTask.task_id == task_id,
+            InsightAnalysisTask.status == "running",
+        ).with_for_update().first()
+        if task is None:
+            return False
+        request_payload = safe_json_loads(task.request_json, {})
+        if not isinstance(request_payload, dict):
+            request_payload = {}
+        request_payload["pending_clarification"] = dict(clarification)
+        request_payload["clarification_resume_context"] = dict(resume_context or {})
+        task.request_json = dump_json(request_payload)
+        task.status = "waiting_clarification"
+        task.worker_id = ""
+        task.error_message = ""
+        task.finished_at = None
+        task.updated_at = _now()
+        task.heartbeat_at = task.updated_at
+        self.session.flush()
+        return True
+
+    def resume_from_clarification(
+        self,
+        task_id: str,
+        *,
+        clarification_id: str,
+        answer_text: str,
+        option_id: str = "",
+        answers: list[dict[str, Any]] | None = None,
+    ) -> tuple[InsightAnalysisTask | None, dict[str, Any]]:
+        task = self.session.query(InsightAnalysisTask).filter(
+            InsightAnalysisTask.task_id == task_id,
+            InsightAnalysisTask.status == "waiting_clarification",
+        ).with_for_update().first()
+        if task is None:
+            return None, {}
+        request_payload = safe_json_loads(task.request_json, {})
+        pending = (
+            request_payload.get("pending_clarification")
+            if isinstance(request_payload, dict)
+            else None
+        )
+        if (
+            not isinstance(pending, dict)
+            or str(pending.get("clarification_id") or "")
+            != str(clarification_id or "")
+        ):
+            return None, {}
+
+        pending_items = [
+            item for item in pending.get("items") or [] if isinstance(item, dict)
+        ] or [pending]
+        submitted_items = [item for item in (answers or []) if isinstance(item, dict)]
+        if not submitted_items:
+            submitted_items = [{
+                "item_id": str(pending_items[0].get("item_id") or ""),
+                "option_id": str(option_id or ""),
+                "answer_text": str(answer_text or ""),
+            }]
+        submitted_by_id = {
+            str(item.get("item_id") or ""): item for item in submitted_items
+        }
+        resolved_answers: list[dict[str, Any]] = []
+        for index, pending_item in enumerate(pending_items):
+            item_id = str(pending_item.get("item_id") or "")
+            submitted = submitted_by_id.get(item_id)
+            if submitted is None and len(pending_items) == 1:
+                submitted = submitted_items[0]
+            if submitted is None:
+                return None, {}
+            submitted_option_id = str(submitted.get("option_id") or "")
+            selected_option = next(
+                (
+                    item
+                    for item in pending_item.get("options") or []
+                    if isinstance(item, dict)
+                    and str(item.get("id") or "") == submitted_option_id
+                ),
+                None,
+            )
+            if submitted_option_id and selected_option is None:
+                return None, {}
+            normalized_answer = str(submitted.get("answer_text") or "").strip()
+            if not normalized_answer and selected_option is not None:
+                normalized_answer = str(
+                    selected_option.get("label")
+                    or selected_option.get("value")
+                    or ""
+                ).strip()
+            if selected_option is None and not bool(pending_item.get("allow_free_text")):
+                return None, {}
+            if not normalized_answer:
+                return None, {}
+            resolved_answers.append({
+                "clarification_id": str(clarification_id),
+                "clarification_item_id": item_id or f"item_{index + 1}",
+                "question": str(pending_item.get("question") or ""),
+                "semantic_scope": (
+                    dict(pending_item.get("semantic_scope") or {})
+                    if isinstance(pending_item.get("semantic_scope"), dict)
+                    else {}
+                ),
+                "option_id": submitted_option_id,
+                "answer_text": normalized_answer,
+                "resolved_value": (
+                    selected_option.get("value")
+                    if selected_option is not None
+                    else normalized_answer
+                ),
+            })
+
+        answer = resolved_answers[0] if len(resolved_answers) == 1 else {
+            "clarification_id": str(clarification_id),
+            "answer_text": "\n".join(
+                f"{item['question']}：{item['answer_text']}" for item in resolved_answers
+            ),
+            "answers": resolved_answers,
+            "target_subjects": [
+                str((item.get("semantic_scope") or {}).get("subject") or "").strip()
+                for item in resolved_answers
+                if str((item.get("semantic_scope") or {}).get("subject") or "").strip()
+            ],
+        }
+        history = request_payload.get("clarifications")
+        if not isinstance(history, list):
+            history = []
+        history.extend(resolved_answers)
+        request_payload["clarifications"] = history
+        request_payload.pop("pending_clarification", None)
+        task.request_json = dump_json(request_payload)
+        task.status = "queued"
+        task.worker_id = ""
+        task.error_message = ""
+        task.finished_at = None
+        task.updated_at = _now()
+        task.heartbeat_at = task.updated_at
+        self.session.flush()
+        return task, answer
+
     def heartbeat(self, task_id: str) -> None:
         task = self.get_task(task_id)
         if task is None or task.status not in ACTIVE_TASK_STATUSES:
@@ -180,6 +331,10 @@ class AnalysisTaskService:
 
     def serialize_task(self, task: InsightAnalysisTask) -> dict[str, Any]:
         return self._serialize_task(task)
+
+    def get_request_payload(self, task: InsightAnalysisTask) -> dict[str, Any]:
+        payload = safe_json_loads(task.request_json, {})
+        return payload if isinstance(payload, dict) else {}
 
     def cleanup_inactive_tasks(self, *, username: str, conversation_id: Any | None = None) -> None:
         query = self.session.query(InsightAnalysisTask).filter(
@@ -235,6 +390,9 @@ class AnalysisTaskService:
         return True
 
     def _serialize_task(self, task: InsightAnalysisTask) -> dict[str, Any]:
+        request_payload = self.get_request_payload(task)
+        public_request = dict(request_payload)
+        public_request.pop("clarification_resume_context", None)
         return {
             "id": task.id,
             "analysis_task_id": task.id,
@@ -245,7 +403,7 @@ class AnalysisTaskService:
             "turn_id": task.turn_id,
             "task_type": task.task_type,
             "status": task.status,
-            "request": safe_json_loads(task.request_json, {}),
+            "request": public_request,
             "error_message": task.error_message,
             "created_at": task.created_at.isoformat() if task.created_at else None,
             "started_at": task.started_at.isoformat() if task.started_at else None,

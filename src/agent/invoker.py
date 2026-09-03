@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+import time
 from calendar import monthrange
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -10,10 +11,12 @@ from queue import Empty, Queue
 from typing import Any, Callable, Iterator
 from zoneinfo import ZoneInfo
 
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from sqlalchemy.exc import SQLAlchemyError
 
 from agent import (
     CustomContext,
+    InputMessage,
     get_data_insight_agent,
     get_general_conversation_agent,
     get_general_input,
@@ -37,6 +40,10 @@ from agent.intent_classifier import (
     PENDING_SCOPE_MEMORY_TYPE,
     resolve_context_mode_with_llm,
 )
+from agent.invocation_policy import (
+    normalize_clarification_mode,
+    normalize_output_contract,
+)
 from config import Config
 from config.database import session_scope
 from service.conversation_context_service import ConversationContextService, ConversationRunContext
@@ -46,6 +53,7 @@ from utils.datasource_utils import safe_json_loads
 from utils.analysis_task_cancel import AnalysisTaskCancelled, CANCELLED_MESSAGE, is_analysis_task_cancelled
 from utils.llm_error_utils import get_user_facing_agent_error
 from utils.llm_model_factory import bind_selected_model_id, create_runtime_config, reset_selected_model_id
+from utils.token_budget import estimate_messages_tokens
 
 THINK_BLOCK_PATTERN = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
 TOOL_CALL_BLOCK_PATTERN = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", flags=re.DOTALL)
@@ -64,11 +72,11 @@ RELATIVE_SHORT_TIME_PATTERN = re.compile(
 )
 RELATIVE_DATE_TIME_PATTERN = re.compile(
     r"(近|最近|过去)\s*(?P<amount>\d+|[一二两三四五六七八九十]{1,3})\s*"
-    r"(?P<unit>天|日|周|星期|月|个月|年)"
+    r"(?P<unit>天|日|周(?!期)|星期|月|个月|年)"
 )
-EXPECTED_TIME_RANGE_CONTRACT_VERSION = 2
+EXPECTED_TIME_RANGE_CONTRACT_VERSION = 3
 ANALYSIS_EXPLICIT_TIME_PATTERN = re.compile(
-    r"(今天|昨天|前天|本周|上周|本月|上月|今年|去年|(?:近|最近|过去)\s*(?:\d+|[一二两三四五六七八九十]{1,3})\s*(?:天|日|周|星期|月|个月|年)|"
+    r"(今天|昨天|前天|本周(?!期)|上周(?!期)|本月|上月|今年|去年|(?:近|最近|过去)\s*(?:\d+|[一二两三四五六七八九十]{1,3})\s*(?:天|日|周(?!期)|星期|月|个月|年)|"
     r"\d{4}[-/年]\d{1,2}([-/月]\d{1,2})?|\d{1,2}月\d{1,2}日)"
 )
 MAX_ANALYSIS_AGENT_ROUNDS = 3
@@ -77,7 +85,6 @@ RETRY_PATTERN_HINT_LIMIT = 5
 RETRY_ERROR_MAX_CHARS = 700
 RETRY_HINT_MAX_CHARS = 500
 RETRY_RECOVERY_INSTRUCTION_MAX_CHARS = 14000
-PROBE_NO_DATA_MEMORY_LIMIT = 3
 PROBE_NO_DATA_ERROR_TYPES = {'probe_feedback', 'no_data_found'}
 TIME_SERIES_EMPTY_SOURCE_ERROR_MARKERS = (
     'unknown tag',
@@ -136,6 +143,10 @@ class AgentRequest:
     fedquery_authorization: str = ''
     selected_llm_model_id: str = ''
     database_conn_info: dict[str, Any] | None = None
+    clarification_context: dict[str, Any] | None = None
+    output_contract: dict[str, Any] | None = None
+    clarification_mode: str = "same_turn"
+    evidence_enabled: bool = True
 
     @property
     def database_context(self) -> dict[str, Any]:
@@ -155,6 +166,19 @@ class AgentResponse:
     analysis_report: str = ''
     chart_artifact_id: int = 0
     chart_artifact_ids: list[int] | None = None
+
+
+def _apply_invocation_policy(
+    runtime: ConversationRunContext,
+    agent_request: AgentRequest,
+) -> None:
+    runtime.output_contract = normalize_output_contract(
+        getattr(agent_request, "output_contract", None)
+    ).to_dict()
+    runtime.clarification_mode = normalize_clarification_mode(
+        getattr(agent_request, "clarification_mode", "same_turn")
+    )
+    runtime.evidence_enabled = bool(getattr(agent_request, "evidence_enabled", True))
 
 
 def _clean_message_content(content: Any) -> str:
@@ -239,8 +263,9 @@ def _load_latest_execution_result(
             runtime.turn.id,
             started_at=runtime.turn.started_at,
             analysis_task_id=runtime.analysis_task_id,
+            successful_only=True,
         )
-        if latest_execution is None or latest_execution.execution_status != 'success':
+        if latest_execution is None:
             return '', [], []
 
         try:
@@ -294,7 +319,7 @@ def _is_internal_tool_feedback(content: Any) -> bool:
 
     return (
         payload.get('tool') == 'execute_python'
-        and payload.get('status') == 'failed'
+        and payload.get('status') in {'failed', 'observation'}
         and isinstance(payload.get('error_type'), str)
         and isinstance(payload.get('error_message'), str)
         and isinstance(payload.get('repair_instructions'), list)
@@ -480,9 +505,9 @@ def _build_expected_time_range_from_user_query(user_query: str) -> dict[str, Any
     if anchored_month_range:
         return anchored_month_range
 
-    if '本周' in text:
+    if re.search(r'本周(?!期)', text):
         return _format_expected_time_range(current_week_start, current_week_start + timedelta(days=7), '本周')
-    if '上周' in text:
+    if re.search(r'上周(?!期)', text):
         start = current_week_start - timedelta(days=7)
         return _format_expected_time_range(start, current_week_start, '上周')
     if '今天' in text:
@@ -689,6 +714,13 @@ def _build_agent_context(
             else runtime.active_datasource_snapshot or {}
         ),
         analysis_task_id=runtime.analysis_task_id,
+        output_contract=dict(
+            getattr(runtime, 'output_contract', None) or {"type": "standard"}
+        ),
+        clarification_mode=str(
+            getattr(runtime, 'clarification_mode', 'same_turn') or 'same_turn'
+        ),
+        evidence_enabled=bool(getattr(runtime, 'evidence_enabled', True)),
     )
 
 
@@ -703,10 +735,38 @@ def _build_agent_input_with_runtime_instruction(
     runtime: ConversationRunContext,
     runtime_instruction: str = '',
     preparation: PreparationResult | None = None,
+    prior_messages: list[BaseMessage] | None = None,
 ):
-    """在必要时追加一条很短的运行时修复指令。"""
-    extra_system_messages = [runtime_instruction] if runtime_instruction else []
-    return get_input(
+    """Build the first Runtime input or continue the same ReAct conversation."""
+    clarification_message = _build_runtime_clarification_answer_instruction(
+        agent_request.clarification_context,
+    )
+    probe_observation_instruction = _build_resumed_probe_observation_instruction(
+        agent_request.clarification_context
+    )
+    if prior_messages:
+        prior_content = [
+            str(getattr(message, 'content', '') or '') for message in prior_messages
+        ]
+        if clarification_message and any(
+            '<user-clarification-answers>' in content for content in prior_content
+        ):
+            clarification_message = ''
+        if probe_observation_instruction and any(
+            '<resumed-probe-observations>' in content for content in prior_content
+        ):
+            probe_observation_instruction = ''
+    extra_system_messages = [
+        item for item in (probe_observation_instruction, runtime_instruction) if item
+    ]
+    if prior_messages:
+        continued_messages = list(prior_messages)
+        if extra_system_messages:
+            continued_messages.append(SystemMessage("\n\n".join(extra_system_messages)))
+        if clarification_message:
+            continued_messages.append(HumanMessage(clarification_message))
+        return InputMessage(messages=continued_messages)
+    agent_input = get_input(
         agent_request.user_message,
         namespace_id=runtime.conversation.insight_namespace_id,
         conversation_id=runtime.conversation.id,
@@ -718,12 +778,25 @@ def _build_agent_input_with_runtime_instruction(
             else runtime.active_datasource_snapshot
         ),
         context_mode=getattr(runtime, 'context_mode', None),
+        output_contract=runtime.output_contract,
+        clarification_mode=runtime.clarification_mode,
     )
+    if clarification_message:
+        agent_input.messages.append(HumanMessage(clarification_message))
+    return agent_input
 
 
-def _get_runtime_agent(runtime_config, *, analysis_request_expected: bool):
+def _get_runtime_agent(
+    runtime_config,
+    *,
+    analysis_request_expected: bool,
+    clarification_mode: str = "same_turn",
+):
     if analysis_request_expected:
-        return get_data_insight_agent(runtime_config)
+        return get_data_insight_agent(
+            runtime_config,
+            clarification_mode=clarification_mode,
+        )
     return get_general_conversation_agent(runtime_config)
 
 
@@ -734,6 +807,7 @@ def _build_runtime_agent_input(
     analysis_request_expected: bool,
     runtime_instruction: str = '',
     preparation: PreparationResult | None = None,
+    prior_messages: list[BaseMessage] | None = None,
 ):
     if not analysis_request_expected:
         return get_general_input(
@@ -748,11 +822,165 @@ def _build_runtime_agent_input(
         runtime=runtime,
         runtime_instruction=runtime_instruction,
         preparation=preparation,
+        prior_messages=prior_messages,
     )
 
 
+def _build_runtime_clarification_answer_instruction(
+    clarification_context: dict[str, Any] | None,
+) -> str:
+    context = dict(clarification_context or {})
+    facts = _canonical_runtime_clarification_facts(
+        context.get("user_clarifications")
+    )
+    if not facts:
+        return ''
+    return (
+        '<user-clarification-answers>\n'
+        '以下是用户对本轮澄清问题的直接回答，是当前分析的权威业务事实。'
+        '请在同一个 Runtime 洞察语义中继续原问题，保留每条回答的完整含义并映射到完整 Schema。'
+        '仍可由数据核实的技术未知合并到一次有界 Probe；不要增加独立的指标计划、报告模板或语义审核回合。\n'
+        + json.dumps(facts, ensure_ascii=False, separators=(',', ':'))
+        + '\n</user-clarification-answers>'
+    )
+
+
+def _canonical_runtime_clarification_facts(
+    clarifications: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Preserve user-confirmed facts without compiling them into analysis semantics."""
+    facts: list[dict[str, Any]] = []
+    for item in clarifications or []:
+        if not isinstance(item, dict):
+            continue
+        answer_text = str(item.get('answer_text') or '').strip()
+        resolved_value = str(item.get('resolved_value') or answer_text).strip()
+        if not resolved_value:
+            continue
+        semantic_scope = item.get('semantic_scope')
+        if not isinstance(semantic_scope, dict):
+            semantic_scope = {}
+        fact = {
+            'clarification_id': str(item.get('clarification_id') or '').strip(),
+            'item_id': str(
+                item.get('clarification_item_id') or item.get('item_id') or ''
+            ).strip(),
+            'question': str(item.get('question') or '').strip(),
+            'answer_text': answer_text,
+            'resolved_value': resolved_value,
+            'option_id': str(item.get('option_id') or '').strip(),
+            'semantic_scope': dict(semantic_scope),
+        }
+        facts.append(fact)
+    return facts
+
+
+def _build_resumed_probe_observation_instruction(
+    clarification_context: dict[str, Any] | None,
+) -> str:
+    """Restore bounded tool observations when a clarification resumes one task."""
+    context = dict(clarification_context or {})
+    observations = [
+        item for item in context.get('probe_observations') or []
+        if isinstance(item, dict)
+    ]
+    if not observations:
+        return ''
+    return (
+        '<resumed-probe-observations>\n'
+        '以下是发起本轮澄清前已经由 probe_analysis_data 得到的结构化观察。'
+        '它们只用于恢复真实枚举、格式、覆盖范围和查询可用性，不替代用户回答的业务定义。\n'
+        + json.dumps(observations, ensure_ascii=False, separators=(',', ':'))
+        + '\n</resumed-probe-observations>'
+    )
+
+
+def _clarification_fact_key(item: dict[str, Any]) -> str:
+    item_id = str(
+        item.get('clarification_item_id') or item.get('item_id') or ''
+    ).strip()
+    if item_id:
+        return f'item:{item_id}'
+    clarification_id = str(item.get('clarification_id') or '').strip()
+    question = str(item.get('question') or '').strip()
+    if clarification_id and question:
+        return f'question:{clarification_id}:{question}'
+    return ''
+
+
+def _merge_runtime_clarification_facts(
+    persisted: list[dict[str, Any]] | None,
+    current: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Merge only the same clarification item, preserving complementary answers."""
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for index, item in enumerate([*(persisted or []), *(current or [])]):
+        if not isinstance(item, dict):
+            continue
+        answer_text = str(item.get('resolved_value') or item.get('answer_text') or '').strip()
+        key = _clarification_fact_key(item)
+        if not answer_text:
+            continue
+        if not key:
+            key = f'append:{index}'
+        if key in merged:
+            order.remove(key)
+        merged[key] = dict(item)
+        order.append(key)
+    return [merged[key] for key in order]
+
+
+def _hydrate_persisted_runtime_clarifications(
+    runtime: ConversationRunContext,
+    agent_request: AgentRequest,
+) -> None:
+    """Restore same-turn business facts when a completed or interrupted turn is rerun."""
+    if runtime.short_term_memory.get('persisted_clarifications_loaded'):
+        return
+    # A new analysis or an in-place clarification resume already carries the
+    # current answers in AgentRequest. Only an explicit rerun of an existing
+    # turn needs to recover older answers from message history. Keeping this
+    # lookup off the normal Preparation path avoids an extra database roundtrip
+    # for every analysis.
+    if not bool(getattr(runtime, 'is_rerun', False)):
+        runtime.short_term_memory['persisted_clarifications_loaded'] = True
+        return
+    with session_scope(expire_on_commit=False) as session:
+        persisted = ConversationContextService(session).get_turn_clarification_answers(
+            runtime.turn.id
+        )
+    context = dict(agent_request.clarification_context or {})
+    merged = _merge_runtime_clarification_facts(
+        persisted,
+        [
+            item for item in context.get('user_clarifications') or []
+            if isinstance(item, dict)
+        ],
+    )
+    if merged:
+        context['user_clarifications'] = merged
+        agent_request.clarification_context = context
+    logger.info(
+        'restored persisted runtime clarifications: conversation_id=%s turn_id=%s count=%s',
+        runtime.conversation.id,
+        runtime.turn.id,
+        len(merged),
+    )
+    runtime.short_term_memory['persisted_clarifications_loaded'] = True
+
+
 def _resolve_agent_runtime_config(agent_request: AgentRequest):
-    return create_runtime_config(selected_model_id=agent_request.selected_llm_model_id)
+    runtime_config = create_runtime_config(
+        selected_model_id=agent_request.selected_llm_model_id
+    )
+    logger.info(
+        "analysis LLM runtime resolved provider=%s model=%s base_url=%s",
+        runtime_config.provider,
+        runtime_config.model_id,
+        runtime_config.base_url,
+    )
+    return runtime_config
 
 
 def _prepare_analysis_context(
@@ -763,10 +991,22 @@ def _prepare_analysis_context(
     stage_callback: Callable[[str], None] | None = None,
 ) -> PreparationResult | ScopeClarificationResult:
     """Select and enrich datasource Schema without owning insight semantics."""
+    _hydrate_persisted_runtime_clarifications(runtime, agent_request)
     cached = runtime.short_term_memory.get("preparation_result")
     if isinstance(cached, PreparationResult):
         _clear_consumed_scope_clarification(runtime)
         return cached
+
+    clarification_context = dict(
+        getattr(agent_request, "clarification_context", None) or {}
+    )
+    resumed = PreparationResult.from_resume_payload(
+        clarification_context.get("preparation")
+    )
+    if resumed is not None:
+        runtime.active_datasource_snapshot = resumed.selected_snapshot
+        runtime.short_term_memory["preparation_result"] = resumed
+        return resumed
 
     user_query = getattr(runtime.turn, "user_query", "") or agent_request.user_message
     conversation_context: dict[str, Any] = {}
@@ -1129,7 +1369,7 @@ def _build_regenerate_instruction(
         '当前用户输入“重新生成/重试”明确指向最近一次成功分析任务。'
         f'请把本轮目标理解为：重新执行第 {latest_turn.turn_no} 轮的分析请求：'
         f'「{latest_question}」。'
-        '不要复述历史结论，必须重新调用 execute_python 基于当前会话数据源重新完成分析。'
+        '不要复述历史结论，必须重新调用 submit_analysis_program 基于当前会话数据源重新完成分析。'
     )
 
 
@@ -1360,7 +1600,7 @@ def _build_history_requirement_recovery_instruction(
     lines.extend([
         '如果最近补充/纠错指出了遗漏的数据源、字段、关联键或计算口径，必须合并进本轮恢复后的分析目标。',
         '不要回答“没有历史对话上下文”，也不要要求用户重新描述完整需求；当前链路已经提供了历史消息、历史摘要和当前数据源快照。',
-        '如果恢复出的目标需要数据分析、统计、联表、图表或报告，必须调用 execute_python 重新执行，而不是复述历史结论。',
+        '如果恢复出的目标需要数据分析、统计、联表、图表或报告，必须调用 submit_analysis_program 重新执行，而不是复述历史结论。',
         '访问表型数据源时，datasource_name 只用于语义匹配；真正写 SQL 必须使用 datasource_identifier。',
     ])
     datasource_lines = _build_datasource_reference_lines(runtime)
@@ -1566,6 +1806,8 @@ def _should_require_rerun_analysis_execution(
 def _build_rerun_instruction(
     service: ConversationContextService,
     runtime: ConversationRunContext,
+    *,
+    analysis_request_expected: bool,
 ) -> str:
     """
     为“分析刷新/原轮次重跑”补一条首轮运行时指令。
@@ -1575,6 +1817,12 @@ def _build_rerun_instruction(
     """
     if not runtime.is_rerun:
         return ''
+
+    if not analysis_request_expected:
+        return (
+            '当前操作是“刷新回复”，需要基于本轮原始问题和相关会话上下文重新回答。'
+            '本轮已分流为普通问答，请直接用自然语言回答。'
+        )
 
     original_user_query = getattr(runtime.turn, 'user_query', '') or ''
     if _is_regenerate_request(original_user_query):
@@ -1589,15 +1837,8 @@ def _build_rerun_instruction(
                 f'请把本次刷新目标还原为最近一次成功分析任务：第 {latest_turn.turn_no} 轮'
                 f'「{(latest_turn.user_query or "").strip()}」。'
                 '不要把“重新分析”本身当作分析对象，也不要复述历史结论；'
-                '必须重新调用 execute_python，基于当前会话数据源重新完成该分析目标并生成新的分析结果。'
+                '必须重新调用 submit_analysis_program，基于当前会话数据源重新完成该分析目标并生成新的分析结果。'
             )
-
-    if not _rerun_has_prior_analysis_result(service, runtime):
-        return (
-            '当前操作是“刷新回复”，需要基于本轮原始问题重新生成回答。'
-            '请根据本轮原始问题自行判断是否需要调用工具；'
-            '如果只是问候、闲聊、概念解释或普通问答，可以直接用自然语言回答并结束。'
-        )
 
     lines = [
         '当前操作是“刷新分析”，需要在同一轮内重新执行这条分析请求。',
@@ -1605,7 +1846,7 @@ def _build_rerun_instruction(
         '本轮分析目标只能来自本轮原始问题；历史上下文只能用于理解背景、数据口径和歧义消解，',
         '不得把历史轮次的问题、结论、图表或表格追加、合并成本轮新的分析目标。',
         '请基于本轮原始问题和当前会话数据源重新完成分析，',
-        '不要直接复述之前的结论，必须重新调用 execute_python 生成新的分析结果。',
+        '不要直接复述之前的结论，必须重新调用 submit_analysis_program 生成新的分析结果。',
     ]
     original_context_mode = getattr(runtime, 'context_mode', '') or classify_analysis_context_mode(
         getattr(runtime.turn, 'user_query', '') or ''
@@ -1679,6 +1920,7 @@ def _finalize_run(
         tables=tables,
         replace_existing_results=runtime.is_rerun,
         analysis_task_id=runtime.analysis_task_id,
+        evidence_enabled=runtime.evidence_enabled,
     )
     chart_artifact_ids: list[int] = []
     for artifact in run_result.get('artifacts', []):
@@ -1745,6 +1987,9 @@ def _open_fresh_persistence_context(
         history_turn_limit=runtime.history_turn_limit,
         analysis_task_id=runtime.analysis_task_id,
         context_mode=getattr(runtime, 'context_mode', '') or '',
+        output_contract=dict(runtime.output_contract or {"type": "standard"}),
+        clarification_mode=runtime.clarification_mode,
+        evidence_enabled=runtime.evidence_enabled,
     )
     return ConversationContextService(session), fresh_runtime
 
@@ -1816,19 +2061,31 @@ def _ensure_analysis_result_ready(
     analysis_report: str,
     charts: list[dict[str, Any]] | None = None,
     tables: list[dict[str, Any]] | None = None,
+    output_format: str = "standard",
 ) -> None:
     """分析型请求必须真实产出结构化分析结果。"""
+    if output_format in {"text", "json"} and analysis_report:
+        return
     if analysis_report and ((charts or []) or (tables or [])):
         return
     raise ValueError('本轮未生成完整分析产物：缺少结构化图表/表格结果或分析报告，请重新执行分析。')
 
 
-def _build_analysis_start_instruction(user_message: str) -> str:
+def _build_analysis_start_instruction(
+    user_message: str,
+    output_format: str = "standard",
+) -> str:
     """当模型没有进入分析流时，补一条最小运行时纠偏指令。"""
+    result_instruction = (
+        '按本轮 analysis-output-contract 生成并保存纯文本或 JSON 结果；'
+        if output_format in {"text", "json"}
+        else '生成图表、表格和分析报告；'
+    )
     return (
         '当前用户输入是明确的数据分析任务，不能按普通问答结束。'
         f'请围绕这条请求真正启动分析执行：{user_message}。'
-        '必须调用 execute_python 读取当前会话已绑定的数据源，生成图表和分析报告；'
+        '必须调用 submit_analysis_program 读取当前会话已绑定的数据源，'
+        + result_instruction +
         '不要只给自然语言说明，也不要提前结束本轮。'
     )
 
@@ -1839,9 +2096,12 @@ def _should_use_report_only_fallback(
     round_index: int,
     has_any_artifact: bool,
     assistant_message: str,
+    analysis_flow_started: bool = False,
 ) -> bool:
     """判断是否允许把最后一条可见回复直接当作报告产物收口。"""
     if not analysis_request_expected:
+        return False
+    if analysis_flow_started:
         return False
     if has_any_artifact:
         return False
@@ -1939,9 +2199,12 @@ def _should_use_failure_reason_fallback(
     round_index: int,
     has_any_artifact: bool,
     assistant_message: str,
+    analysis_flow_started: bool = False,
 ) -> bool:
     """当最后没有任何自然语言回复时，补一条失败原因说明产物。"""
     if not analysis_request_expected:
+        return False
+    if analysis_flow_started:
         return False
     if has_any_artifact:
         return False
@@ -1979,9 +2242,16 @@ def _format_tool_call_message(tool_call: dict[str, Any]) -> str:
     tool_name = tool_call.get('name', 'unknown_tool')
     args = tool_call.get('args') or {}
 
-    if tool_name == 'execute_python':
+    if tool_name in {'execute_python', 'submit_analysis_program'}:
         title = args.get('title') or '数据分析任务'
         return f"已生成分析代码，准备执行：{title}"
+
+    if tool_name == 'probe_analysis_data':
+        title = args.get('title') or '数据探测'
+        return f"已生成探测代码，准备核实：{title}"
+
+    if tool_name == 'read_runtime_reference':
+        return "正在查阅分析工具的用法说明。"
 
     return f"准备调用工具：{tool_name}"
 
@@ -2106,20 +2376,21 @@ def _build_failed_pattern_hints(executions: list[Any]) -> list[str]:
 
 
 def _get_latest_failed_repair_target(executions: list[Any]) -> dict[str, Any]:
-    """Return an immutable execution reference and bounded local repair context."""
+    """Return a patch target only when the tool explicitly proved patchability."""
     for execution in reversed(executions):
         if getattr(execution, 'execution_status', '') == 'success':
             continue
         generated_code = (getattr(execution, 'generated_code', '') or '').strip()
-        if generated_code:
-            payload = _extract_execution_payload(execution)
-            code_error_context = payload.get('code_error_context')
-            return {
-                'base_execution_id': int(getattr(execution, 'id', 0) or 0),
-                'source_sha256': hashlib.sha256(generated_code.encode('utf-8')).hexdigest(),
-                'line_count': len(generated_code.splitlines()),
-                'code_error_context': code_error_context if isinstance(code_error_context, dict) else {},
-            }
+        if not generated_code:
+            continue
+        payload = _extract_execution_payload(execution)
+        repair_target = payload.get('repair_target')
+        if not isinstance(repair_target, dict):
+            continue
+        base_execution_id = int(repair_target.get('base_execution_id') or 0)
+        if base_execution_id != int(getattr(execution, 'id', 0) or 0):
+            continue
+        return dict(repair_target)
     return {}
 
 
@@ -2149,7 +2420,10 @@ def _build_structured_execution_feedback(executions: list[Any]) -> list[dict[str
         repair_instructions = payload.get('repair_instructions')
         if not retry_type and not isinstance(diagnostics, dict) and not isinstance(repair_instructions, list):
             continue
-        item: dict[str, Any] = {}
+        item: dict[str, Any] = {
+            'execution_id': getattr(execution, 'id', None),
+            'feedback_kind': 'observation' if retry_type == 'probe_feedback' else 'execution_failure',
+        }
         if retry_type:
             item['retry_type'] = retry_type
         message = str(payload.get('message') or getattr(execution, 'error_message', '') or '').strip()
@@ -2158,16 +2432,262 @@ def _build_structured_execution_feedback(executions: list[Any]) -> list[dict[str
         if isinstance(diagnostics, dict) and diagnostics:
             item['diagnostics'] = diagnostics
         if isinstance(repair_instructions, list) and repair_instructions:
-            item['repair_instructions'] = [
-                _clip_retry_text(str(value), 500)
-                for value in repair_instructions[:5]
-                if str(value).strip()
-            ]
+            item['repair_instructions'] = [str(value) for value in repair_instructions if str(value).strip()]
+        if isinstance(payload.get('query_snapshots'), dict):
+            item['query_snapshots'] = payload['query_snapshots']
         if item:
             feedback.append(item)
         if len(feedback) >= RETRY_LATEST_ERROR_LIMIT:
             break
     return list(reversed(feedback))
+
+
+def _message_identity(message: BaseMessage) -> tuple[Any, ...]:
+    message_id = getattr(message, 'id', None)
+    if message_id:
+        return ('id', message_id)
+    return (
+        type(message).__name__,
+        getattr(message, 'tool_call_id', None),
+        json.dumps(getattr(message, 'tool_calls', None), ensure_ascii=False, default=str),
+        str(getattr(message, 'content', '') or ''),
+    )
+
+
+def _merge_agent_round_messages(
+    input_messages: list[BaseMessage],
+    output_messages: list[BaseMessage],
+) -> list[BaseMessage]:
+    """Preserve one coherent ReAct transcript across outer recovery rounds."""
+    merged = list(input_messages)
+    known = {_message_identity(message) for message in merged}
+    for message in output_messages:
+        identity = _message_identity(message)
+        if identity in known:
+            continue
+        known.add(identity)
+        merged.append(message)
+    return merged
+
+
+def _new_agent_round_messages(
+    input_messages: list[BaseMessage],
+    output_messages: list[BaseMessage],
+) -> list[BaseMessage]:
+    """Return only messages created in the current graph invocation."""
+    known = {_message_identity(message) for message in input_messages}
+    current: list[BaseMessage] = []
+    current_positions: dict[tuple[Any, ...], int] = {}
+    for message in output_messages:
+        identity = _message_identity(message)
+        if identity in known:
+            continue
+        message_id = getattr(message, 'id', None)
+        stable_identity = ('id', message_id) if message_id else identity
+        if stable_identity in current_positions:
+            current[current_positions[stable_identity]] = message
+            continue
+        current_positions[stable_identity] = len(current)
+        current.append(message)
+    return current
+
+
+def _runtime_message_stats(messages: list[BaseMessage]) -> dict[str, Any]:
+    """Summarize message volume without logging user or analysis content."""
+    by_type: dict[str, int] = {}
+    content_chars = 0
+    tool_call_count = 0
+    for message in messages:
+        message_type = str(
+            getattr(message, "type", "") or type(message).__name__
+        )
+        by_type[message_type] = by_type.get(message_type, 0) + 1
+        content = getattr(message, "content", "")
+        if isinstance(content, str):
+            content_chars += len(content)
+        else:
+            content_chars += len(json.dumps(content, ensure_ascii=False, default=str))
+        tool_call_count += len(getattr(message, "tool_calls", None) or [])
+    return {
+        "message_count": len(messages),
+        "message_types": by_type,
+        "content_chars": content_chars,
+        "estimated_tokens": estimate_messages_tokens(messages),
+        "tool_call_count": tool_call_count,
+    }
+
+
+def _runtime_model_response_stats(messages: list[BaseMessage]) -> dict[str, Any]:
+    """Collect standard model usage and finish metadata from one graph round."""
+    finish_reasons: list[str] = []
+    input_tokens = 0
+    output_tokens = 0
+    total_tokens = 0
+    usage_observed = False
+    latest_messages: dict[tuple[Any, ...], BaseMessage] = {}
+    for index, message in enumerate(messages):
+        message_id = getattr(message, "id", None)
+        identity = ("id", message_id) if message_id else ("index", index)
+        latest_messages[identity] = message
+    for message in latest_messages.values():
+        response_metadata = getattr(message, "response_metadata", None)
+        response_token_usage: dict[str, Any] = {}
+        if isinstance(response_metadata, dict):
+            finish_reason = str(
+                response_metadata.get("finish_reason")
+                or response_metadata.get("stop_reason")
+                or ""
+            ).strip()
+            if finish_reason and finish_reason not in finish_reasons:
+                finish_reasons.append(finish_reason)
+            token_usage = response_metadata.get("token_usage")
+            if isinstance(token_usage, dict):
+                response_token_usage = token_usage
+        usage_metadata = getattr(message, "usage_metadata", None)
+        if isinstance(usage_metadata, dict):
+            input_tokens += int(usage_metadata.get("input_tokens") or 0)
+            output_tokens += int(usage_metadata.get("output_tokens") or 0)
+            total_tokens += int(usage_metadata.get("total_tokens") or 0)
+            usage_observed = True
+        elif response_token_usage:
+            input_tokens += int(
+                response_token_usage.get("input_tokens")
+                or response_token_usage.get("prompt_tokens")
+                or 0
+            )
+            output_tokens += int(
+                response_token_usage.get("output_tokens")
+                or response_token_usage.get("completion_tokens")
+                or 0
+            )
+            total_tokens += int(response_token_usage.get("total_tokens") or 0)
+            usage_observed = True
+    if usage_observed and total_tokens == 0:
+        total_tokens = input_tokens + output_tokens
+    truncated_reasons = {
+        "length",
+        "max_tokens",
+        "max_output_tokens",
+        "model_length",
+    }
+    return {
+        "finish_reasons": finish_reasons,
+        "truncated": any(reason.lower() in truncated_reasons for reason in finish_reasons),
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        } if usage_observed else {},
+    }
+
+
+def _log_runtime_round_input(
+    *,
+    runtime: ConversationRunContext,
+    round_index: int,
+    mode: str,
+    messages: list[BaseMessage],
+) -> None:
+    logger.info(
+        "Runtime模型轮次开始 conversation_id=%s turn_id=%s round=%s mode=%s input=%s",
+        runtime.conversation.id,
+        runtime.turn.id,
+        round_index + 1,
+        mode,
+        _runtime_message_stats(messages),
+    )
+
+
+def _log_runtime_round_output(
+    *,
+    runtime: ConversationRunContext,
+    round_index: int,
+    mode: str,
+    messages: list[BaseMessage],
+    transcript: list[BaseMessage],
+    duration_seconds: float,
+) -> None:
+    model_stats = _runtime_model_response_stats(messages)
+    tool_calls: list[dict[str, Any]] = []
+    for message in messages:
+        for tool_call in getattr(message, 'tool_calls', None) or []:
+            args = tool_call.get('args') if isinstance(tool_call, dict) else None
+            args = args if isinstance(args, dict) else {}
+            code = args.get('code')
+            patches = args.get('patches')
+            tool_calls.append({
+                'name': str(tool_call.get('name') or ''),
+                'arg_keys': sorted(str(key) for key in args),
+                'code_chars': len(code) if isinstance(code, str) else 0,
+                'base_execution_id': int(args.get('base_execution_id') or 0),
+                'patch_count': len(patches) if isinstance(patches, list) else 0,
+            })
+    payload = {
+        "duration_seconds": round(duration_seconds, 3),
+        "output": _runtime_message_stats(messages),
+        "model": model_stats,
+        "transcript": _runtime_message_stats(transcript),
+        "tool_calls": tool_calls,
+    }
+    log_method = logger.warning if model_stats["truncated"] else logger.info
+    log_method(
+        "Runtime模型轮次结束 conversation_id=%s turn_id=%s round=%s mode=%s stats=%s",
+        runtime.conversation.id,
+        runtime.turn.id,
+        round_index + 1,
+        mode,
+        payload,
+    )
+
+
+def _agent_input_messages(agent_input: Any) -> list[BaseMessage]:
+    messages = getattr(agent_input, 'messages', None)
+    if messages is None and isinstance(agent_input, dict):
+        messages = agent_input.get('messages')
+    return list(messages or [])
+
+
+def _extract_runtime_clarification(
+    messages: list[BaseMessage],
+) -> dict[str, Any] | None:
+    """Read the terminal clarification tool payload from one Runtime graph run."""
+    for message in reversed(messages):
+        content = getattr(message, 'content', '')
+        if not isinstance(content, str) or not content.lstrip().startswith('{'):
+            continue
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if (
+            payload.get('tool') != 'request_analysis_clarification'
+            or payload.get('status') != 'clarification_required'
+        ):
+            continue
+        clarification = payload.get('clarification')
+        return dict(clarification) if isinstance(clarification, dict) else None
+    return None
+
+
+def _build_clarification_resume_context(
+    *,
+    preparation: PreparationResult | None,
+    runtime: ConversationRunContext,
+) -> dict[str, Any]:
+    probe_observations = [
+        item
+        for item in _build_structured_execution_feedback(
+            _load_turn_executions_fresh(runtime)
+        )
+        if str(item.get('retry_type') or '') == 'probe_feedback'
+    ]
+    return {
+        "preparation": preparation.resume_payload() if preparation is not None else None,
+        "context_mode": getattr(runtime, "context_mode", "") or "fresh_analysis",
+        "probe_observations": probe_observations,
+    }
 
 
 def _execution_has_time_series_empty_source_error(execution: Any) -> bool:
@@ -2277,18 +2797,32 @@ def _update_short_term_memory_from_tool_payload(runtime: ConversationRunContext,
         if not isinstance(short_term_memory, dict):
             short_term_memory = {}
             setattr(runtime, 'short_term_memory', short_term_memory)
-        probe_no_data_memory = short_term_memory.get('probe_no_data_retry')
-        if not isinstance(probe_no_data_memory, dict):
-            probe_no_data_memory = {
-                'count': 0,
-                'last_error_type': '',
-                'limit': PROBE_NO_DATA_MEMORY_LIMIT,
-            }
-        probe_no_data_memory['count'] = int(probe_no_data_memory.get('count') or 0) + 1
-        probe_no_data_memory['last_error_type'] = error_type
-        probe_no_data_memory['limit'] = PROBE_NO_DATA_MEMORY_LIMIT
-        probe_no_data_memory['limit_reached'] = probe_no_data_memory['count'] >= PROBE_NO_DATA_MEMORY_LIMIT
-        short_term_memory['probe_no_data_retry'] = probe_no_data_memory
+        task_id = int(getattr(runtime, 'analysis_task_id', 0) or 0)
+        if short_term_memory.get('execution_feedback_task_id') != task_id:
+            short_term_memory['execution_feedback_task_id'] = task_id
+            short_term_memory['seen_execution_feedback'] = []
+            short_term_memory.pop('probe_no_data_retry', None)
+            short_term_memory['probe_feedback_count'] = 0
+        execution_id = payload.get('execution_id')
+        if execution_id:
+            key = f'{execution_id}:{error_type}'
+            seen = short_term_memory.setdefault('seen_execution_feedback', [])
+            if key in seen:
+                return
+            seen.append(key)
+        if error_type == 'probe_feedback':
+            short_term_memory['probe_feedback_count'] = (
+                int(short_term_memory.get('probe_feedback_count') or 0) + 1
+            )
+        else:
+            diagnostics = payload.get('diagnostics') or {}
+            if isinstance(diagnostics, dict) and 'probe_no_data_retry_count' in diagnostics:
+                short_term_memory['probe_no_data_retry'] = {
+                    'count': diagnostics['probe_no_data_retry_count'],
+                    'limit': diagnostics.get('probe_no_data_retry_limit'),
+                    'limit_reached': diagnostics.get('probe_no_data_limit_reached', False),
+                    'last_error_type': error_type,
+                }
 
 
 def _update_short_term_memory_from_messages(runtime: ConversationRunContext, messages: list[Any]) -> None:
@@ -2304,231 +2838,45 @@ def _update_short_term_memory_from_messages(runtime: ConversationRunContext, mes
             _update_short_term_memory_from_tool_payload(runtime, payload)
 
 
-def _collect_probe_candidate_values(diagnostics: dict[str, Any]) -> list[tuple[str, str]]:
-    """从 probe diagnostics 中提取候选值文本。"""
-    if not isinstance(diagnostics, dict):
-        return []
-
-    collected: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for key, value in diagnostics.items():
-        lowered_key = str(key or '').lower()
-        if 'candidate' not in lowered_key:
-            continue
-        if not isinstance(value, list):
-            continue
-        for item in value:
-            candidate_text = ''
-            if isinstance(item, str):
-                candidate_text = item.strip()
-            elif isinstance(item, dict):
-                for candidate_field in ('value', 'name', 'material', 'candidate', 'text', 'label'):
-                    candidate_text = str(item.get(candidate_field) or '').strip()
-                    if candidate_text:
-                        break
-            if not candidate_text:
-                continue
-            signature = (str(key), candidate_text)
-            if signature in seen:
-                continue
-            seen.add(signature)
-            collected.append(signature)
-    return collected
-
-
-def _pick_exact_probe_candidate(user_query: str, diagnostics: dict[str, Any]) -> tuple[str, str]:
-    """当 probe 已给出足够明确的候选值时，挑选最接近用户原意的单个真实值。"""
-    candidates = _collect_probe_candidate_values(diagnostics)
-    if not candidates:
-        return '', ''
-    if len(candidates) == 1:
-        return candidates[0]
-
-    query_text = str(user_query or '').strip()
-    if not query_text:
-        return '', ''
-
-    matched = [
-        (key, candidate)
-        for key, candidate in candidates
-        if candidate and candidate in query_text
-    ]
-    if len(matched) == 1:
-        return matched[0]
-
-    return '', ''
-
-
 def _build_analysis_recovery_instruction(
     service: ConversationContextService,
     runtime: ConversationRunContext,
     round_index: int,
 ) -> str:
-    """为同一轮分析构造后续修复回合的运行时指令。"""
+    """Recover exact execution feedback without introducing new business rules."""
     executions = _load_turn_executions_fresh(runtime)
-    failed_errors = [
-        execution.error_message.strip()
-        for execution in executions
-        if execution.execution_status != 'success' and (execution.error_message or '').strip()
-    ]
-    latest_errors = [
-        _clip_retry_text(item, RETRY_ERROR_MAX_CHARS)
-        for item in failed_errors[-RETRY_LATEST_ERROR_LIMIT:]
-    ]
-    latest_error_types = [
-        error_type
-        for error_type in (_extract_execution_error_type(execution) for execution in executions)
-        if error_type
-    ][-3:]
-    failed_pattern_hints = _build_failed_pattern_hints(executions)
-    failure_summary = _build_failure_frequency_summary(executions)
+    feedback = _build_structured_execution_feedback(executions)
+    lines = [_build_continued_react_recovery_instruction()]
+    output = getattr(runtime, 'output_contract', None) or {'type': 'standard'}
+    lines.append('继续遵循当前输出协议：' + json.dumps(output, ensure_ascii=False))
+    if getattr(runtime, 'clarification_mode', 'same_turn') == 'same_turn':
+        lines.append('只有业务歧义无法由现有信息或 Probe 消除时，才调用 request_analysis_clarification；技术错误不交给用户澄清。')
+    else:
+        lines.append('当前调用不支持用户澄清；对无法确定的业务含义说明限制，不编造规则或指标值。')
     latest_repair_target = _get_latest_failed_repair_target(executions)
-    latest_probe_feedback_payload = next(
-        (
-            payload
-            for execution in reversed(executions)
-            for payload in [_extract_execution_payload(execution)]
-            if payload.get('error_type') == 'probe_feedback'
-        ),
-        {},
-    )
-    latest_probe_diagnostics = (
-        latest_probe_feedback_payload.get('diagnostics')
-        if isinstance(latest_probe_feedback_payload.get('diagnostics'), dict)
-        else {}
-    )
-    structured_execution_feedback = _build_structured_execution_feedback(
-        executions
-    )
-    exact_probe_candidate_key, exact_probe_candidate = _pick_exact_probe_candidate(
-        runtime.turn.user_query,
-        latest_probe_diagnostics,
-    )
-
-    lines = [
-        '本轮已经进入数据分析执行阶段。',
-        f'当前轮次累计执行了 {len(executions)} 次 Python 分析代码，但仍未成功生成完整分析产物。',
-    ]
     if latest_repair_target:
         lines.extend([
-            '最近失败代码已完整保存在不可变执行记录中；下面的引用和原始行号可用于理解失败位置。',
-            '只有独立的局部 API 参数、单个图表字段映射或语法拼写错误，才适合令 code="" 并使用 base_execution_id + patches 修补。',
-            '如果错误影响数据源字段、查询范围、JOIN、聚合粒度、计算变量、报告求值或最终产物结构，必须在当前完整洞察语义下重新提交完整 code，不能依赖局部 patch 保留旧数据流。',
+            'repair_target.allowed_ranges 是已核对的源码定位；可按该原版本行号提交局部 patches，合成后校验完整程序，不要求恰好替换整个定位范围。',
             json.dumps(latest_repair_target, ensure_ascii=False),
         ])
-    explicit_time_range_guard = getattr(runtime, 'short_term_memory', {}).get('explicit_time_range_guard', {})
-    if isinstance(explicit_time_range_guard, dict) and explicit_time_range_guard.get('active'):
+    if feedback:
         lines.extend([
-            '本轮短期记忆：用户问题里有明确时间范围，且本轮已经出现过无数据或探测反馈。',
-            '后续所有 analysis 代码必须保持用户原始时间范围对应的 query_constraints.time_range；不能改成 diagnostics、探测 SQL 或数据库实际数据覆盖范围。',
-            '如果目标时间范围内仍无数据，应返回无数据反馈或无数据结论，不要为了生成成功结果而改查其他时间范围。',
+            '以下是本次任务真实执行的反馈；Probe 观察不是执行失败，也不自动确定业务筛选条件：',
+            json.dumps(feedback, ensure_ascii=False),
         ])
-    probe_no_data_memory = getattr(runtime, 'short_term_memory', {}).get('probe_no_data_retry', {})
-    if isinstance(probe_no_data_memory, dict) and probe_no_data_memory.get('limit_reached'):
-        count = int(probe_no_data_memory.get('count') or 0)
-        limit = int(probe_no_data_memory.get('limit') or PROBE_NO_DATA_MEMORY_LIMIT)
-        lines.extend([
-            f'本轮已经连续出现 {count} 次 probe_feedback/no_data_found 反馈，已达到上限 {limit} 次。',
-            '下一步不要继续生成 probe 代码，不要继续猜测时序查询语法、字段名或表名，也不要扩大到其他数据源。',
-            '请直接切换为 execution_intent = "analysis"，保持用户原始问题和原始时间范围，调用 save_analysis_result(...) 以“无数据或数据源暂不可分析”的结论收口；如已探测过多个数据源，应在表格中列出已尝试的数据源和失败原因。',
-        ])
-    if latest_errors:
-        lines.append('最近的执行错误如下：')
-        lines.extend(f'- {item}' for item in latest_errors)
-    if structured_execution_feedback:
-        lines.extend([
-            '最近工具返回的结构化执行反馈如下。它是下一次修复的事实依据；必须消费其中的 diagnostics 和 repair_instructions，不能只根据错误摘要猜测。',
-            json.dumps(structured_execution_feedback, ensure_ascii=False),
-        ])
-    if latest_error_types:
-        lines.append(f'最近的结构化错误类型：{", ".join(latest_error_types)}。')
-
-    latest_error_type = latest_error_types[-1] if latest_error_types else ''
-    if latest_error_type in {'contract_error', 'missing_query_constraints', 'invalid_query_constraints'}:
-        lines.extend([
-            '最近失败发生在 execute_python 的静态契约检查阶段，上一版代码没有真正进入数据执行。',
-            '下一步必须重新调用 execute_python，并提交一份完整的新代码；不能只用自然语言说明，也不能直接结束本轮。',
-            '如果继续按分析执行：代码顶部必须声明 execution_intent = "analysis"，并一次性包含 query_constraints、validate_query_constraints(...)、数据加载、空数据检查、图表/表格构造和 result = save_analysis_result(...)。',
-            '如果只是探测字段、样例、候选值或数据覆盖：代码顶部必须声明 execution_intent = "probe"，并以 result = request_retry(...) 返回结构化探测反馈。',
-        ])
-
-    if failure_summary:
-        lines.append('本轮重复失败摘要如下，优先修复出现次数最多的问题，不要沿着同一错误反复试错：')
-        lines.extend(f'- {_clip_retry_text(item, RETRY_ERROR_MAX_CHARS)}' for item in failure_summary)
-
-    datasource_selection_hints = _build_possible_datasource_selection_hints(runtime, executions)
-    if datasource_selection_hints:
-        lines.append('本轮可能存在正式 analysis 数据源规划遗漏，请重新规划 used_datasource_ids：')
-        lines.extend(f'- {item}' for item in datasource_selection_hints)
-
-    if failed_pattern_hints:
-        lines.append('本轮已经确认的失败写法如下，新的修复代码中不要再次出现：')
-        lines.extend(f'- {item}' for item in failed_pattern_hints)
-
-    lines.extend([
-        '修复应保留已验证正确的业务口径和产物意图；但当错误影响数据流或结果表达时，应重建受影响的完整代码路径，不要用局部替换留下不一致的旧变量或占位文本。',
-        '修复技术错误时必须保持当前用户问题的输出语言；不得翻译或切换上一版已经形成的报告、图表和表格语言。',
-        '请直接修正完整 Python 代码并再次调用 execute_python。',
-    ])
-    if 'probe_feedback' in latest_error_types:
-        lines.append(
-            '最近一轮是 probe_feedback：探测阶段使用的 LIKE/contains 只用于确认候选值，下一版正式分析不能直接沿用这些模糊条件。'
-        )
-        lines.append(
-            '如果用户问题里有明确时间范围，不能把正式分析的 query_constraints.time_range 改成 diagnostics 里的数据覆盖范围；数据覆盖范围只能用于解释为什么目标时间窗无数据。'
-        )
-        lines.append(
-            '如果 probe 已确认用户明确时间范围内无数据，下一版应保持原始时间范围并调用 raise_no_data_error(...) 返回无数据反馈，不要为了命中数据改查其他时间范围。'
-        )
-        if exact_probe_candidate:
-            field_hint = '目标字段'
-            lowered_key = exact_probe_candidate_key.lower()
-            if 'material' in lowered_key:
-                field_hint = 'material'
-            lines.extend([
-                f'最近探测已给出足够明确的候选值：`{exact_probe_candidate}`。',
-                f"下一版必须切换为 execution_intent = \"analysis\"，并对 {field_hint} 使用单个精确筛选条件（例如 `{field_hint} = '{exact_probe_candidate}'`）；禁止继续使用 LIKE、ILIKE、contains、str.contains(...) 或前缀匹配。",
-            ])
-        else:
-            lines.append(
-                '如果 diagnostics 中候选值已经足够明确，应从中选择单个真实值收敛成精确筛选条件；不要把 probe 中的 LIKE/contains 直接延续到正式分析。'
-            )
-    if latest_error_type == 'chart_contract_error' or any(_is_chart_contract_error_text(item) for item in failed_errors):
-        lines.extend([
-            '本轮已出现图表产物契约错误。下一版必须把修复重点放在 charts 构造，不要重新发散数据查询逻辑。',
-            '禁止继续使用 matplotlib、base64 图片、手写 chart_spec 或自造 chart_type/chart_kind 结构。',
-            '请使用 build_chart_result(...)、build_multi_metric_chart_result(...) 或 build_chart_suite(...) 生成 charts；异常值、分布和四分位数场景使用 chart_kind="boxplot"；如果无法生成图表，则至少用 tables 返回结构化汇总。',
-        ])
-    elif latest_error_type in {'data_source_not_found', 'data_source_unavailable'}:
-        lines.extend([
-            '最近失败属于数据源不可用或数据源标识错误，不是 no_data_found。',
-            '不要调用 raise_no_data_error(...) 包装文件不存在、表不存在、路径不可访问或接口不可访问；raise_no_data_error 只用于数据源已成功加载后，过滤/关联/聚合结果为空。',
-            '只能原样使用当前数据源上下文提供的文件路径、表名或接口地址；如果已原样使用仍不可访问，应调用 request_retry(retry_type="data_source_unavailable", message=..., diagnostics=..., repair_instructions=...) 返回结构化反馈，或让本轮失败结束，不要伪装成空数据分析。',
-        ])
-    elif latest_error_type == 'no_data_found':
-        if any(_execution_has_time_series_empty_source_error(execution) for execution in executions):
-            lines.append(
-                '本轮已有时序数据源返回 unknown tag/no results：这些数据源视为当前没有可分析数据或尚未初始化。下一版应把这些数据源从独立分析范围中剔除，继续分析其他仍可查询的数据源；只有所有相关数据源都无数据时，才输出整体无数据结论。'
-            )
-        lines.append(
-            '最近失败属于 no_data_found：请优先检查时间过滤是否命中数据、过滤后数据集是否为空、关联结果是否为空；如果探测后仍为空，应调用 raise_no_data_error(...) 把“无数据”返回给 execute_python，而不是继续误改字段名或图表参数。'
-        )
-        lines.append(
-            '如果用户问题里有明确时间范围，必须继续保持该时间范围；不要把 query_constraints.time_range 改成探测到的数据覆盖范围来制造命中结果。'
-        )
-    else:
-        lines.append(
-            '只有在数据源已经成功加载后，过滤、关联或聚合结果为空时，才允许调用 raise_no_data_error(...)；文件、表或接口不可访问不属于无数据。'
-        )
-    lines.extend([
-        '不要向用户解释工具错误，不要再次询问用户，也不要用自然语言提前结束本轮。',
-        '只有成功生成完整的结构化图表结果和分析报告，这一轮分析才算完成。',
-    ])
-
     if round_index >= MAX_ANALYSIS_AGENT_ROUNDS - 1:
-        lines.append('这已经是本轮最后一次修复机会；如果仍无法完成，请让本轮以失败结束，而不是伪装成成功。')
+        lines.append('本次任务的执行预算即将用尽；未完成分析时如实说明，不能把预算耗尽当作无数据证明。')
+    return '\n'.join(lines)
 
-    return _clip_retry_text('\n'.join(lines), RETRY_RECOVERY_INSTRUCTION_MAX_CHARS)
+
+def _build_continued_react_recovery_instruction() -> str:
+    """Continue from exact tool feedback already present in one transcript."""
+    return (
+        '继续完成同一分析任务。请直接消费上方最近一次分析工具 ToolMessage 中的 '
+        'diagnostics、repair_instructions、失败代码和源码位置，在保持原问题、数据范围及产物意图的前提下修复；'
+        '已有观察足以实现分析时直接调用 submit_analysis_program；'
+        '若仍有影响答案的技术未知，可用 probe_analysis_data 核实，不重复已确认的观察。'
+    )
 
 
 def _extract_invoke_result(messages: list[Any]) -> tuple[str, str, list[dict[str, Any]], list[dict[str, Any]], bool]:
@@ -2579,6 +2927,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
             conversation_id=agent_request.conversation_id,
             user_message=agent_request.user_message,
         )
+    _apply_invocation_policy(runtime, agent_request)
     service = None
 
     selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)
@@ -2634,6 +2983,11 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
             )
 
         if isinstance(preparation, ScopeClarificationResult):
+            if runtime.clarification_mode == "disabled":
+                raise ValueError(
+                    "当前调用的分析范围仍存在关键歧义，且该调用模式不支持用户澄清："
+                    + preparation.assistant_message()
+                )
             _persist_scope_clarification(runtime, preparation)
             assistant_message = preparation.assistant_message()
             allow_report_only = True
@@ -2649,22 +3003,30 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 allow_report_only=allow_report_only,
             )
 
-        agent = _get_runtime_agent(
-            runtime_config,
-            analysis_request_expected=analysis_request_expected,
-        )
+        agent_round_messages: list[BaseMessage] | None = None
 
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
             _raise_if_analysis_task_cancelled(runtime)
+            agent = _get_runtime_agent(
+                runtime_config,
+                analysis_request_expected=analysis_request_expected,
+                clarification_mode=runtime.clarification_mode,
+            )
             runtime_instruction = ''
             if analysis_flow_started:
-                runtime_instruction = _build_analysis_recovery_instruction(
-                    service=service,
-                    runtime=runtime,
-                    round_index=round_index,
+                runtime_instruction = (
+                    _build_continued_react_recovery_instruction()
+                    if agent_round_messages
+                    else _build_analysis_recovery_instruction(
+                        service=service,
+                        runtime=runtime,
+                        round_index=round_index,
+                    )
                 )
             elif runtime.is_rerun:
-                runtime_instruction = _build_rerun_instruction(service, runtime)
+                runtime_instruction = _build_rerun_instruction(
+                    service, runtime, analysis_request_expected=analysis_request_expected,
+                )
             elif round_index == 0:
                 runtime_instruction = _build_regenerate_instruction(
                     service=service,
@@ -2684,16 +3046,29 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                         runtime=runtime,
                     )
             elif analysis_request_expected:
-                runtime_instruction = _build_analysis_start_instruction(agent_request.user_message)
+                runtime_instruction = _build_analysis_start_instruction(
+                    agent_request.user_message,
+                    str(runtime.output_contract.get("type") or "standard"),
+                )
 
+            agent_input = _build_runtime_agent_input(
+                agent_request=agent_request,
+                runtime=runtime,
+                analysis_request_expected=analysis_request_expected,
+                runtime_instruction=runtime_instruction,
+                preparation=preparation,
+                prior_messages=agent_round_messages,
+            )
+            round_input_messages = _agent_input_messages(agent_input)
+            _log_runtime_round_input(
+                runtime=runtime,
+                round_index=round_index,
+                mode="invoke",
+                messages=round_input_messages,
+            )
+            round_started_at = time.monotonic()
             agent_response = agent.invoke(
-                _build_runtime_agent_input(
-                    agent_request=agent_request,
-                    runtime=runtime,
-                    analysis_request_expected=analysis_request_expected,
-                    runtime_instruction=runtime_instruction,
-                    preparation=preparation,
-                ),
+                agent_input,
                 context=_build_agent_context(
                     agent_request,
                     runtime,
@@ -2701,9 +3076,31 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 ),
             )
             _raise_if_analysis_task_cancelled(runtime)
-            _update_short_term_memory_from_messages(runtime, agent_response.get('messages', []))
+            response_messages = list(agent_response.get('messages', []))
+            round_output_messages = _new_agent_round_messages(
+                round_input_messages,
+                response_messages,
+            )
+            agent_round_messages = _merge_agent_round_messages(
+                round_input_messages,
+                response_messages,
+            )
+            _log_runtime_round_output(
+                runtime=runtime,
+                round_index=round_index,
+                mode="invoke",
+                messages=round_output_messages,
+                transcript=agent_round_messages,
+                duration_seconds=time.monotonic() - round_started_at,
+            )
+            clarification = _extract_runtime_clarification(response_messages)
+            if clarification is not None:
+                raise ValueError(
+                    "当前分析需要用户补充业务定义，请通过异步分析接口完成同轮次澄清。"
+                )
+            _update_short_term_memory_from_messages(runtime, response_messages)
             assistant_message, analysis_report, charts, tables, raw_tool_call_detected = _extract_invoke_result(
-                agent_response.get('messages', [])
+                response_messages
             )
 
             # A general answer has no execution or artifact contract. In
@@ -2739,6 +3136,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 round_index=round_index,
                 has_any_artifact=bool((analysis_report or '').strip() or charts or tables),
                 assistant_message=assistant_message,
+                analysis_flow_started=analysis_flow_started,
             ):
                 analysis_report = _promote_assistant_message_to_report(assistant_message, analysis_report)
                 allow_report_only = True
@@ -2749,6 +3147,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 round_index=round_index,
                 has_any_artifact=bool((analysis_report or '').strip() or charts or tables),
                 assistant_message=assistant_message,
+                analysis_flow_started=analysis_flow_started,
             ):
                 assistant_message = _build_failure_reason_reply(
                     service=service,
@@ -2770,7 +3169,12 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 latest_failed_error_type = _latest_failed_execution_error_type(runtime)
                 if latest_failed_error_type in {'contract_error', 'missing_query_constraints', 'invalid_query_constraints'}:
                     raise ValueError('生成的分析代码未通过静态契约检查，且模型未按反馈重新生成可执行代码，请重试。')
-                _ensure_analysis_result_ready(analysis_report=analysis_report, charts=charts, tables=tables)
+                _ensure_analysis_result_ready(
+                    analysis_report=analysis_report,
+                    charts=charts,
+                    tables=tables,
+                    output_format=str(runtime.output_contract.get("type") or "standard"),
+                )
                 break
 
             if _should_require_rerun_analysis_execution(service, runtime, analysis_flow_started):
@@ -2828,6 +3232,9 @@ def _stream_with_runtime(
     agent_request: AgentRequest,
 ) -> Iterator[dict[str, Any]]:
     """在给定上下文中执行流式分析或重跑，并持续产出 SSE 事件。"""
+    # Keep this entry point self-contained: callers that resume or directly invoke
+    # the runtime must receive the same policy defaults as controller-driven calls.
+    _apply_invocation_policy(runtime, agent_request)
     assistant_message = ''
     analysis_report = ''
     charts: list[dict[str, Any]] = []
@@ -2940,6 +3347,11 @@ def _stream_with_runtime(
             return
 
         if isinstance(preparation, ScopeClarificationResult):
+            if runtime.clarification_mode == "disabled":
+                raise ValueError(
+                    "当前调用的分析范围仍存在关键歧义，且该调用模式不支持用户澄清："
+                    + preparation.assistant_message()
+                )
             _persist_scope_clarification(runtime, preparation)
             assistant_message = preparation.assistant_message()
             allow_report_only = True
@@ -2968,21 +3380,27 @@ def _stream_with_runtime(
             )
             return
 
-        agent = _get_runtime_agent(
-            runtime_config,
-            analysis_request_expected=analysis_request_expected,
-        )
+        agent_round_messages: list[BaseMessage] | None = None
 
         for round_index in range(MAX_ANALYSIS_AGENT_ROUNDS):
             _raise_if_analysis_task_cancelled(runtime)
+            agent = _get_runtime_agent(
+                runtime_config,
+                analysis_request_expected=analysis_request_expected,
+                clarification_mode=runtime.clarification_mode,
+            )
             raw_tool_call_detected = False
             runtime_instruction = ''
             tool_result_ready = False
             if analysis_flow_started:
-                runtime_instruction = _build_analysis_recovery_instruction(
-                    service=service,
-                    runtime=runtime,
-                    round_index=round_index,
+                runtime_instruction = (
+                    _build_continued_react_recovery_instruction()
+                    if agent_round_messages
+                    else _build_analysis_recovery_instruction(
+                        service=service,
+                        runtime=runtime,
+                        round_index=round_index,
+                    )
                 )
                 yield _build_progress_event(
                     'status',
@@ -2993,7 +3411,9 @@ def _stream_with_runtime(
                     message='本轮分析尚未完成，正在根据最近执行错误继续修正代码。',
                 )
             elif runtime.is_rerun:
-                runtime_instruction = _build_rerun_instruction(service, runtime)
+                runtime_instruction = _build_rerun_instruction(
+                    service, runtime, analysis_request_expected=analysis_request_expected,
+                )
             elif round_index == 0:
                 runtime_instruction = _build_regenerate_instruction(
                     service=service,
@@ -3013,7 +3433,10 @@ def _stream_with_runtime(
                         runtime=runtime,
                     )
             elif analysis_request_expected:
-                runtime_instruction = _build_analysis_start_instruction(agent_request.user_message)
+                runtime_instruction = _build_analysis_start_instruction(
+                    agent_request.user_message,
+                    str(runtime.output_contract.get("type") or "standard"),
+                )
                 yield _build_progress_event(
                     'status',
                     conversation_id=runtime.conversation.id,
@@ -3023,14 +3446,25 @@ def _stream_with_runtime(
                     message='正在重新引导模型进入分析执行阶段。',
                 )
 
+            agent_input = _build_runtime_agent_input(
+                agent_request=agent_request,
+                runtime=runtime,
+                analysis_request_expected=analysis_request_expected,
+                runtime_instruction=runtime_instruction,
+                preparation=preparation,
+                prior_messages=agent_round_messages,
+            )
+            round_input_messages = _agent_input_messages(agent_input)
+            _log_runtime_round_input(
+                runtime=runtime,
+                round_index=round_index,
+                mode="stream",
+                messages=round_input_messages,
+            )
+            round_started_at = time.monotonic()
+            streamed_messages: list[BaseMessage] = []
             for stream_mode, chunk in agent.stream(
-                _build_runtime_agent_input(
-                    agent_request=agent_request,
-                    runtime=runtime,
-                    analysis_request_expected=analysis_request_expected,
-                    runtime_instruction=runtime_instruction,
-                    preparation=preparation,
-                ),
+                agent_input,
                 context=_build_agent_context(
                     agent_request,
                     runtime,
@@ -3041,8 +3475,11 @@ def _stream_with_runtime(
                 _raise_if_analysis_task_cancelled(runtime)
                 if stream_mode == "updates":
                     for _, payload in chunk.items():
+                        if payload is None:
+                            continue
                         messages = payload.get("messages", [])
                         for message in messages:
+                            streamed_messages.append(message)
                             tool_calls = getattr(message, 'tool_calls', None)
                             raw_tool_call = _extract_raw_tool_call(getattr(message, 'content', ''))
                             cleaned = _clean_message_content(getattr(message, 'content', ''))
@@ -3139,6 +3576,39 @@ def _stream_with_runtime(
                             message=str(chunk),
                         )
 
+            agent_round_messages = _merge_agent_round_messages(
+                round_input_messages,
+                streamed_messages,
+            )
+            round_output_messages = _new_agent_round_messages(
+                round_input_messages,
+                streamed_messages,
+            )
+            _log_runtime_round_output(
+                runtime=runtime,
+                round_index=round_index,
+                mode="stream",
+                messages=round_output_messages,
+                transcript=agent_round_messages,
+                duration_seconds=time.monotonic() - round_started_at,
+            )
+
+            clarification = _extract_runtime_clarification(streamed_messages)
+            if clarification is not None:
+                yield {
+                    "type": "clarification_required",
+                    "stage": "runtime_clarification",
+                    "level": "info",
+                    "conversation_id": runtime.conversation.id,
+                    "turn_id": runtime.turn.id,
+                    "clarification": clarification,
+                    "_resume_context": _build_clarification_resume_context(
+                        preparation=preparation,
+                        runtime=runtime,
+                    ),
+                }
+                return
+
             if tool_result_ready:
                 analysis_flow_started = True
                 break
@@ -3176,6 +3646,7 @@ def _stream_with_runtime(
                 round_index=round_index,
                 has_any_artifact=bool((analysis_report or '').strip() or charts or tables),
                 assistant_message=assistant_message,
+                analysis_flow_started=analysis_flow_started,
             ):
                 analysis_report = _promote_assistant_message_to_report(assistant_message, analysis_report)
                 allow_report_only = True
@@ -3186,6 +3657,7 @@ def _stream_with_runtime(
                 round_index=round_index,
                 has_any_artifact=bool((analysis_report or '').strip() or charts or tables),
                 assistant_message=assistant_message,
+                analysis_flow_started=analysis_flow_started,
             ):
                 assistant_message = _build_failure_reason_reply(
                     service=service,
@@ -3207,7 +3679,12 @@ def _stream_with_runtime(
                 latest_failed_error_type = _latest_failed_execution_error_type(runtime)
                 if latest_failed_error_type in {'contract_error', 'missing_query_constraints', 'invalid_query_constraints'}:
                     raise ValueError('生成的分析代码未通过静态契约检查，且模型未按反馈重新生成可执行代码，请重试。')
-                _ensure_analysis_result_ready(analysis_report=analysis_report, charts=charts, tables=tables)
+                _ensure_analysis_result_ready(
+                    analysis_report=analysis_report,
+                    charts=charts,
+                    tables=tables,
+                    output_format=str(runtime.output_contract.get("type") or "standard"),
+                )
                 break
 
             if _should_require_rerun_analysis_execution(service, runtime, analysis_flow_started):
@@ -3299,6 +3776,7 @@ def stream_invoke_agent(agent_request: AgentRequest) -> Iterator[dict[str, Any]]
             conversation_id=agent_request.conversation_id,
             user_message=agent_request.user_message,
         )
+    _apply_invocation_policy(runtime, agent_request)
     service = None
 
     selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)
@@ -3423,13 +3901,27 @@ def stream_existing_turn_events(
             is_rerun=is_rerun,
             history_turn_limit=max(turn.turn_no - 1, 0) if is_rerun else None,
             analysis_task_id=analysis_task_id,
+            output_contract=normalize_output_contract(
+                agent_request.output_contract
+            ).to_dict(),
+            clarification_mode=normalize_clarification_mode(
+                agent_request.clarification_mode
+            ),
+            evidence_enabled=bool(agent_request.evidence_enabled),
         )
 
     with session_scope(expire_on_commit=False) as session:
         runtime = _load_runtime(session)
+    _apply_invocation_policy(runtime, agent_request)
     selected_model_token = bind_selected_model_id(agent_request.selected_llm_model_id)
     try:
-        _resolve_runtime_context_mode(runtime, agent_request.user_message)
+        clarification_context = dict(agent_request.clarification_context or {})
+        if clarification_context:
+            runtime.context_mode = str(
+                clarification_context.get("context_mode") or "fresh_analysis"
+            )
+        else:
+            _resolve_runtime_context_mode(runtime, agent_request.user_message)
         yield from _stream_with_runtime(None, runtime, agent_request)
     finally:
         reset_selected_model_id(selected_model_token)

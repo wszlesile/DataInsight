@@ -65,6 +65,7 @@ class InsightNsConversationService:
         namespace = self.session.query(InsightNamespace).filter(
             InsightNamespace.id == namespace_id_int,
             InsightNamespace.username == username,
+            InsightNamespace.namespace_kind == 'interactive',
             InsightNamespace.is_deleted == 0,
         ).first()
         if namespace is None:
@@ -93,6 +94,7 @@ class InsightNsConversationService:
         namespace = self.session.query(InsightNamespace).filter(
             InsightNamespace.id == namespace_id_int,
             InsightNamespace.username == username,
+            InsightNamespace.namespace_kind == 'interactive',
             InsightNamespace.is_deleted == 0,
         ).first()
         if namespace is None:
@@ -1540,9 +1542,15 @@ class InsightNsConversationService:
         conversation_id_int = to_int(conversation_id, 0)
         if conversation_id_int <= 0:
             return None
-        return self.session.query(InsightNsConversation).filter(
+        return self.session.query(InsightNsConversation).join(
+            InsightNamespace,
+            InsightNamespace.id == InsightNsConversation.insight_namespace_id,
+        ).filter(
             InsightNsConversation.id == conversation_id_int,
             InsightNsConversation.is_deleted == 0,
+            InsightNamespace.username == username,
+            InsightNamespace.namespace_kind == 'interactive',
+            InsightNamespace.is_deleted == 0,
         ).first()
 
     def _get_turn(self, conversation: InsightNsConversation, turn_id: Any) -> InsightNsTurn | None:

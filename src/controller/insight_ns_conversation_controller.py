@@ -342,6 +342,7 @@ class InsightNsConversationController(BaseController):
         session = SessionLocal()
         task_status = ''
         expected_task_id = ''
+        pending_clarification = None
         try:
             task = AnalysisTaskService(session).get_latest_task_for_turn(
                 username=username,
@@ -352,10 +353,28 @@ class InsightNsConversationController(BaseController):
                 return self.error_response('当前轮次没有可订阅的分析任务', 404)
             task_status = task.status or ''
             expected_task_id = task.task_id or ''
+            task_payload = AnalysisTaskService(session).serialize_task(task)
+            pending_clarification = task_payload.get("request", {}).get(
+                "pending_clarification"
+            )
         finally:
             session.close()
 
         def generate():
+            if (
+                task_status == "waiting_clarification"
+                and isinstance(pending_clarification, dict)
+            ):
+                yield encode_sse({
+                    "type": "clarification_required",
+                    "stage": "clarification",
+                    "level": "info",
+                    "task_id": expected_task_id,
+                    "conversation_id": conversation_id,
+                    "turn_id": turn_id,
+                    "clarification": pending_clarification,
+                })
+                return
             try:
                 redis_client = get_redis_client()
                 queue = AnalysisStreamQueue(
@@ -405,7 +424,7 @@ class InsightNsConversationController(BaseController):
                 event.setdefault('conversation_id', conversation_id)
                 event.setdefault('turn_id', turn_id)
                 yield encode_sse(event)
-                if event.get('type') in ('done', 'error'):
+                if event.get('type') in ('done', 'error', 'clarification_required'):
                     return
 
         return Response(generate(), mimetype='text/event-stream')
@@ -582,6 +601,19 @@ class InsightNsConversationController(BaseController):
                     'level': 'warning',
                     'message': '分析任务已取消',
                 }
+            if task_status == 'waiting_clarification' and task is not None:
+                task_payload = AnalysisTaskService(session).serialize_task(task)
+                clarification = task_payload.get('request', {}).get(
+                    'pending_clarification'
+                )
+                if isinstance(clarification, dict):
+                    return {
+                        **base_event,
+                        'type': 'clarification_required',
+                        'stage': 'clarification',
+                        'level': 'info',
+                        'clarification': clarification,
+                    }
             if task_status == 'success' or turn_status == 'success':
                 return {
                     **base_event,

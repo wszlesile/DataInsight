@@ -136,6 +136,194 @@ class AnalysisTaskServiceTestCase(unittest.TestCase):
         self.assertFalse(has_active)
         self.assertEqual("failed", saved.status)
 
+    def test_waiting_clarification_blocks_conversation_without_counting_worker(self):
+        task = self.service.create_task(
+            username="alice",
+            namespace_id=7,
+            conversation_id=19,
+            turn_id=39,
+            task_type="new_analysis",
+            request_payload={"user_message": "分析批次率"},
+        )
+        self.service.mark_running(task.task_id)
+        marked = self.service.mark_waiting_clarification(
+            task.task_id,
+            clarification={
+                "clarification_id": "clarify-1",
+                "question": "批次月份按哪个时间归属？",
+                "options": [],
+                "allow_free_text": True,
+            },
+            resume_context={"preparation": {"intent": {}}},
+        )
+        self.session.commit()
+
+        self.assertTrue(marked)
+        self.assertEqual(0, self.service.count_active_tasks("alice"))
+        self.assertTrue(self.service.has_active_conversation_task("alice", 19))
+        running = self.service.get_running_turn(username="alice", conversation_id=19)
+        self.assertEqual("waiting_clarification", running["status"])
+        self.assertEqual(
+            "clarify-1",
+            running["request"]["pending_clarification"]["clarification_id"],
+        )
+
+    def test_resume_clarification_is_atomic_and_uses_selected_semantic_value(self):
+        task = self.service.create_task(
+            username="alice",
+            namespace_id=7,
+            conversation_id=19,
+            turn_id=39,
+            task_type="new_analysis",
+            request_payload={"user_message": "分析批次率"},
+        )
+        self.service.mark_running(task.task_id)
+        self.service.mark_waiting_clarification(
+            task.task_id,
+            clarification={
+                "clarification_id": "clarify-1",
+                "question": "批次月份按哪个时间归属？",
+                "options": [{
+                    "id": "batch_start",
+                    "label": "按批次开始时间",
+                    "value": "批次月份按批次开始时间归属",
+                }],
+                "allow_free_text": True,
+            },
+        )
+
+        resumed, answer = self.service.resume_from_clarification(
+            task.task_id,
+            clarification_id="clarify-1",
+            answer_text="",
+            option_id="batch_start",
+        )
+        second_resume, _ = self.service.resume_from_clarification(
+            task.task_id,
+            clarification_id="clarify-1",
+            answer_text="按批次开始时间",
+            option_id="batch_start",
+        )
+
+        self.assertIsNotNone(resumed)
+        self.assertEqual("queued", resumed.status)
+        self.assertEqual("批次月份按批次开始时间归属", answer["resolved_value"])
+        self.assertIsNone(second_resume)
+
+    def test_batch_clarification_requires_every_answer_and_resumes_once(self):
+        task = self.service.create_task(
+            username="alice",
+            namespace_id=7,
+            conversation_id=19,
+            turn_id=40,
+            task_type="new_analysis",
+            request_payload={"user_message": "分析质量指标"},
+        )
+        self.service.mark_running(task.task_id)
+        self.service.mark_waiting_clarification(
+            task.task_id,
+            clarification={
+                "clarification_id": "clarify-batch",
+                "question": "请确认两项口径",
+                "items": [
+                    {
+                        "item_id": "first_pass",
+                        "question": "一次合格率如何定义？",
+                        "options": [],
+                        "allow_free_text": True,
+                        "semantic_scope": {"subject": "一次合格率"},
+                    },
+                    {
+                        "item_id": "oos_rate",
+                        "question": "OOS率按记录还是批次？",
+                        "options": [{
+                            "id": "batch",
+                            "label": "按批次",
+                            "value": "OOS率按批次计算",
+                        }],
+                        "allow_free_text": True,
+                        "semantic_scope": {"subject": "OOS批次率"},
+                    },
+                ],
+            },
+        )
+
+        incomplete, _ = self.service.resume_from_clarification(
+            task.task_id,
+            clarification_id="clarify-batch",
+            answer_text="",
+            answers=[{
+                "item_id": "first_pass",
+                "answer_text": "按批次，仅首检且全部首检记录合格",
+            }],
+        )
+        resumed, answer = self.service.resume_from_clarification(
+            task.task_id,
+            clarification_id="clarify-batch",
+            answer_text="",
+            answers=[
+                {
+                    "item_id": "first_pass",
+                    "answer_text": "按批次，仅首检且全部首检记录合格",
+                },
+                {"item_id": "oos_rate", "option_id": "batch"},
+            ],
+        )
+
+        self.assertIsNone(incomplete)
+        self.assertIsNotNone(resumed)
+        self.assertEqual("queued", resumed.status)
+        self.assertEqual(["一次合格率", "OOS批次率"], answer["target_subjects"])
+        self.assertEqual(2, len(answer["answers"]))
+        self.assertEqual("OOS率按批次计算", answer["answers"][1]["resolved_value"])
+
+    def test_option_only_clarification_rejects_free_text_and_unknown_option(self):
+        task = self.service.create_task(
+            username="alice",
+            namespace_id=7,
+            conversation_id=19,
+            turn_id=41,
+            task_type="new_analysis",
+            request_payload={"user_message": "分析批次率"},
+        )
+        self.service.mark_running(task.task_id)
+        self.service.mark_waiting_clarification(
+            task.task_id,
+            clarification={
+                "clarification_id": "clarify-option-only",
+                "question": "批次月份按哪个时间归属？",
+                "options": [{
+                    "id": "batch_start",
+                    "label": "按批次开始时间",
+                    "value": "批次月份按批次开始时间归属",
+                }],
+                "allow_free_text": False,
+            },
+        )
+
+        free_text_resume, _ = self.service.resume_from_clarification(
+            task.task_id,
+            clarification_id="clarify-option-only",
+            answer_text="按其他时间",
+        )
+        unknown_option_resume, _ = self.service.resume_from_clarification(
+            task.task_id,
+            clarification_id="clarify-option-only",
+            answer_text="",
+            option_id="unknown",
+        )
+        valid_resume, answer = self.service.resume_from_clarification(
+            task.task_id,
+            clarification_id="clarify-option-only",
+            answer_text="",
+            option_id="batch_start",
+        )
+
+        self.assertIsNone(free_text_resume)
+        self.assertIsNone(unknown_option_resume)
+        self.assertIsNotNone(valid_resume)
+        self.assertEqual("批次月份按批次开始时间归属", answer["resolved_value"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -509,6 +509,7 @@ class InsightNsRelDatasourceService:
         authorization: str,
         lake_rds_database_name: str = '',
         ts_query_source: str = '',
+        verify_access: bool = False,
     ) -> dict[str, int]:
         """Materialize semantic-center node IDs without changing user selections."""
         normalized_node_ids = list(dict.fromkeys(
@@ -518,6 +519,15 @@ class InsightNsRelDatasourceService:
             raise ValueError('semantic selection returned no UNS node IDs')
         if not authorization:
             raise ValueError('semantic UNS materialization requires authorization')
+
+        verified_detail_by_id = (
+            self.validate_uns_node_access(
+                uns_node_ids=normalized_node_ids,
+                authorization=authorization,
+            )
+            if verify_access
+            else {}
+        )
 
         rows = self.session.query(InsightDatasource).filter(
             InsightDatasource.datasource_type == 'table',
@@ -535,35 +545,16 @@ class InsightNsRelDatasourceService:
             if node_id not in datasource_by_node_id
         ]
         if missing_node_ids:
-            release_clean_session_connection(self.session)
-            detail_results = self._fetch_uns_details_in_parallel(
-                missing_node_ids,
-                authorization,
-            )
-            failed = [item for item in detail_results if not item.get('success')]
-            if failed:
-                raise ValueError(self._build_uns_failure_message(
-                    [
-                        {
-                            'id': item.get('id', ''),
-                            'message': item.get('message', 'UNS detail lookup failed'),
-                        }
-                        for item in failed
-                    ],
-                    'semantic UNS materialization failed',
-                ))
-            details: list[dict[str, Any]] = []
-            for item in detail_results:
-                requested_node_id = str(item.get('id') or '').strip()
-                detail = dict(item['detail'])
-                returned_node_id = str(detail.get('id') or '').strip()
-                if returned_node_id and returned_node_id != requested_node_id:
-                    raise ValueError(
-                        'UNS instance response node ID mismatch: '
-                        f'{requested_node_id} -> {returned_node_id}'
-                    )
-                detail['id'] = requested_node_id
-                details.append(detail)
+            if verified_detail_by_id:
+                details = [
+                    dict(verified_detail_by_id[node_id])
+                    for node_id in missing_node_ids
+                ]
+            else:
+                details = list(self.validate_uns_node_access(
+                    uns_node_ids=missing_node_ids,
+                    authorization=authorization,
+                ).values())
             data_types = {
                 str(detail.get('id') or '').strip(): self._normalize_uns_data_type(detail)
                 for detail in details
@@ -614,6 +605,57 @@ class InsightNsRelDatasourceService:
             node_id: int(datasource_by_node_id[node_id].id)
             for node_id in normalized_node_ids
         }
+
+    def validate_uns_node_access(
+        self,
+        *,
+        uns_node_ids: list[str],
+        authorization: str,
+    ) -> dict[str, dict[str, Any]]:
+        """Resolve every requested UNS node through the caller's authorization."""
+        normalized_node_ids = list(dict.fromkeys(
+            str(item or '').strip() for item in uns_node_ids if str(item or '').strip()
+        ))
+        if not normalized_node_ids:
+            raise ValueError('UNS node IDs cannot be empty')
+        if not authorization:
+            raise ValueError('UNS node access validation requires authorization')
+        release_clean_session_connection(self.session)
+        detail_results = self._fetch_uns_details_in_parallel(
+            normalized_node_ids,
+            authorization,
+        )
+        failed = [item for item in detail_results if not item.get('success')]
+        if failed:
+            raise ValueError(self._build_uns_failure_message(
+                [
+                    {
+                        'id': item.get('id', ''),
+                        'message': item.get('message', 'UNS detail lookup failed'),
+                    }
+                    for item in failed
+                ],
+                'UNS node access validation failed',
+            ))
+
+        detail_by_id: dict[str, dict[str, Any]] = {}
+        for item in detail_results:
+            requested_node_id = str(item.get('id') or '').strip()
+            detail = dict(item.get('detail') or {})
+            returned_node_id = str(detail.get('id') or '').strip()
+            if returned_node_id and returned_node_id != requested_node_id:
+                raise ValueError(
+                    'UNS instance response node ID mismatch: '
+                    f'{requested_node_id} -> {returned_node_id}'
+                )
+            detail['id'] = requested_node_id
+            detail_by_id[requested_node_id] = detail
+        missing = [
+            node_id for node_id in normalized_node_ids if node_id not in detail_by_id
+        ]
+        if missing:
+            raise ValueError(f'UNS node IDs could not be validated: {missing}')
+        return detail_by_id
 
     def _build_uns_failure_message(
         self,

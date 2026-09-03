@@ -1,5 +1,6 @@
 import ast
 import hashlib
+import inspect
 import json
 import math
 import multiprocessing as mp
@@ -42,6 +43,7 @@ from utils import (
     normalize_ts_query_source,
 )
 from utils.analysis_task_cancel import AnalysisTaskCancelled, CANCELLED_MESSAGE, is_analysis_task_cancelled
+from agent.invocation_policy import validate_json_output
 
 CURRENT_USERNAME = ContextVar('current_username', default='anonymous')
 CURRENT_EXPECTED_TIME_RANGE = ContextVar('current_expected_time_range', default={})
@@ -52,15 +54,18 @@ CURRENT_LAST_QUERY_KEY = ContextVar('current_last_query_key', default='')
 CURRENT_DATASOURCE_NUMERIC_FIELDS = ContextVar('current_datasource_numeric_fields', default=[])
 CURRENT_EXECUTION_INTENT = ContextVar('current_execution_intent', default='')
 CURRENT_CONFIRMED_NO_DATA_RESULT = ContextVar('current_confirmed_no_data_result', default=False)
+CURRENT_OUTPUT_CONTRACT = ContextVar(
+    'current_output_contract',
+    default={"type": "standard"},
+)
 
 TOOL_ERROR_CURRENT_CODE_MAX_CHARS = int(os.environ.get('TOOL_ERROR_CURRENT_CODE_MAX_CHARS', '3500'))
 TOOL_ERROR_TEXT_MAX_CHARS = int(os.environ.get('TOOL_ERROR_TEXT_MAX_CHARS', '1800'))
 TOOL_ERROR_PREVIOUS_ITEM_MAX_CHARS = int(os.environ.get('TOOL_ERROR_PREVIOUS_ITEM_MAX_CHARS', '700'))
-TOOL_ERROR_INSTRUCTION_MAX_CHARS = int(os.environ.get('TOOL_ERROR_INSTRUCTION_MAX_CHARS', '700'))
 TOOL_ERROR_STDIO_MAX_CHARS = int(os.environ.get('TOOL_ERROR_STDIO_MAX_CHARS', '800'))
 TOOL_ERROR_CODE_CONTEXT_MAX_CHARS = int(os.environ.get('TOOL_ERROR_CODE_CONTEXT_MAX_CHARS', '1800'))
 PROBE_NO_DATA_RETRY_LIMIT = max(int(os.environ.get('PROBE_NO_DATA_RETRY_LIMIT', '3') or 3), 1)
-PROBE_NO_DATA_RETRY_TYPES = {'probe_feedback', 'no_data_found'}
+PROBE_NO_DATA_RETRY_TYPES = {'no_data_found'}
 GENERATED_CODE_FILENAME = '<generated_analysis_code>'
 GENERATED_CODE_CONTEXT_RADIUS = 8
 FRONTEND_TOOL_RETRY_MESSAGE = '分析代码规范需要调整，正在反馈给大模型重新生成。'
@@ -283,6 +288,7 @@ def _clip_retry_context_list(items: list[Any] | None, max_items: int, max_chars:
 def _is_chart_contract_error_message(error_message: str) -> bool:
     lowered = (error_message or '').lower()
     if any(marker in lowered for marker in (
+        'chart_semantic_error',
         'structured chart item',
         'chart_document',
         'chart_spec',
@@ -380,21 +386,161 @@ def _build_generated_code_error_context(
                 ]
 
     statement_ranges = _source_statement_patch_ranges(code, line_no)
+    if (
+        not statement_ranges
+        and isinstance(error, SyntaxError)
+        and line_no is not None
+        and 1 <= line_no <= len(code_lines)
+    ):
+        local_start = max(1, line_no - GENERATED_CODE_CONTEXT_RADIUS)
+        local_end = min(len(code_lines), line_no + GENERATED_CODE_CONTEXT_RADIUS)
+        statement_ranges = [{
+            'start_line': line_no,
+            'end_line': line_no,
+            'kind': 'SyntaxErrorLine',
+            'source': code_lines[line_no - 1],
+            'role': 'syntax_error_line',
+        }, {
+            'start_line': local_start,
+            'end_line': local_end,
+            'kind': 'SyntaxRepairWindow',
+            'source': '\n'.join(code_lines[local_start - 1:local_end]),
+            'role': 'nearby_same_root_syntax_repair',
+        }]
     if line_no and any(
         marker in str(error or '').lower()
         for marker in ('query result exceeds', 'rows, please update query conditions')
     ):
         statement_ranges = _extend_query_dependency_ranges(code, line_no, statement_ranges)
 
+    symbol_references = _generated_code_error_symbol_references(code, error)
+    related_contexts: list[dict[str, Any]] = []
+    for reference in symbol_references:
+        reference_line = int(reference.get('line_no') or 0)
+        if reference_line == line_no:
+            continue
+        context = _static_node_code_context_by_line(code, reference_line)
+        if context and context not in related_contexts:
+            related_contexts.append(context)
+    for context in related_contexts:
+        for item in context.get('suggested_patch_ranges') or []:
+            if item not in statement_ranges:
+                statement_ranges.append(item)
+
     return {
         'filename': GENERATED_CODE_FILENAME,
+        'location_domain': 'python_source',
         'line_no': line_no,
         'column_no': column_no,
         'error_line': error_line,
         'context_lines': context_lines,
         'related_context_lines': related_context_lines,
+        'related_contexts': related_contexts,
+        'symbol_references': symbol_references,
         'suggested_patch_ranges': statement_ranges,
         'traceback_excerpt': _clip_retry_context_text(traceback_text, TOOL_ERROR_CODE_CONTEXT_MAX_CHARS),
+    }
+
+
+def _generated_code_error_symbols(error: Exception) -> list[str]:
+    """Return identifier-like names implicated by a runtime lookup failure."""
+    candidates: list[str] = []
+    if isinstance(error, NameError):
+        name = str(getattr(error, 'name', '') or '').strip()
+        if name:
+            candidates.append(name)
+    if isinstance(error, KeyError) and getattr(error, 'args', None):
+        value = error.args[0]
+        if isinstance(value, str):
+            candidates.append(value.strip())
+
+    message = str(error or '')
+    candidates.extend(re.findall(r"name ['\"]([A-Za-z_]\w*)['\"] is not defined", message))
+    candidates.extend(re.findall(r"['\"]([A-Za-z_]\w*)['\"]", message))
+
+    normalized: list[str] = []
+    for candidate in candidates:
+        candidate = str(candidate or '').strip()
+        if not re.fullmatch(r'[A-Za-z_]\w*', candidate):
+            continue
+        if candidate not in normalized:
+            normalized.append(candidate)
+    return normalized[:8]
+
+
+def _generated_code_error_symbol_references(
+    code: str,
+    error: Exception,
+) -> list[dict[str, Any]]:
+    """Locate every static use of a failed variable or column identifier."""
+    symbols = _generated_code_error_symbols(error)
+    if not symbols:
+        return []
+    try:
+        tree = ast.parse(str(code or ''))
+    except SyntaxError:
+        return []
+
+    references: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, int]] = set()
+    for node in ast.walk(tree):
+        symbol = ''
+        kind = ''
+        if isinstance(node, ast.Name) and node.id in symbols:
+            symbol = node.id
+            kind = 'python_name'
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in symbols
+        ):
+            symbol = node.value
+            kind = 'string_identifier'
+        if not symbol:
+            continue
+        line_no = int(getattr(node, 'lineno', 0) or 0)
+        column_no = int(getattr(node, 'col_offset', 0) or 0) + 1
+        identity = (symbol, line_no, column_no)
+        if line_no <= 0 or identity in seen:
+            continue
+        seen.add(identity)
+        references.append({
+            'symbol': symbol,
+            'kind': kind,
+            'line_no': line_no,
+            'column_no': column_no,
+        })
+    return sorted(
+        references,
+        key=lambda item: (item['line_no'], item['column_no'], item['symbol']),
+    )[:24]
+
+
+def _static_node_code_context_by_line(code: str, line_no: int) -> dict[str, Any]:
+    """Build a verified patch context for the smallest statement at a line."""
+    ranges = _source_statement_patch_ranges(code, line_no)
+    if not ranges:
+        return {}
+    source_lines = str(code or '').splitlines()
+    start = max(1, line_no - GENERATED_CODE_CONTEXT_RADIUS)
+    end = min(len(source_lines), line_no + GENERATED_CODE_CONTEXT_RADIUS)
+    return {
+        'filename': GENERATED_CODE_FILENAME,
+        'location_domain': 'python_source',
+        'line_no': line_no,
+        'column_no': None,
+        'error_line': source_lines[line_no - 1] if 1 <= line_no <= len(source_lines) else '',
+        'context_lines': [
+            {
+                'line_no': current_line_no,
+                'code': source_lines[current_line_no - 1],
+                'is_error_line': current_line_no == line_no,
+            }
+            for current_line_no in range(start, end + 1)
+        ],
+        'related_context_lines': [],
+        'suggested_patch_ranges': ranges,
+        'traceback_excerpt': '',
     }
 
 
@@ -1494,6 +1640,15 @@ def _time_range_literal_candidates(value: Any) -> set[str]:
         return set()
 
     candidates = {text}
+    midnight_match = re.fullmatch(
+        r'(\d{4}-\d{2}-\d{2})[T ]00:00(?::00)?(?:Z|[+-]\d{2}:?\d{2})?',
+        text,
+    )
+    if midnight_match:
+        # A half-open DATE boundary and an explicitly supplied midnight can
+        # denote the same business-day boundary. This comparison must not
+        # mutate the caller's original parameter representation.
+        candidates.add(midnight_match.group(1))
     if ' ' in text and 'T' not in text:
         candidates.add(text.replace(' ', 'T'))
         if re.fullmatch(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}', text):
@@ -1610,6 +1765,46 @@ def _find_malformed_ts_query_literal(sql: str) -> dict[str, Any] | None:
                 }
             index += 1
     return None
+
+
+def _find_fedquery_scalar_cte_references(sql: str) -> list[str]:
+    """Return CTE aliases used from scalar subqueries unsupported by FedQuery.
+
+    FedQuery qualifies physical table names before execution. CTE references
+    in a statement's main FROM/JOIN path are preserved, while a CTE referenced
+    from a SELECT scalar subquery is currently qualified as a physical table.
+    Detect that narrow unsupported shape without rejecting ordinary or chained
+    CTEs.
+    """
+    try:
+        from sqlglot import exp, parse
+
+        statements = parse(_normalize_sql_driver_placeholders(sql))
+    except Exception:
+        return []
+
+    unsupported: set[str] = set()
+    for statement in statements:
+        if not isinstance(statement, exp.Expression):
+            continue
+        with_clause = statement.args.get("with_")
+        if not isinstance(with_clause, exp.With):
+            continue
+        cte_aliases = {
+            str(cte.alias_or_name or "").strip().lower()
+            for cte in with_clause.expressions
+            if isinstance(cte, exp.CTE) and str(cte.alias_or_name or "").strip()
+        }
+        if not cte_aliases:
+            continue
+        for table in statement.find_all(exp.Table):
+            alias = str(table.name or "").strip().lower()
+            if not alias or alias not in cte_aliases or table.db or table.catalog:
+                continue
+            subquery = table.find_ancestor(exp.Subquery)
+            if subquery is not None and not isinstance(subquery.parent, (exp.From, exp.Join)):
+                unsupported.add(alias)
+    return sorted(unsupported)
 
 
 def _validate_sql_context_fragments(
@@ -2052,6 +2247,7 @@ def load_data_with_sql(
             _mark_latest_query_snapshot_execution(
                 status='failed',
                 duration_ms=int((time.time() - start_time) * 1000),
+                diagnostics={'error_type': error_type, 'error_message': str(exc)},
             )
         raise
     _mark_latest_query_snapshot_execution(
@@ -2066,18 +2262,61 @@ def load_data_with_sql(
     return data
 
 
+class ProbeQueryFailure(RuntimeError):
+    """Preserve the query failure when inspection is attempted on a failed Probe."""
+
+    def __init__(self, error_type: str, message: str) -> None:
+        super().__init__(message or 'Probe query failed; no DataFrame is available.')
+        self.error_type = error_type or 'runtime_error'
+
+
+class ProbeQueryOutcome(dict[str, Any]):
+    """Query observation envelope; its data member is the separate DataFrame."""
+
+    def _dataframe(self):
+        import pandas as pd
+
+        if self.get('status') == 'query_error':
+            raise ProbeQueryFailure(
+                str(self.get('error_type') or ''),
+                str(self.get('error_message') or ''),
+            )
+        data = self.get('data')
+        return data if isinstance(data, pd.DataFrame) else pd.DataFrame()
+
+    @property
+    def success(self) -> bool:
+        return self.get('status') == 'success'
+
+    @property
+    def no_data(self) -> bool:
+        return self.get('status') == 'no_data'
+
+    def __getattr__(self, name: str):
+        if name.startswith('__') and name.endswith('__'):
+            raise AttributeError(name)
+        if name in self:
+            return self[name]
+        if self.get('status') == 'query_error':
+            self._dataframe()
+        raise AttributeError(
+            f'ProbeQueryOutcome has no attribute {name!r}. '
+            'Check status first; successful query rows are in outcome.data, not the outcome envelope.'
+        )
+
+
 def probe_data_with_sql(
     sql: str,
     params: Optional[list[Any]] = None,
     numeric_columns: Optional[list[str]] = None,
     text_columns: Optional[list[str]] = None,
-) -> dict[str, Any]:
+) -> ProbeQueryOutcome:
     """Execute one diagnostic SQL query without hiding its outcome.
 
     Probe programs often need to inspect several independent candidate queries.
     This wrapper keeps query failures as structured observations so one invalid
     candidate does not force generated code to invent broad exception handling.
-    Formal analysis code must continue to use ``load_data_with_sql`` directly.
+    Formal analysis uses the regular query helpers and re-queries its population.
     """
     if CURRENT_EXECUTION_INTENT.get() != "probe":
         raise RuntimeError("probe_data_with_sql(...) is only available to probe code")
@@ -2091,20 +2330,20 @@ def probe_data_with_sql(
     except Exception as exc:
         error_message = str(exc)
         error_type = _classify_execution_error(exc, error_message)
-        return {
+        return ProbeQueryOutcome({
             "status": "no_data" if error_type == "no_data_found" else "query_error",
             "data": None,
-            "row_count": 0,
+            "row_count": 0 if error_type == "no_data_found" else None,
             "error_type": error_type,
             "error_message": error_message,
-        }
-    return {
+        })
+    return ProbeQueryOutcome({
         "status": "success",
         "data": data,
         "row_count": int(len(data)),
         "error_type": "",
         "error_message": "",
-    }
+    })
 
 
 def _restore_sql_projection_column_names(sql: str, data: Any) -> Any:
@@ -2302,7 +2541,7 @@ def _infer_schema_numeric_result_columns(sql: str, result_columns: list[Any]) ->
 
 
 def _infer_sql_aggregate_numeric_columns(sql: str) -> list[str]:
-    """Infer unambiguously numeric aggregate and date-part projection aliases."""
+    """Infer aliases whose SQL expression has an unambiguous numeric result."""
     try:
         from sqlglot import exp, parse
     except Exception:
@@ -2313,6 +2552,53 @@ def _infer_sql_aggregate_numeric_columns(sql: str) -> list[str]:
         statements = parse(_normalize_sql_driver_placeholders(sql))
     except Exception:
         return []
+
+    def is_numeric_literal(node: Any) -> bool:
+        if isinstance(node, exp.Literal):
+            return bool(node.is_number)
+        if isinstance(node, exp.Null):
+            return True
+        if isinstance(node, exp.Neg):
+            return is_numeric_literal(node.this)
+        if isinstance(node, exp.Cast):
+            target = str(node.args.get("to") or "").upper()
+            return any(token in target for token in (
+                "INT", "DECIMAL", "NUMERIC", "FLOAT", "DOUBLE", "REAL",
+            ))
+        return False
+
+    def is_numeric_case(node: Any) -> bool:
+        if not isinstance(node, exp.Case):
+            return False
+        values = [
+            item.args.get("true")
+            for item in node.args.get("ifs") or []
+            if isinstance(item, exp.If)
+        ]
+        default = node.args.get("default")
+        if default is not None:
+            values.append(default)
+        return bool(values) and all(is_numeric_literal(value) for value in values)
+
+    def is_numeric_expression(node: Any) -> bool:
+        if is_numeric_literal(node):
+            return True
+        if isinstance(node, (exp.TimestampDiff, exp.DateDiff, exp.Extract)):
+            return True
+        if isinstance(node, (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod, exp.Pow)):
+            return is_numeric_expression(node.left) and is_numeric_expression(node.right)
+        if isinstance(node, exp.Neg):
+            return is_numeric_expression(node.this)
+        if isinstance(node, exp.Case):
+            return is_numeric_case(node)
+        if isinstance(node, exp.Anonymous):
+            function_name = str(node.name or "").strip().upper()
+            return function_name in {
+                "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
+                "DATEDIFF", "TIMESTAMPDIFF",
+            }
+        return False
+
     for statement in statements:
         selects = list(statement.find_all(exp.Select))
         if isinstance(statement, exp.Select):
@@ -2320,8 +2606,14 @@ def _infer_sql_aggregate_numeric_columns(sql: str) -> list[str]:
         for select in selects:
             for projection in select.expressions:
                 aggregate_nodes = list(projection.find_all(exp.AggFunc))
-                numeric_aggregate = bool(aggregate_nodes) and not all(
-                    isinstance(node, (exp.Min, exp.Max)) for node in aggregate_nodes
+                numeric_minmax_case = any(
+                    isinstance(node, (exp.Min, exp.Max))
+                    and is_numeric_case(node.this)
+                    for node in aggregate_nodes
+                )
+                numeric_aggregate = bool(aggregate_nodes) and (
+                    numeric_minmax_case
+                    or not all(isinstance(node, (exp.Min, exp.Max)) for node in aggregate_nodes)
                 )
                 date_part_projection = bool(list(projection.find_all(exp.Extract)))
                 if not date_part_projection:
@@ -2340,7 +2632,14 @@ def _infer_sql_aggregate_numeric_columns(sql: str) -> list[str]:
                             str(direct_expression.name or ""),
                         ))
                     )
-                if not numeric_aggregate and not date_part_projection:
+                deterministic_numeric_expression = is_numeric_expression(
+                    projection.this if isinstance(projection, exp.Alias) else projection
+                )
+                if (
+                    not numeric_aggregate
+                    and not date_part_projection
+                    and not deterministic_numeric_expression
+                ):
                     continue
                 alias = str(projection.alias_or_name or "").strip()
                 if alias and alias not in result:
@@ -2504,15 +2803,31 @@ def _register_query_snapshot(
     snapshots = dict(CURRENT_QUERY_SNAPSHOTS.get() or {})
     sql_text, sql_truncated = _clip_snapshot_text(sql, QUERY_SNAPSHOT_SQL_MAX_CHARS)
     sql_context_json, sql_context_truncated = _clip_snapshot_json(sql_context or {}, QUERY_SNAPSHOT_CONTEXT_MAX_CHARS)
+    normalized_query_scope = _normalize_query_scope(
+        query_key=query_key,
+        query_constraints=query_constraints,
+        query_scope=query_scope,
+    )
+    scope_source_query_key = str(
+        normalized_query_scope.get("scope_source_query_key") or ""
+    ).strip()
+    inherited_analysis_scope = None
+    if scope_source_query_key:
+        parent_snapshot = snapshots.get(scope_source_query_key)
+        if isinstance(parent_snapshot, dict):
+            inherited_analysis_scope = _copy_jsonable(
+                parent_snapshot.get("analysis_scope") or {},
+                {},
+            )
     snapshot = {
         "query_key": query_key,
         "query_constraints": _copy_jsonable(query_constraints, {}),
-        "analysis_scope": _analysis_scope_from_query_constraints(query_constraints),
-        "query_scope": _normalize_query_scope(
-            query_key=query_key,
-            query_constraints=query_constraints,
-            query_scope=query_scope,
+        "analysis_scope": (
+            inherited_analysis_scope
+            if inherited_analysis_scope is not None
+            else _analysis_scope_from_query_constraints(query_constraints)
         ),
+        "query_scope": normalized_query_scope,
         "implementation": {
             "sql": sql_text,
             "sql_hash": hashlib.sha256(str(sql or '').encode('utf-8')).hexdigest() if str(sql or '').strip() else '',
@@ -2523,6 +2838,11 @@ def _register_query_snapshot(
             "aggregation_hints": _copy_jsonable(aggregation_hints or [], []),
             "sql_context": sql_context_json,
             "sql_context_truncated": sql_context_truncated,
+            "scope_source_query_key": scope_source_query_key,
+            "scope_binding": _copy_jsonable(
+                normalized_query_scope.get("scope_binding") or {},
+                {},
+            ),
         },
         "execution": {
             "status": "validated",
@@ -2773,6 +3093,25 @@ def _begin_loader_snapshot_execution(
     parent = snapshots.get(parent_key) if parent_key else None
     parent = parent if isinstance(parent, dict) else {}
     parent_implementation = parent.get('implementation') if isinstance(parent.get('implementation'), dict) else {}
+    parent_execution = parent.get('execution') if isinstance(parent.get('execution'), dict) else {}
+    if (
+        parent_key
+        and parent_execution.get('status') == 'validated'
+        and not parent_implementation.get('physical_execution')
+    ):
+        parent_implementation.update({
+            'loader': loader,
+            'datasource_identifier': identifier,
+            'loader_options': _copy_jsonable(options or {}, {}),
+            'access_hash': access_hash,
+            'physical_execution': True,
+        })
+        parent['implementation'] = parent_implementation
+        parent['execution'] = {'status': 'running'}
+        snapshots[parent_key] = parent
+        CURRENT_QUERY_SNAPSHOTS.set(snapshots)
+        CURRENT_LAST_QUERY_KEY.set(parent_key)
+        return
     scope_source_key = str(parent_implementation.get('scope_source_query_key') or '').strip()
     if scope_source_key and isinstance(snapshots.get(scope_source_key), dict):
         parent_key = scope_source_key
@@ -2937,8 +3276,7 @@ def describe_time_coverage(dataframe, column_name: str) -> dict[str, Any]:
             'max_time': None,
         }
 
-    if not isinstance(dataframe, pd.DataFrame):
-        dataframe = pd.DataFrame(dataframe)
+    dataframe = _ensure_probe_dataframe(dataframe)
 
     if column_name not in dataframe.columns:
         raise KeyError(column_name)
@@ -3069,6 +3407,20 @@ def _ensure_probe_dataframe(dataframe):
         return pd.DataFrame()
     if isinstance(dataframe, pd.DataFrame):
         return dataframe
+    if isinstance(dataframe, ProbeQueryOutcome):
+        return dataframe._dataframe()
+    if isinstance(dataframe, dict) and 'data' in dataframe:
+        if dataframe.get('status') == 'query_error':
+            raise ProbeQueryFailure(
+                str(dataframe.get('error_type') or ''),
+                str(dataframe.get('error_message') or ''),
+            )
+        nested = dataframe.get('data')
+        if nested is None:
+            return pd.DataFrame()
+        if isinstance(nested, pd.DataFrame):
+            return nested
+        return pd.DataFrame(nested)
     return pd.DataFrame(dataframe)
 
 
@@ -3099,7 +3451,12 @@ def _serialize_probe_value(value: Any) -> Any:
     return value.item() if hasattr(value, 'item') else value
 
 
-def build_markdown_table(dataframe, columns: Optional[list[Any]] = None, max_rows: int = 10) -> str:
+def build_markdown_table(
+    dataframe,
+    columns: Optional[list[Any]] = None,
+    max_rows: int = 10,
+    value_precision: Optional[int] = None,
+) -> str:
     """
     把 DataFrame 转成 Markdown 表格文本。
 
@@ -3108,11 +3465,18 @@ def build_markdown_table(dataframe, columns: Optional[list[Any]] = None, max_row
     如果当前分析任务并不需要表格展示，则不必使用它。
     columns 可以传字符串列表，也可以传 {"key": ..., "label": ...} 列表；
     当 DataFrame 使用底层字段名时，应使用后一种形式提供用户可读表头。
+    value_precision 用于统一控制浮点数展示精度；不传时沿用默认的两位精度。
     """
     import pandas as pd
 
     if dataframe is None:
         return ''
+
+    if value_precision is not None:
+        if isinstance(value_precision, bool) or not isinstance(value_precision, int):
+            raise ValueError('build_markdown_table.value_precision 必须是 0 到 10 的整数。')
+        if value_precision < 0 or value_precision > 10:
+            raise ValueError('build_markdown_table.value_precision 必须是 0 到 10 的整数。')
 
     if not isinstance(dataframe, pd.DataFrame):
         dataframe = pd.DataFrame(dataframe)
@@ -3144,7 +3508,8 @@ def build_markdown_table(dataframe, columns: Optional[list[Any]] = None, max_row
 
     def _stringify(value: Any) -> str:
         if isinstance(value, float):
-            return f"{value:,.2f}".rstrip('0').rstrip('.')
+            precision = 2 if value_precision is None else value_precision
+            return f"{value:,.{precision}f}".rstrip('0').rstrip('.')
         return re.sub(r'\s+', ' ', str(value)).strip()
 
     headers = [header_labels.get(str(column), str(column)) for column in table_df.columns]
@@ -3168,6 +3533,14 @@ class StructuredResult(BaseModel):
     analysis_parameters_schema: dict[str, Any] = Field(default_factory=dict, description="Reusable parameter schema")
     analysis_parameters: dict[str, Any] = Field(default_factory=dict, description="Actual parameter values")
     query_snapshots: dict[str, Any] = Field(default_factory=dict, description="Runtime query snapshots collected by backend")
+    output_format: Literal["standard", "text", "json"] = Field(
+        default="standard",
+        description="当前调用采用的结果协议。",
+    )
+    output_payload: Any = Field(
+        default=None,
+        description="纯文本或 JSON 调用的原始结果；standard 模式为空。",
+    )
 
 
 class RetryResult(BaseModel):
@@ -3211,6 +3584,14 @@ class NoDataFoundError(Exception):
         super().__init__(normalized_reason)
 
 
+class QueryConstraintRetrySignal(Exception):
+    """Internal control signal for the composed query API."""
+
+    def __init__(self, retry_result: RetryResult):
+        self.retry_result = retry_result
+        super().__init__(retry_result.message)
+
+
 PROBE_TIME_RANGE_DRIFT_PATTERNS = (
     re.compile(r'真实数据覆盖范围.*重新生成分析代码'),
     re.compile(r'数据覆盖范围.*重新生成分析代码'),
@@ -3251,6 +3632,8 @@ def _normalize_probe_feedback_repair_instructions(instructions: list[str]) -> li
 
 
 _PROBE_POPULATION_COUNT_FIELDS = {
+    "cnt",
+    "count",
     "row_count",
     "total_count",
     "population_count",
@@ -3265,14 +3648,19 @@ _PROBE_POPULATION_COUNT_FIELDS = {
 def _extract_probe_population_counts(observation: dict[str, Any]) -> dict[str, int]:
     """Read explicit population aggregates without confusing them with result rows."""
     data = observation.get("data")
+    if data is None:
+        data = observation.get("rows")
     records = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
-    counts: dict[str, int] = {}
+    values_by_key: dict[str, list[int]] = {}
     for record in records:
         if not isinstance(record, dict):
             continue
         for raw_key, raw_value in record.items():
             key = str(raw_key or "").strip().lower()
-            if key not in _PROBE_POPULATION_COUNT_FIELDS:
+            if (
+                key not in _PROBE_POPULATION_COUNT_FIELDS
+                and not re.search(r"(?:^|_)(?:count|cnt)$", key)
+            ):
                 continue
             try:
                 value = int(float(raw_value))
@@ -3280,7 +3668,18 @@ def _extract_probe_population_counts(observation: dict[str, Any]) -> dict[str, i
                 continue
             if value < 0:
                 continue
-            counts[key] = max(counts.get(key, 0), value)
+            values_by_key.setdefault(key, []).append(value)
+
+    counts: dict[str, int] = {}
+    for key, values in values_by_key.items():
+        # Grouped COUNT rows partition one queried population. Explicit total
+        # and distinct aliases are already complete aggregates.
+        if len(values) > 1 and key in {
+            "cnt", "count", "row_count", "record_count", "sample_count", "event_count",
+        }:
+            counts[key] = sum(values)
+        else:
+            counts[key] = max(values)
     return counts
 
 
@@ -3330,6 +3729,22 @@ def request_retry(
         normalized_instructions = _normalize_probe_feedback_repair_instructions(normalized_instructions)
     normalized_diagnostics = _copy_jsonable(diagnostics or {}, {})
     if normalized_retry_type == "probe_feedback":
+        # Execution facts must survive even when generated code omits an error.
+        normalized_diagnostics.pop('_query_execution_outcomes', None)
+        executed_outcomes = []
+        for query_key, snapshot in (CURRENT_QUERY_SNAPSHOTS.get() or {}).items():
+            if not isinstance(snapshot, dict):
+                continue
+            execution = snapshot.get('execution') or {}
+            if not isinstance(execution, dict) or execution.get('status') not in {'success', 'no_data', 'failed'}:
+                continue
+            outcome = {'query_key': query_key, 'status': execution['status']}
+            for key in ('row_count', 'effective_no_data', 'error_type', 'error_message'):
+                if key in execution:
+                    outcome[key] = execution[key]
+            executed_outcomes.append(outcome)
+        if executed_outcomes:
+            normalized_diagnostics['_query_execution_outcomes'] = executed_outcomes
         query_observations = normalized_diagnostics.get("query_observations")
         if isinstance(query_observations, list):
             outcome_groups = {
@@ -3472,6 +3887,31 @@ def _has_validate_query_constraints_argument(tree: ast.AST) -> bool:
             if keyword.arg == 'query_constraints':
                 return True
     return False
+
+
+def _has_composed_query_constraints_argument(tree: ast.AST) -> bool:
+    """Return whether every composed physical query carries its own contract."""
+    composed_helpers = {
+        'query_data_with_sql',
+        'query_local_file',
+        'query_local_file_low_memory',
+    }
+    query_calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        function_name = (
+            func.id if isinstance(func, ast.Name)
+            else func.attr if isinstance(func, ast.Attribute)
+            else ''
+        )
+        if function_name in composed_helpers:
+            query_calls.append(node)
+    return bool(query_calls) and all(
+        any(keyword.arg == 'query_constraints' for keyword in node.keywords or [])
+        for node in query_calls
+    )
 
 
 def _extract_query_constraints_literal(tree: ast.AST) -> Any:
@@ -3687,6 +4127,9 @@ def _validate_report_extrema_selection_contract(
         "最高", "最低", "最多", "最少", "峰值", "高峰", "为主", "主导",
         "highest", "lowest", "largest", "smallest", "peak", "dominant", "most ",
     )
+    frame_assignments: dict[str, ast.AST] = {}
+    static_strings: dict[str, str] = {}
+
     def sorted_frame_orders() -> dict[str, set[tuple[str, bool]]]:
         """Collect explicit DataFrame sort orders assigned back to a frame."""
         orders: dict[str, set[tuple[str, bool]]] = {}
@@ -3703,6 +4146,13 @@ def _validate_report_extrema_selection_contract(
             }
             if not target_names:
                 continue
+            for target_name in target_names:
+                frame_assignments[target_name] = assignment.value
+                if (
+                    isinstance(assignment.value, ast.Constant)
+                    and isinstance(assignment.value.value, str)
+                ):
+                    static_strings[target_name] = assignment.value.value
             for call in ast.walk(assignment.value):
                 if not (
                     isinstance(call, ast.Call)
@@ -3715,12 +4165,19 @@ def _validate_report_extrema_selection_contract(
                     continue
                 ascending = True
                 for keyword in call.keywords:
+                    if keyword.arg == "ascending" and not (
+                        isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, bool)
+                    ):
+                        ascending = None
+                        break
                     if (
                         keyword.arg == "ascending"
                         and isinstance(keyword.value, ast.Constant)
                         and isinstance(keyword.value.value, bool)
                     ):
                         ascending = keyword.value.value
+                if ascending is None:
+                    continue
                 for target_name in target_names:
                     orders.setdefault(target_name, set()).add((
                         str(call.args[0].value), ascending,
@@ -3769,8 +4226,6 @@ def _validate_report_extrema_selection_contract(
             row_index = -row.slice.operand.value
         else:
             return None
-        if row_index not in {0, -1}:
-            return None
         frame_expression = row.value.value
         frame_key = (
             frame_expression.id
@@ -3779,21 +4234,95 @@ def _validate_report_extrema_selection_contract(
         )
         return frame_key, row_index
 
-    def ordered_extremum_is_proven(value: ast.AST, claim_text: str) -> bool:
-        """Accept a positional row only when its stated metric is sorted."""
+    def static_sql_from_call(call: ast.Call) -> str | None:
+        function_name = (
+            call.func.id
+            if isinstance(call.func, ast.Name)
+            else call.func.attr
+            if isinstance(call.func, ast.Attribute)
+            else ""
+        )
+        if function_name not in {"load_data_with_sql", "query_data_with_sql"}:
+            return None
+        sql_position = 2 if function_name == "query_data_with_sql" else 0
+        sql_node: ast.AST | None = call.args[sql_position] if len(call.args) > sql_position else None
+        for keyword in call.keywords:
+            if keyword.arg == "sql":
+                sql_node = keyword.value
+                break
+        if isinstance(sql_node, ast.Constant) and isinstance(sql_node.value, str):
+            return sql_node.value
+        if isinstance(sql_node, ast.Name):
+            return static_strings.get(sql_node.id)
+        return None
+
+    def sql_order_state(
+        frame_name: str,
+        metric_field: str,
+        required_ascending: bool,
+    ) -> Literal["valid", "invalid", "unknown"]:
+        source = frame_assignments.get(frame_name)
+        if source is None:
+            return "unknown"
+        load_calls = [
+            item for item in ast.walk(source)
+            if isinstance(item, ast.Call)
+            and (
+                (isinstance(item.func, ast.Name) and item.func.id in {"load_data_with_sql", "query_data_with_sql"})
+                or (isinstance(item.func, ast.Attribute) and item.func.attr in {"load_data_with_sql", "query_data_with_sql"})
+            )
+        ]
+        if len(load_calls) == 1 and source is load_calls[0]:
+            sql = static_sql_from_call(load_calls[0])
+            if sql is None:
+                return "unknown"
+            try:
+                from sqlglot import exp, parse_one
+                statement = parse_one(sql)
+            except Exception:
+                return "unknown"
+            if not isinstance(statement, exp.Select):
+                return "unknown"
+            projections = statement.expressions
+            if (
+                statement.args.get("group") is None
+                and all(isinstance(p.unalias(), exp.AggFunc) for p in projections)
+            ):
+                # A scalar aggregate has one output row, not an unordered ranking.
+                return "valid"
+            order = statement.args.get("order")
+            if not order or not order.expressions:
+                return "unknown"
+            first = order.expressions[0]
+            expression = first.this
+            if not isinstance(expression, exp.Column):
+                return "unknown"
+            if expression.name.lower() != metric_field.lower():
+                return "unknown"
+            actual_ascending = not bool(first.args.get("desc"))
+            return "valid" if actual_ascending == required_ascending else "invalid"
+        return "unknown"
+
+    def ordered_extremum_state(
+        value: ast.AST,
+        claim_text: str,
+    ) -> Literal["valid", "invalid", "unknown"]:
+        """Classify whether a positional row is ordered by the claimed metric."""
         value = unwrap_display_call(value)
         if not isinstance(value, ast.Subscript):
-            return False
+            return "unknown"
         if not (
             isinstance(value.slice, ast.Constant)
             and isinstance(value.slice.value, str)
         ):
-            return False
+            return "unknown"
         metric_field = str(value.slice.value)
         row_signature = positional_row_signature(value)
         if row_signature is None:
-            return False
+            return "unknown"
         frame_name, row_index = row_signature
+        if row_index not in {0, -1}:
+            return "unknown"
         lower = claim_text.lower()
         highest_markers = (
             "highest", "largest", "peak", "dominant", "most ",
@@ -3805,8 +4334,11 @@ def _validate_report_extrema_selection_contract(
         claims_highest = any(marker in lower for marker in highest_markers)
         claims_lowest = any(marker in lower for marker in lowest_markers)
         if claims_highest == claims_lowest:
-            return False
-        required_ascending = row_index == -1 if claims_highest else row_index == 0
+            return "unknown"
+        if claims_highest:
+            required_ascending = row_index < 0
+        else:
+            required_ascending = row_index >= 0
         row = value.value
         frame_expression = row.value.value
         orders = set(frame_orders.get(frame_name, set()))
@@ -3820,6 +4352,10 @@ def _validate_report_extrema_selection_contract(
         ):
             ascending = True
             for keyword in frame_expression.keywords:
+                if keyword.arg == "ascending" and not (
+                    isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, bool)
+                ):
+                    return "unknown"
                 if (
                     keyword.arg == "ascending"
                     and isinstance(keyword.value, ast.Constant)
@@ -3827,7 +4363,11 @@ def _validate_report_extrema_selection_contract(
                 ):
                     ascending = keyword.value.value
             orders.add((str(frame_expression.args[0].value), ascending))
-        return (metric_field, required_ascending) in orders
+        if (metric_field, required_ascending) in orders:
+            return "valid"
+        if any(field == metric_field for field, _ in orders):
+            return "invalid"
+        return sql_order_state(frame_name, metric_field, required_ascending)
 
     findings: list[dict[str, Any]] = []
     for node in ast.walk(tree):
@@ -3850,34 +4390,45 @@ def _validate_report_extrema_selection_contract(
                 for item in ast.walk(formatted.value)
             ):
                 positional_values.append(formatted.value)
-        proven_rows = {
+        row_states: dict[tuple[str, int], set[str]] = {}
+        for value in positional_values:
+            signature = positional_row_signature(value)
+            if signature is None or signature[1] not in {0, -1}:
+                continue
+            row_states.setdefault(signature, set()).add(
+                ordered_extremum_state(value, literal_text)
+            )
+        invalid_rows = {
             signature
-            for value in positional_values
-            if ordered_extremum_is_proven(value, literal_text)
-            for signature in [positional_row_signature(value)]
-            if signature is not None
+            for signature, states in row_states.items()
+            if "valid" not in states and "invalid" in states
+        }
+        unproven_rows = {
+            signature for signature, states in row_states.items()
+            if "valid" not in states and "unknown" in states
         }
         positional_expressions = [
             ast.get_source_segment(code, value) or ast.unparse(value)
             for value in positional_values
-            if positional_row_signature(value) not in proven_rows
+            if positional_row_signature(value) in invalid_rows | unproven_rows
         ]
         if positional_expressions:
             findings.append({
                 "line_no": int(getattr(node, "lineno", 0) or 0),
                 "claim_preview": literal_text[:240],
                 "positional_expressions": positional_expressions,
+                "proof_state": "invalid" if invalid_rows else "unknown",
             })
     if not findings:
         return None
     return request_retry(
         retry_type="contract_error",
         message=(
-            "报告使用 DataFrame 位置行直接支撑最高、最低、最多、峰值或主导项判断；"
-            "位置顺序不能证明业务极值。"
+            "报告使用位置行表达极值判断；需核实排序方向或查询聚合是否支撑该判断。"
         ),
         diagnostics={
             "violated_contract": "report_superlative_requires_explicit_extrema",
+            "proof_state": "invalid" if any(item['proof_state'] == 'invalid' for item in findings) else "unknown",
             "findings": findings[:12],
         },
         repair_instructions=[
@@ -4145,6 +4696,7 @@ def _validate_report_bounded_time_window_contract(
             related_nodes = dependency_nodes(formatted.value)
             date_comparison_count = 0
             has_between = False
+            has_unresolved_filter_helper = False
             for related in related_nodes:
                 for item in ast.walk(related):
                     if isinstance(item, ast.Compare):
@@ -4159,9 +4711,45 @@ def _validate_report_bounded_time_window_contract(
                         call_source = ast.get_source_segment(code, item) or ast.unparse(item)
                         if date_markers.search(call_source):
                             has_between = True
+                    elif isinstance(item, ast.Call):
+                        function_name = (
+                            item.func.id
+                            if isinstance(item.func, ast.Name)
+                            else item.func.attr
+                            if isinstance(item.func, ast.Attribute)
+                            else ""
+                        )
+                        if function_name and function_name not in {
+                            "DateOffset",
+                            "Timestamp",
+                            "abs",
+                            "copy",
+                            "count",
+                            "dropna",
+                            "float",
+                            "int",
+                            "len",
+                            "load_data_with_sql",
+                            "max",
+                            "mean",
+                            "min",
+                            "now",
+                            "nunique",
+                            "query_data_with_sql",
+                            "round",
+                            "size",
+                            "sum",
+                            "to_datetime",
+                        }:
+                            has_unresolved_filter_helper = True
             # No statically visible date predicate means there is no safe basis
             # for a rejection (the boundary may live in SQL or a helper API).
-            if has_between or date_comparison_count == 0 or date_comparison_count >= 2:
+            if (
+                has_between
+                or has_unresolved_filter_helper
+                or date_comparison_count == 0
+                or date_comparison_count >= 2
+            ):
                 continue
             findings.append({
                 "line_no": int(getattr(formatted, "lineno", 0) or 0),
@@ -4281,6 +4869,29 @@ def _validate_report_paired_metric_population_contract(
                 fields.add(field[1])
         return fields
 
+    def population_selector_fields(expression: ast.AST) -> set[str]:
+        """Return fields that explicitly select the metric population."""
+        fields: set[str] = set()
+        selector_methods = {"groupby", "value_counts"}
+        for related in dependency_nodes(expression):
+            for item in ast.walk(related):
+                if isinstance(item, ast.Compare):
+                    for nested in ast.walk(item):
+                        field = subscript_field(nested)
+                        if field is not None:
+                            fields.add(field[1])
+                elif (
+                    isinstance(item, ast.Call)
+                    and isinstance(item.func, ast.Attribute)
+                    and item.func.attr in selector_methods
+                ):
+                    field = subscript_field(item.func.value)
+                    if field is not None:
+                        fields.add(field[1])
+                    elif item.args:
+                        fields.update(_static_string_values(item.args[0]))
+        return fields
+
     def has_population_selector(expression: ast.AST) -> bool:
         selector_calls = {"groupby", "value_counts", "nunique", "count"}
         return any(
@@ -4348,10 +4959,14 @@ def _validate_report_paired_metric_population_contract(
                 continue
             percent_fields = root_fields(percent_expr.value)
             count_fields = root_fields(count_expr.value)
+            percent_selectors = population_selector_fields(percent_expr.value)
+            count_selectors = population_selector_fields(count_expr.value)
             if (
                 not percent_fields
                 or not count_fields
-                or not percent_fields.isdisjoint(count_fields)
+                or not percent_selectors
+                or not count_selectors
+                or not percent_selectors.isdisjoint(count_selectors)
                 or not has_population_selector(percent_expr.value)
                 or not has_population_selector(count_expr.value)
             ):
@@ -4368,16 +4983,19 @@ def _validate_report_paired_metric_population_contract(
                 ),
                 "percentage_population_fields": sorted(percent_fields),
                 "count_population_fields": sorted(count_fields),
+                "percentage_selector_fields": sorted(percent_selectors),
+                "count_selector_fields": sorted(count_selectors),
             })
     if not findings:
         return None
     return request_retry(
         retry_type="contract_error",
         message=(
-            "报告把占比与括号内数量表达为同一业务群体，但两者实际来自不同的筛选或分组总体。"
+            "报告中成对展示的占比和数量使用不同筛选字段；静态分析无法确定两个业务群体是否等价。"
         ),
         diagnostics={
             "violated_contract": "paired_report_metrics_require_shared_population",
+            "proof_state": "unknown",
             "findings": findings[:12],
         },
         repair_instructions=[
@@ -5566,6 +6184,34 @@ def _actual_time_range_matches_expected(actual_time_range: Any, expected_time_ra
     return True
 
 
+def _static_time_range_comparison(
+    actual_time_range: Any,
+    expected_time_range: Any,
+) -> str:
+    """Return valid, invalid or unknown for a statically extracted range."""
+    if not isinstance(actual_time_range, dict) or not isinstance(expected_time_range, dict):
+        return 'unknown'
+
+    actual_start = _date_text(actual_time_range.get('start'))
+    actual_end = _date_text(actual_time_range.get('end'))
+    expected_start = _date_text(expected_time_range.get('start'))
+    expected_ends = {
+        item
+        for item in (
+            _date_text(expected_time_range.get('end')),
+            _date_text(expected_time_range.get('display_end')),
+        )
+        if item
+    }
+    if not actual_start or (expected_ends and not actual_end):
+        return 'unknown'
+    if expected_start and actual_start != expected_start:
+        return 'invalid'
+    if expected_ends and actual_end not in expected_ends:
+        return 'invalid'
+    return 'valid'
+
+
 def _build_explicit_time_range_drift_retry(
     expected_time_range: dict[str, Any],
     actual_time_range: Any,
@@ -5610,7 +6256,8 @@ def _validate_explicit_time_range_guard(
         return None
 
     actual_time_range = query_constraints.get('time_range')
-    if _actual_time_range_matches_expected(actual_time_range, expected_time_range):
+    comparison = _static_time_range_comparison(actual_time_range, expected_time_range)
+    if comparison != 'invalid':
         return None
 
     return _build_explicit_time_range_drift_retry(expected_time_range, actual_time_range)
@@ -5619,12 +6266,17 @@ def _validate_explicit_time_range_guard(
 def _validate_probe_observation_contract(
     tree: ast.AST,
     calls: set[str],
+    *,
+    allow_implicit_feedback: bool = False,
 ) -> RetryResult | None:
     """Ensure a Probe returns observed facts rather than a plan to inspect data."""
 
     data_access_calls = {
         "load_data_with_sql",
         "probe_data_with_sql",
+        "query_data_with_sql",
+        "query_local_file",
+        "query_local_file_low_memory",
         "load_local_data_with_sql",
         "load_local_file",
         "load_local_file_low_memory",
@@ -5647,6 +6299,9 @@ def _validate_probe_observation_contract(
                 "把这些实际观测结果放进 request_retry(..., diagnostics=...)；不要只返回 SQL 字符串、检查计划或预期值。",
             ],
         )
+
+    if allow_implicit_feedback and "request_retry" not in calls:
+        return None
 
     def call_name(node: ast.Call) -> str:
         if isinstance(node.func, ast.Name):
@@ -5786,6 +6441,7 @@ def _static_node_code_context(code: str, node: ast.AST) -> dict[str, Any]:
     statement_ranges = _source_statement_patch_ranges(code, line_no)
     return {
         "filename": GENERATED_CODE_FILENAME,
+        "location_domain": "python_source",
         "line_no": line_no,
         "column_no": int(getattr(node, "col_offset", 0) or 0) + 1,
         "error_line": source_lines[line_no - 1],
@@ -6021,7 +6677,356 @@ def _merge_static_contract_retries(
     )
 
 
-def _validate_generated_code_contract(code: str) -> RetryResult | None:
+def _validate_runtime_helper_signature_contract(
+    tree: ast.AST,
+    code: str,
+) -> RetryResult | None:
+    """Reject only statically provable calls that cannot bind to Runtime helpers."""
+    helper_signatures: dict[str, inspect.Signature] = {}
+    for name, helper in _build_execution_namespace().items():
+        if not callable(helper):
+            continue
+        try:
+            helper_signatures[name] = inspect.signature(helper)
+        except (TypeError, ValueError):
+            continue
+
+    locally_defined_names = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    findings: list[dict[str, Any]] = []
+    contexts: list[dict[str, Any]] = []
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if not isinstance(call.func, ast.Name):
+            continue
+        helper_name = call.func.id
+        signature = helper_signatures.get(helper_name)
+        if signature is None or helper_name in locally_defined_names:
+            continue
+        if any(isinstance(argument, ast.Starred) for argument in call.args):
+            continue
+        if any(keyword.arg is None for keyword in call.keywords):
+            continue
+
+        parameters = list(signature.parameters.values())
+        keyword_names = {str(keyword.arg) for keyword in call.keywords if keyword.arg}
+        accepts_var_positional = any(
+            parameter.kind is inspect.Parameter.VAR_POSITIONAL
+            for parameter in parameters
+        )
+        accepts_var_keyword = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        positional_parameters = [
+            parameter
+            for parameter in parameters
+            if parameter.kind in {
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            }
+        ]
+        accepted_keyword_names = {
+            parameter.name
+            for parameter in parameters
+            if parameter.kind in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+        }
+        unsupported_keywords = (
+            []
+            if accepts_var_keyword
+            else sorted(keyword_names - accepted_keyword_names)
+        )
+        too_many_positional = (
+            not accepts_var_positional
+            and len(call.args) > len(positional_parameters)
+        )
+
+        if not unsupported_keywords and not too_many_positional:
+            continue
+
+        context = _static_node_code_context(code, call)
+        finding = {
+            'helper': helper_name,
+            'line': int(getattr(call, 'lineno', 0) or 0),
+            'accepted_signature': f'{helper_name}{signature}',
+            'unsupported_keywords': unsupported_keywords,
+            'positional_argument_count': len(call.args),
+            'maximum_positional_arguments': (
+                None if accepts_var_positional else len(positional_parameters)
+            ),
+        }
+        findings.append(finding)
+        if context and context not in contexts:
+            contexts.append(context)
+
+    if not findings:
+        return None
+
+    return request_retry(
+        retry_type='contract_error',
+        message=(
+            'Generated code contains Runtime helper calls that cannot bind to the '
+            'published helper signatures.'
+        ),
+        diagnostics={
+            'violated_contract': 'runtime_helper_signature_mismatch',
+            'findings': findings,
+        },
+        repair_instructions=[
+            'Keep the analysis scope and artifacts unchanged. Repair every listed helper call to match its accepted_signature.',
+            'Do not replace a supported Runtime helper with hand-written serialization or an unrelated API merely to avoid the signature error.',
+        ],
+        code_error_context={
+            'related_contexts': contexts,
+            'suggested_patch_ranges': contexts,
+        },
+    )
+
+
+def _static_frame_reads_have_stable_binding(
+    tree: ast.AST,
+    frame: str,
+    definition_line: int,
+    read_lines: list[int],
+) -> bool:
+    """Limit column proofs to a closed, straight-line binding we can establish.
+
+    Unknown mutation or lexical scope is not evidence of a missing column.
+    Actual execution still checks those programs and reports real KeyErrors.
+    """
+    if not isinstance(tree, ast.Module) or not read_lines:
+        return False
+    simple_statements = (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Expr)
+    definition = next((node for node in tree.body if node.lineno == definition_line), None)
+    if not isinstance(definition, (ast.Assign, ast.AnnAssign)):
+        return False
+    for line in read_lines:
+        if not any(
+            isinstance(node, simple_statements)
+            and node.lineno <= line <= node.end_lineno
+            for node in tree.body
+        ):
+            return False
+    last_line = max(read_lines)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            if any(isinstance(item, ast.Name) and item.id == frame for item in ast.walk(node)):
+                return False
+        if not definition_line < getattr(node, 'lineno', 0) <= last_line:
+            continue
+        if isinstance(node, ast.Name) and node.id == frame and isinstance(node.ctx, (ast.Store, ast.Del)):
+            return False
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Name) and node.value.id == frame:
+            return False  # The alias can mutate the original frame.
+        if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            # Direct literal column writes are understood by the projection
+            # checker; loc/iloc/columns and dynamic writes invalidate its proof.
+            if (
+                isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+                and node.value.id == frame and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, str) and isinstance(node.ctx, ast.Store)
+            ):
+                continue
+            if any(isinstance(item, ast.Name) and item.id == frame for item in ast.walk(node)):
+                return False
+        if isinstance(node, ast.Call):
+            if any(
+                isinstance(item, ast.Name) and item.id == frame
+                for argument in [*node.args, *(kw.value for kw in node.keywords)]
+                for item in ast.walk(argument)
+            ):
+                return False
+            if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == frame:
+                if node.func.attr not in {'groupby', 'agg', 'aggregate', 'copy'}:
+                    return False
+    return True
+
+
+def _validate_dataframe_subset_column_contract(
+    tree: ast.AST,
+    code: str,
+) -> RetryResult | None:
+    """Reject reads of columns removed by a local DataFrame projection."""
+
+    def literal_columns(node: ast.AST | None) -> list[str]:
+        if not isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            return []
+        values: list[str] = []
+        for item in node.elts:
+            if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+                return []
+            value = item.value.strip()
+            if value:
+                values.append(value)
+        return values
+
+    def unwrap_copy(node: ast.AST | None) -> ast.AST | None:
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'copy'
+            and not node.args
+        ):
+            return node.func.value
+        return node
+
+    projections: dict[str, dict[str, Any]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = unwrap_copy(getattr(node, 'value', None))
+        if not isinstance(value, ast.Subscript):
+            continue
+        projected_columns = literal_columns(value.slice)
+        if not projected_columns:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                projections[target.id] = {
+                    'columns': set(projected_columns),
+                    'line': int(getattr(node, 'lineno', 0) or 0),
+                    'context': _static_node_code_context(code, node),
+                }
+    if not projections:
+        return None
+
+    writes: dict[str, dict[str, list[int]]] = {name: {} for name in projections}
+    reads: dict[str, dict[str, list[int]]] = {name: {} for name in projections}
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in projections
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, str)
+        ):
+            continue
+        frame = node.value.id
+        column = node.slice.value.strip()
+        line = int(getattr(node, 'lineno', 0) or 0)
+        bucket = writes if isinstance(node.ctx, ast.Store) else reads
+        bucket[frame].setdefault(column, []).append(line)
+
+    # ``frame = frame.rename(columns={...})`` and
+    # ``frame.rename(columns={...}, inplace=True)`` create the destination
+    # columns before later reads.  Treat those names like explicit writes so a
+    # valid presentation rename is not mistaken for a removed source column.
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'rename'
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in projections
+        ):
+            continue
+        frame = node.func.value.id
+        columns_node = next(
+            (
+                keyword.value
+                for keyword in node.keywords
+                if keyword.arg == 'columns'
+            ),
+            None,
+        )
+        if not isinstance(columns_node, ast.Dict):
+            continue
+        renamed_columns: list[str] = []
+        for destination in columns_node.values:
+            if isinstance(destination, ast.Constant) and isinstance(destination.value, str):
+                name = destination.value.strip()
+                if name:
+                    renamed_columns.append(name)
+        line = int(getattr(node, 'lineno', 0) or 0)
+        for column in renamed_columns:
+            writes[frame].setdefault(column, []).append(line)
+
+    findings: list[dict[str, Any]] = []
+    contexts: list[dict[str, Any]] = []
+    for frame, projection in projections.items():
+        projection_line = int(projection['line'] or 0)
+        for column, usage_lines in reads[frame].items():
+            if column in projection['columns']:
+                continue
+            downstream_lines = sorted(line for line in usage_lines if line > projection_line)
+            if not downstream_lines:
+                continue
+            first_read = downstream_lines[0]
+            if any(
+                projection_line < line < first_read
+                for line in writes[frame].get(column, [])
+            ):
+                continue
+            findings.append({
+                'dataframe': frame,
+                'missing_column': column,
+                'projection_line': projection_line,
+                'read_lines': downstream_lines,
+                'projected_columns': sorted(projection['columns']),
+            })
+            context = projection.get('context')
+            if isinstance(context, dict) and context not in contexts:
+                contexts.append(context)
+    if not findings:
+        return None
+
+    proof_state = 'proven' if all(
+        _static_frame_reads_have_stable_binding(
+            tree, item['dataframe'], item['projection_line'], item['read_lines'],
+        ) for item in findings
+    ) else 'unknown'
+    return request_retry(
+        retry_type='contract_error',
+        message=(
+            'DataFrame reads refer to columns absent from a visible projection. '
+            'Only a proven unchanged binding establishes a missing-column error.'
+        ),
+        diagnostics={
+            'violated_contract': 'dataframe_subset_missing_columns',
+            'proof_state': proof_state,
+            'findings': findings,
+        },
+        repair_instructions=[
+            'Preserve the query, analysis scope and artifact design. Add every listed source column to the local DataFrame projection, or derive it on the projected DataFrame before its first read.',
+            'Repair all findings in one pass; do not remove the downstream metric merely to avoid the missing-column error.',
+        ],
+        code_error_context={
+            'related_contexts': contexts,
+            'suggested_patch_ranges': contexts,
+        },
+    )
+
+
+def _save_analysis_result_keywords(tree: ast.AST) -> set[str]:
+    keywords: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function_name = ''
+        if isinstance(node.func, ast.Name):
+            function_name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            function_name = node.func.attr
+        if function_name != 'save_analysis_result':
+            continue
+        keywords.update(
+            keyword.arg for keyword in node.keywords if keyword.arg is not None
+        )
+    return keywords
+
+
+def _validate_generated_code_contract(
+    code: str,
+    *,
+    output_format: str = "standard",
+    allow_implicit_probe_feedback: bool = False,
+) -> RetryResult | None:
     """Validate the static tool contract of generated Python code before execution."""
     try:
         tree = ast.parse(code or '')
@@ -6042,14 +7047,16 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
             repair_instructions=[
                 "根据 code_error_context 中的错误行和相邻代码，只修正该处 Python 引号、括号、逗号或缩进语法；不要原样重复同一错误。",
                 "保留已经完成的查询、计算、图表、表格、报告语言和洞察内容，不要因为局部语法错误重写整个分析。",
-                "修复后仍须提交一份顶部声明 execution_intent 的完整可执行代码。",
+                "若反馈提供 repair_target，可只替换其中的语法错误行；后端会合成并重新解析完整代码。否则提交顶部声明 execution_intent 的完整可执行代码。",
             ],
+            code_error_context=code_error_context,
         )
 
     execution_intent = _extract_static_string_assignment(tree, 'execution_intent')
     has_query_constraints = (
         _has_static_assignment(tree, 'query_constraints')
         or _has_validate_query_constraints_argument(tree)
+        or _has_composed_query_constraints_argument(tree)
     )
     calls = _called_function_names(tree)
 
@@ -6078,13 +7085,32 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
         return dynamic_timescale_identifier_retry
 
     if execution_intent == 'analysis':
+        incomplete_analysis_retry: RetryResult | None = None
         missing_items: list[str] = []
         if not has_query_constraints:
             missing_items.append('query_constraints')
-        if 'validate_query_constraints' not in calls:
-            missing_items.append('validate_query_constraints(...)')
+        composed_query_calls = {
+            'query_data_with_sql',
+            'query_local_file',
+            'query_local_file_low_memory',
+        }
+        if not ({'validate_query_constraints'} | composed_query_calls) & calls:
+            missing_items.append(
+                'validate_query_constraints(...) or a composed query helper'
+            )
         if 'save_analysis_result' not in calls:
             missing_items.append('save_analysis_result(...)')
+        save_keywords = _save_analysis_result_keywords(tree)
+        expected_output_keyword = {
+            "text": "output_text",
+            "json": "output_json",
+        }.get(str(output_format or "standard").strip().lower())
+        if (
+            expected_output_keyword
+            and 'save_analysis_result' in calls
+            and expected_output_keyword not in save_keywords
+        ):
+            missing_items.append(f'save_analysis_result(..., {expected_output_keyword}=...)')
         static_query_constraint_keys = _static_query_constraints_keys(tree)
         missing_time_series_query = (
             _tree_contains_ts_query_sql(tree)
@@ -6116,10 +7142,10 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
                 )
             repair_instructions = [
                 '不要只在半成品代码上逐项补字段；请重写为完整 analysis 模板后再执行。',
-                'analysis 代码必须先声明 query_constraints，再生成 SQL 或 pandas/DataFrame 过滤表达式。',
-                'analysis 代码必须调用 validate_query_constraints(...)；只有返回 None 时才能继续加载数据、聚合、构造图表和调用 save_analysis_result(...)。',
+                'analysis 的每条物理查询都必须通过 composed query helper 的 query_constraints 参数，或先调用 validate_query_constraints(...)；不要求使用固定的变量名。',
+                '常规 SQL 使用 query_data_with_sql(...) 一次完成校验、注册和加载；复杂控制流才拆成 validate_query_constraints(...) 与 loader。',
                 'analysis 代码最终必须构造 analysis_report、charts 或 tables，并将 save_analysis_result(...) 的返回值赋给 result。',
-                '如果 validate_query_constraints(...) 返回 RetryResult，必须将其赋给 result 并结束当前尝试。',
+                '底层 validate_query_constraints(...) 返回 RetryResult 时，必须将其赋给 result 并结束当前尝试。',
             ]
             if missing_time_series_query:
                 repair_instructions.extend([
@@ -6127,7 +7153,7 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
                     '原始值使用 mode=raw；采样使用 mode=sample 并声明 window；统计使用 mode=aggregate，并声明 window 与 aggregations。',
                     '采样和统计必须由时序库内部 SQL 实现，不能查询原始点后再用 pandas 替代。',
                 ])
-            return request_retry(
+            incomplete_analysis_retry = request_retry(
                 retry_type=(
                     'invalid_query_constraints'
                     if missing_items == ['query_constraints.time_series_query']
@@ -6175,18 +7201,52 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
         if validation_order_retry is not None:
             return validation_order_retry
 
-        mapping_default_retry = _validate_query_mapping_default_contract(tree)
-        if mapping_default_retry is not None:
-            return mapping_default_retry
-
-        static_semantic_retry = _merge_static_contract_retries([
+        static_checks = [
+            incomplete_analysis_retry,
             _validate_report_extrema_selection_contract(tree, code or ''),
             _validate_bounded_interval_direction_contract(tree, code or ''),
             _validate_report_bounded_time_window_contract(tree, code or ''),
             _validate_report_paired_metric_population_contract(tree, code or ''),
-            _validate_grouped_visible_dimension_contract(tree, code or ''),
+            (
+                _validate_analysis_query_result_consumption_contract(tree, code or '')
+                if incomplete_analysis_retry is None
+                else None
+            ),
+            _validate_dataframe_subset_column_contract(tree, code or ''),
+            _validate_runtime_helper_signature_contract(tree, code or ''),
+            _validate_query_dataframe_projection_contract(code or ''),
+            _validate_static_composed_query_constraints_contract(tree, code or ''),
+            _validate_sql_projection_contract(tree, code or ''),
+        ]
+        static_advisories = [
+            retry for retry in static_checks
+            if retry is not None and (retry.diagnostics or {}).get('proof_state') == 'unknown'
+        ]
+        static_semantic_retry = _merge_static_contract_retries([
+            retry for retry in static_checks
+            if retry is not None and (retry.diagnostics or {}).get('proof_state') != 'unknown'
         ])
+        # These checks expose real data-quality risks, but syntax alone cannot
+        # prove the runtime values are wrong. Keep the diagnostics without
+        # forcing a speculative model repair.
+        for advisory in (
+            *static_advisories,
+            _validate_query_mapping_default_contract(tree),
+            _validate_grouped_visible_dimension_contract(tree, code or ''),
+        ):
+            if advisory is not None:
+                logger.info(
+                    "Runtime static advisory contract=%s diagnostics=%s",
+                    (advisory.diagnostics or {}).get("violated_contract"),
+                    advisory.diagnostics or {},
+                )
+
         if static_semantic_retry is not None:
+            if static_advisories:
+                static_semantic_retry.diagnostics = {
+                    **(static_semantic_retry.diagnostics or {}),
+                    'unproven_advisories': [advisory.diagnostics for advisory in static_advisories],
+                }
             return static_semantic_retry
 
         helper_chart_retry = _validate_helper_chart_usage_contract(tree, calls)
@@ -6195,10 +7255,10 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
 
     if execution_intent == 'probe':
         violations: list[str] = []
-        if 'request_retry' not in calls:
-            violations.append('probe 代码必须调用 request_retry(...)')
         if 'save_analysis_result' in calls:
             violations.append('probe 代码不要调用 save_analysis_result(...)')
+        if not allow_implicit_probe_feedback and 'request_retry' not in calls:
+            violations.append('通过 execute_python 提交的 probe 代码需要 result = request_retry(...)')
         if violations:
             return request_retry(
                 retry_type="contract_error",
@@ -6210,12 +7270,16 @@ def _validate_generated_code_contract(code: str) -> RetryResult | None:
                     'violations': violations,
                 },
                 repair_instructions=[
-                    'probe 代码只做轻量探测，并调用 request_retry(retry_type="probe_feedback", ...) 返回结构化反馈。',
+                    'probe 代码只做轻量探测；可用 request_retry(retry_type="probe_feedback", ...) 返回自定义结构化反馈。',
                     'probe 代码不要调用 save_analysis_result(...)；query_constraints 不是必需项，但已有的只读查询校验不会改变正式分析口径。',
                 ],
             )
 
-        probe_observation_retry = _validate_probe_observation_contract(tree, calls)
+        probe_observation_retry = _validate_probe_observation_contract(
+            tree,
+            calls,
+            allow_implicit_feedback=allow_implicit_probe_feedback,
+        )
         if probe_observation_retry is not None:
             return probe_observation_retry
 
@@ -6231,6 +7295,8 @@ def validate_query_constraints(
     filter_expressions: Optional[list[str]] = None,
     aggregation_hints: Optional[list[str]] = None,
     sql_context: Optional[dict[str, Any]] = None,
+    scope_source_query_key: str = '',
+    scope_binding: Optional[dict[str, str]] = None,
 ) -> RetryResult | None:
     """Validate analysis query constraints and register the physical query."""
     if query_params is not None and sql_params is not None and query_params != sql_params:
@@ -6256,10 +7322,18 @@ def validate_query_constraints(
         )
 
     expected_time_range = CURRENT_EXPECTED_TIME_RANGE.get()
+    has_parent_scope = bool(str(scope_source_query_key or '').strip())
+    is_reference_lookup = (
+        query_constraints.get('time_range') in (None, {})
+        and not (query_constraints.get('target_filters') or [])
+        and query_constraints.get('aggregation') is None
+    )
     if (
         CURRENT_TIME_RANGE_GUARD_ACTIVE.get()
         and isinstance(expected_time_range, dict)
         and expected_time_range
+        and not has_parent_scope
+        and not is_reference_lookup
         and not _actual_time_range_matches_expected(query_constraints.get('time_range'), expected_time_range)
     ):
         return _build_explicit_time_range_drift_retry(
@@ -6322,6 +7396,22 @@ def validate_query_constraints(
             ],
         )
 
+    scalar_cte_aliases = _find_fedquery_scalar_cte_references(sql)
+    if scalar_cte_aliases:
+        return request_retry(
+            retry_type="query_constraint_violation",
+            message="FedQuery 不支持在标量子查询中引用当前语句的 CTE。",
+            diagnostics={
+                "violated_constraint": "fedquery_scalar_cte_reference",
+                "cte_aliases": scalar_cte_aliases,
+            },
+            repair_instructions=[
+                "保留当前业务范围、筛选口径和全部指标，只重写 SQL 结构。",
+                "CTE 可以继续使用，但应从主查询的 FROM/JOIN 路径消费；多个单值聚合 CTE 可通过 CROSS JOIN 组合。",
+                "也可以改成等价派生表；不要把 CTE 别名改写成物理表名，不要删除查询或指标。",
+            ],
+        )
+
     portable_bucket_issue = _check_portable_time_bucket_expression(
         query_constraints,
         sql,
@@ -6356,6 +7446,69 @@ def validate_query_constraints(
                 '混合关系型与时序查询时，外层 SQL 应保留明确 JOIN 和 ON 条件。',
             ],
         )
+
+    normalized_scope_source_key = _normalize_query_key(scope_source_query_key) \
+        if str(scope_source_query_key or '').strip() else ''
+    query_scope: dict[str, Any] = {}
+    inherits_analysis_scope = False
+    if normalized_scope_source_key:
+        snapshots = CURRENT_QUERY_SNAPSHOTS.get() or {}
+        source_snapshot = snapshots.get(normalized_scope_source_key)
+        normalized_binding = {
+            'source_field': str((scope_binding or {}).get('source_field') or '').strip(),
+            'target_field': str((scope_binding or {}).get('target_field') or '').strip(),
+        }
+        source_execution = (
+            source_snapshot.get('execution')
+            if isinstance(source_snapshot, dict)
+            and isinstance(source_snapshot.get('execution'), dict)
+            else {}
+        )
+        source_columns = {
+            str(item).strip().lower()
+            for item in (source_execution.get('columns') or [])
+            if str(item).strip()
+        }
+        source_field = normalized_binding['source_field']
+        target_field = normalized_binding['target_field']
+        invalid_reason = ''
+        if not isinstance(source_snapshot, dict):
+            invalid_reason = 'source_query_not_found'
+        elif str(source_execution.get('status') or '').strip().lower() != 'success':
+            invalid_reason = 'source_query_not_executed'
+        elif not source_field or not target_field:
+            invalid_reason = 'missing_scope_binding'
+        elif source_field.lower() not in source_columns:
+            invalid_reason = 'source_field_not_in_result'
+        elif not re.search(rf'(?<![\w]){re.escape(target_field)}(?![\w])', str(sql or ''), re.I):
+            invalid_reason = 'target_field_not_in_query'
+        elif effective_query_params is None or (
+            isinstance(effective_query_params, (list, tuple, dict, set))
+            and not effective_query_params
+        ):
+            invalid_reason = 'missing_derived_scope_values'
+        if invalid_reason:
+            return request_retry(
+                retry_type='invalid_query_constraints',
+                message='派生查询没有完整绑定到已执行的父查询结果，无法继承其分析范围。',
+                diagnostics={
+                    'violated_constraint': 'derived_query_scope',
+                    'reason': invalid_reason,
+                    'scope_source_query_key': normalized_scope_source_key,
+                    'scope_binding': normalized_binding,
+                    'source_result_columns': sorted(source_columns),
+                },
+                repair_instructions=[
+                    '先成功执行父查询，再从父查询结果列提取关联值，作为当前查询参数。',
+                    '调用 validate_query_constraints(...) 时传入父 query_key，并用 scope_binding 明确父结果字段与当前查询字段。',
+                    '不要为了通过校验而给子表强加一个业务语义不等价的时间字段。',
+                ],
+            )
+        inherits_analysis_scope = True
+        query_scope = {
+            'scope_source_query_key': normalized_scope_source_key,
+            'scope_binding': normalized_binding,
+        }
 
     parameter_code = json.dumps(effective_query_params, ensure_ascii=False, default=str) \
         if effective_query_params is not None else ""
@@ -6401,11 +7554,14 @@ def validate_query_constraints(
             ],
         )
 
-    checker_inputs = (
-        (_check_target_filter_constraints, filter_code),
-        (_check_time_range_constraint, filter_code),
+    checker_inputs = [
         (_check_aggregation_constraint, aggregation_code),
-    )
+    ]
+    if not inherits_analysis_scope:
+        checker_inputs[0:0] = [
+            (_check_target_filter_constraints, filter_code),
+            (_check_time_range_constraint, filter_code),
+        ]
     for checker, code_to_check in checker_inputs:
         if not code_to_check:
             continue
@@ -6418,6 +7574,8 @@ def validate_query_constraints(
                 repair_instructions=[
                     '先保持 query_constraints 不变，再重写 SQL / pandas / 文件过滤实现，使其符合时间范围、目标筛选和聚合粒度约束。',
                     '时间范围优先直接作用于原始时间字段：field >= start 且 field < end；除非完整保持日期边界，不要用 YEAR/MONTH 派生条件替代原始范围。',
+                    '如果当前查询通过父查询结果中的主体 ID 集合补充关联事实，不要给子表强加语义不等价的时间字段；请参数化传入关联值，并设置 scope_source_query_key 与 scope_binding 继承父查询已验证的分析范围。',
+                    '关系型 SQL 参数使用当前 loader 支持的 `%s` 占位符与顺序参数列表，不要使用 `:name` 命名占位符。',
                     '如果 target_filters 里的 match_mode = "exact"，正式 analysis 代码不要把同一个值实现成 LIKE、ILIKE、contains 或 str.contains(...)。',
                     '如果需要先探测候选值，请改成 execution_intent = "probe"，不要在 analysis 阶段继续放宽口径。',
                 ],
@@ -6431,6 +7589,139 @@ def validate_query_constraints(
         filter_expressions=filter_expressions,
         aggregation_hints=aggregation_hints,
         sql_context=sql_context,
+        query_scope=query_scope,
+    )
+
+
+def query_data_with_sql(
+    *,
+    query_key: str,
+    query_constraints: dict[str, Any],
+    sql: str,
+    params: Optional[list[Any]] = None,
+    filter_expressions: Optional[list[str]] = None,
+    aggregation_hints: Optional[list[str]] = None,
+    sql_context: Optional[dict[str, Any]] = None,
+    scope_source_query_key: str = '',
+    scope_binding: Optional[dict[str, str]] = None,
+    numeric_columns: Optional[list[str]] = None,
+    text_columns: Optional[list[str]] = None,
+):
+    """Validate, register and execute one SQL query as a single operation.
+
+    The lower-level validation and loader APIs remain available for unusual
+    control flows. Normal analysis code should use this helper so a repair
+    cannot accidentally execute before validation or discard the retry result.
+    """
+    validation = validate_query_constraints(
+        query_key=query_key,
+        query_constraints=query_constraints,
+        sql=sql,
+        query_params=params,
+        filter_expressions=filter_expressions,
+        aggregation_hints=aggregation_hints,
+        sql_context=sql_context,
+        scope_source_query_key=scope_source_query_key,
+        scope_binding=scope_binding,
+    )
+    if validation is not None:
+        raise QueryConstraintRetrySignal(validation)
+    return load_data_with_sql(
+        sql=sql,
+        params=params,
+        numeric_columns=numeric_columns,
+        text_columns=text_columns,
+    )
+
+
+def _local_file_validation_hints(
+    query_constraints: Any,
+    filter_expressions: Optional[list[str]],
+    aggregation_hints: Optional[list[str]],
+) -> Optional[list[str]]:
+    """Describe a provable full-file detail read without duplicated model hints."""
+    if aggregation_hints or filter_expressions:
+        return aggregation_hints
+    if not isinstance(query_constraints, dict):
+        return aggregation_hints
+    if query_constraints.get('time_range') or query_constraints.get('target_filters'):
+        return aggregation_hints
+
+    aggregation = query_constraints.get('aggregation')
+    if aggregation is None:
+        return ['detail']
+    if isinstance(aggregation, dict) and str(aggregation.get('grain') or '').strip().lower() == 'detail':
+        return ['detail']
+    return aggregation_hints
+
+
+def query_local_file(
+    *,
+    query_key: str,
+    query_constraints: dict[str, Any],
+    file_path: str,
+    sheet_name: Optional[str] = None,
+    filter_expressions: Optional[list[str]] = None,
+    aggregation_hints: Optional[list[str]] = None,
+):
+    """Validate, register and load one local file as a single operation."""
+    effective_aggregation_hints = _local_file_validation_hints(
+        query_constraints,
+        filter_expressions,
+        aggregation_hints,
+    )
+    validation = validate_query_constraints(
+        query_key=query_key,
+        query_constraints=query_constraints,
+        sql="",
+        filter_expressions=filter_expressions,
+        aggregation_hints=effective_aggregation_hints,
+    )
+    if validation is not None:
+        raise QueryConstraintRetrySignal(validation)
+    return load_local_file(
+        file_path=file_path,
+        sheet_name=sheet_name,
+    )
+
+
+def query_local_file_low_memory(
+    *,
+    query_key: str,
+    query_constraints: dict[str, Any],
+    file_path: str,
+    sheet_name: Optional[str] = None,
+    filter_expressions: Optional[list[str]] = None,
+    aggregation_hints: Optional[list[str]] = None,
+    chunk_size: int = 50000,
+    usecols: Optional[list[str] | list[int] | str] = None,
+    dtype: Optional[dict[str, Any] | str] = None,
+    parse_dates: Optional[list[str] | bool] = None,
+    low_memory: bool = True,
+):
+    """Validate, register and stream one local file as a single operation."""
+    effective_aggregation_hints = _local_file_validation_hints(
+        query_constraints,
+        filter_expressions,
+        aggregation_hints,
+    )
+    validation = validate_query_constraints(
+        query_key=query_key,
+        query_constraints=query_constraints,
+        sql="",
+        filter_expressions=filter_expressions,
+        aggregation_hints=effective_aggregation_hints,
+    )
+    if validation is not None:
+        raise QueryConstraintRetrySignal(validation)
+    return load_local_file_low_memory(
+        file_path=file_path,
+        sheet_name=sheet_name,
+        chunk_size=chunk_size,
+        usecols=usecols,
+        dtype=dtype,
+        parse_dates=parse_dates,
+        low_memory=low_memory,
     )
 
 
@@ -6565,6 +7856,21 @@ def build_table_result(
             rows = data.get('rows') or []
             if columns is None:
                 columns = data.get('columns')
+        elif isinstance(data, dict):
+            import pandas as pd
+
+            try:
+                frame = pd.DataFrame(data)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    'build_table_result.data 的列式 dict 必须包含长度一致的列表。'
+                ) from exc
+            rows = frame.to_dict(orient='records')
+            if columns is None:
+                columns = [
+                    {'key': str(column), 'label': str(column)}
+                    for column in list(frame.columns)
+                ]
         elif isinstance(data, list):
             rows = data
             if columns is None and rows and isinstance(rows[0], dict):
@@ -6573,7 +7879,7 @@ def build_table_result(
                     for key in rows[0].keys()
                 ]
         else:
-            raise ValueError('build_table_result.data 必须是 DataFrame、records 列表或包含 rows 的 dict。')
+            raise ValueError('build_table_result.data 必须是 DataFrame、records 列表或 dict。')
 
     clean_columns: list[dict[str, Any]] = []
     for index, column in enumerate(columns or [], start=1):
@@ -6605,41 +7911,6 @@ def build_table_result(
                     clean_row[key] = round(float(value), value_precision)
         clean_rows.append(clean_row)
 
-    metric_discriminator_keys = {
-        column["key"]
-        for column in clean_columns
-        if re.search(r"(?:^|_)(?:metric|measure)(?:$|_)|指标|度量", column["key"], re.IGNORECASE)
-        or re.search(r"指标|度量|metric|measure", column["label"], re.IGNORECASE)
-    }
-    for discriminator_key in metric_discriminator_keys:
-        metric_labels = {
-            str(row.get(discriminator_key) or '').strip()
-            for row in clean_rows
-            if str(row.get(discriminator_key) or '').strip()
-        }
-        if len(metric_labels) < 2:
-            continue
-        mixed_value_columns = []
-        for column in clean_columns:
-            key = column["key"]
-            if key == discriminator_key:
-                continue
-            labels_with_numeric_values = {
-                str(row.get(discriminator_key) or '').strip()
-                for row in clean_rows
-                if isinstance(row.get(key), (int, float))
-                and not isinstance(row.get(key), bool)
-                and math.isfinite(float(row.get(key)))
-            }
-            if len(labels_with_numeric_values) > 1:
-                mixed_value_columns.append(key)
-        if mixed_value_columns:
-            raise ValueError(
-                'table_semantic_error: 同一数值列包含多个由指标行区分的计算口径，'
-                f'无法形成稳定的列级指标语义：{mixed_value_columns[:8]}。'
-                '请使用长表结构，将部门、月份等作为维度列，并把每个业务指标分别放在独立数值列中。'
-            )
-
     return {"table": {
         "title": str(title or '表格').strip() or '表格',
         "description": str(description or '').strip(),
@@ -6654,6 +7925,7 @@ def get_analysis_parameters(defaults: Optional[dict[str, Any]] = None) -> dict[s
     override = CURRENT_ANALYSIS_PARAMETERS_OVERRIDE.get() or {}
     if isinstance(override, dict):
         base.update(override)
+
     return base
 
 
@@ -6663,6 +7935,8 @@ def save_analysis_result(
     tables: Optional[list[dict[str, Any]]] = None,
     analysis_parameters_schema: Optional[dict[str, Any]] = None,
     analysis_parameters: Optional[dict[str, Any]] = None,
+    output_text: str = '',
+    output_json: Optional[dict[str, Any]] = None,
 ) -> StructuredResult:
     """
     结束一次由生成代码驱动的分析任务，并返回标准结构化结果。
@@ -6673,16 +7947,39 @@ def save_analysis_result(
     - tables: 表格数组
 
     """
-    report_text = _strip_structural_empty_report_lines(analysis_report)
-    if not report_text:
-        raise ValueError('analysis_report 不能为空，必须传入完整的 Markdown 分析报告。')
+    output_contract = dict(CURRENT_OUTPUT_CONTRACT.get() or {"type": "standard"})
+    output_format = str(output_contract.get("type") or "standard").strip().lower()
+    if output_format == "standard":
+        if output_text or output_json is not None:
+            raise ValueError("standard 输出只能使用 analysis_report、charts 和 tables。")
+        report_text = _strip_structural_empty_report_lines(analysis_report)
+        if not report_text:
+            raise ValueError('analysis_report 不能为空，必须传入完整的 Markdown 分析报告。')
+        output_payload: Any = None
+    elif output_format == "text":
+        if analysis_report or charts or tables or output_json is not None:
+            raise ValueError("text 输出只能传入 output_text，不能混入标准产物或 JSON。")
+        report_text = str(output_text or '').strip()
+        if not report_text:
+            raise ValueError("output_text 不能为空。")
+        output_payload = report_text
+    elif output_format == "json":
+        if analysis_report or charts or tables or output_text:
+            raise ValueError("json 输出只能传入 output_json，不能混入标准产物或文本。")
+        if not isinstance(output_json, dict):
+            raise ValueError("output_json 必须是 Python dict。")
+        validate_json_output(output_json, dict(output_contract.get("schema") or {}))
+        output_payload = _copy_jsonable(output_json, {})
+        report_text = json.dumps(output_payload, ensure_ascii=False, indent=2)
+    else:
+        raise ValueError(f"未知输出协议: {output_format}")
 
     _raise_if_all_query_snapshots_no_data()
 
     normalized_charts = _copy_jsonable(
         _normalize_chart_items(charts=_copy_jsonable(charts or [], [])),
         [],
-    )
+    ) if output_format == "standard" else []
     # A conditional analytic branch may legitimately produce no rows even when
     # other branches have data. It is not a user-facing chart until it has a
     # renderable point; retaining its shell creates an empty panel and gives a
@@ -6694,7 +7991,7 @@ def save_analysis_result(
     normalized_tables = _copy_jsonable(
         _normalize_table_items(tables=_copy_jsonable(tables or [], [])),
         [],
-    )
+    ) if output_format == "standard" else []
     generated_parameter_schema, generated_parameter_values = strip_generated_runtime_parameter_metadata(
         _copy_jsonable(analysis_parameters_schema or {}, {}),
         _copy_jsonable(analysis_parameters or {}, {}),
@@ -6712,6 +8009,8 @@ def save_analysis_result(
         analysis_parameters_schema=normalized_parameter_schema,
         analysis_parameters=normalized_parameter_values,
         query_snapshots=_copy_jsonable(CURRENT_QUERY_SNAPSHOTS.get() or {}, {}),
+        output_format=output_format,
+        output_payload=output_payload,
     )
 
 
@@ -6741,7 +8040,50 @@ class SourceCodePatch(BaseModel):
 
     start_line: int = Field(description="被替换区间的起始行号（1-based，包含）。")
     end_line: int = Field(description="被替换区间的结束行号（1-based，包含）。")
-    replacement: str = Field(description="替换一个完整 Python 语句或代码块的可解析源码。")
+    replacement: str = Field(description="指定行区间的替换源码，保留所需缩进；合成后的完整 Python 必须语法合法。")
+
+
+class ClarificationOptionInput(BaseModel):
+    id: str = Field(description="选项的稳定标识。")
+    label: str = Field(description="面向用户的简短选项名称。")
+    value: str = Field(description="选择该项后补充到当前轮次的完整业务含义。")
+    description: str = Field(default='', description="必要时说明选项差异。")
+
+
+class ClarificationItemInput(BaseModel):
+    item_id: str = Field(default='', description="当前澄清项的稳定标识；省略时由后端生成。")
+    ambiguity_kind: Literal[
+        "business_definition",
+        "metric_definition",
+        "time_attribution",
+        "calculation_rule",
+    ] = Field(
+        default="business_definition",
+        description="需要用户确认的业务歧义类型。",
+    )
+    subject: str = Field(
+        description=(
+            "存在关键歧义的业务主题，或用户已经明确要求但缺少权威定义的业务指标；"
+            "不能借此新增报告指标或规划产物。"
+        )
+    )
+    question: str = Field(description="用户能够直接回答的一句话问题。")
+    options: list[ClarificationOptionInput] = Field(
+        default_factory=list,
+        description="存在少量互斥定义时提供 2-3 个快捷选项；否则留空并允许文本回答。",
+    )
+    allow_free_text: bool = Field(default=True, description="是否允许用户直接补充文本。")
+
+
+class AnalysisClarificationInput(BaseModel):
+    items: list[ClarificationItemInput] = Field(
+        description=(
+            "必须由用户决定、且 Schema、业务规则及可执行 Probe 都无法唯一确认的关键业务歧义。"
+            "可以确认用户明确点名指标的总体、粒度、分子分母、时间归属或业务公式，"
+            "但不能规划用户没有要求的指标。"
+            "可以一次提交多个互不重复的澄清项。"
+        )
+    )
 
 
 class ExePythonCodeInput(BaseModel):
@@ -6771,10 +8113,62 @@ class ExePythonCodeInput(BaseModel):
     patches: list[SourceCodePatch] = Field(
         default_factory=list,
         description=(
-            "针对 base_execution_id 完整源码的非重叠语句替换。start_line/end_line 必须完整覆盖"
-            "错误反馈 repair_target.allowed_ranges 中的一个 Python 语句或代码块；"
+            "针对 base_execution_id 完整源码的非重叠行区间替换。start_line/end_line 使用原版本行号，"
+            "参考错误定位及 repair_target.allowed_ranges；可以修改参数行或相邻语句，保留缩进。"
             "后端合成并验证完整代码，未覆盖区域保持原样。"
         ),
+    )
+
+
+class ProbeAnalysisDataInput(BaseModel):
+    code: str = Field(
+        description=(
+            "一份独立、只读、有界的 Probe Python 代码。执行用途由此工具确定，无需重复声明 execution_intent；"
+            "只查询确认正式分析所需的真实枚举、格式、时间覆盖、关联可达性或有无数据，"
+            "后端会把查询执行事实和打印的有界摘要作为标准观察返回；需要给观察命名或组织更丰富的诊断时，"
+            "可再以 result = request_retry(retry_type='probe_feedback', diagnostics=...) 自定义反馈。"
+            "不要计算正式指标、构造图表/表格或保存分析报告。"
+        )
+    )
+    title: str = Field(default='', description="本次数据探测的简短标题。")
+    description: str = Field(default='', description="本次探测要消除的技术未知。")
+    used_datasource_ids: list[int] = Field(
+        default_factory=list,
+        description="Probe 代码实际读取或查询的数据源 datasource_id 列表，只能取自当前候选范围。",
+    )
+
+
+class SubmitAnalysisProgramInput(BaseModel):
+    code: str = Field(
+        default='',
+        description=(
+            "一份独立、完整、可执行的正式洞察分析程序。执行用途由此工具确定，无需重复声明 execution_intent；"
+            "并在同一次提交内完成查询、计算、空数据处理、当前结果协议要求的产物构造，"
+            "最后以 result = save_analysis_result(...) 收口。此工具不是数据观察工作台；"
+            "如果还需要观察真实枚举、格式、覆盖或关联，请先调用 probe_analysis_data。"
+            "首次生成或整体调整时填写；局部技术错误修复时使用 base_execution_id + patches。"
+        ),
+    )
+    title: str = Field(default='', description="正式洞察分析任务的简短标题。")
+    description: str = Field(default='', description="正式洞察分析任务的业务说明。")
+    used_datasource_ids: list[int] = Field(
+        default_factory=list,
+        description=(
+            "正式代码实际读取或查询的数据源 datasource_id 列表。只能取自当前候选范围，"
+            "且最终报告、图表和表格声称覆盖的数据源必须与实际访问范围一致。"
+            "使用 base_execution_id + patches 时可省略，由后端继承原版本范围。"
+        ),
+    )
+    base_execution_id: int = Field(
+        default=0,
+        description=(
+            "局部修复所基于的失败 execution_id。局部修复时填写并让 code 为空；"
+            "后端从不可变执行记录恢复完整源码。"
+        ),
+    )
+    patches: list[SourceCodePatch] = Field(
+        default_factory=list,
+        description="针对 base_execution_id 完整源码的非重叠语句替换；范围必须来自错误反馈。",
     )
 
 
@@ -7352,6 +8746,41 @@ def _find_empty_markdown_leaf_sections(report_text: str) -> list[dict[str, Any]]
     return empty
 
 
+def _locate_report_section_source(code: str, sections: list[dict[str, Any]]) -> dict[str, Any]:
+    """Locate unique literal heading emitters, without interpreting report numbers."""
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, TypeError):
+        return {}
+    contexts = []
+    for section in sections:
+        heading = str(section.get('heading') or '').strip()
+        marker = '#' * int(section.get('level') or 0) + ' ' + heading
+        candidates = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and marker in [line.strip() for line in node.value.splitlines()]
+        ]
+        if len(candidates) != 1:
+            continue
+        context = _static_node_code_context(code, candidates[0])
+        if context and context not in contexts:
+            contexts.append(context)
+    if not contexts:
+        return {}
+    ranges = []
+    for context in contexts:
+        for item in context.get('suggested_patch_ranges') or []:
+            item = {**item, 'role': 'report_section_emitter'}
+            if item not in ranges:
+                ranges.append(item)
+    return {
+        **contexts[0],
+        'related_contexts': contexts,
+        'suggested_patch_ranges': ranges,
+    }
+
+
 def _result_discloses_limit_usage(exec_result: StructuredResult) -> bool:
     return _text_discloses_limit_usage(_result_visible_text(exec_result))
 
@@ -7502,7 +8931,7 @@ def _query_snapshot_table_names(query_snapshots: dict[str, Any]) -> set[str]:
         if not isinstance(snapshot, dict):
             continue
         execution = snapshot.get('execution') if isinstance(snapshot.get('execution'), dict) else {}
-        if execution.get('status') not in {'success', 'validated', None}:
+        if execution.get('status') not in {'success', 'no_data', 'validated', None}:
             continue
         implementation = (
             snapshot.get('implementation')
@@ -7949,6 +9378,154 @@ def _find_unreadable_table_column_labels(
     return findings
 
 
+def _find_report_structured_table_value_conflicts(
+    report_text: str,
+    tables: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Compare duplicate metric tables without scanning narrative numbers."""
+
+    def normalize_label(value: Any) -> str:
+        text = re.sub(r"[*_`~]", "", str(value or "")).strip().casefold()
+        # Units and qualifiers inside a display label are part of the metric
+        # boundary. This validator is allowed to reject only a proven duplicate,
+        # so keep punctuation and merely ignore presentation whitespace.
+        return re.sub(r"\s+", "", text)
+
+    def numeric_cell(value: Any) -> tuple[float, bool] | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            number = float(value)
+            return (number, False) if math.isfinite(number) else None
+        text = re.sub(r"[*_`~]", "", str(value or "")).strip()
+        match = re.fullmatch(
+            r"([+-]?(?:\d+(?:,\d{3})*|\d*)(?:\.\d+)?)\s*(%)?",
+            text,
+        )
+        if not match or not match.group(1):
+            return None
+        try:
+            number = float(match.group(1).replace(",", ""))
+        except ValueError:
+            return None
+        is_explicit_percent = bool(match.group(2))
+        return (number / 100.0 if is_explicit_percent else number, is_explicit_percent)
+
+    def comparable_values(value: Any, *, label: str = "") -> list[float]:
+        parsed = numeric_cell(value)
+        if parsed is None:
+            return []
+        number, is_explicit_percent = parsed
+        values = [number]
+        # A percentage may be carried by the cell or declared only by the
+        # metric/header label while the cell stores percentage points. When only
+        # the label declares the display unit, accept both storage conventions
+        # so this display-consistency check does not invent a contract about
+        # whether the structured value is a fraction or percentage points.
+        label_declares_percent = bool(re.search(r"%|百分比|百分率", str(label or ""), re.I))
+        if label_declares_percent and not is_explicit_percent:
+            values.append(number / 100.0)
+        return values
+
+    structured_candidates: dict[str, list[tuple[str, list[float]]]] = {}
+    for table in tables or []:
+        if not isinstance(table, dict):
+            continue
+        rows = table.get("rows") or table.get("data") or []
+        columns = table.get("columns") or []
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+            continue
+        labels = {
+            str(column.get("key") or ""): str(column.get("label") or column.get("key") or "")
+            for column in columns
+            if isinstance(column, dict) and str(column.get("key") or "").strip()
+        }
+        for key, raw_value in rows[0].items():
+            label = labels.get(str(key), str(key))
+            normalized = normalize_label(label)
+            numbers = comparable_values(raw_value, label=label)
+            if normalized and numbers:
+                structured_candidates.setdefault(normalized, []).append((label, numbers))
+    # The same display label may legitimately describe different populations,
+    # filters or grains in different structured tables. Without lineage this
+    # validator cannot decide which one a Markdown duplicate refers to, so only
+    # compare labels that identify one structured calculation unambiguously.
+    structured_values = {
+        normalized: candidates[0]
+        for normalized, candidates in structured_candidates.items()
+        if len(candidates) == 1
+    }
+    if len(structured_values) < 2:
+        return []
+
+    lines = str(report_text or "").splitlines()
+    report_values: list[tuple[str, str, float]] = []
+    index = 0
+    while index < len(lines):
+        if not lines[index].lstrip().startswith("|"):
+            index += 1
+            continue
+        block: list[str] = []
+        while index < len(lines) and lines[index].lstrip().startswith("|"):
+            block.append(lines[index].strip())
+            index += 1
+        if len(block) < 3 or not re.fullmatch(r"\|?[\s:|\-]+\|?", block[1]):
+            continue
+
+        def cells(line: str) -> list[str]:
+            return [item.strip() for item in line.strip().strip("|").split("|")]
+
+        headers = cells(block[0])
+        data_rows = [cells(line) for line in block[2:]]
+        for row in data_rows:
+            if len(row) >= 2:
+                label = row[0]
+                normalized = normalize_label(label)
+                numbers = comparable_values(row[1], label=label)
+                if normalized in structured_values and numbers:
+                    report_values.append((normalized, label, numbers))
+            for column_index, raw_value in enumerate(row):
+                if column_index >= len(headers):
+                    continue
+                normalized = normalize_label(headers[column_index])
+                numbers = comparable_values(raw_value, label=headers[column_index])
+                if normalized in structured_values and numbers:
+                    report_values.append((normalized, headers[column_index], numbers))
+
+    comparable = {
+        normalized for normalized, _, _ in report_values if normalized in structured_values
+    }
+    if len(comparable) < 2:
+        return []
+
+    conflicts: list[dict[str, Any]] = []
+    seen: set[tuple[str, tuple[float, ...]]] = set()
+    for normalized, report_label, report_values_for_metric in report_values:
+        structured_label, structured_values_for_metric = structured_values[normalized]
+        equivalent = any(
+            math.isclose(
+                report_value,
+                structured_value,
+                rel_tol=1e-4,
+                abs_tol=max(1e-6, abs(structured_value) * 1e-4),
+            )
+            for report_value in report_values_for_metric
+            for structured_value in structured_values_for_metric
+        )
+        if equivalent:
+            continue
+        identity = (normalized, tuple(report_values_for_metric))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        conflicts.append({
+            "metric": structured_label or report_label,
+            "report_value": report_values_for_metric[0],
+            "structured_value": structured_values_for_metric[0],
+        })
+    return conflicts
+
+
 def _validate_structured_result_contract(
     exec_result: StructuredResult,
     *,
@@ -7993,19 +9570,23 @@ def _validate_structured_result_contract(
 
     empty_leaf_sections = _find_empty_markdown_leaf_sections(report_text)
     if empty_leaf_sections:
+        code_error_context = _locate_report_section_source(generated_code, empty_leaf_sections)
         return request_retry(
             retry_type="incomplete_result",
             message="The rendered Markdown report contains empty leaf sections.",
             diagnostics={
                 "violated_contract": "empty_markdown_leaf_sections",
+                "location_domain": "analysis_report",
                 "empty_sections": empty_leaf_sections,
             },
             repair_instructions=[
                 "Preserve the complete queries, calculations, charts, tables, report structure and datasource scope.",
                 "For each listed leaf heading, render the calculated finding when its population is non-empty; when that population is empty or unsupported, render a concise factual boundary statement instead of leaving the section blank.",
                 "Do not delete requested analytical sections merely to satisfy this structural check.",
+                "empty_sections line_no locates rendered Markdown, not Python. Use code_error_context for source locations; a section emitter is a navigation reference, not proof of the faulty branch.",
             ],
             analysis_report=report_text,
+            code_error_context=code_error_context,
         )
 
     unrendered_placeholders = _find_unrendered_report_placeholders(
@@ -8072,6 +9653,17 @@ def _validate_structured_result_contract(
                 "同步检查报告中由同一变量生成的其他位置，避免重复出现单位。",
             ],
             analysis_report=report_text,
+        )
+
+    table_value_conflicts = _find_report_structured_table_value_conflicts(
+        report_text,
+        exec_result.tables,
+    )
+    if table_value_conflicts:
+        logger.warning(
+            "报告 Markdown 表格与结构化表格存在疑似同名数值差异，"
+            "文本标签不足以证明计算边界一致，保留为非阻断诊断: conflicts=%s",
+            table_value_conflicts,
         )
 
     sql_limit_clauses = _extract_sql_limit_clauses(generated_code)
@@ -8294,86 +9886,21 @@ def _validate_structured_result_contract(
     unreadable_table_columns = _find_unreadable_table_column_labels(
         exec_result.tables
     )
-    if (generated_code and exec_result.query_snapshots) or unreadable_table_columns:
-        # This is an artifact-semantic check, not Evidence generation.  A
-        # chart/table value field must represent one calculation boundary
-        # across its rows so it remains comparable and can later receive one
-        # column/series-level trace.  Run the deterministic lineage half only;
-        # no LLM or Evidence metadata participates in formal analysis.
-        from service.post_analysis_evidence_service import (
-            AnalysisExecutionSnapshot,
-            PostAnalysisEvidenceCompiler,
-        )
-
-        semantic_snapshot = AnalysisExecutionSnapshot(
-            execution_id=0,
-            code_hash="runtime-contract",
-            result_hash="runtime-contract",
-            generated_code=generated_code,
-            query_snapshots=exec_result.query_snapshots,
-            selected_datasource_snapshot=selected_datasource_snapshot or [],
-            user_query="",
+    if unreadable_table_columns:
+        return request_retry(
+            retry_type="result_contract_error",
+            message="结构化表格把底层字段标识直接作为用户表头，缺少用户可读的业务列名。",
+            diagnostics={
+                "violated_contract": "unreadable_table_column_labels",
+                "unreadable_table_columns": unreadable_table_columns,
+            },
+            repair_instructions=[
+                "保留查询、分析范围、图表表格和报告内容，只修正表头展示名称。",
+                "为每一列显式传入 columns=[{'key': 真实字段, 'label': 用户可读业务名称}]。",
+                "只改展示标签，不重命名数据字段、改变计算或删除产物。",
+            ],
             analysis_report=report_text,
-            charts=exec_result.charts or [],
-            tables=exec_result.tables or [],
         )
-        semantic_compiler = PostAnalysisEvidenceCompiler()
-        heterogeneous_outputs = (
-            semantic_compiler.find_heterogeneous_structured_outputs(semantic_snapshot)
-            if generated_code and exec_result.query_snapshots
-            else []
-        )
-        heterogeneous_rankings = (
-            semantic_compiler.find_heterogeneous_rankings(semantic_snapshot)
-            if generated_code and exec_result.query_snapshots
-            else []
-        )
-        if heterogeneous_outputs or heterogeneous_rankings or unreadable_table_columns:
-            findings = [
-                {
-                    "artifact_type": str(item.get("artifact_type") or ""),
-                    "artifact_index": int(item.get("artifact_index") or 0),
-                    "field": str(item.get("field") or ""),
-                }
-                for item in heterogeneous_outputs
-            ]
-            return request_retry(
-                retry_type=(
-                    "chart_contract_error"
-                    if any(item["artifact_type"] == "chart" for item in findings)
-                    else "result_contract_error"
-                ),
-                message=(
-                    "结构化分析产物存在需要一次修正的业务语义问题：不可比数值被放入同一比较边界，"
-                    "或表格把底层字段标识直接作为用户表头。"
-                    if heterogeneous_outputs or heterogeneous_rankings
-                    else "结构化表格把底层字段标识直接作为用户表头，缺少用户可读的业务列名。"
-                ),
-                diagnostics={
-                    "violated_contract": (
-                        "multiple_structured_semantic_contracts"
-                        if unreadable_table_columns
-                        and (heterogeneous_outputs or heterogeneous_rankings)
-                        else "heterogeneous_structured_metric"
-                        if heterogeneous_outputs
-                        else "heterogeneous_ranking_metric"
-                        if heterogeneous_rankings
-                        else "unreadable_table_column_labels"
-                    ),
-                    "outputs": findings,
-                    "rankings": heterogeneous_rankings,
-                    "unreadable_table_columns": unreadable_table_columns,
-                },
-                repair_instructions=[
-                    "保留已经完成的查询、分析范围、有效图表表格和报告内容，只修正诊断列出的不可比计算边界。",
-                    "同一个 value_field、数值列或排序值必须共享统计对象、单位、总体、粒度和计算方式；分类可以变化，指标定义不能随分类变化。",
-                    "不同指标可以并列展示为独立 series/列，但不能仅因都能计数就按绝对数量形成共同优先级。确需排序时，先转换为同一总体上的覆盖率、发生率或有明确共同定义的标准化得分。",
-                    "若当前“类别”实际是物料成本、人工成本、制造费用等不同指标名称，不要继续使用“类别 + 统一数值列”的长表；改成同一统计粒度的一行多指标列，图表使用独立 value_fields/series，表格使用独立业务列，使每个指标保持自己的计算边界。",
-                    "修复后保留各维度的独立事实与业务解释；不要删除图表、表格、数据源、报告章节或分析问题来绕过反馈。",
-                    "为 unreadable_table_columns 中的每一列显式传入 columns=[{'key': 真实字段, 'label': 用户可读业务名称}]；只改展示标签，不重命名数据字段或改动计算。",
-                ],
-                analysis_report=report_text,
-            )
 
     return None
 
@@ -8604,6 +10131,67 @@ def _sanitize_tool_output(output: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
+def _bind_program_execution_mode(code: str, execution_mode: str) -> str:
+    """Materialize the tool's known mode in the persisted, replayable source."""
+    if execution_mode not in {'analysis', 'probe'}:
+        raise ValueError('Unknown execution mode')
+    if not code.strip():
+        return code
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        # The normal compiler reports the original source and repair ranges.
+        return code
+    declarations = [
+        node for node in tree.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        and any(
+            isinstance(target, ast.Name) and target.id == 'execution_intent'
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        )
+    ]
+    if declarations:
+        if any(
+            not isinstance(node.value, ast.Constant) or node.value.value != execution_mode
+            for node in declarations
+        ):
+            raise ValueError(f"execution_intent must match the selected tool ({execution_mode})")
+        return code
+    if any(
+        isinstance(node, ast.Name) and node.id == 'execution_intent' and isinstance(node.ctx, ast.Store)
+        for node in ast.walk(tree)
+    ):
+        raise ValueError('execution_intent is supplied by the tool; remove its dynamic assignment')
+
+    lines = code.splitlines(keepends=True)
+    first_body_statement = None
+    for index, node in enumerate(tree.body):
+        is_docstring = (
+            index == 0 and isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+        )
+        if not (is_docstring or isinstance(node, ast.ImportFrom) and node.module == '__future__'):
+            first_body_statement = node
+            break
+    newline = '\r\n' if '\r\n' in code else '\n'
+    if first_body_statement is None:
+        prefix, suffix = code, ''
+    else:
+        line_index = first_body_statement.lineno - 1
+        byte_offset = first_body_statement.col_offset
+        decorators = getattr(first_body_statement, 'decorator_list', ())
+        if decorators:
+            # A decorated definition starts at its first decorator, not at def/class.
+            line_index = min(decorator.lineno for decorator in decorators) - 1
+            byte_offset = 0
+        current_line = lines[line_index].encode('utf-8')
+        prefix = ''.join(lines[:line_index]) + current_line[:byte_offset].decode('utf-8')
+        suffix = current_line[byte_offset:].decode('utf-8') + ''.join(lines[line_index + 1:])
+    if prefix and not prefix.endswith(('\n', '\r')):
+        prefix += newline
+    return prefix + f'execution_intent = "{execution_mode}"{newline}' + suffix
+
+
 def _build_analysis_logic_signature(code: str) -> str:
     normalized_code = (code or '').replace('\r\n', '\n').strip()
     if not normalized_code:
@@ -8612,29 +10200,22 @@ def _build_analysis_logic_signature(code: str) -> str:
 
 
 def _apply_source_code_patches(code: str, patches: list[SourceCodePatch]) -> str:
-    """Apply syntax-safe complete-statement edits to an immutable source snapshot."""
+    """Apply atomic line edits and validate the complete immutable source revision."""
     source_lines = str(code or '').splitlines()
     if not source_lines:
         raise ValueError('base_execution_id 对应的执行记录没有可修复代码。')
     if not patches:
         raise ValueError('使用 base_execution_id 修复时必须提供至少一个 patches 行区间替换。')
 
+    source_syntax_error: SyntaxError | None = None
     try:
-        source_tree = ast.parse(code or '')
+        ast.parse(code or '')
     except SyntaxError as exc:
-        raise ValueError(
-            '失败代码本身无法建立可靠的 Python 语句边界，请提交完整 code 重新生成，不能使用 patches。'
-        ) from exc
-    valid_statement_ranges = {
-        (
-            int(getattr(node, 'lineno', 0) or 0),
-            int(getattr(node, 'end_lineno', 0) or 0),
-        )
-        for node in ast.walk(source_tree)
-        if isinstance(node, ast.stmt)
-    }
+        source_syntax_error = exc
 
     normalized = sorted(patches, key=lambda item: (item.start_line, item.end_line))
+    syntax_line = int(source_syntax_error.lineno or 0) if source_syntax_error is not None else 0
+    syntax_patch_seen = False
     previous_end = 0
     for patch in normalized:
         if patch.start_line < 1 or patch.end_line < patch.start_line:
@@ -8645,11 +10226,25 @@ def _apply_source_code_patches(code: str, patches: list[SourceCodePatch]) -> str
             )
         if patch.start_line <= previous_end:
             raise ValueError('patches 不能包含重叠的源码行区间。')
-        if (patch.start_line, patch.end_line) not in valid_statement_ranges:
-            raise ValueError(
-                'patches 必须完整替换一个 Python 语句或代码块，不能从字典、字符串、调用参数或缩进块中间截断。'
+        if source_syntax_error is not None:
+            local_start = max(1, syntax_line - GENERATED_CODE_CONTEXT_RADIUS)
+            local_end = min(len(source_lines), syntax_line + GENERATED_CODE_CONTEXT_RADIUS)
+            if (
+                syntax_line <= 0
+                or patch.start_line < local_start
+                or patch.end_line > local_end
+                or patch.end_line - patch.start_line > GENERATED_CODE_CONTEXT_RADIUS * 2
+            ):
+                raise ValueError(
+                    '语法错误代码的 patches 只能替换编译器定位行附近的有限代码块。'
+                )
+            syntax_patch_seen = syntax_patch_seen or (
+                patch.start_line <= syntax_line <= patch.end_line
             )
         previous_end = patch.end_line
+
+    if source_syntax_error is not None and not syntax_patch_seen:
+        raise ValueError('语法错误代码的 patches 至少有一项必须覆盖编译器定位行。')
 
     for patch in reversed(normalized):
         source_lines[patch.start_line - 1:patch.end_line] = patch.replacement.splitlines()
@@ -8662,9 +10257,58 @@ def _apply_source_code_patches(code: str, patches: list[SourceCodePatch]) -> str
     except SyntaxError as exc:
         raise ValueError(
             f'patches 合成后的完整代码存在语法错误（第 {exc.lineno or 0} 行：{exc.msg}）；'
-            '本次补丁未创建执行，请按完整语句边界重新修复或提交完整 code。'
+            '本次补丁未创建执行，请核对原版本行号、缩进和括号后修复，或提交完整 code。'
         ) from exc
     return rendered
+
+
+class SourcePatchResolutionError(ValueError):
+    """A rejected edit, with coordinates still bound to its stored base source."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        execution_id: int,
+        source: str,
+        patches: list[SourceCodePatch],
+        datasource_ids: list[int],
+        syntax_error: SyntaxError | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.execution_id = execution_id
+        self.source = source
+        ranges = []
+        for patch in patches:
+            for line_no in (patch.start_line, patch.end_line):
+                ranges.extend(_source_statement_patch_ranges(source, line_no))
+        if not ranges:
+            # Invalid base syntax still has an exact compiler location.
+            try:
+                ast.parse(source)
+            except SyntaxError as exc:
+                ranges = _build_generated_code_error_context(source, exc, '').get(
+                    'suggested_patch_ranges', []
+                )
+        self.code_error_context = {
+            'location_domain': 'python_source',
+            'suggested_patch_ranges': ranges,
+        }
+        self.diagnostics = {
+            'violated_contract': 'source_patch_rejected',
+            'base_execution_id': execution_id,
+            'new_execution_created': False,
+            'base_source_unchanged': True,
+            'inherited_used_datasource_ids': datasource_ids,
+        }
+        if syntax_error is not None:
+            self.diagnostics['candidate_syntax_error'] = {
+                'location_domain': 'uncommitted_patch_candidate',
+                'line_no': syntax_error.lineno,
+                'column_no': syntax_error.offset,
+                'message': syntax_error.msg,
+                'source_line': str(syntax_error.text or '').rstrip('\r\n'),
+            }
 
 
 def _resolve_execute_python_source(
@@ -8713,19 +10357,33 @@ def _resolve_execute_python_source(
             base_ids = _normalize_used_datasource_ids(json.loads(base_execution.used_datasource_ids_json or '[]'))
         except (TypeError, ValueError, json.JSONDecodeError):
             base_ids = []
-        if normalized_ids and normalized_ids != base_ids:
-            raise ValueError(
+        errors: list[str] = []
+        if normalized_ids and set(normalized_ids) != set(base_ids):
+            errors.append(
                 '局部技术修复不能改变 base_execution_id 的 used_datasource_ids；'
                 '省略该参数或原样传入上一版范围。'
             )
-        resolved_code = _apply_source_code_patches(
-            str(base_execution.generated_code or ''),
-            normalized_patches,
-        )
-        if resolved_code == str(base_execution.generated_code or ''):
-            raise ValueError(
+        source = str(base_execution.generated_code or '')
+        syntax_error = None
+        try:
+            resolved_code = _apply_source_code_patches(source, normalized_patches)
+        except ValueError as exc:
+            errors.append(str(exc))
+            syntax_error = exc.__cause__ if isinstance(exc.__cause__, SyntaxError) else None
+            resolved_code = None
+        if resolved_code == source:
+            errors.append(
                 '局部修复没有改变失败代码。请依据错误反馈中的 SQL 定义或完整语句范围提交实际修改，'
                 '不要重复原语句。'
+            )
+        if errors:
+            raise SourcePatchResolutionError(
+                '\n'.join(errors),
+                execution_id=base_execution_id,
+                source=source,
+                patches=normalized_patches,
+                datasource_ids=base_ids,
+                syntax_error=syntax_error,
             )
         return resolved_code, base_ids, base_execution_id, 'llm_patch_repair'
     finally:
@@ -8941,6 +10599,9 @@ def _build_execution_namespace() -> dict[str, Any]:
         'load_local_file_low_memory': load_local_file_low_memory,
         'load_minio_file': load_minio_file,
         'load_data_with_sql': load_data_with_sql,
+        'query_data_with_sql': query_data_with_sql,
+        'query_local_file': query_local_file,
+        'query_local_file_low_memory': query_local_file_low_memory,
         'probe_data_with_sql': probe_data_with_sql,
         'load_data_with_api': load_data_with_api,
         'normalize_relationship_key': normalize_relationship_key,
@@ -8977,6 +10638,9 @@ def _serialize_runtime_user_context(runtime_context: CustomContext | None) -> di
         'expected_time_range': dict(getattr(runtime_context, 'expected_time_range', {}) or {}),
         'analysis_parameters_override': dict(getattr(runtime_context, 'analysis_parameters_override', {}) or {}),
         'datasource_numeric_fields': numeric_field_profiles,
+        'output_contract': dict(
+            getattr(runtime_context, 'output_contract', {}) or {"type": "standard"}
+        ),
     }
 
 
@@ -9040,6 +10704,9 @@ def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -
     CURRENT_LAST_QUERY_KEY.set('')
     CURRENT_EXECUTION_INTENT.set('')
     CURRENT_CONFIRMED_NO_DATA_RESULT.set(bool(payload.get('confirmed_no_data_result')))
+    CURRENT_OUTPUT_CONTRACT.set(dict(
+        payload.get('output_contract') or {"type": "standard"}
+    ))
     conn_info_payload = payload.get('database_conn_info') or {}
     platform_authorization = str(payload.get('platform_authorization') or '').strip()
     # Older worker payloads carried the database credential as ``token``.
@@ -9884,6 +11551,21 @@ def _execute_generated_code_worker(
                 'status': 'success',
                 'result_file_path': result_file_path,
             })
+        except QueryConstraintRetrySignal as exc:
+            result_file_path = _write_worker_result_payload({
+                'status': 'success',
+                'stdout_text': _sanitize_tool_output(stdout_buffer.getvalue()),
+                'stderr_text': _sanitize_tool_output(stderr_buffer.getvalue()),
+                'exec_result': _serialize_exec_result(exc.retry_result),
+                'query_snapshots': _copy_jsonable(
+                    CURRENT_QUERY_SNAPSHOTS.get() or {},
+                    {},
+                ),
+            })
+            result_queue.put({
+                'status': 'success',
+                'result_file_path': result_file_path,
+            })
         except Exception as exc:
             raw_error_message = str(exc)
             full_traceback = traceback.format_exc()
@@ -9969,6 +11651,8 @@ def _get_stream_emitter():
 
 def _classify_execution_error(error: Exception | None, error_message: str) -> str:
     """把执行失败归类成更容易被模型理解的错误类型。"""
+    if isinstance(error, ProbeQueryFailure):
+        return error.error_type
     if isinstance(error, SyntaxError):
         return 'syntax_error'
     if isinstance(error, ModuleNotFoundError):
@@ -10001,6 +11685,7 @@ def _classify_execution_error(error: Exception | None, error_message: str) -> st
         'not in index' in lowered
         or 'no such column' in lowered
         or 'unknown column' in lowered
+        or 'duplicate column name' in lowered
         or 'cannot be resolved' in lowered
         or 'does not exist' in lowered and 'column' in lowered
         or 'referenced column' in lowered and 'not found' in lowered
@@ -10070,6 +11755,46 @@ def _static_sql_candidates(code: str) -> list[dict[str, Any]]:
             'end_line': int(getattr(node, 'end_lineno', 0) or getattr(node, 'lineno', 0) or 0),
             'source': (ast.get_source_segment(code, node) or ast.unparse(node))[:2400],
             'target_names': target_names,
+            'origin': 'assignment',
+        })
+
+    sql_call_names = {
+        'load_data_with_sql',
+        'probe_data_with_sql',
+        'query_data_with_sql',
+    }
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            call_name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            call_name = node.func.attr
+        else:
+            call_name = ''
+        if call_name not in sql_call_names:
+            continue
+        sql_node = next(
+            (keyword.value for keyword in node.keywords if keyword.arg == 'sql'),
+            None,
+        )
+        if sql_node is None and node.args:
+            sql_node = node.args[0]
+        sql = render_string(sql_node)
+        if not re.search(r'(?is)\bselect\b.+\bfrom\b', sql):
+            continue
+        candidates.append({
+            'sql': sql,
+            'start_line': int(getattr(sql_node, 'lineno', 0) or getattr(node, 'lineno', 0) or 0),
+            'end_line': int(
+                getattr(sql_node, 'end_lineno', 0)
+                or getattr(node, 'end_lineno', 0)
+                or getattr(node, 'lineno', 0)
+                or 0
+            ),
+            'source': (ast.get_source_segment(code, sql_node) or ast.unparse(sql_node))[:2400],
+            'target_names': [],
+            'origin': 'inline_query_call',
         })
     return candidates
 
@@ -10438,6 +12163,966 @@ def _build_schema_field_mismatch_diagnostics(
     }
 
 
+def _validate_static_sql_field_ownership_contract(
+    *,
+    code: str,
+    selected_datasource_snapshot: list[dict[str, Any]] | None,
+) -> RetryResult | None:
+    """Reject statically provable table-alias/field ownership mismatches.
+
+    This validation is deliberately limited to qualified columns whose physical
+    table alias maps unambiguously to one selected datasource. Unqualified
+    columns, derived relations and fields absent from every selected Schema are
+    left to the query engine instead of being guessed here.
+    """
+    if not str(code or '').strip() or not selected_datasource_snapshot:
+        return None
+    try:
+        from sqlglot import exp, parse_one
+    except Exception:
+        return None
+
+    def normalize(value: Any) -> str:
+        return str(value or '').strip().strip('`"[]').casefold()
+
+    sources: list[dict[str, Any]] = []
+    field_owners: dict[str, list[dict[str, Any]]] = {}
+    for datasource in selected_datasource_snapshot:
+        if not isinstance(datasource, dict):
+            continue
+        try:
+            datasource_id = int(datasource.get('datasource_id') or datasource.get('id') or 0)
+        except (TypeError, ValueError):
+            continue
+        schema = datasource.get('metadata_schema') if isinstance(datasource.get('metadata_schema'), dict) else {}
+        properties = schema.get('properties') if isinstance(schema.get('properties'), dict) else {}
+        tokens = {
+            normalize(token)
+            for token in _datasource_relation_tokens(datasource)
+            if normalize(token)
+        }
+        if datasource_id <= 0 or not tokens or not properties:
+            continue
+        owner = {
+            'datasource_id': datasource_id,
+            'datasource_name': str(datasource.get('datasource_name') or schema.get('title') or ''),
+            'datasource_identifier': str(datasource.get('datasource_identifier') or ''),
+        }
+        fields = {
+            normalize(field_name)
+            for field_name in properties
+            if normalize(field_name)
+        }
+        source = {**owner, 'tokens': tokens, 'fields': fields}
+        sources.append(source)
+        for field_name in fields:
+            field_owners.setdefault(field_name, []).append(owner)
+
+    if not sources:
+        return None
+
+    findings: list[dict[str, Any]] = []
+    contexts: list[dict[str, Any]] = []
+    seen: set[tuple[int, int, str, str]] = set()
+    for candidate in _static_sql_candidates(code):
+        try:
+            statement = parse_one(re.sub(
+                r"%\([A-Za-z_][A-Za-z0-9_]*\)s|%s",
+                "'__query_parameter__'",
+                str(candidate.get('sql') or ''),
+            ))
+        except Exception:
+            continue
+
+        alias_sources: dict[str, dict[str, Any]] = {}
+        for table in statement.find_all(exp.Table):
+            parts = [
+                normalize(part)
+                for part in (table.catalog, table.db, table.name)
+                if normalize(part)
+            ]
+            if not parts:
+                continue
+            full_token = '.'.join(parts)
+            exact_matches = [source for source in sources if full_token in source['tokens']]
+            matched_sources = exact_matches or [
+                source for source in sources if parts[-1] in source['tokens']
+            ]
+            if len(matched_sources) != 1:
+                continue
+            alias = normalize(table.alias_or_name)
+            if alias:
+                alias_sources[alias] = matched_sources[0]
+
+        for column in statement.find_all(exp.Column):
+            alias = normalize(column.table)
+            field_name = normalize(column.name)
+            source = alias_sources.get(alias)
+            if not alias or not field_name or source is None or field_name in source['fields']:
+                continue
+            other_owners = [
+                owner
+                for owner in field_owners.get(field_name, [])
+                if int(owner.get('datasource_id') or 0) != int(source['datasource_id'])
+            ]
+            if not other_owners:
+                continue
+            key = (
+                int(candidate.get('start_line') or 0),
+                int(candidate.get('end_line') or 0),
+                alias,
+                field_name,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append({
+                'sql_alias': alias,
+                'field_name': field_name,
+                'bound_datasource': {
+                    'datasource_id': source['datasource_id'],
+                    'datasource_name': source['datasource_name'],
+                    'datasource_identifier': source['datasource_identifier'],
+                },
+                'actual_owners': other_owners,
+                'sql_start_line': int(candidate.get('start_line') or 0),
+                'sql_end_line': int(candidate.get('end_line') or 0),
+            })
+
+        if any(
+            int(item.get('sql_start_line') or 0) == int(candidate.get('start_line') or 0)
+            and int(item.get('sql_end_line') or 0) == int(candidate.get('end_line') or 0)
+            for item in findings
+        ):
+            contexts.append({
+                'start_line': int(candidate.get('start_line') or 0),
+                'end_line': int(candidate.get('end_line') or 0),
+                'kind': 'sql_definition',
+                'source': candidate.get('source'),
+                'role': 'field_ownership_mismatch',
+            })
+
+    if not findings:
+        return None
+
+    descriptions = []
+    for item in findings:
+        actual = ', '.join(
+            f"datasource {owner.get('datasource_id')} ({owner.get('datasource_name') or owner.get('datasource_identifier')})"
+            for owner in item.get('actual_owners') or []
+        )
+        bound = item.get('bound_datasource') or {}
+        descriptions.append(
+            f"{item.get('sql_alias')}.{item.get('field_name')} is bound to datasource "
+            f"{bound.get('datasource_id')} ({bound.get('datasource_name') or bound.get('datasource_identifier')}), "
+            f"but the selected Schema assigns that field to {actual}"
+        )
+    return request_retry(
+        retry_type='schema_or_column_mismatch',
+        message=(
+            'Generated SQL uses qualified fields on physical table aliases that do not own those fields: '
+            + '; '.join(descriptions)
+        ),
+        diagnostics={
+            'violated_contract': 'static_sql_alias_field_ownership_mismatch',
+            'findings': findings,
+        },
+        repair_instructions=[
+            'Repair every listed alias/field mismatch in one pass using the authoritative selected datasource Schema.',
+            'If the field is needed, JOIN or query its real owning datasource through a confirmed relationship; otherwise project only fields owned by the current table alias.',
+            'Preserve the user question, query scope, selected datasource coverage and intended artifacts.',
+        ],
+        code_error_context={
+            'related_contexts': contexts,
+            'suggested_patch_ranges': contexts,
+        },
+    )
+
+
+def _build_dataframe_projection_mismatch_diagnostics(code: str) -> dict[str, Any]:
+    """Find fields consumed from a loaded frame but omitted by its SQL projection."""
+    if not str(code or '').strip():
+        return {}
+    try:
+        from sqlglot import exp, parse_one
+        tree = ast.parse(code)
+    except Exception:
+        return {}
+
+    sql_candidates: dict[str, dict[str, Any]] = {}
+    for candidate in _static_sql_candidates(code):
+        try:
+            statement = parse_one(candidate.get('sql') or '')
+        except Exception:
+            continue
+        select = statement if isinstance(statement, exp.Select) else statement.find(exp.Select)
+        if select is None or any(isinstance(item, exp.Star) for item in select.expressions):
+            continue
+        projected = {
+            str(item.alias_or_name or '').strip().casefold()
+            for item in select.expressions
+            if str(item.alias_or_name or '').strip()
+        }
+        if not projected:
+            continue
+        for target_name in candidate.get('target_names') or []:
+            sql_candidates[str(target_name)] = {
+                'projected_fields': projected,
+                'sql_assignment_range': {
+                    'start_line': candidate.get('start_line'),
+                    'end_line': candidate.get('end_line'),
+                    'kind': 'sql_definition',
+                    'source': candidate.get('source'),
+                    'role': 'dataframe_projection_source',
+                },
+            }
+
+    def call_name(call: ast.Call) -> str:
+        if isinstance(call.func, ast.Name):
+            return call.func.id
+        if isinstance(call.func, ast.Attribute):
+            return call.func.attr
+        return ''
+
+    def root_frame(node: ast.AST | None) -> str:
+        current = node
+        while current is not None:
+            if isinstance(current, ast.Name):
+                return current.id
+            if isinstance(current, ast.Call):
+                current = current.func.value if isinstance(current.func, ast.Attribute) else None
+                continue
+            if isinstance(current, (ast.Attribute, ast.Subscript)):
+                current = current.value
+                continue
+            return ''
+        return ''
+
+    frame_sources: dict[str, dict[str, Any]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = getattr(node, 'value', None)
+        if (
+            not isinstance(value, ast.Call)
+            or call_name(value) not in {'load_data_with_sql', 'query_data_with_sql'}
+        ):
+            continue
+        sql_expression = next(
+            (item.value for item in value.keywords if item.arg == 'sql'),
+            value.args[0] if value.args else None,
+        )
+        if not isinstance(sql_expression, ast.Name) or sql_expression.id not in sql_candidates:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                frame_sources[target.id] = {
+                    **sql_candidates[sql_expression.id],
+                    'sql_variable': sql_expression.id,
+                    'load_line': int(getattr(node, 'lineno', 0) or 0),
+                }
+
+    # Row filters preserve the source projection. Track their aliases so
+    # downstream groupby/agg calls are checked against the original SQL too.
+    for node in sorted(
+        (item for item in ast.walk(tree) if isinstance(item, (ast.Assign, ast.AnnAssign))),
+        key=lambda item: int(getattr(item, 'lineno', 0) or 0),
+    ):
+        value = getattr(node, 'value', None)
+        if not isinstance(value, ast.Subscript):
+            continue
+        source_name = root_frame(value)
+        if source_name not in frame_sources:
+            continue
+        # A literal list/tuple subscript is a column projection rather than a
+        # row filter and has its own stricter validator.
+        if isinstance(value.slice, (ast.List, ast.Tuple)) and all(
+            isinstance(item, ast.Constant) and isinstance(item.value, str)
+            for item in value.slice.elts
+        ):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id not in frame_sources:
+                frame_sources[target.id] = {
+                    **frame_sources[source_name],
+                    'derived_from': source_name,
+                    'load_line': int(getattr(node, 'lineno', 0) or 0),
+                }
+    if not frame_sources:
+        return {}
+
+    assigned_fields: dict[str, set[str]] = {name: set() for name in frame_sources}
+    references: dict[str, dict[str, list[int]]] = {name: {} for name in frame_sources}
+
+    def add_reference(frame: str, field: Any, line: int) -> None:
+        normalized = str(field or '').strip().casefold()
+        if frame not in references or not normalized:
+            return
+        references[frame].setdefault(normalized, []).append(int(line or 0))
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in frame_sources
+                    and isinstance(target.slice, ast.Constant)
+                    and isinstance(target.slice.value, str)
+                ):
+                    assigned_fields[target.value.id].add(target.slice.value.strip().casefold())
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, ast.Load)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in frame_sources
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, str)
+        ):
+            add_reference(node.value.id, node.slice.value, getattr(node, 'lineno', 0))
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {'agg', 'aggregate'}
+        ):
+            continue
+        frame = root_frame(node.func.value)
+        if frame not in frame_sources:
+            continue
+        groupby_call = next(
+            (
+                item for item in ast.walk(node.func.value)
+                if isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Attribute)
+                and item.func.attr == 'groupby'
+            ),
+            None,
+        )
+        if groupby_call is not None:
+            for argument in groupby_call.args:
+                values = argument.elts if isinstance(argument, (ast.List, ast.Tuple)) else [argument]
+                for value in values:
+                    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                        add_reference(frame, value.value, getattr(value, 'lineno', 0))
+        for keyword in node.keywords:
+            value = keyword.value
+            if (
+                isinstance(value, (ast.Tuple, ast.List))
+                and value.elts
+                and isinstance(value.elts[0], ast.Constant)
+                and isinstance(value.elts[0].value, str)
+            ):
+                add_reference(frame, value.elts[0].value, getattr(value.elts[0], 'lineno', 0))
+
+    mismatches: list[dict[str, Any]] = []
+    for frame, source in frame_sources.items():
+        missing = sorted(
+            set(references[frame])
+            - set(source.get('projected_fields') or set())
+            - assigned_fields[frame]
+        )
+        if not missing:
+            continue
+        mismatches.append({
+            'dataframe': frame,
+            'load_line': source.get('load_line'),
+            'sql_variable': source.get('sql_variable'),
+            'missing_projection_fields': missing,
+            'usage_lines': {
+                field: sorted(set(references[frame].get(field) or []))
+                for field in missing
+            },
+            'sql_assignment_range': source.get('sql_assignment_range'),
+        })
+    if not mismatches:
+        return {}
+    return {
+        'dataframe_projection_mismatches': mismatches,
+    }
+
+
+def _validate_query_dataframe_projection_contract(code: str) -> RetryResult | None:
+    """Reject all statically provable SQL/DataFrame projection mismatches."""
+    diagnostics = _build_dataframe_projection_mismatch_diagnostics(code)
+    mismatches = diagnostics.get('dataframe_projection_mismatches') or []
+    if not mismatches:
+        return None
+    tree = ast.parse(code)
+    proof_state = 'proven' if all(
+        _static_frame_reads_have_stable_binding(
+            tree, item['dataframe'], int(item.get('load_line') or 0),
+            [line for lines in item['usage_lines'].values() for line in lines],
+        ) for item in mismatches
+    ) else 'unknown'
+    patch_ranges = [
+        item.get('sql_assignment_range')
+        for item in mismatches
+        if isinstance(item.get('sql_assignment_range'), dict)
+    ]
+    return request_retry(
+        retry_type='contract_error',
+        message=(
+            'The generated program consumes DataFrame fields omitted by its own SQL projections. '
+            'All statically visible projection mismatches are listed together.'
+        ),
+        diagnostics={
+            'violated_contract': 'query_dataframe_projection_mismatch',
+            'proof_state': proof_state,
+            'findings': mismatches,
+        },
+        repair_instructions=[
+            'Preserve the complete query, calculation and artifact scope. Repair every listed field in one pass.',
+            'Project a real field supplied by the same datasource, or use a projection-independent reduction such as groupby.size(); do not fix only the first runtime exception.',
+        ],
+        code_error_context={
+            'suggested_patch_ranges': patch_ranges,
+        },
+    )
+
+
+_STATIC_QUERY_VALUE_UNKNOWN = object()
+
+
+def _evaluate_static_query_value(
+    node: ast.AST | None,
+    values: dict[str, Any],
+) -> Any:
+    """Evaluate the small literal subset used by generated query declarations."""
+    if node is None:
+        return _STATIC_QUERY_VALUE_UNKNOWN
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        return values.get(node.id, _STATIC_QUERY_VALUE_UNKNOWN)
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        items = [_evaluate_static_query_value(item, values) for item in node.elts]
+        if any(item is _STATIC_QUERY_VALUE_UNKNOWN for item in items):
+            return _STATIC_QUERY_VALUE_UNKNOWN
+        if isinstance(node, ast.Tuple):
+            return tuple(items)
+        if isinstance(node, ast.Set):
+            return set(items)
+        return items
+    if isinstance(node, ast.Dict):
+        result: dict[Any, Any] = {}
+        for key_node, value_node in zip(node.keys, node.values):
+            value = _evaluate_static_query_value(value_node, values)
+            if value is _STATIC_QUERY_VALUE_UNKNOWN:
+                return _STATIC_QUERY_VALUE_UNKNOWN
+            if key_node is None:
+                if not isinstance(value, dict):
+                    return _STATIC_QUERY_VALUE_UNKNOWN
+                result.update(value)
+                continue
+            key = _evaluate_static_query_value(key_node, values)
+            if key is _STATIC_QUERY_VALUE_UNKNOWN:
+                return _STATIC_QUERY_VALUE_UNKNOWN
+            result[key] = value
+        return result
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for item in node.values:
+            if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                parts.append(item.value)
+                continue
+            if not isinstance(item, ast.FormattedValue):
+                return _STATIC_QUERY_VALUE_UNKNOWN
+            value = _evaluate_static_query_value(item.value, values)
+            parts.append(
+                str(value)
+                if value is not _STATIC_QUERY_VALUE_UNKNOWN
+                else "__runtime_value__"
+            )
+        return "".join(parts)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        value = _evaluate_static_query_value(node.operand, values)
+        if not isinstance(value, (int, float)):
+            return _STATIC_QUERY_VALUE_UNKNOWN
+        return -value if isinstance(node.op, ast.USub) else value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _evaluate_static_query_value(node.left, values)
+        right = _evaluate_static_query_value(node.right, values)
+        if left is _STATIC_QUERY_VALUE_UNKNOWN or right is _STATIC_QUERY_VALUE_UNKNOWN:
+            return _STATIC_QUERY_VALUE_UNKNOWN
+        try:
+            return left + right
+        except (TypeError, ValueError):
+            return _STATIC_QUERY_VALUE_UNKNOWN
+    return _STATIC_QUERY_VALUE_UNKNOWN
+
+
+def _static_query_declaration_environment(tree: ast.AST, before_line: int | None = None) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for statement in getattr(tree, "body", []):
+        if before_line is not None and statement.lineno >= before_line:
+            break
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom)):
+                values.clear()
+            continue
+        value = _evaluate_static_query_value(getattr(statement, "value", None), values)
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                if value is _STATIC_QUERY_VALUE_UNKNOWN:
+                    values.pop(target.id, None)
+                else:
+                    values[target.id] = value
+            else:
+                values.clear()  # A subscript/attribute write can mutate a stored declaration.
+    return values
+
+
+def _static_query_result_lineage(
+    tree: ast.AST,
+    values: dict[str, Any],
+    before_line: int | None = None,
+) -> dict[str, set[str]]:
+    """Track top-level values derived from composed query results.
+
+    The runtime query-scope contract is attached to a logical query, not to the
+    incidental Python list later used as ``params``.  Models commonly derive a
+    subject-id list from one query result and use it to load related facts.  A
+    plain literal evaluator cannot see that relationship, so retain the parent
+    query key while following ordinary assignments such as
+    ``batch_ids = candidates["batch_id"].unique().tolist()``.
+    """
+    lineage: dict[str, set[str]] = {}
+    assignments = sorted(
+        (
+            node
+            for node in getattr(tree, 'body', [])
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and (before_line is None or node.lineno < before_line)
+        ),
+        key=lambda node: int(getattr(node, "lineno", 0) or 0),
+    )
+    for statement in assignments:
+        value_node = getattr(statement, "value", None)
+        targets = (
+            statement.targets
+            if isinstance(statement, ast.Assign)
+            else [statement.target]
+        )
+        target_names = [
+            target.id
+            for target in targets
+            if isinstance(target, ast.Name)
+        ]
+        if not target_names or value_node is None:
+            continue
+
+        source_keys: set[str] = set()
+        if isinstance(value_node, ast.Call):
+            function_name = (
+                value_node.func.id
+                if isinstance(value_node.func, ast.Name)
+                else value_node.func.attr
+                if isinstance(value_node.func, ast.Attribute)
+                else ""
+            )
+            if function_name == "query_data_with_sql":
+                keywords = {
+                    keyword.arg: keyword.value
+                    for keyword in value_node.keywords
+                    if keyword.arg is not None
+                }
+                query_key = _evaluate_static_query_value(
+                    keywords.get("query_key"),
+                    _static_query_declaration_environment(tree, statement.lineno),
+                )
+                if isinstance(query_key, str) and query_key.strip():
+                    source_keys.add(query_key.strip())
+
+        if not source_keys:
+            for node in ast.walk(value_node):
+                if isinstance(node, ast.Name):
+                    source_keys.update(lineage.get(node.id, set()))
+        for target_name in target_names:
+            if source_keys:
+                lineage[target_name] = set(source_keys)
+            else:
+                lineage.pop(target_name, None)
+    return lineage
+
+
+def _static_expression_query_lineage(
+    node: ast.AST | None,
+    lineage: dict[str, set[str]],
+) -> set[str]:
+    if node is None:
+        return set()
+    result: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name):
+            result.update(lineage.get(child.id, set()))
+    return result
+
+
+def _validate_static_composed_query_constraints_contract(
+    tree: ast.AST,
+    code: str,
+) -> RetryResult | None:
+    """Report every statically provable composed-query scope mismatch at once."""
+    findings: list[dict[str, Any]] = []
+    contexts: list[dict[str, Any]] = []
+
+    for call in (item for item in ast.walk(tree) if isinstance(item, ast.Call)):
+        function_name = (
+            call.func.id
+            if isinstance(call.func, ast.Name)
+            else call.func.attr
+            if isinstance(call.func, ast.Attribute)
+            else ""
+        )
+        if function_name != "query_data_with_sql":
+            continue
+        direct_statement = next((
+            node for node in getattr(tree, 'body', [])
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.Expr))
+            and node.lineno <= call.lineno <= node.end_lineno
+        ), None)
+        values = _static_query_declaration_environment(tree, call.lineno) if direct_statement is not None else {}
+        result_lineage = _static_query_result_lineage(tree, values, call.lineno) if direct_statement is not None else {}
+        keywords = {
+            keyword.arg: keyword.value
+            for keyword in call.keywords
+            if keyword.arg is not None
+        }
+        constraints = _evaluate_static_query_value(
+            keywords.get("query_constraints"),
+            values,
+        )
+        sql = _evaluate_static_query_value(keywords.get("sql"), values)
+        if not isinstance(constraints, dict):
+            continue
+        static_sql = sql if isinstance(sql, str) and sql.strip() else ""
+        query_key = _evaluate_static_query_value(keywords.get("query_key"), values)
+        scope_source = _evaluate_static_query_value(
+            keywords.get("scope_source_query_key"),
+            values,
+        )
+        scope_binding = _evaluate_static_query_value(
+            keywords.get("scope_binding"),
+            values,
+        )
+        params = _evaluate_static_query_value(keywords.get("params"), values)
+        params_lineage = _static_expression_query_lineage(
+            keywords.get("params"),
+            result_lineage,
+        )
+        parameter_code = (
+            json.dumps(params, ensure_ascii=False, default=str)
+            if params is not _STATIC_QUERY_VALUE_UNKNOWN
+            else ""
+        )
+        filter_code = "\n".join(item for item in (static_sql, parameter_code) if item)
+
+        query_findings: list[dict[str, Any]] = []
+        schema_errors = _validate_query_constraints_schema(constraints)
+        if schema_errors:
+            query_findings.append({
+                "constraint": "schema",
+                "message": "query_constraints 结构不合法。",
+                "diagnostics": {"schema_errors": schema_errors},
+            })
+        elif static_sql and not (isinstance(scope_source, str) and scope_source.strip()):
+            has_runtime_placeholders = bool(re.search(
+                r"%s|%\([A-Za-z_][A-Za-z0-9_]*\)s|:[A-Za-z_][A-Za-z0-9_]*|\?",
+                static_sql,
+            ))
+            for checker in (
+                _check_target_filter_constraints,
+                _check_time_range_constraint,
+            ):
+                issue = checker(constraints, filter_code)
+                if issue is None:
+                    continue
+                # A placeholder-backed query whose params are computed at
+                # runtime cannot be disproved from source text alone.  Runtime
+                # validation still checks the bound values before execution.
+                if params is _STATIC_QUERY_VALUE_UNKNOWN and has_runtime_placeholders:
+                    continue
+                query_findings.append({
+                    "constraint": str(
+                        (issue.get("diagnostics") or {}).get("violated_constraint")
+                        or issue.get("error_type")
+                        or "query_constraint"
+                    ),
+                    "message": str(issue.get("error_message") or "查询声明与物理实现不一致。"),
+                    "diagnostics": issue.get("diagnostics") or {},
+                })
+        has_scope_source = isinstance(scope_source, str) and bool(scope_source.strip())
+        if params_lineage:
+            expected_parents = sorted(params_lineage)
+            if not has_scope_source:
+                query_findings.append({
+                    "constraint": "derived_query_scope",
+                    "proof_state": "unknown",
+                    "message": (
+                        "查询参数依赖上游结果；仅凭数据依赖不能确定它是否代表父实体集合，需结合实际业务用途判断。"
+                    ),
+                    "diagnostics": {
+                        "reason": "missing_scope_source_query_key",
+                        "expected_parent_query_keys": expected_parents,
+                    },
+                })
+            elif scope_source.strip() not in params_lineage:
+                query_findings.append({
+                    "constraint": "derived_query_scope",
+                    "message": "关联查询声明的父范围与参数的真实查询来源不一致。",
+                    "diagnostics": {
+                        "reason": "scope_source_query_key_mismatch",
+                        "declared_parent_query_key": scope_source.strip(),
+                        "expected_parent_query_keys": expected_parents,
+                    },
+                })
+            if has_scope_source and not (
+                isinstance(scope_binding, dict)
+                and str(scope_binding.get("source_field") or "").strip()
+                and str(scope_binding.get("target_field") or "").strip()
+            ):
+                query_findings.append({
+                    "constraint": "derived_query_scope",
+                    "message": "关联查询继承父范围时缺少明确的源字段与目标字段绑定。",
+                    "diagnostics": {
+                        "reason": "missing_scope_binding",
+                        "declared_parent_query_key": scope_source.strip(),
+                        "expected_parent_query_keys": expected_parents,
+                    },
+                })
+        if not query_findings:
+            continue
+        context = _static_node_code_context(code, call)
+        contexts.append(context)
+        findings.append({
+            "query_key": str(query_key or ""),
+            "call_line": int(getattr(call, "lineno", 0) or 0),
+            "issues": query_findings,
+        })
+
+    if not findings:
+        return None
+    proven_findings = [
+        {**finding, 'issues': [issue for issue in finding['issues'] if issue.get('proof_state') != 'unknown']}
+        for finding in findings
+        if any(issue.get('proof_state') != 'unknown' for issue in finding['issues'])
+    ]
+    advisory_findings = [
+        {**finding, 'issues': [issue for issue in finding['issues'] if issue.get('proof_state') == 'unknown']}
+        for finding in findings
+        if any(issue.get('proof_state') == 'unknown' for issue in finding['issues'])
+    ]
+    return request_retry(
+        retry_type="invalid_query_constraints",
+        message=(
+            "正式程序中多条物理查询的 query_constraints 与各自 SQL 实现不一致；"
+            "已在执行前一次汇总全部可静态证明的问题。"
+        ),
+        diagnostics={
+            "violated_contract": "composed_query_scope_mismatch",
+            "proof_state": 'proven' if proven_findings else 'unknown',
+            "findings": proven_findings or advisory_findings,
+            "unproven_advisories": advisory_findings if proven_findings else [],
+        },
+        repair_instructions=[
+            "逐条保持真实业务口径：只有物理查询实际实现的时间和目标筛选，才写入该 query_key 的 query_constraints。",
+            "不受分析时间限制的主数据或字典补充查询，应声明 time_range=None、target_filters=[]；不要机械复制总体范围。",
+            "由父查询主体集合派生的关联事实，使用 scope_source_query_key 与 scope_binding 继承已验证范围，不要为子表伪造另一套时间字段。",
+            "一次修复 diagnostics.findings 中的全部查询，保留原有数据源、指标、图表、表格和报告范围。",
+        ],
+        code_error_context={
+            "related_contexts": contexts,
+            "suggested_patch_ranges": contexts,
+        },
+    )
+
+
+def _validate_sql_projection_contract(tree: ast.AST, code: str) -> RetryResult | None:
+    """Reject duplicate result-column names in every statically known SQL call."""
+    try:
+        from sqlglot import exp, parse_one
+    except Exception:
+        return None
+
+    def render_string(node: ast.AST | None) -> str:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.JoinedStr):
+            parts: list[str] = []
+            for item in node.values:
+                if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                    parts.append(item.value)
+                elif isinstance(item, ast.FormattedValue):
+                    parts.append('__runtime_value__')
+            return ''.join(parts)
+        return ''
+
+    sql_variables: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        sql = render_string(getattr(node, 'value', None))
+        if not re.search(r'(?is)\bselect\b.+\bfrom\b', sql):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                sql_variables[target.id] = sql
+
+    findings: list[dict[str, Any]] = []
+    contexts: list[dict[str, Any]] = []
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        function_name = ''
+        if isinstance(call.func, ast.Name):
+            function_name = call.func.id
+        elif isinstance(call.func, ast.Attribute):
+            function_name = call.func.attr
+        if function_name not in {'query_data_with_sql', 'load_data_with_sql'}:
+            continue
+        sql_node = next((item.value for item in call.keywords if item.arg == 'sql'), None)
+        if sql_node is None and call.args:
+            sql_node = call.args[0]
+        sql = sql_variables.get(sql_node.id, '') if isinstance(sql_node, ast.Name) else render_string(sql_node)
+        if not sql:
+            continue
+        try:
+            statement = parse_one(sql)
+        except Exception:
+            continue
+        select = statement if isinstance(statement, exp.Select) else statement.find(exp.Select)
+        if select is None or any(isinstance(item, exp.Star) for item in select.expressions):
+            continue
+        names = [
+            str(item.alias_or_name or '').strip()
+            for item in select.expressions
+            if str(item.alias_or_name or '').strip()
+        ]
+        duplicates = sorted({name for name in names if names.count(name) > 1}, key=str.casefold)
+        if not duplicates:
+            continue
+        query_key_node = next((item.value for item in call.keywords if item.arg == 'query_key'), None)
+        query_key = render_string(query_key_node)
+        context = _static_node_code_context(code, call)
+        contexts.append(context)
+        findings.append({
+            'query_key': query_key,
+            'duplicate_output_fields': duplicates,
+            'call_line': int(getattr(call, 'lineno', 0) or 0),
+        })
+    if not findings:
+        return None
+    return request_retry(
+        retry_type='contract_error',
+        message='SQL projections contain duplicate output field names that make the query result ambiguous.',
+        diagnostics={
+            'violated_contract': 'duplicate_sql_projection_fields',
+            'findings': findings,
+        },
+        repair_instructions=[
+            'Preserve every required business field and query scope. Remove an accidental duplicate projection, or give genuinely different same-named expressions unique aliases.',
+            'Repair all listed queries in one pass before resubmitting the formal analysis program.',
+        ],
+        code_error_context={
+            'related_contexts': contexts,
+            'suggested_patch_ranges': contexts,
+        },
+    )
+
+
+def _validate_analysis_query_result_consumption_contract(
+    tree: ast.AST,
+    code: str,
+) -> RetryResult | None:
+    """Identify possible unused query results, not a proof of missing analysis."""
+
+    def call_name(node: ast.AST | None) -> str:
+        if not isinstance(node, ast.Call):
+            return ''
+        if isinstance(node.func, ast.Name):
+            return node.func.id
+        if isinstance(node.func, ast.Attribute):
+            return node.func.attr
+        return ''
+
+    query_functions = {
+        'query_data_with_sql',
+        'load_data_with_sql',
+        'query_local_file',
+        'query_local_file_low_memory',
+    }
+    assignments: list[tuple[str, ast.AST, ast.Call]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = getattr(node, 'value', None)
+        if call_name(value) not in query_functions:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                assignments.append((target.id, node, value))
+
+    findings: list[dict[str, Any]] = []
+    contexts: list[dict[str, Any]] = []
+    for variable_name, assignment, query_call in assignments:
+        assignment_line = int(getattr(assignment, 'end_lineno', 0) or getattr(assignment, 'lineno', 0) or 0)
+        consumed_lines = sorted({
+            int(getattr(node, 'lineno', 0) or 0)
+            for node in ast.walk(tree)
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id == variable_name
+                and int(getattr(node, 'lineno', 0) or 0) > assignment_line
+            )
+        })
+        if consumed_lines:
+            continue
+        query_key_node = next(
+            (item.value for item in query_call.keywords if item.arg == 'query_key'),
+            None,
+        )
+        query_key = (
+            str(query_key_node.value).strip()
+            if isinstance(query_key_node, ast.Constant) and isinstance(query_key_node.value, str)
+            else ''
+        )
+        context = _static_node_code_context(code, assignment)
+        contexts.append(context)
+        findings.append({
+            'query_key': query_key,
+            'result_variable': variable_name,
+            'assignment_line': int(getattr(assignment, 'lineno', 0) or 0),
+        })
+    if not findings:
+        return None
+    return request_retry(
+        retry_type='contract_error',
+        message=(
+            'No later direct variable read was found for these query results. '
+            'This does not prove they are unused: closures and indirect access may consume them.'
+        ),
+        diagnostics={
+            'violated_contract': 'unconsumed_analysis_query_results',
+            'proof_state': 'unknown',
+            'findings': findings,
+        },
+        repair_instructions=[
+            'Use every listed query result in the analysis conclusion or remove the unnecessary query and any claim attributed to it.',
+            'When two sources are used to cross-check a fact, compute and disclose their actual values or discrepancy; do not merely execute the second query and claim that the sources agree.',
+            'Preserve the business question, selected datasource scope and useful artifacts while repairing all findings in one pass.',
+        ],
+        code_error_context={
+            'related_contexts': contexts,
+            'suggested_patch_ranges': contexts,
+        },
+    )
+
+
 def _augment_schema_field_mismatch_feedback(
     *,
     code: str,
@@ -10457,11 +13142,19 @@ def _augment_schema_field_mismatch_feedback(
         selected_datasource_snapshot=selected_datasource_snapshot,
         code_error_context=code_error_context,
     )
-    if not ownership:
+    projection = _build_dataframe_projection_mismatch_diagnostics(code)
+    if not ownership and not projection:
         return error_type, error_signature, diagnostics, repair_instructions, code_error_context
 
     incompatible_fields = ownership.get('incompatible_fields') or []
+    projection_mismatches = projection.get('dataframe_projection_mismatches') or []
     field_names = [str(item.get('field_name') or '') for item in incompatible_fields]
+    field_names.extend(
+        field
+        for item in projection_mismatches
+        for field in item.get('missing_projection_fields') or []
+    )
+    field_names = list(dict.fromkeys(field_names))
     owner_descriptions = []
     for item in incompatible_fields:
         owners = item.get('actual_owners') or []
@@ -10480,18 +13173,38 @@ def _augment_schema_field_mismatch_feedback(
     })
     enriched_diagnostics = dict(diagnostics or {})
     enriched_diagnostics.update(ownership)
+    enriched_diagnostics.update(projection)
     enriched_context = dict(code_error_context or {})
     patch_ranges = list(enriched_context.get('suggested_patch_ranges') or [])
     sql_range = ownership.get('sql_assignment_range')
     if isinstance(sql_range, dict) and sql_range not in patch_ranges:
         patch_ranges.insert(0, sql_range)
+    for item in projection_mismatches:
+        sql_range = item.get('sql_assignment_range')
+        if isinstance(sql_range, dict) and sql_range not in patch_ranges:
+            patch_ranges.append(sql_range)
     enriched_context['suggested_patch_ranges'] = patch_ranges
-    instruction = (
-        f"The failed query targets datasource {ownership.get('query_datasource_id')} "
-        f"({ownership.get('query_datasource_name') or ownership.get('query_datasource_identifier')}), "
-        f"but all incompatible fields are: {'; '.join(owner_descriptions)}. "
-        "Repair all listed fields in one pass using their owning datasource queries and preserve the analysis scope; "
-        "do not merely remove the first field reported by the database."
+    instruction_parts = []
+    if ownership:
+        instruction_parts.append(
+            f"The failed query targets datasource {ownership.get('query_datasource_id')} "
+            f"({ownership.get('query_datasource_name') or ownership.get('query_datasource_identifier')}), "
+            f"but all incompatible fields are: {'; '.join(owner_descriptions)}."
+        )
+    if projection_mismatches:
+        projection_description = '; '.join(
+            f"{item.get('dataframe')} loaded from {item.get('sql_variable')} omits "
+            f"{item.get('missing_projection_fields')} used at {item.get('usage_lines')}"
+            for item in projection_mismatches
+        )
+        instruction_parts.append(
+            "The generated program also consumes fields omitted by its own SQL projections: "
+            + projection_description + '.'
+        )
+    instruction = ' '.join(instruction_parts) + (
+        " Repair all listed fields in one pass while preserving the analysis scope. "
+        "Either project a real field supplied by that datasource or use a projection-independent operation such as groupby.size(); "
+        "do not merely remove the first field reported by the runtime."
     )
     return (
         error_type,
@@ -10511,7 +13224,7 @@ def _augment_missing_mapping_key_feedback(
     repair_instructions: list[str],
     code_error_context: dict[str, Any],
 ) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
-    """Expose every static use of one missing mapping key in a single repair."""
+    """Locate the failing mapping's construction and uses, not namesakes elsewhere."""
     if error_type != 'schema_or_column_mismatch':
         return diagnostics, repair_instructions, code_error_context
     key_match = re.match(r"^['\"]([^'\"]+)['\"](?:\r?\n|$)", str(error_message or '').strip())
@@ -10530,6 +13243,14 @@ def _augment_missing_mapping_key_feedback(
         for parent in ast.walk(tree)
         for child in ast.iter_child_nodes(parent)
     }
+
+    def lexical_scope(node: ast.AST) -> ast.AST:
+        while node in parent_by_node:
+            node = parent_by_node[node]
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                return node
+        return tree
+
     occurrences: list[dict[str, Any]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Subscript):
@@ -10543,6 +13264,8 @@ def _augment_missing_mapping_key_feedback(
         if not isinstance(statement, ast.stmt):
             continue
         occurrences.append({
+            '_node': node,
+            '_scope': lexical_scope(node),
             'mapping_expression': ast.unparse(node.value),
             'line_no': int(getattr(node, 'lineno', 0) or 0),
             'statement_range': {
@@ -10560,17 +13283,47 @@ def _augment_missing_mapping_key_feedback(
         failed_line = int((code_error_context or {}).get('line_no') or 0)
     except (TypeError, ValueError):
         failed_line = 0
-    failed_mapping = next(
+    failed_occurrence = next(
         (
-            item['mapping_expression'] for item in occurrences
+            item for item in occurrences
             if item['line_no'] == failed_line
         ),
-        occurrences[0]['mapping_expression'],
+        None,
     )
+    if failed_occurrence is None:
+        return diagnostics, repair_instructions, code_error_context
+    failed_mapping = failed_occurrence['mapping_expression']
+    failed_scope = failed_occurrence['_scope']
     related = [
         item for item in occurrences
-        if item['mapping_expression'] == failed_mapping
+        if item['mapping_expression'] == failed_mapping and item['_scope'] is failed_scope
     ]
+    source_lines = code.splitlines()
+    definitions = []
+    mapping = failed_occurrence['_node'].value
+    while isinstance(mapping, (ast.Attribute, ast.Subscript)):
+        mapping = mapping.value
+    if isinstance(mapping, ast.Name):
+        for node in ast.walk(tree):
+            if (
+                not isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+                or node.lineno >= failed_line
+                or lexical_scope(node) is not failed_scope
+            ):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                while isinstance(target, (ast.Attribute, ast.Subscript)):
+                    target = target.value
+                if isinstance(target, ast.Name) and target.id == mapping.id:
+                    definitions.append({
+                        'start_line': node.lineno,
+                        'end_line': node.end_lineno,
+                        'kind': type(node).__name__,
+                        'source': '\n'.join(source_lines[node.lineno - 1:node.end_lineno]),
+                        'role': 'mapping_construction',
+                    })
+                    break
     enriched_diagnostics = dict(diagnostics or {})
     enriched_diagnostics.update({
         'violated_contract': 'missing_mapping_key',
@@ -10579,12 +13332,22 @@ def _augment_missing_mapping_key_feedback(
         'usage_lines': [item['line_no'] for item in related],
     })
     enriched_context = dict(code_error_context or {})
-    patch_ranges = list(enriched_context.get('suggested_patch_ranges') or [])
+    # The generic lookup feedback may contain every literal with this spelling.
+    # Once the failing object is known, those unrelated sources are not repair targets.
+    patch_ranges = list(definitions)
     for item in related:
         statement_range = item['statement_range']
         if statement_range not in patch_ranges:
             patch_ranges.append(statement_range)
     enriched_context['suggested_patch_ranges'] = patch_ranges
+    enriched_context['related_contexts'] = []
+    enriched_context['symbol_references'] = [{
+        'symbol': missing_key,
+        'kind': 'mapping_key',
+        'mapping_expression': failed_mapping,
+        'line_no': item['line_no'],
+    } for item in related]
+    enriched_context['location_domain'] = 'python_source'
     instruction = (
         f"Mapping expression {failed_mapping} has no key {missing_key!r}, and the generated program "
         f"uses that same missing key at lines {[item['line_no'] for item in related]}. "
@@ -10671,8 +13434,48 @@ def _extract_error_signature(error_type: str, error_message: str) -> dict[str, A
     return signature
 
 
+def _current_task_execution_query(session, turn_id: int, current_execution_id: int, *, include_current: bool = False):
+    """Anchor every history reader to the actual execution, not a previous refresh."""
+    from model import InsightNsExecution, InsightNsTurn
+
+    current = session.query(InsightNsExecution.analysis_task_id).filter(
+        InsightNsExecution.id == current_execution_id,
+        InsightNsExecution.turn_id == turn_id,
+        InsightNsExecution.is_deleted == 0,
+    ).first()
+    query = session.query(InsightNsExecution).filter(
+        InsightNsExecution.turn_id == turn_id,
+        InsightNsExecution.is_deleted == 0,
+        (InsightNsExecution.id <= current_execution_id) if include_current
+        else (InsightNsExecution.id < current_execution_id),
+    )
+    if current is None:
+        return query.filter(False)
+    if current.analysis_task_id:
+        return query.filter(InsightNsExecution.analysis_task_id == current.analysis_task_id)
+    turn = session.query(InsightNsTurn).filter(InsightNsTurn.id == turn_id).first()
+    if turn is None or turn.started_at is None:
+        return query.filter(False)
+    return query.filter(
+        InsightNsExecution.analysis_task_id.is_(None),
+        InsightNsExecution.created_at >= turn.started_at,
+    )
+
+
+def _execution_feedback_type(execution: Any) -> str:
+    try:
+        payload = json.loads(getattr(execution, 'result_payload_json', '') or '{}')
+    except (TypeError, ValueError):
+        payload = {}
+    if isinstance(payload, dict):
+        for key in ('retry_type', 'error_type', 'retry_reason_code'):
+            if payload.get(key):
+                return str(payload[key]).strip()
+    return _classify_execution_error(None, str(getattr(execution, 'error_message', '') or ''))
+
+
 def _build_turn_failure_memory(turn_id: int, current_execution_id: int) -> dict[str, Any]:
-    """汇总同一轮中之前已失败的执行记录，供模型避免重复犯错。"""
+    """Summarize failures from this task, excluding successful Probe observations."""
     if turn_id <= 0:
         return {
             'previous_failure_messages': [],
@@ -10684,18 +13487,17 @@ def _build_turn_failure_memory(turn_id: int, current_execution_id: int) -> dict[
 
     session = SessionLocal()
     try:
-        previous_failures = session.query(InsightNsExecution).filter(
-            InsightNsExecution.turn_id == turn_id,
-            InsightNsExecution.id != current_execution_id,
-            InsightNsExecution.is_deleted == 0,
-            InsightNsExecution.execution_status != 'success',
-        ).order_by(InsightNsExecution.created_at.asc()).all()
+        previous_failures = _current_task_execution_query(
+            session, turn_id, current_execution_id,
+        ).filter(InsightNsExecution.execution_status == 'failed').order_by(InsightNsExecution.id.asc()).all()
 
         failure_messages: list[str] = []
         failure_hints: list[str] = []
         seen_hints: set[str] = set()
 
         for execution in previous_failures:
+            if _execution_feedback_type(execution) == 'probe_feedback':
+                continue
             error_message = (execution.error_message or '').strip()
             if not error_message:
                 continue
@@ -10751,8 +13553,11 @@ def _validate_scope_preserving_technical_repair(
     previous_used_datasource_ids: list[int],
     current_used_datasource_ids: list[int],
     previous_failure_payload: dict[str, Any] | None,
+    previous_scope_is_proven: bool = False,
 ) -> RetryResult | None:
-    """A static implementation rejection cannot authorize silent analysis-scope loss."""
+    """Preserve only datasource scope proven by successful physical accesses."""
+    if not previous_scope_is_proven:
+        return None
     failure_payload = dict(previous_failure_payload or {})
     diagnostics = failure_payload.get('diagnostics')
     diagnostics = dict(diagnostics) if isinstance(diagnostics, dict) else {}
@@ -10827,6 +13632,45 @@ def _failure_requires_scope_preservation(
     )
 
 
+def _proven_datasource_ids_from_execution_payload(
+    payload: dict[str, Any] | None,
+    selected_datasource_snapshot: list[dict[str, Any]] | None,
+) -> list[int]:
+    """Resolve successful/no-data physical query snapshots to selected IDs."""
+    if not isinstance(payload, dict) or not selected_datasource_snapshot:
+        return []
+    raw_snapshots = payload.get('query_snapshots')
+    if not isinstance(raw_snapshots, dict):
+        return []
+
+    proven_snapshots: dict[str, Any] = {}
+    for query_key, snapshot in raw_snapshots.items():
+        if not isinstance(snapshot, dict):
+            continue
+        execution = snapshot.get('execution')
+        implementation = snapshot.get('implementation')
+        if not isinstance(execution, dict) or not isinstance(implementation, dict):
+            continue
+        if str(execution.get('status') or '').strip().lower() not in {'success', 'no_data'}:
+            continue
+        if not implementation.get('physical_execution'):
+            continue
+        proven_snapshots[str(query_key)] = snapshot
+
+    accessed_tokens = _query_snapshot_table_names(proven_snapshots)
+    if not accessed_tokens:
+        return []
+    proven_ids: list[int] = []
+    for item in selected_datasource_snapshot:
+        try:
+            datasource_id = int(item.get('datasource_id') or item.get('id') or 0)
+        except (TypeError, ValueError):
+            continue
+        if datasource_id > 0 and _datasource_relation_tokens(item) & accessed_tokens:
+            proven_ids.append(datasource_id)
+    return _normalize_used_datasource_ids(proven_ids)
+
+
 def _validate_analysis_scope_against_execution_history(
     *,
     previous_executions: list[Any],
@@ -10873,45 +13717,17 @@ def _validate_analysis_scope_against_execution_history(
             continue
         if not isinstance(payload, dict) or not _failure_requires_scope_preservation(payload):
             continue
-        try:
-            previous_used_ids = json.loads(
-                getattr(previous, 'used_datasource_ids_json', '') or '[]'
-            )
-        except (TypeError, ValueError):
-            previous_used_ids = []
-        diagnostics = payload.get('diagnostics')
-        diagnostics = dict(diagnostics) if isinstance(diagnostics, dict) else {}
-        inherited_scope_anchor = (
-            _normalize_used_datasource_ids(
-                diagnostics.get('previous_used_datasource_ids')
-            )
-            if diagnostics.get('violated_contract')
-            == 'analysis_scope_regression_after_technical_repair'
-            else []
+        previous_used_ids = _proven_datasource_ids_from_execution_payload(
+            payload,
+            selected_datasource_snapshot,
         )
-        if inherited_scope_anchor:
-            # This execution was rejected precisely because its generated code
-            # had already lost scope. Keep carrying the pre-regression anchor;
-            # the rejected code cannot redefine the next repair's authority.
-            previous_used_ids = inherited_scope_anchor
-        referenced_ids = _statically_referenced_datasource_ids(
-            getattr(previous, 'generated_code', '') or '',
-            selected_datasource_snapshot=selected_datasource_snapshot,
-        )
-        if selected_datasource_snapshot and not referenced_ids:
-            # A rejected attempt with declarations but no data-access implementation
-            # cannot become the semantic scope anchor for later repairs.
+        if not previous_used_ids:
             continue
-        if referenced_ids and not inherited_scope_anchor:
-            previous_used_ids = [
-                datasource_id
-                for datasource_id in _normalize_used_datasource_ids(previous_used_ids)
-                if datasource_id in referenced_ids
-            ]
         return _validate_scope_preserving_technical_repair(
-            previous_used_datasource_ids=_normalize_used_datasource_ids(previous_used_ids),
+            previous_used_datasource_ids=previous_used_ids,
             current_used_datasource_ids=effective_current_used_ids,
             previous_failure_payload=payload,
+            previous_scope_is_proven=True,
         )
     return None
 
@@ -11028,19 +13844,11 @@ def _validate_technical_repair_scope_from_history(
         return None
 
     from config.database import SessionLocal
-    from model import InsightNsExecution, InsightNsTurn
+    from model import InsightNsExecution
 
     session = SessionLocal()
     try:
-        turn = session.query(InsightNsTurn).filter(InsightNsTurn.id == turn_id).first()
-        previous_query = session.query(InsightNsExecution).filter(
-            InsightNsExecution.turn_id == turn_id,
-            InsightNsExecution.id < current_execution_id,
-            InsightNsExecution.is_deleted == 0,
-            InsightNsExecution.execution_status != 'success',
-        )
-        if turn is not None and turn.started_at is not None:
-            previous_query = previous_query.filter(InsightNsExecution.created_at >= turn.started_at)
+        previous_query = _current_task_execution_query(session, turn_id, current_execution_id)
         previous_executions = previous_query.order_by(
             InsightNsExecution.id.desc()
         ).limit(20).all()
@@ -11070,14 +13878,7 @@ def _turn_has_prior_time_range_guard_signal(turn_id: int, current_execution_id: 
 
     session = SessionLocal()
     try:
-        query = session.query(InsightNsExecution).filter(
-            InsightNsExecution.turn_id == turn_id,
-            InsightNsExecution.id != current_execution_id,
-            InsightNsExecution.is_deleted == 0,
-            InsightNsExecution.execution_status != 'success',
-        )
-        if current_execution_id > 0:
-            query = query.filter(InsightNsExecution.id < current_execution_id)
+        query = _current_task_execution_query(session, turn_id, current_execution_id)
 
         previous_failures = query.order_by(InsightNsExecution.created_at.desc()).limit(12).all()
         for execution in previous_failures:
@@ -11107,26 +13908,8 @@ def _turn_has_prior_time_range_guard_signal(turn_id: int, current_execution_id: 
 
 
 def _extract_probe_no_data_signal(execution: Any) -> str:
-    payload_text = str(getattr(execution, 'result_payload_json', '') or '')
-    try:
-        payload = json.loads(payload_text or '{}')
-    except Exception:
-        payload = {}
-    if isinstance(payload, dict):
-        for key in ('retry_type', 'error_type', 'retry_reason_code'):
-            value = str(payload.get(key) or '').strip()
-            if value in PROBE_NO_DATA_RETRY_TYPES:
-                return value
-
-    error_message = str(getattr(execution, 'error_message', '') or '')
-    classified = _classify_execution_error(None, error_message)
-    if classified in PROBE_NO_DATA_RETRY_TYPES:
-        return classified
-    lowered = error_message.lower()
-    for signal in PROBE_NO_DATA_RETRY_TYPES:
-        if signal in lowered:
-            return signal
-    return ''
+    signal = _execution_feedback_type(execution)
+    return signal if signal in PROBE_NO_DATA_RETRY_TYPES else ''
 
 
 def _count_probe_no_data_failures(turn_id: int, current_execution_id: int) -> int:
@@ -11138,13 +13921,9 @@ def _count_probe_no_data_failures(turn_id: int, current_execution_id: int) -> in
 
     session = SessionLocal()
     try:
-        query = session.query(InsightNsExecution).filter(
-            InsightNsExecution.turn_id == turn_id,
-            InsightNsExecution.is_deleted == 0,
-            InsightNsExecution.execution_status != 'success',
-        )
-        if current_execution_id > 0:
-            query = query.filter(InsightNsExecution.id <= current_execution_id)
+        query = _current_task_execution_query(
+            session, turn_id, current_execution_id, include_current=True,
+        ).filter(InsightNsExecution.execution_status == 'failed')
         executions = query.order_by(InsightNsExecution.created_at.asc()).all()
         return sum(1 for execution in executions if _extract_probe_no_data_signal(execution))
     finally:
@@ -11205,7 +13984,7 @@ def _extract_confirmed_no_data_query_snapshots(
                     'query_key': inherited_key,
                 }
             recovered[inherited_key] = inherited
-    return dict(list(recovered.items())[-12:])
+    return recovered
 
 
 def _load_confirmed_no_data_query_snapshots(
@@ -11217,23 +13996,40 @@ def _load_confirmed_no_data_query_snapshots(
         return {}
 
     from config.database import SessionLocal
-    from model import InsightNsExecution, InsightNsTurn
+    from model import InsightNsExecution
 
     session = SessionLocal()
     try:
-        turn = session.query(InsightNsTurn).filter(InsightNsTurn.id == turn_id).first()
-        query = session.query(InsightNsExecution).filter(
-            InsightNsExecution.turn_id == turn_id,
-            InsightNsExecution.id < current_execution_id,
-            InsightNsExecution.is_deleted == 0,
-            InsightNsExecution.execution_status != 'success',
-        )
-        if turn is not None and turn.started_at is not None:
-            query = query.filter(InsightNsExecution.created_at >= turn.started_at)
-        previous_executions = query.order_by(
-            InsightNsExecution.id.desc()
-        ).limit(20).all()
-        return _extract_confirmed_no_data_query_snapshots(previous_executions)
+        previous = _current_task_execution_query(
+            session, turn_id, current_execution_id,
+        ).filter(InsightNsExecution.execution_status != 'running').order_by(
+            InsightNsExecution.id.desc(),
+        ).all()
+        for execution in previous:
+            signal = _execution_feedback_type(execution)
+            try:
+                payload = json.loads(execution.result_payload_json or '{}')
+            except (TypeError, ValueError):
+                return {}
+            snapshots = payload.get('query_snapshots') if isinstance(payload, dict) else None
+            physical = [
+                item for item in (snapshots or {}).values()
+                if isinstance(item, dict)
+                and isinstance(item.get('implementation'), dict)
+                and item['implementation'].get('physical_execution')
+            ] if isinstance(snapshots, dict) else []
+            if not physical and execution.execution_status == 'failed' and signal not in {'no_data_found', 'probe_feedback'}:
+                # A syntax/API failure before querying does not erase prior facts.
+                continue
+            if signal not in {'no_data_found', 'probe_feedback'}:
+                return {}
+            # Counts never establish emptiness. Positive/failed newer paths
+            # invalidate old empty observations instead of reviving them.
+            empty = _extract_confirmed_no_data_query_snapshots([execution])
+            if not physical or len(empty) != len(physical):
+                return {}
+            return empty
+        return {}
     finally:
         session.close()
 
@@ -11266,10 +14062,9 @@ def _apply_probe_no_data_retry_limit(
         'probe_no_data_limit_reached': True,
     })
     limit_instructions = [
-        f'本轮 probe_feedback/no_data_found 已达到 {count}/{PROBE_NO_DATA_RETRY_LIMIT} 次上限。',
-        '不要再生成 probe 代码，不要继续猜测时序查询语法、字段名或表名，也不要继续扩大查询到其他数据源。',
-        '下一次必须切换为 execution_intent = "analysis"，保持用户原始问题和原始时间范围，调用 save_analysis_result(...) 以无数据或数据源暂不可分析的结论收口。',
-        '如果已经尝试过多个数据源，请至少返回一个表格汇总已尝试的数据源、使用的查询口径和失败原因；used_datasource_ids 填写实际尝试过的数据源 ID。',
+        f'本次任务已收到 {count} 次真实 no_data_found 反馈，复查预算为 {PROBE_NO_DATA_RETRY_LIMIT} 次；正常 Probe 观察不计入。',
+        '次数不是全部业务范围无数据的证据。根据实际查询事实区分有数据、空集、查询失败和尚未验证的路径，不重复相同条件的无效尝试。',
+        '已确认所有必要路径在正确口径下为空时，按当前输出格式生成无数据原因与建议；部分路径有数据时继续分析并披露空集或不可用路径。',
     ]
     return [*limit_instructions, *repair_instructions], limit_diagnostics
 
@@ -11277,9 +14072,10 @@ def _apply_probe_no_data_retry_limit(
 def _build_repair_instructions(error_type: str) -> list[str]:
     """根据错误类型生成定向修复建议。"""
     common_instructions = [
-        '重新生成完整可执行代码，不要只修改局部片段。',
-        '正式分析代码应调用 save_analysis_result(...) 并把返回值赋给 result；探测或结构化反馈代码应调用 request_retry(...) 并把返回值赋给 result。',
-        '修复技术错误时必须保持当前业务问题和 analysis_semantic_context 的事实边界不变；不得改用 unsupported_field_bindings 已排除的字段或未确认关系。可选拆解无法可靠实现时，删除该可选拆解，不要用相邻代理指标补齐。',
+        '局部技术修复可按原版本行号提交 patches，参考 repair_target.allowed_ranges；整体分析设计调整也可提交完整可执行 code。',
+        '正式分析代码应以 result = save_analysis_result(...) 收口；专用 probe_analysis_data 会返回查询事实与打印摘要，'
+        '也可通过 result = request_retry(...) 返回自定义结构化观察。',
+        '修复技术错误时保留当前业务问题、已确认规则及已有分析内容；依据 Schema、真实查询观察和用户澄清修正错误假设，不把技术错误当作缩减分析范围的理由。',
         '如果当前修正思路与上一次相同且未解决错误，请更换实现方式后再重试。',
     ]
 
@@ -11313,21 +14109,20 @@ def _build_repair_instructions(error_type: str) -> list[str]:
             '如果目标时间窗口没有命中数据，不要输出空图表或直接调用 save_empty_analysis_result() 收口；应调用 raise_no_data_error(reason=..., detail_lines=[...]) 把信息返回给上层重试。',
         ],
         'no_data_found': [
-            '当前正式查询未命中数据，下一版优先生成独立 probe：声明 execution_intent = "probe"，严格依据 diagnostics.probe_targets 中的真实查询实现、数据源与已应用筛选进行探测，不要扩散到其他已选数据源。',
+            '当前正式查询未命中数据；口径尚有技术未知时，声明 execution_intent = "probe"，依据 diagnostics.probe_targets 中的真实查询与已应用筛选进行有界探测。已有事实足以确认空集时，无需重复相同探测。',
             'Probe 必须执行轻量只读查询，并把真实行数、枚举、格式或时间覆盖写入 request_retry(..., diagnostics=...)；不要只返回 SQL 文本、预期值或检查计划。',
             '如果错误信息里包含 unknown tag 或 no results，表示当前时序数据源在时序库中没有可查询的数据或尚未初始化；将该数据源从本轮分析中剔除。如果用户问题涉及多个互相独立的数据源，继续分析其他数据源；只有所有相关数据源都无数据时，才以整体无数据收口。',
             '请先复核 SQL、时间范围、筛选条件、JOIN 条件或聚合口径是否过严，再生成下一版完整代码。',
             '如果用户问题里有明确时间范围，必须保持原始 query_constraints.time_range 不变；探测得到的数据覆盖范围只能用于解释无数据原因，不能替换成正式分析的时间范围。',
-            '在数据加载、过滤、关联、聚合完成后，必须先检查 DataFrame 是否为空；只要为空，就调用 raise_no_data_error(reason=..., detail_lines=[...])，不要继续生成空图表或空结果产物。',
+            '在数据加载、过滤、关联、聚合后检查空集；部分独立路径为空时继续其余分析并披露限制。全部必要路径为空且尚未确认原因时调用 raise_no_data_error；确认口径后按当前输出协议说明无数据原因与建议。',
             'reason 要直接说明是哪一步没有命中数据，detail_lines 可补充当前时间范围、筛选条件、关联键或中间行数，方便上层感知后继续重试。',
         ],
         'probe_feedback': [
         '当前反馈是数据探测结果，不是最终分析报告；diagnostics 只用于确认字段、候选值、时间边界和查询路径，最终报告、图表和表格中的全部数值必须在 execution_intent="analysis" 中重新查询并计算，不能复制探测值作为正式指标。',
-            'Probe 只纠正字段取值、时间边界和访问实现，不会授权使用 analysis_semantic_context 中已明确排除的事实字段或未确认关系。',
+            'Probe 观察用于验证准备信息中的假设；它不替代用户规则，也不能仅凭一个候选就确定业务分类或筛选范围。',
             '如果用户问题里有明确时间范围，下一版 analysis 只能保留原始 query_constraints.time_range；diagnostics 里的数据覆盖范围不能被写回 query_constraints.time_range。',
             '如果探测确认用户明确时间范围内无数据，应返回无数据反馈或无数据结论，不要为了命中数据改查其他时间范围。',
-            '下一版代码应切换为 execution_intent = "analysis"，并调用 save_analysis_result(...) 返回最终分析结果。',
-            '不要再次只输出探测报告；如果候选值仍有歧义，再返回 request_retry(retry_type="probe_feedback", ...)。',
+            '已有事实足以回答问题时提交正式 analysis；仍有技术未知时使用 Probe，无法通过数据核实的关键业务歧义按当前澄清模式处理。',
         ],
         'data_source_unavailable': [
             '当前反馈表示必要数据源不可访问或标识无法解析，不是筛选条件未命中数据。',
@@ -11344,11 +14139,11 @@ def _build_repair_instructions(error_type: str) -> list[str]:
             '不要只返回图表或表格，最终结果必须同时包含可读报告和结构化产物。',
         ],
         'incomplete_result': [
-            '当前执行结果不完整；请根据 diagnostics 补齐缺失的报告、图表或表格后重新生成完整代码。',
+            '当前执行结果不完整；根据 diagnostics 在现有代码中补齐受影响的内容，保留其他已完成的分析。',
             '不要把中间探测信息包装成最终分析报告。',
         ],
         'contract_error': [
-            '当前代码主动返回了契约问题反馈；请根据 message、diagnostics 和 repair_instructions 重新生成完整代码。',
+            '根据 message、diagnostics 和源码位置修复实际违反的契约；有可定位的局部问题时使用 patches，不因错误类型笼统重写整份分析。',
             '如果本轮是探测，请返回 request_retry(...)；如果本轮是正式分析，请返回 save_analysis_result(...)。',
         ],
         'chart_contract_error': [
@@ -11361,12 +14156,12 @@ def _build_repair_instructions(error_type: str) -> list[str]:
         ],
         'result_contract_error': [
             '如果错误与 charts/chart_spec/chart_document 有关，下一版不要手写图表 JSON，直接改用 build_chart_result(...)、build_multi_metric_chart_result(...) 或 build_chart_suite(...)。',
-            '最终必须产出完整 analysis_report，并调用 save_analysis_result(analysis_report=..., charts=[...], tables=[...])。',
-            '不要遗漏 result 变量，也不要返回空的 analysis_report 或 charts/tables 同时为空的结构化结果。',
+            '按本轮输出协议修正 save_analysis_result 的参数：standard 使用分析报告与相应产物，text 使用 output_text，json 使用符合指定 Schema 的 output_json。',
+            '将 save_analysis_result 的返回值赋给 result，保留已有业务分析内容。',
         ],
         'missing_query_constraints': [
-            '正式 analysis 代码必须在顶部声明 query_constraints；probe 代码不要生成 query_constraints。',
-            '先描述与当前问题相关的 time_range、target_filters 和 aggregation，再生成 SQL 或 pandas/DataFrame 筛选实现。',
+            '正式 analysis 的每条物理查询都必须有对应的 query_constraints，并传给 query_data_with_sql/query_local_file/query_local_file_low_memory，或在底层 loader 前传给 validate_query_constraints；约束变量可以按查询分别命名，不要求存在固定顶层变量。',
+            '先为每条查询描述与当前问题一致的 time_range、target_filters 和 aggregation，再生成对应 SQL 或 pandas/DataFrame 筛选实现；probe 不生成正式 query_constraints。',
         ],
         'invalid_query_constraints': [
             '请先修正 query_constraints 结构，再重新生成 SQL 或 pandas/DataFrame 实现。',
@@ -11404,9 +14199,9 @@ def _build_repair_instructions(error_type: str) -> list[str]:
         ],
         'execution_timeout': [
             '当前代码执行超时，说明存在无界循环、超大范围数据处理或阻塞式等待。',
-            '请先缩小数据范围、减少无必要的明细拼接与循环处理，并确保所有外部请求都具备明确超时。',
+            '在保持用户总体、筛选口径和分析范围不变的前提下，缩小每次物理加载的中间结果，减少无必要的明细拼接与循环处理，并确保所有外部请求都具备明确超时。',
             '如果当前分析使用的是表数据源，优先把时间过滤、字段裁剪、JOIN、GROUP BY、LIMIT 下推到 SQL 层完成，不要继续把大结果集加载到 pandas 后再 merge 或聚合。',
-            '如果跨表 JOIN 或明细关联已经连续超时，请先退化成单表分析：优先完成主表趋势、分布和有限明细，再在分析报告中明确说明关联部分受查询成本限制暂未展开。',
+            '如果跨表 JOIN 或明细关联超时，优先在各来源分别完成过滤和原事实粒度聚合，再只对小结果做关联或并列综合；不得删除用户问题所需来源、缩减业务问题或把部分分析伪装成完整结果。',
             '如果需要展示明细，请先限制结果行数，再生成图表和分析报告。',
         ],
     }
@@ -11433,6 +14228,37 @@ def _augment_repair_instructions(
     return list(dict.fromkeys(augmented))
 
 
+def _verified_source_patch_ranges(code: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten source diagnostics and bind ranges to the exact failed revision."""
+    source_lines = str(code or '').splitlines()
+    ranges: list[dict[str, Any]] = []
+    seen_ranges: set[tuple[int, int]] = set()
+
+    def visit(item: Any) -> None:
+        if not isinstance(item, dict):
+            return
+        if item.get('location_domain') not in {None, 'python_source'}:
+            return
+        start, end = item.get('start_line'), item.get('end_line')
+        if (
+            type(start) is int and type(end) is int
+            and 1 <= start <= end <= len(source_lines)
+            and isinstance(item.get('source'), str)
+            and item['source'].replace('\r\n', '\n') == '\n'.join(source_lines[start - 1:end])
+        ):
+            normalized = {**item, 'location_domain': 'python_source'}
+            identity = (start, end)
+            if identity not in seen_ranges:
+                seen_ranges.add(identity)
+                ranges.append(normalized)
+        for key in ('suggested_patch_ranges', 'related_contexts'):
+            for child in item.get(key) or []:
+                visit(child)
+
+    visit(context)
+    return ranges
+
+
 def _tool_error_message(
     *,
     tool_call_id: str,
@@ -11445,6 +14271,7 @@ def _tool_error_message(
     feedback_kind: str = '',
     retry_reason_code: str = '',
     diagnostics: dict[str, Any] | None = None,
+    query_snapshots: dict[str, Any] | None = None,
     analysis_report: str = '',
     current_failed_code: str = '',
     previous_failure_messages: list[str] | None = None,
@@ -11473,8 +14300,10 @@ def _tool_error_message(
             TOOL_ERROR_CODE_CONTEXT_MAX_CHARS,
         )
 
-    patch_ranges = clipped_code_error_context.get('suggested_patch_ranges')
-    patch_ranges = patch_ranges if isinstance(patch_ranges, list) else []
+    patch_ranges = _verified_source_patch_ranges(current_failed_code, clipped_code_error_context)
+    if patch_ranges:
+        clipped_code_error_context['location_domain'] = 'python_source'
+        clipped_code_error_context['suggested_patch_ranges'] = patch_ranges
     patch_available_error_types = {
         'chart_contract_error',
         'data_type_or_time_mismatch',
@@ -11489,13 +14318,43 @@ def _tool_error_message(
         'schema_or_column_mismatch',
         'undefined_name',
     }
+    syntax_contract_patch = bool(
+        error_type == 'contract_error'
+        and isinstance(diagnostics, dict)
+        and diagnostics.get('violated_contract') == 'invalid_python_syntax'
+    )
+    localized_contract_patch = bool(
+        error_type in {
+            'contract_error',
+            'result_contract_error',
+            'incomplete_result',
+        }
+        and clipped_code_error_context.get('location_domain') == 'python_source'
+    )
     patch_available = bool(
         execution_id > 0
         and current_failed_code
         and patch_ranges
-        and error_type in patch_available_error_types
+        and (error_type in patch_available_error_types or syntax_contract_patch or localized_contract_patch)
     )
     patch_required = patch_available and error_type in patch_required_error_types
+
+    symbol_references = clipped_code_error_context.get('symbol_references')
+    if isinstance(symbol_references, list) and len(symbol_references) > 1:
+        symbols = list(dict.fromkeys(
+            str(item.get('symbol') or '').strip()
+            for item in symbol_references
+            if isinstance(item, dict) and str(item.get('symbol') or '').strip()
+        ))
+        if symbols:
+            repair_instructions = [
+                (
+                    f"完整代码中共定位到 {len(symbol_references)} 处相关标识引用"
+                    f"（{', '.join(symbols)}）；请一次核对并修复全部相关定义、计算、图表、"
+                    "表格和报告引用，不要只修当前首先报错的一行。"
+                ),
+                *repair_instructions,
+            ]
 
     payload = {
         'tool': 'execute_python',
@@ -11504,16 +14363,16 @@ def _tool_error_message(
         'error_type': error_type,
         'error_message': clipped_error_message,
         'error_message_truncated': clipped_error_message != (error_message or ''),
-        'repair_instructions': _clip_retry_context_list(
-            repair_instructions,
-            max_items=8,
-            max_chars=TOOL_ERROR_INSTRUCTION_MAX_CHARS,
-        ),
+        'repair_instructions': list(dict.fromkeys(
+            str(item).strip() for item in repair_instructions if str(item).strip()
+        )),
         'error_signature': clipped_error_signature,
         'code_error_context': clipped_code_error_context,
         'minimal_patch_required': patch_required,
-        'current_failed_code': clipped_current_code,
-        'current_failed_code_truncated': clipped_current_code != (current_failed_code or ''),
+        'current_failed_code': '' if patch_available else clipped_current_code,
+        'current_failed_code_truncated': (
+            False if patch_available else clipped_current_code != (current_failed_code or '')
+        ),
         'previous_failure_messages': _clip_retry_context_list(
             previous_failure_messages,
             max_items=3,
@@ -11528,18 +14387,25 @@ def _tool_error_message(
     }
     if patch_available:
         payload['repair_target'] = {
+            'location_domain': 'python_source',
             'base_execution_id': int(execution_id),
             'source_sha256': _build_analysis_logic_signature(current_failed_code),
             'line_count': len(str(current_failed_code).splitlines()),
             'mode': 'line_patch',
             'allowed_ranges': patch_ranges,
             'usage': (
-                '仅当修复可完整落在 allowed_ranges 的语句边界内时，才令 code 为空并提交 '
-                'base_execution_id 与 patches；涉及查询范围、整体契约或多处逻辑调整时提交完整 code。'
+                '局部修复令 code 为空并提交 base_execution_id 与 patches。allowed_ranges 是相关源码定位，'
+                '不要求一个 patch 恰好等于一个语句；行号基于完整原版本，合成后统一校验语法。'
             ),
+            'full_source_location': 'preceding assistant tool call arguments',
         }
     if feedback_kind:
         payload['feedback_kind'] = feedback_kind
+    if error_type == 'probe_feedback':
+        payload['status'] = 'observation'
+        payload['feedback_kind'] = 'observation'
+    if query_snapshots:
+        payload['query_snapshots'] = query_snapshots
     if retry_reason_code:
         payload['retry_reason_code'] = retry_reason_code
     if diagnostics:
@@ -11555,6 +14421,83 @@ def _tool_error_message(
         content=json.dumps(payload, ensure_ascii=False),
         tool_call_id=tool_call_id,
     )
+
+
+def _compact_probe_query_snapshots_for_feedback(
+    query_snapshots: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Keep Probe query facts without replaying SQL already present in the tool call."""
+    compact: dict[str, Any] = {}
+    for fallback_key, raw_snapshot in (query_snapshots or {}).items():
+        if not isinstance(raw_snapshot, dict):
+            continue
+        implementation = raw_snapshot.get('implementation')
+        implementation = implementation if isinstance(implementation, dict) else {}
+        query_key = str(raw_snapshot.get('query_key') or fallback_key)
+        compact[query_key] = {
+            'query_key': query_key,
+            'query_constraints': raw_snapshot.get('query_constraints') or {},
+            'analysis_scope': raw_snapshot.get('analysis_scope') or {},
+            'query_scope': raw_snapshot.get('query_scope') or {},
+            'implementation': {
+                key: implementation.get(key)
+                for key in (
+                    'sql_hash',
+                    'logical_query_family',
+                    'datasource_identifiers',
+                    'datasource_identifier',
+                    'filter_expressions',
+                    'aggregation_hints',
+                )
+                if implementation.get(key) not in (None, '', [], {})
+            },
+            'execution': raw_snapshot.get('execution') or {},
+        }
+    return compact
+
+
+def _build_implicit_probe_feedback(
+    query_snapshots: dict[str, Any] | None,
+    stdout_text: str,
+) -> RetryResult:
+    """Convert a successful dedicated Probe call into its standard observation."""
+    outcomes: list[dict[str, Any]] = []
+    for query_key, snapshot in (query_snapshots or {}).items():
+        if not isinstance(snapshot, dict):
+            continue
+        execution = snapshot.get('execution')
+        execution = execution if isinstance(execution, dict) else {}
+        implementation = snapshot.get('implementation')
+        implementation = implementation if isinstance(implementation, dict) else {}
+        outcome = {
+            'query_key': str(snapshot.get('query_key') or query_key),
+            'status': str(execution.get('status') or ''),
+            'row_count': execution.get('row_count'),
+            'columns': list(execution.get('columns') or []),
+            'datasource_identifiers': list(
+                implementation.get('datasource_identifiers') or []
+            ),
+        }
+        outcomes.append({
+            key: value for key, value in outcome.items()
+            if value not in (None, '', [], {})
+        })
+
+    diagnostics: dict[str, Any] = {}
+    printed = _clip_retry_context_text(stdout_text, 6000)
+    if printed:
+        diagnostics['printed_observations'] = printed
+        diagnostics['printed_observations_truncated'] = printed != str(stdout_text or '')
+    retry = request_retry(
+        retry_type='probe_feedback',
+        message='专用 Probe 已完成只读探测，以下为本轮真实观察。',
+        diagnostics=diagnostics,
+        repair_instructions=[],
+    )
+    # request_retry reads query snapshots from the current process context.
+    # Dedicated Probe executes in a worker, so preserve the worker outcomes here.
+    retry.diagnostics['_query_execution_outcomes'] = outcomes
+    return retry
 
 
 def _tool_success_message(
@@ -11597,7 +14540,135 @@ def _tool_success_message(
 
 def _terminal_tool_success(message: ToolMessage) -> Command:
     """Finish the agent graph after a fully validated analysis result."""
+    return Command(update={"messages": [message], "analysis_complete": True})
+
+
+def _message_text(message: Any) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(item.get("text") or "") if isinstance(item, dict) else str(item)
+            for item in content
+        )
+    return str(content or "")
+
+
+@tool(
+    description=(
+        "仅当一个会实质改变答案的关键业务定义存在互斥解释，并且当前用户问题、业务规则、"
+        "完整 Schema 与可执行 Probe 都无法唯一确定时，请求用户在当前轮次补充信息。"
+        "这包括用户明确点名指标但其总体、粒度、分子分母、时间归属或业务公式没有权威定义的情况。"
+        "该工具会结束本次 Agent 图并等待用户回答；不要用它新增指标、规划报告结构，"
+        "也不要询问可由数据探测解决的技术事实。"
+    ),
+    args_schema=AnalysisClarificationInput,
+)
+def request_analysis_clarification(
+    runtime: ToolRuntime[CustomContext],
+    items: list[ClarificationItemInput],
+) -> Command:
+    """Terminate the current Runtime graph with a structured clarification request."""
+    clarification = _build_analysis_clarification_payload(items)
+    analysis_task_id = int(
+        getattr(getattr(runtime, "context", None), "analysis_task_id", 0) or 0
+    )
+    if analysis_task_id <= 0:
+        message = ToolMessage(
+            content=json.dumps({
+                "tool": "request_analysis_clarification",
+                "status": "clarification_unavailable",
+                "clarification": clarification,
+                "instruction": (
+                    "当前调用不支持挂起同一轮次。请把澄清问题作为简洁的普通回复返回给用户，"
+                    "不要生成分析代码，也不要声称已经完成分析。"
+                ),
+            }, ensure_ascii=False),
+            tool_call_id=runtime.tool_call_id,
+        )
+        return Command(update={"messages": [message]})
+    message = ToolMessage(
+        content=json.dumps({
+            "tool": "request_analysis_clarification",
+            "status": "clarification_required",
+            "clarification": clarification,
+        }, ensure_ascii=False),
+        tool_call_id=runtime.tool_call_id,
+    )
     return Command(update={"messages": [message]}, goto=END)
+
+
+def _build_analysis_clarification_payload(
+    items: list[ClarificationItemInput | dict[str, Any]],
+) -> dict[str, Any]:
+    normalized_items: list[dict[str, Any]] = []
+    seen_item_ids: set[str] = set()
+    for raw_item in items or []:
+        item = (
+            raw_item
+            if isinstance(raw_item, ClarificationItemInput)
+            else ClarificationItemInput.model_validate(raw_item)
+        )
+        subject = item.subject.strip()
+        question = item.question.strip()
+        if not subject or not question:
+            continue
+        options: list[dict[str, str]] = []
+        option_ids: set[str] = set()
+        for option in item.options:
+            option_id = str(option.id or '').strip()
+            label = str(option.label or '').strip()
+            value = str(option.value or '').strip()
+            if not option_id or not label or not value:
+                raise ValueError("澄清快捷选项必须包含非空 id、label 和 value。")
+            if option_id in option_ids:
+                raise ValueError("同一澄清项的快捷选项 id 必须唯一。")
+            option_ids.add(option_id)
+            options.append({
+                "id": option_id,
+                "label": label,
+                "value": value,
+                "description": str(option.description or '').strip(),
+            })
+        if not item.allow_free_text and not options:
+            raise ValueError("澄清项不允许文本回答时必须提供快捷选项。")
+        item_id = item.item_id.strip() or hashlib.sha256(
+            f"{subject}\n{question}".encode("utf-8")
+        ).hexdigest()[:12]
+        if item_id in seen_item_ids:
+            raise ValueError("同一批澄清项的 item_id 必须唯一。")
+        seen_item_ids.add(item_id)
+        normalized_items.append({
+            "item_id": item_id,
+            "question": question,
+            "options": options,
+            "allow_free_text": bool(item.allow_free_text),
+            "semantic_scope": {
+                "subject": subject,
+                "ambiguity_kind": item.ambiguity_kind,
+            },
+        })
+
+    if not normalized_items:
+        raise ValueError("至少需要一个有效的业务澄清项。")
+
+    first = normalized_items[0]
+    return (
+        {**first, "items": normalized_items}
+        if len(normalized_items) == 1
+        else {
+            "question": f"本轮有 {len(normalized_items)} 项关键业务定义需要确认。",
+            "options": [],
+            "allow_free_text": False,
+            "semantic_scope": {
+                "subjects": [
+                    item["semantic_scope"]["subject"] for item in normalized_items
+                ],
+            },
+            "items": normalized_items,
+        }
+    )
 
 
 def run_generated_code_locally(
@@ -11804,6 +14875,8 @@ def execute_python(
     used_datasource_ids: list[int] | None = None,
     base_execution_id: int = 0,
     patches: list[SourceCodePatch] | None = None,
+    *,
+    execution_mode: str = '',
 ) -> Optional[ToolMessage | Command]:
     """
     执行模型生成的 Python 分析代码。
@@ -11827,15 +14900,36 @@ def execute_python(
             patches=patches,
         )
     except (TypeError, ValueError) as exc:
+        patch_error = exc if isinstance(exc, SourcePatchResolutionError) else None
         return _tool_error_message(
             tool_call_id=runtime.tool_call_id,
+            execution_id=patch_error.execution_id if patch_error else 0,
             error_type='contract_error',
             error_message=str(exc),
+            diagnostics=patch_error.diagnostics if patch_error else None,
+            code_error_context=patch_error.code_error_context if patch_error else None,
+            current_failed_code=patch_error.source if patch_error else '',
             repair_instructions=[
                 '首次执行请提交完整 code；局部修复请提交 code=""、失败的 base_execution_id 和非重叠 patches。',
                 'patches 的 start_line/end_line 必须引用错误反馈 code_error_context 中的原始行号。',
+                '被拒绝的补丁没有执行或改变原版本。下一次仍基于原 base_execution_id 的行号；'
+                'used_datasource_ids 可省略，由后端从原版本继承。',
             ],
         )
+    if execution_mode:
+        try:
+            code = _bind_program_execution_mode(code, execution_mode)
+        except ValueError as exc:
+            return _tool_error_message(
+                tool_call_id=runtime.tool_call_id,
+                error_type='contract_error',
+                error_message=str(exc),
+                diagnostics={'violated_contract': 'tool_execution_mode', 'execution_mode': execution_mode},
+                repair_instructions=[
+                    '执行用途由所选工具确定。去掉冲突的 execution_intent 声明，或使用符合本次代码目的的工具。',
+                    '保留原查询、计算和产物逻辑，不为执行标识重写或缩减分析。',
+                ],
+            )
     execution_id = _create_execution_record(
         conversation_id=conversation_id,
         turn_id=turn_id,
@@ -11888,7 +14982,14 @@ def execute_python(
         used_datasource_ids=normalized_used_datasource_ids,
     )
     if contract_retry is None:
-        contract_retry = _validate_generated_code_contract(code)
+        contract_retry = _validate_generated_code_contract(
+            code,
+            allow_implicit_probe_feedback=execution_mode == 'probe',
+            output_format=str(
+                (getattr(runtime.context, 'output_contract', {}) or {}).get('type')
+                or 'standard'
+            ),
+        )
     if contract_retry is None:
         contract_retry = _validate_technical_repair_scope_from_history(
             turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
@@ -11903,6 +15004,11 @@ def execute_python(
             code,
         )
     if contract_retry is None:
+        contract_retry = _validate_static_sql_field_ownership_contract(
+            code=code,
+            selected_datasource_snapshot=selected_datasource_snapshot,
+        )
+    if contract_retry is None:
         contract_retry = _validate_explicit_time_range_guard(
             code=code,
             expected_time_range=expected_time_range,
@@ -11914,27 +15020,7 @@ def execute_python(
             turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
             current_execution_id=execution_id,
         )
-        _update_execution_record(
-            execution_id,
-            execution_status='failed',
-            analysis_report=contract_retry.analysis_report,
-            result_payload_json=contract_retry.model_dump_json(),
-            stdout_text='',
-            stderr_text='',
-            execution_seconds=int((time.time() - start_time) * 1000),
-            error_message=contract_retry.message,
-            used_datasource_ids=normalized_used_datasource_ids,
-        )
-        with logger.context(**execution_log_context):
-            logger.warning(contract_retry.message)
-        emit(
-            'status',
-            stage='tool_retry',
-            level='warning',
-            tool='execute_python',
-            message=FRONTEND_TOOL_RETRY_MESSAGE,
-        )
-        return _tool_error_message(
+        tool_error_message = _tool_error_message(
             tool_call_id=runtime.tool_call_id,
             execution_id=execution_id,
             error_type=contract_retry.retry_type,
@@ -11950,6 +15036,27 @@ def execute_python(
             previous_failure_messages=failure_memory.get('previous_failure_messages', []),
             previous_failure_hints=failure_memory.get('previous_failure_hints', []),
         )
+        _update_execution_record(
+            execution_id,
+            execution_status='failed',
+            analysis_report=contract_retry.analysis_report,
+            result_payload_json=tool_error_message.content,
+            stdout_text='',
+            stderr_text='',
+            execution_seconds=int((time.time() - start_time) * 1000),
+            error_message=contract_retry.message,
+            used_datasource_ids=normalized_used_datasource_ids,
+        )
+        with logger.context(**execution_log_context):
+            logger.warning(contract_retry.message)
+        emit(
+            'status',
+            stage='tool_retry',
+            level='warning',
+            tool='execute_python',
+            message=FRONTEND_TOOL_RETRY_MESSAGE,
+        )
+        return tool_error_message
 
     from config.config import Config
 
@@ -11958,20 +15065,12 @@ def execute_python(
     runtime_user_context = _serialize_runtime_user_context(runtime.context)
     runtime_user_context['time_range_guard_active'] = time_range_guard_active
     runtime_turn_id = int(getattr(runtime.context, 'turn_id', 0) or 0)
-    runtime_user_context['confirmed_no_data_result'] = (
-        _count_probe_no_data_failures(
-            turn_id=runtime_turn_id,
-            current_execution_id=max(execution_id - 1, 0),
-        )
-        >= PROBE_NO_DATA_RETRY_LIMIT
+    empty_query_snapshots = _load_confirmed_no_data_query_snapshots(
+        turn_id=runtime_turn_id, current_execution_id=execution_id,
     )
-    if runtime_user_context['confirmed_no_data_result']:
-        runtime_user_context['initial_query_snapshots'] = (
-            _load_confirmed_no_data_query_snapshots(
-                turn_id=runtime_turn_id,
-                current_execution_id=execution_id,
-            )
-        )
+    runtime_user_context['confirmed_no_data_result'] = bool(empty_query_snapshots)
+    if empty_query_snapshots:
+        runtime_user_context['initial_query_snapshots'] = empty_query_snapshots
     process = mp.Process(
         target=_execute_generated_code_worker,
         args=(code, getattr(runtime.context, 'username', 'anonymous'), runtime_user_context, result_queue),
@@ -12249,6 +15348,7 @@ def execute_python(
             repair_instructions=repair_instructions,
             error_signature=error_signature,
             diagnostics=limit_diagnostics,
+            query_snapshots=worker_payload.get('query_snapshots') or {},
             code_error_context=code_error_context,
             current_failed_code=code,
             previous_failure_messages=failure_memory.get('previous_failure_messages', []),
@@ -12259,7 +15359,12 @@ def execute_python(
 
     exec_result = _deserialize_exec_result(worker_result.get('exec_result') or {})
     exec_result = _deserialize_exec_result(worker_payload.get('exec_result') or {})
-    if isinstance(exec_result, StructuredResult):
+    if execution_mode == 'probe' and exec_result is None:
+        exec_result = _build_implicit_probe_feedback(
+            worker_payload.get('query_snapshots') or {},
+            stdout_text,
+        )
+    if isinstance(exec_result, StructuredResult) and exec_result.output_format == "standard":
         from service.report_presentation_service import normalize_report_presentation
         from service.table_presentation_service import normalize_table_column_labels
 
@@ -12347,12 +15452,18 @@ def execute_python(
             repair_instructions=retry_repair_instructions,
             diagnostics=exec_result.diagnostics,
         )
+        is_observation = exec_result.retry_type == 'probe_feedback'
+        feedback_query_snapshots = worker_payload.get('query_snapshots') or {}
+        if is_observation:
+            feedback_query_snapshots = _compact_probe_query_snapshots_for_feedback(
+                feedback_query_snapshots,
+            )
         emit(
             'status',
-            stage='tool_retry',
-            level='warning',
+            stage='tool_observation' if is_observation else 'tool_retry',
+            level='info' if is_observation else 'warning',
             tool='execute_python',
-            message=FRONTEND_TOOL_RETRY_MESSAGE,
+            message='数据探测已完成，继续分析。' if is_observation else FRONTEND_TOOL_RETRY_MESSAGE,
         )
         return _tool_error_message(
             tool_call_id=runtime.tool_call_id,
@@ -12364,6 +15475,7 @@ def execute_python(
             feedback_kind='retryable_feedback',
             retry_reason_code=exec_result.retry_type,
             diagnostics=retry_diagnostics,
+            query_snapshots=feedback_query_snapshots,
             analysis_report=exec_result.analysis_report,
             current_failed_code=code,
             previous_failure_messages=failure_memory.get('previous_failure_messages', []),
@@ -12433,14 +15545,16 @@ def execute_python(
                 stdout_text=stdout_text,
                 stderr_text=stderr_text,
             )
-        contract_retry = _validate_structured_result_contract(
-            exec_result,
-            generated_code=code,
-            allow_empty_artifact_no_data=time_range_guard_active,
-            expected_time_range=expected_time_range,
-            used_datasource_ids=normalized_used_datasource_ids,
-            selected_datasource_snapshot=selected_datasource_snapshot,
-        )
+        contract_retry = None
+        if exec_result.output_format == "standard":
+            contract_retry = _validate_structured_result_contract(
+                exec_result,
+                generated_code=code,
+                allow_empty_artifact_no_data=time_range_guard_active,
+                expected_time_range=expected_time_range,
+                used_datasource_ids=normalized_used_datasource_ids,
+                selected_datasource_snapshot=selected_datasource_snapshot,
+            )
         if contract_retry is not None:
             failure_memory = _build_turn_failure_memory(
                 turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
@@ -12550,4 +15664,60 @@ def execute_python(
         ).get('previous_failure_hints', []),
         stdout_text=stdout_text,
         stderr_text=stderr_text,
+    )
+
+
+@tool(
+    description=(
+        "运行一次独立、只读、有界的数据探测，消除正式分析前仍未知的枚举、格式、时间覆盖、"
+        "关联可达性或有无数据。探测结果通过结构化 probe_feedback 返回同一个 Runtime ReAct；"
+        "不要用它分段编写正式分析程序。"
+    ),
+    args_schema=ProbeAnalysisDataInput,
+)
+def probe_analysis_data(
+    runtime: ToolRuntime[CustomContext],
+    code: str,
+    title: str = '',
+    description: str = '',
+    used_datasource_ids: list[int] | None = None,
+) -> Optional[ToolMessage | Command]:
+    """Run a bounded Probe through the shared Python execution implementation."""
+    return execute_python.func(
+        runtime=runtime,
+        code=code,
+        title=title,
+        description=description,
+        used_datasource_ids=used_datasource_ids,
+        execution_mode='probe',
+    )
+
+
+@tool(
+    description=(
+        "提交一份独立闭环的正式 Python 洞察分析程序。一次提交必须完成查询、计算、产物构造和"
+        "save_analysis_result(...)；该工具不是数据观察工作台。局部技术修复可使用失败反馈中的"
+        "base_execution_id 与行级 patches，并保留原程序的洞察范围。"
+    ),
+    args_schema=SubmitAnalysisProgramInput,
+)
+def submit_analysis_program(
+    runtime: ToolRuntime[CustomContext],
+    code: str = '',
+    title: str = '',
+    description: str = '',
+    used_datasource_ids: list[int] | None = None,
+    base_execution_id: int = 0,
+    patches: list[SourceCodePatch] | None = None,
+) -> Optional[ToolMessage | Command]:
+    """Submit one complete formal program through the shared execution implementation."""
+    return execute_python.func(
+        runtime=runtime,
+        code=code,
+        title=title,
+        description=description,
+        used_datasource_ids=used_datasource_ids,
+        base_execution_id=base_execution_id,
+        patches=patches,
+        execution_mode='analysis',
     )

@@ -19,6 +19,32 @@ from utils.chart_document_utils import (
 
 
 class ChartDocumentUtilsTestCase(unittest.TestCase):
+    def test_multi_metric_chart_accepts_labels_keyed_by_value_field(self) -> None:
+        chart_item = build_multi_metric_chart_result(
+            chart_kind="bar",
+            data=[{"parameter": "temperature", "alarm": 2, "above": 1}],
+            title="Parameter alarms",
+            category_field="parameter",
+            value_fields=["alarm", "above"],
+            value_labels={"above": "Above limit", "alarm": "Alarm count"},
+        )
+
+        normalized_item = normalize_chart_result_item(chart_item)
+        self.assertEqual(
+            [item["name"] for item in normalized_item["chart_spec"]["series"]],
+            ["Alarm count", "Above limit"],
+        )
+
+    def test_multi_metric_chart_rejects_unknown_label_mapping_field(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not present in value_fields"):
+            build_multi_metric_chart_result(
+                data=[{"parameter": "temperature", "alarm": 2, "above": 1}],
+                title="Parameter alarms",
+                category_field="parameter",
+                value_fields=["alarm", "above"],
+                value_labels={"alarm": "Alarm count", "missing": "Missing"},
+            )
+
     def test_multi_metric_line_supports_a_business_series_dimension(self) -> None:
         chart_item = build_multi_metric_chart_result(
             chart_kind="line",
@@ -159,7 +185,7 @@ class ChartDocumentUtilsTestCase(unittest.TestCase):
             {"WS1": [17.23, 3.53], "WS2": [3.23, 2.19]},
         )
 
-    def test_chart_rejects_multiple_metrics_hidden_in_generic_value_column(self) -> None:
+    def test_chart_accepts_metric_categories_in_generic_value_column(self) -> None:
         chart_item = build_chart_result(
             chart_kind="bar",
             data=[
@@ -171,8 +197,15 @@ class ChartDocumentUtilsTestCase(unittest.TestCase):
             value_field="套数",
         )
 
-        with self.assertRaisesRegex(ValueError, "chart_semantic_error.*独立数值列"):
-            normalize_chart_result_item(chart_item)
+        normalized_item = normalize_chart_result_item(chart_item)
+        self.assertEqual(
+            normalized_item["chart_spec"]["xAxis"]["data"],
+            ["年度目标套数", "上半年签约套数"],
+        )
+        self.assertEqual(
+            normalized_item["chart_spec"]["series"][0]["data"],
+            [1130.0, 481.0],
+        )
 
     def test_line_chart_rejects_duplicate_category_and_series_pair(self) -> None:
         chart_item = build_chart_result(

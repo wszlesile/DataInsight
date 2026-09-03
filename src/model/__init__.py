@@ -42,6 +42,12 @@ class InsightNamespace(Base):
     id = Column(Integer, primary_key=True, autoincrement=True, comment='洞察空间主键')
     username = Column(String(64), nullable=False, comment='空间所属用户名')
     name = Column(String(128), nullable=False, comment='洞察空间名称')
+    namespace_kind = Column(
+        String(32),
+        nullable=False,
+        default='interactive',
+        comment='interactive 或 workflow_internal',
+    )
     is_deleted = Column(Integer, nullable=False, default=0, comment='软删除标记')
     created_at = Column(DateTime, default=_now, comment='创建时间')
 
@@ -55,6 +61,7 @@ class InsightNamespace(Base):
             "id": self.id,
             "username": self.username,
             "name": self.name,
+            "namespace_kind": self.namespace_kind,
             "is_deleted": self.is_deleted,
             "created_at": _format(self.created_at),
         }
@@ -420,6 +427,47 @@ class InsightAnalysisTask(Base):
             "updated_at": _format(self.updated_at),
             "heartbeat_at": _format(self.heartbeat_at),
         }
+
+
+class InsightWorkflowJob(Base):
+    """External workflow invocation mapped to one hidden analysis turn."""
+
+    __tablename__ = 'insight_workflow_job'
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment='工作流作业主键')
+    job_id = Column(String(64), nullable=False, unique=True, comment='外部作业 ID')
+    username = Column(String(64), nullable=False, comment='调用用户')
+    namespace_id = Column(Integer, nullable=False, comment='内部空间 ID')
+    conversation_id = Column(Integer, nullable=False, comment='内部会话 ID')
+    turn_id = Column(Integer, nullable=False, default=0, comment='内部轮次 ID')
+    analysis_task_id = Column(Integer, nullable=False, default=0, comment='后台分析任务主键')
+    analysis_task_public_id = Column(String(64), nullable=False, default='', comment='后台分析任务 ID')
+    analysis_question = Column(Text, nullable=False, comment='分析问题')
+    uns_node_ids_json = Column(Text, nullable=False, default='[]', comment='UNS 节点 ID JSON')
+    output_contract_json = Column(Text, nullable=False, default='{}', comment='输出协议 JSON')
+    analysis_preferences = Column(Text, nullable=False, default='', comment='调用方补充分析偏好')
+    status = Column(String(32), nullable=False, default='queued', comment='作业状态')
+    idempotency_key = Column(String(128), nullable=True, default=None, comment='调用方幂等键')
+    request_id = Column(String(128), nullable=False, default='', comment='调用方请求追踪 ID')
+    request_fingerprint = Column(String(64), nullable=False, default='', comment='请求摘要')
+    result_json = Column(Text, nullable=False, default='{}', comment='终态结果 JSON')
+    error_message = Column(Text, nullable=False, default='', comment='终态错误')
+    created_at = Column(DateTime, default=_now, comment='创建时间')
+    started_at = Column(DateTime, nullable=True, comment='开始时间')
+    finished_at = Column(DateTime, nullable=True, comment='结束时间')
+    updated_at = Column(DateTime, default=_now, onupdate=_now, comment='更新时间')
+
+    __table_args__ = (
+        Index('idx_workflow_job_owner_created', 'username', 'created_at'),
+        Index(
+            'uq_workflow_job_owner_idempotency',
+            'username',
+            'idempotency_key',
+            unique=True,
+        ),
+        Index('idx_workflow_job_task', 'analysis_task_id'),
+        {'comment': '外部业务工作流洞察作业表'},
+    )
 
 
 class InsightTaskDefinition(Base):

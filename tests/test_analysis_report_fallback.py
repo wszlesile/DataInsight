@@ -56,6 +56,26 @@ class AnalysisReportFallbackTestCase(unittest.TestCase):
             "这次没有完成分析，但我已经定位到问题了。",
         )
 
+    def test_failed_analysis_execution_cannot_be_promoted_to_report(self) -> None:
+        self.assertFalse(
+            _should_use_report_only_fallback(
+                analysis_request_expected=True,
+                round_index=MAX_ANALYSIS_AGENT_ROUNDS - 1,
+                has_any_artifact=False,
+                assistant_message="执行失败后的解释",
+                analysis_flow_started=True,
+            )
+        )
+        self.assertFalse(
+            _should_use_failure_reason_fallback(
+                analysis_request_expected=True,
+                round_index=MAX_ANALYSIS_AGENT_ROUNDS - 1,
+                has_any_artifact=False,
+                assistant_message="",
+                analysis_flow_started=True,
+            )
+        )
+
     def test_failure_reason_fallback_requires_no_visible_reply(self) -> None:
         self.assertTrue(
             _should_use_failure_reason_fallback(

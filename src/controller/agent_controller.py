@@ -25,6 +25,9 @@ def create_agent_controller() -> Blueprint:
     blueprint.route('/tasks', methods=['POST'])(controller.create_task)
     blueprint.route('/tasks/<task_id>', methods=['GET'])(controller.get_task)
     blueprint.route('/tasks/<task_id>/cancel', methods=['POST'])(controller.cancel_task)
+    blueprint.route('/tasks/<task_id>/clarification', methods=['POST'])(
+        controller.submit_clarification
+    )
     return blueprint
 
 
@@ -61,6 +64,7 @@ def _build_agent_request(data: dict):
             'lake_rds_database_name': getattr(database_conn_info, 'lake_rds_database_name', '') or '',
             'ts_query_source': getattr(database_conn_info, 'ts_query_source', '') or '',
         } if database_conn_info else {},
+        clarification_mode=str(data.get('clarification_mode') or 'same_turn'),
     )
 
 
@@ -153,6 +157,7 @@ class AgentController(BaseController):
                     'conversation_id': runtime.conversation.id,
                     'turn_id': runtime.turn.id,
                     'user_message': agent_request.user_message,
+                    'clarification_mode': agent_request.clarification_mode,
                 },
             )
             session.commit()
@@ -206,6 +211,105 @@ class AgentController(BaseController):
         except Exception as exc:
             session.rollback()
             return self.error_response(f'停止分析任务失败: {get_user_facing_agent_error(exc)}')
+        finally:
+            session.close()
+
+    def submit_clarification(self, task_id: str):
+        """Resume a suspended analysis inside its existing turn."""
+        username = _get_username()
+        data = self.get_json_data()
+        clarification_id = str(data.get("clarification_id") or "").strip()
+        answer_text = str(data.get("answer_text") or "").strip()
+        option_id = str(data.get("option_id") or "").strip()
+        answers = [
+            item for item in data.get("answers") or [] if isinstance(item, dict)
+        ]
+        if not clarification_id:
+            return self.error_response("clarification_id 不能为空")
+
+        session = SessionLocal()
+        try:
+            task_service = AnalysisTaskService(session)
+            task = task_service.get_task(task_id, username=username)
+            if task is None:
+                return self.error_response("分析任务不存在", 404)
+            request_payload = task_service.get_request_payload(task)
+            pending = request_payload.get("pending_clarification") or {}
+            resumed_task, answer = task_service.resume_from_clarification(
+                task_id,
+                clarification_id=clarification_id,
+                answer_text=answer_text,
+                option_id=option_id,
+                answers=answers,
+            )
+            if resumed_task is None:
+                return self.error_response("澄清请求已失效或回答为空", 409)
+
+            ConversationContextService(session).resume_from_clarification(
+                conversation_id=int(task.conversation_id or 0),
+                turn_id=int(task.turn_id or 0),
+                answer=answer,
+                analysis_task_id=task.id,
+            )
+            resume_context = request_payload.get("clarification_resume_context")
+            if not isinstance(resume_context, dict):
+                resume_context = {}
+            agent_request = _build_agent_request({
+                "namespace_id": task.namespace_id,
+                "conversation_id": task.conversation_id,
+                "user_message": str(request_payload.get("user_message") or ""),
+                "clarification_mode": str(
+                    request_payload.get("clarification_mode") or "same_turn"
+                ),
+            })
+            clarification_history = [
+                item
+                for item in request_payload.get("clarifications") or []
+                if isinstance(item, dict)
+            ]
+            answer_items = [
+                item for item in answer.get("answers") or [] if isinstance(item, dict)
+            ] or [answer]
+            clarification_history.extend(answer_items)
+            agent_request.clarification_context = {
+                **resume_context,
+                "request": pending,
+                "answer_text": answer.get("answer_text"),
+                "resolved_value": answer.get("resolved_value"),
+                "user_clarifications": clarification_history,
+                "target_subjects": [
+                    str((item.get("semantic_scope") or {}).get("subject") or "").strip()
+                    for item in answer_items
+                    if str((item.get("semantic_scope") or {}).get("subject") or "").strip()
+                ],
+            }
+            session.commit()
+            try:
+                queue = AnalysisStreamQueue(
+                    get_redis_client(),
+                    max_len=Config.STREAM_QUEUE_MAX_LEN,
+                    event_max_bytes=Config.STREAM_EVENT_MAX_BYTES,
+                    ttl_seconds=Config.STREAM_QUEUE_TTL_SECONDS,
+                )
+                queue.clear_turn(int(task.turn_id or 0))
+            except Exception:
+                pass
+            get_analysis_task_runner().submit(
+                task_id=task.task_id,
+                analysis_task_id=task.id,
+                agent_request=agent_request,
+                turn_id=int(task.turn_id or 0),
+                is_rerun=(task.task_type == "rerun"),
+            )
+            return jsonify(Result.success(
+                data=task_service.serialize_task(resumed_task),
+                message="已补充业务语义，继续分析",
+            ).to_dict())
+        except Exception as exc:
+            session.rollback()
+            return self.error_response(
+                f"提交澄清回答失败: {get_user_facing_agent_error(exc)}"
+            )
         finally:
             session.close()
 

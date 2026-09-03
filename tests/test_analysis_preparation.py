@@ -657,12 +657,79 @@ def test_prompt_snapshot_keeps_semantic_reference_without_er_binding():
         "datasource_id": 13,
         "datasource_name": "合同指标口径",
         "description": "提供合同状态与金额指标定义，不承载合同明细事实",
+        "metadata_schema": compact_datasource_snapshot(snapshot)[
+            "selected_datasource_snapshot"
+        ][-1]["metadata_schema"],
     }]
     assert all(
         relationship["left_datasource_id"] != 13
         and relationship["right_datasource_id"] != 13
         for relationship in prompt_snapshot["analysis_semantic_context"]["relationships"]
     )
+
+
+@pytest.mark.parametrize("schema_shape", ["properties", "fields"])
+def test_semantic_reference_definitions_reach_model_and_survive_resume(monkeypatch, schema_shape):
+    import copy
+    import agent
+    import agent.context_engineering_runtime as runtime_context
+
+    definition = {
+        "type": "number",
+        "description": "Net rate uses total net amount divided by total base amount.",
+        "formula": "sum(net_amount) / sum(base_amount)",
+        "unit": "ratio",
+        "applicable_objects": ["settled_transaction"],
+    }
+    schema = {"description": "Business definitions", "rules": [{
+        "name": "period", "field": "settled_at", "boundary": "[start,end)",
+    }]}
+    if schema_shape == "properties":
+        schema["properties"] = {"net_rate": definition}
+    else:
+        schema["fields"] = [{"name": "net_rate", **definition}]
+    snapshot = _snapshot()
+    snapshot["selected_datasource_ids"].append(13)
+    snapshot["selected_datasource_snapshot"].append({
+        "datasource_id": 13, "datasource_name": "Business definitions",
+        "datasource_type": "table", "datasource_identifier": "rules.definitions",
+        "metadata_schema": schema,
+    })
+    original = copy.deepcopy(snapshot)
+    selection_payload = _selection().model_dump()
+    selection_payload["question_coverage"][0]["fact_coverage"][0][
+        "semantic_reference_datasource_ids"
+    ] = [13]
+    prepared = PreparationResult(
+        intent=_intent(),
+        selection=DatasourceSelectionContract.model_validate(selection_payload),
+        business_context=_business_context(), selected_snapshot=snapshot,
+        query_capabilities=("sql",),
+    )
+    restored = PreparationResult.from_resume_payload(prepared.resume_payload())
+    assert restored is not None
+    prompt_snapshot = restored.prompt_snapshot()
+    reference = prompt_snapshot["analysis_semantic_context"]["semantic_references"][0]
+    for key, value in schema.items():
+        assert reference["metadata_schema"][key] == value
+    assert prompt_snapshot["selected_datasource_ids"] == [11, 12]
+    assert 13 not in {item["datasource_id"] for item in prompt_snapshot["selected_datasource_snapshot"]}
+
+    monkeypatch.setattr(runtime_context, "_load_conversation", lambda _: None)
+    monkeypatch.setattr(agent, "_build_conversation_prompt_message", lambda *_: None)
+    monkeypatch.setattr(agent, "get_memory_messages", lambda *_, **__: [])
+    monkeypatch.setattr(agent, "get_history_messages", lambda *_, **__: [])
+    messages = agent.build_prompt_messages(
+        "Analyze the settled business", namespace_id=1, conversation_id=1,
+        datasource_snapshot_override=prompt_snapshot, context_mode="fresh_analysis",
+    )
+    model_text = "\n".join(message.content for message in messages)
+    assert definition["description"] in model_text
+    assert definition["formula"] in model_text
+    assert "settled_at" in model_text
+    assert snapshot == original
+    reference["metadata_schema"]["description"] = "changed output only"
+    assert snapshot == original
 
 
 def test_derived_fact_inherits_sources_and_status_from_canonical_facts():

@@ -1709,7 +1709,54 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 }
 ```
 
-### 5.6 查询当前会话运行中轮次
+### 5.6 提交同轮次业务语义澄清
+
+`POST /api/agent/tasks/{task_id}/clarification`
+
+用途：
+
+- 当分析任务进入 `waiting_clarification` 时，在原任务、原轮次内补充业务口径并继续执行。
+- 一个澄清事件可以包含一项或多项问题。多项问题应一次提交，避免同一轮次连续挂起和重复调用语义解析模型。
+
+单项请求体：
+
+```json
+{
+  "clarification_id": "47d1932c24644f08bcbdedc2265a91d2",
+  "option_id": "batch_grain",
+  "answer_text": "按生产批次计算"
+}
+```
+
+批量请求体：
+
+```json
+{
+  "clarification_id": "47d1932c24644f08bcbdedc2265a91d2",
+  "answers": [
+    {
+      "item_id": "d48a4a0f8837",
+      "option_id": "",
+      "answer_text": "按批次，仅首检，全部首检记录合格才算一次合格"
+    },
+    {
+      "item_id": "2fc9939fc46a",
+      "option_id": "batch_grain",
+      "answer_text": "按批次计算"
+    }
+  ]
+}
+```
+
+说明：
+
+- `clarification_id` 必须与 SSE `clarification_required` 事件中的值一致。
+- 批量澄清必须回答 `clarification.items` 中的全部项目；缺少任一项时返回 `409`，任务继续保持 `waiting_clarification`。
+- `allow_free_text=false` 的项目只能提交服务端给出的 `option_id`；未知选项或任意文本返回 `409`。
+- 服务端原子地写入全部回答，并把任务恢复为 `queued`。同一澄清请求只能成功恢复一次。
+- SSE 澄清事件中的每个 `items[]` 项包含稳定的 `item_id`、`question`、`options`、`allow_free_text` 和 `semantic_scope`。
+
+### 5.7 查询当前会话运行中轮次
 
 `GET /api/insight/conversations/{conversation_id}/running-turn`
 
@@ -1754,7 +1801,7 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 }
 ```
 
-### 5.7 订阅轮次流式输出
+### 5.8 订阅轮次流式输出
 
 `GET /api/insight/conversations/{conversation_id}/turns/{turn_id}/stream`
 
@@ -1787,7 +1834,7 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 - 任务结束后，前端收到 `done` 或 `error` 应关闭当前 SSE 连接，并重新拉取会话历史。
 - 如果队列暂时没有事件，后端会保持 SSE 连接并输出 heartbeat。
 
-### 5.8 提交原轮次异步刷新分析任务
+### 5.9 提交原轮次异步刷新分析任务
 
 `POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/rerun/task`
 
@@ -1817,7 +1864,7 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 - 成功后结果回写到同一个 `turn_id`。
 - 同样受用户任务并发上限和会话运行中任务限制。
 
-### 5.9 原轮次同步流式刷新分析
+### 5.10 原轮次同步流式刷新分析
 
 `POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/rerun/stream`
 
@@ -2741,3 +2788,124 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 - 响应只包含运行状态和审计字段，不经 Gateway 返回完整报告和图表。
 
 非服务账号请求返回 HTTP `403`。
+
+## 13. 业务工作流洞察调用
+
+业务协同工作流可直接提交异步洞察作业，不需要预先创建用户可见的洞察空间或会话。接口复用现有 Preparation、统一 Runtime 与 Python 执行链路，但不生成 Evidence，也不支持挂起等待用户澄清。
+
+### 13.1 提交洞察作业
+
+`POST /api/insight/workflow/jobs`
+
+请求头：
+
+- `Authorization`：当前调用用户认证信息。
+- `Idempotency-Key`：可选；同一用户使用相同键和相同请求时返回原作业，内容不同时返回错误。
+- `X-Request-ID`：可选调用链追踪 ID。
+
+请求体：
+
+```json
+{
+  "analysis_question": "分析本周期质量风险",
+  "uns_node_ids": ["2066811253765967872", "2066811253765967873"],
+  "output_format": {
+    "type": "json",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "oos_batch_count": {
+          "type": "integer",
+          "description": "本周期 OOS 去重批次数"
+        },
+        "summary": {
+          "type": "string",
+          "description": "结合指标形成的业务结论"
+        }
+      },
+      "required": ["oos_batch_count", "summary"],
+      "additionalProperties": false
+    }
+  },
+  "analysis_preferences": "重点关注异常原因和可执行建议"
+}
+```
+
+字段说明：
+
+- `analysis_question`：必填字符串；由上游工作流完成变量插值后的完整分析问题。
+- `uns_node_ids`：必填 UNS 节点 ID 数组；本轮只在该范围内选源和分析，不调用语义中心扩大范围。
+- `analysis_preferences`：可选文本；语义等同于洞察会话提示词，用于提供业务规则和表达偏好。
+- `output_format`：必填对象，仅支持以下三种形式：
+  - `{"type":"standard"}`：Markdown 报告、图表和表格。
+  - `{"type":"text"}`：纯文本洞察结果。
+  - `{"type":"json","schema":{...}}`：严格 JSON 对象；`schema` 必填。
+
+JSON Schema 根节点必须是 `object`。其属性可使用本地可验证子集：`object/array/string/number/integer/boolean/null`、`properties`、`required`、`additionalProperties`、`items`、`enum`、`const`、数值/长度/数组边界和 `pattern`。不支持远程引用、递归引用和组合关键字。
+
+新建成功返回 HTTP `202`；幂等命中返回 HTTP `200`：
+
+```json
+{
+  "success": true,
+  "data": {
+    "job_id": "6f0786266243472da8c62e05a9ac62c0",
+    "status": "queued",
+    "analysis_question": "分析本周期质量风险",
+    "uns_node_ids": ["2066811253765967872"],
+    "output_format": {
+      "type": "json",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "oos_batch_count": {"type": "integer"},
+          "summary": {"type": "string"}
+        },
+        "required": ["oos_batch_count", "summary"],
+        "additionalProperties": false
+      }
+    },
+    "result": null,
+    "error": "",
+    "created_at": "2026-09-01T10:00:00"
+  },
+  "message": "洞察作业已提交",
+  "code": 202
+}
+```
+
+### 13.2 查询洞察作业
+
+`GET /api/insight/workflow/jobs/{job_id}`
+
+状态支持 `queued/running/success/failed/cancelled`。成功结果随输出模式变化：
+
+标准模式：
+
+```json
+{
+  "result": {
+    "analysis_report": "## 核心结论\n...",
+    "charts": [],
+    "tables": []
+  }
+}
+```
+
+文本模式：`result.content` 为纯文本。JSON 模式：`result.data` 为通过请求 Schema 校验的真实 JSON 对象。工作流结果不包含 Evidence、Evidence ref 或同轮次澄清状态。
+
+### 13.3 取消洞察作业
+
+`POST /api/insight/workflow/jobs/{job_id}/cancel`
+
+取消仍在排队或执行中的作业。接口为幂等操作；已进入终态的作业直接返回当前状态。
+
+### 13.4 交互式澄清开关
+
+现有 `/api/agent/invoke`、`/api/agent/stream` 和 `/api/agent/tasks` 可选提交：
+
+```json
+{"clarification_mode": "same_turn"}
+```
+
+可选值为 `same_turn` 或 `disabled`，省略时保持现有默认值 `same_turn`。该字段只控制是否允许当前轮次挂起澄清，不改变标准产物和 Evidence 行为。

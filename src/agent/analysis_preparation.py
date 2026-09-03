@@ -974,6 +974,9 @@ class PreparationResult:
                     )
                     or ""
                 ),
+                "metadata_schema": copy.deepcopy(
+                    datasource.get("metadata_schema") or {}
+                ),
             }
             for datasource in snapshot.get("selected_datasource_snapshot") or []
             if int(
@@ -1160,6 +1163,7 @@ class PreparationResult:
             "relationships": runtime_relationships,
             "insight_lineage": runtime_lineage,
         }
+        snapshot["query_capabilities"] = list(self.query_capabilities)
         return snapshot
 
 

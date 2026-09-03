@@ -1,4 +1,5 @@
 import sys
+import json
 import unittest
 from pathlib import Path
 
@@ -33,6 +34,275 @@ class ConversationContextServiceTestCase(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.session.close()
+
+    def test_interactive_runtime_cannot_open_hidden_workflow_conversation(self) -> None:
+        namespace = InsightNamespace(
+            username="alice",
+            name="__workflow_internal__",
+            namespace_kind="workflow_internal",
+            is_deleted=0,
+        )
+        self.session.add(namespace)
+        self.session.flush()
+        conversation = InsightNsConversation(
+            insight_namespace_id=namespace.id,
+            title="工作流洞察",
+            status="active",
+            summary_text="",
+            active_datasource_snapshot="{}",
+            last_turn_no=0,
+            user_message="",
+            insight_result="",
+            is_deleted=0,
+        )
+        self.session.add(conversation)
+        self.session.commit()
+
+        service = ConversationContextService(self.session)
+        with self.assertRaisesRegex(ValueError, "当前会话不存在"):
+            service.start_run(
+                username="alice",
+                namespace_id=namespace.id,
+                conversation_id=conversation.id,
+                user_message="分析风险",
+            )
+
+        runtime = service.start_run(
+            username="alice",
+            namespace_id=namespace.id,
+            conversation_id=conversation.id,
+            user_message="分析风险",
+            allow_internal_namespace=True,
+        )
+        self.assertEqual(runtime.conversation.id, conversation.id)
+
+    def test_clarification_answer_inherits_scope_from_persisted_request(self) -> None:
+        clarification_id = "clarification-legacy"
+        self.session.add(InsightNsMessage(
+            id=9001,
+            insight_namespace_id=4,
+            insight_conversation_id=17,
+            turn_id=901,
+            turn_no=1,
+            seq_no=1,
+            role="assistant",
+            message_kind="clarification_request",
+            content="OOS 批次按开始时间还是结束时间归属？",
+            content_json=json.dumps({
+                "clarification": {
+                    "clarification_id": clarification_id,
+                    "question": "OOS 批次按开始时间还是结束时间归属？",
+                    "semantic_scope": {
+                        "metric_name": "OOS批次率",
+                        "clarification_kind": "time_attribution",
+                    },
+                }
+            }, ensure_ascii=False),
+            is_deleted=0,
+        ))
+        self.session.add(InsightNsMessage(
+            id=9002,
+            insight_namespace_id=4,
+            insight_conversation_id=17,
+            turn_id=901,
+            turn_no=1,
+            seq_no=2,
+            role="user",
+            message_kind="clarification_answer",
+            content="按批次开始时间归属。",
+            content_json=json.dumps({
+                "clarification_answer": {
+                    "clarification_id": clarification_id,
+                    "answer_text": "按批次开始时间归属。",
+                    "resolved_value": "按批次开始时间归属。",
+                }
+            }, ensure_ascii=False),
+            is_deleted=0,
+        ))
+        self.session.commit()
+
+        answers = ConversationContextService(
+            self.session
+        ).get_turn_clarification_answers(901)
+
+        self.assertEqual(len(answers), 1)
+        self.assertEqual(answers[0]["semantic_scope"]["subject"], "OOS批次率")
+        self.assertEqual(
+            answers[0]["semantic_scope"]["ambiguity_kind"],
+            "time_attribution",
+        )
+        self.assertEqual(answers[0]["resolved_value"], "按批次开始时间归属。")
+
+    def test_clarification_answers_keep_distinct_items_for_the_same_subject(self) -> None:
+        clarification_id = "clarification-batch"
+        request_items = [
+            {
+                "item_id": "population",
+                "question": "一次合格率按什么总体？",
+                "semantic_scope": {
+                    "subject": "一次合格率",
+                    "ambiguity_kind": "metric_definition",
+                },
+            },
+            {
+                "item_id": "qualification",
+                "question": "什么条件计为一次合格？",
+                "semantic_scope": {
+                    "subject": "一次合格率",
+                    "ambiguity_kind": "metric_definition",
+                },
+            },
+        ]
+        self.session.add(InsightNsMessage(
+            id=9011,
+            insight_namespace_id=4,
+            insight_conversation_id=17,
+            turn_id=902,
+            turn_no=1,
+            seq_no=1,
+            role="assistant",
+            message_kind="clarification_request",
+            content="请确认一次合格率口径",
+            content_json=json.dumps({
+                "clarification": {
+                    "clarification_id": clarification_id,
+                    "items": request_items,
+                }
+            }, ensure_ascii=False),
+            is_deleted=0,
+        ))
+        self.session.add(InsightNsMessage(
+            id=9012,
+            insight_namespace_id=4,
+            insight_conversation_id=17,
+            turn_id=902,
+            turn_no=1,
+            seq_no=2,
+            role="user",
+            message_kind="clarification_answer",
+            content="已确认",
+            content_json=json.dumps({
+                "clarification_answer": {
+                    "clarification_id": clarification_id,
+                    "answers": [
+                        {
+                            "clarification_id": clarification_id,
+                            "clarification_item_id": "population",
+                            "question": request_items[0]["question"],
+                            "answer_text": "按生产批次",
+                            "resolved_value": "每个生产批次计一次",
+                            "semantic_scope": request_items[0]["semantic_scope"],
+                        },
+                        {
+                            "clarification_id": clarification_id,
+                            "clarification_item_id": "qualification",
+                            "question": request_items[1]["question"],
+                            "answer_text": "全部初检合格",
+                            "resolved_value": "批次全部初检记录合格才计入分子",
+                            "semantic_scope": request_items[1]["semantic_scope"],
+                        },
+                    ],
+                }
+            }, ensure_ascii=False),
+            is_deleted=0,
+        ))
+        self.session.commit()
+
+        answers = ConversationContextService(
+            self.session
+        ).get_turn_clarification_answers(902)
+
+        self.assertEqual(
+            [item["clarification_item_id"] for item in answers],
+            ["population", "qualification"],
+        )
+        self.assertEqual(
+            [item["resolved_value"] for item in answers],
+            ["每个生产批次计一次", "批次全部初检记录合格才计入分子"],
+        )
+
+    def test_clarification_rerun_restores_only_latest_task_branch(self) -> None:
+        def add_answer(
+            *,
+            message_id: int,
+            seq_no: int,
+            task_id: int,
+            clarification_id: str,
+            item_id: str,
+            subject: str,
+            value: str,
+        ) -> None:
+            self.session.add(InsightNsMessage(
+                id=message_id,
+                insight_namespace_id=4,
+                insight_conversation_id=17,
+                turn_id=903,
+                turn_no=1,
+                seq_no=seq_no,
+                role="user",
+                message_kind="clarification_answer",
+                content=value,
+                content_json=json.dumps({
+                    "clarification_answer": {
+                        "clarification_id": clarification_id,
+                        "answers": [{
+                            "clarification_id": clarification_id,
+                            "clarification_item_id": item_id,
+                            "question": f"请确认{subject}",
+                            "answer_text": value,
+                            "resolved_value": value,
+                            "semantic_scope": {
+                                "subject": subject,
+                                "ambiguity_kind": "metric_definition",
+                            },
+                        }],
+                    }
+                }, ensure_ascii=False),
+                analysis_task_id=task_id,
+                is_deleted=0,
+            ))
+
+        add_answer(
+            message_id=9021,
+            seq_no=1,
+            task_id=501,
+            clarification_id="old-branch",
+            item_id="legacy-item",
+            subject="一次合格率",
+            value="旧口径",
+        )
+        add_answer(
+            message_id=9022,
+            seq_no=2,
+            task_id=502,
+            clarification_id="latest-branch",
+            item_id="population",
+            subject="一次合格率",
+            value="按生产批次",
+        )
+        add_answer(
+            message_id=9023,
+            seq_no=3,
+            task_id=502,
+            clarification_id="latest-branch",
+            item_id="oos-definition",
+            subject="OOS批次率",
+            value="命中 OOS 的批次计入分子",
+        )
+        self.session.commit()
+
+        answers = ConversationContextService(
+            self.session
+        ).get_turn_clarification_answers(903)
+
+        self.assertEqual(
+            [item["clarification_item_id"] for item in answers],
+            ["population", "oos-definition"],
+        )
+        self.assertEqual(
+            [item["resolved_value"] for item in answers],
+            ["按生产批次", "命中 OOS 的批次计入分子"],
+        )
 
     def _add_turn_messages(
         self,
@@ -189,6 +459,19 @@ class ConversationContextServiceTestCase(unittest.TestCase):
 
         self.assertEqual([execution.id for execution in executions], [12])
         self.assertEqual(latest.id, 12)
+
+    def test_latest_execution_can_require_successful_status(self) -> None:
+        self._add_execution(execution_id=13, turn_id=41, status='success')
+        self._add_execution(execution_id=14, turn_id=41, status='failed')
+        self.session.commit()
+
+        latest = ConversationContextService(self.session).get_latest_execution(
+            turn_id=41,
+            successful_only=True,
+        )
+
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest.id, 13)
 
     def test_recent_prompt_messages_keeps_successful_analysis_answer(self) -> None:
         self._add_turn_messages(

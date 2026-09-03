@@ -11,6 +11,15 @@
 `codex/unified-analysis-runtime` 中的实验代码。目标是在保留原版统一洞察 Agent
 能力的基础上，引入已经验证有价值的 Preparation 和 Runtime 能力。
 
+2026-09-03 实施说明：以上提交是最初重建起点；本轮 Runtime 改造的直接对照基线为
+`be9d3fd7bbaf81ce354459425a85d41078799e40`。本轮工程决策、落实清单与真实验收边界见
+[方案因果复核第 8-9 节](runtime-design-causality-review-20260902.md)，上下文与工具接口详见
+[Runtime 上下文设计](runtime-context-capability-design.md)。总体语义职责保持本文原则，不新增指标规划或审核阶段。
+
+同日补充的[分析程序连续构建设计](runtime-program-construction-design.md)目前是待实施提案：
+在同一 Runtime 中支持信息积累和一份 Python 程序的增量构建，不拆分指标/报告语义，
+不表示当前系统已经有草稿编辑和局部验证工具。
+
 ## 2. 改造目标
 
 ### 2.1 保留原版优势
@@ -131,7 +140,26 @@ Runtime Probe 可以核验当前回答所需的枚举、字段格式、时间覆
 Preparation 在验证 ER 关系时可以复用同一组底层 Probe API，但不能把这条技术
 验证链变成正式分析的前置硬门槛。
 
-### 3.5 Evidence 在正式分析成功后编译
+### 3.5 同轮次澄清属于统一 Runtime 的终止型能力
+
+系统不在正式 Runtime 前增加独立语义规划阶段。统一 Runtime 在同一个 ReAct 上下文中
+读取用户问题、业务规则、Preparation 结果和完整 Schema，自主决定直接分析、执行 Probe，
+或请求用户澄清。
+
+枚举、格式、时间覆盖、查询路径和有无数据等技术事实由 Probe 确认。只有一个关键业务定义
+存在互斥解释、选择会实质改变答案、并且 Schema、业务规则和 Probe 都不能唯一确定时，
+Runtime 才调用 `request_analysis_clarification`。该工具终止当前 Agent 图，任务进入
+`waiting_clarification`；用户回答后原任务、原轮次恢复，Preparation 不重复执行。
+
+澄清回答作为用户事实注入 Runtime，不形成计算边界、指标清单或报告计划。查询、计算、扩展
+洞察、图表表格和报告表达始终由统一 Runtime 完整拥有。详细设计见
+`runtime-clarification-design.md`。
+
+用户已确认事实直接回到统一 Runtime ReAct，由同一个洞察语义所有者落实为查询、计算和报告。
+系统不再增加澄清答案编译器、执行前语义审核器或基于字段字面量的 Probe 硬门槛。静态契约只
+处理语法、安全、字段归属、显式查询范围和产物结构等能够确定性证明的边界。
+
+### 3.6 Evidence 在正式分析成功后编译
 
 目标关系为：
 
@@ -151,13 +179,18 @@ Preparation 在验证 ER 关系时可以复用同一组底层 Probe API，但不
 4. 派生比率、差额、增长率和组合值必须形成独立计算签名和 Evidence。
 5. QuerySnapshot 必须区分两层范围：`analysis_scope` 只记录可复用的用户时间范围和目标筛选；`query_scope` 只记录某一物理查询自己的事实、来源、聚合和粒度。后续物理查询可继承前者，绝不能继承首条查询的指标、粒度或事实边界。
 6. 未显式声明本地范围的辅助物理查询保留为 `implicit` scope：后置 Evidence 可以从真实 SQL / loader 和计算图继续解析其血缘，但不得把它伪装成首条查询的计算口径。
-7. grouped 计算按一个计算列形成 Evidence，各成员通过 selector 定位；不能按单元格生成 Evidence。
+7. grouped 计算按一个计算列形成 Evidence，各成员通过 selector 定位；不能按单元格生成 Evidence。若图表用类别字段承载多个不同指标，且各点真实计算边界不同，则按点生成独立 Evidence，并由 `point_selector` 定位。
 8. TraceRef 由 LineageIndex 与产物位置编译，不由模型手写 ID。
 9. Markdown 数字扫描只用于完整定位候选；计算边界仍由 AST、真实查询快照和必要时的 LLM 语义解析共同确定，不能只凭文本数字反推 Metric 或 Evidence。
 10. Evidence 错误不能推翻正式分析成功，也不能触发业务代码重写。
+11. 派生查询可以通过 `scope_source_query_key + scope_binding` 继承已成功父查询的分析范围：
+    父结果字段、子查询目标字段和实际参数必须完整可验证；它不能伪造不适用的时间字段，
+    也不能绕过聚合粒度契约。该关系同时写入 QuerySnapshot，供后置 Evidence 还原范围。
+12. 日期型参数与带时区午夜时间戳在同一自然日边界下视为等价表达，避免展示格式差异
+    触发错误的时间范围修复；非午夜时间仍必须精确匹配。
 11. 详细设计以 `post-analysis-evidence-architecture.md` 为准。
 
-### 3.6 报告仍由统一洞察 Agent 自由表达
+### 3.7 报告仍由统一洞察 Agent 自由表达
 
 报告不是本地固定模板，也不是指标说明清单。
 
@@ -190,10 +223,15 @@ flowchart TD
     D --> E0["完整已选 Schema + analysis_semantic_context"]
     E0 --> E["统一洞察 Agent"]
     E --> F{"是否需要 Probe"}
-    F -- "需要" --> G["execute_python：Probe"]
+    F -- "需要" --> G["probe_analysis_data：有界观察"]
     G --> H["结构化 Probe 反馈"]
     H --> E
-    F -- "不需要 / 已确认" --> I["execute_python：正式分析"]
+    E -- "关键业务定义仍有互斥歧义" --> C1["request_analysis_clarification"]
+    C1 --> C2["同轮次回答并恢复原任务"]
+    C2 --> E
+    E -- "需要完整 API 用法" --> R["read_runtime_reference：本地只读参考"]
+    R --> E
+    F -- "不需要 / 已确认" --> I["submit_analysis_program：正式分析与修复"]
     I --> J{"执行与契约是否通过"}
     J -- "可修复" --> K["结构化局部错误反馈"]
     K --> E
@@ -204,6 +242,10 @@ flowchart TD
 
 Preparation 可以使用本地 Schema 关系或受限 Probe 验证 ER，但它不改变
 `E -> G -> H -> E` 这条正式分析口径探测闭环。
+
+Probe 与正式提交共用原执行底座，参考查阅不执行 Python、不查询业务数据。全部必需协议首次交付，
+参考只用于可选的完整用法，不是前置门槛。交互澄清与最终输出按 InvocationPolicy 生效；外部工作流
+可选 standard/text/json，禁用同轮次澄清和后置 Evidence。图中标准报告路径不覆盖这些调用策略。
 
 ## 5. 上下文组织
 
@@ -216,22 +258,26 @@ Preparation 可以使用本地 Schema 关系或受限 Probe 验证 ER，但它�
    - 用户问题
    - 会话补充规则
    - 时间和用户显式约束
-3. **数据源上下文**
+3. **Preparation 交接与用户澄清事实**
+   - Preparation 交接完整业务问题、选源结果、Schema、关系和未解决项
+   - 用户澄清后只追加用户直接回答，不生成新的指标边界或报告规划
+   - 相同澄清回答只注入一次，Probe 反馈继续留在同一 ReAct 历史
+4. **数据源上下文**
    - Preparation 选中的完整 Schema
    - 内聚后的 ER 关系
    - 完整业务问题、逐问题选源覆盖和洞察分析业务血缘
-4. **数据访问协议**
+5. **数据访问协议**
    - 仅加载当前数据源类型需要的查询能力模块
-5. **分析代码协议**
+6. **分析代码协议**
    - Probe/Analysis 生命周期
    - Python 代码结构
    - No Data 处理
-6. **分析产物 API**
+7. **分析产物 API**
    - 正式 Agent 只负责报告、图表和表格产物
    - Evidence 由成功执行后的独立编译链生成，不进入正式 Agent 主 Prompt
-7. **对话历史和短期记忆**
+8. **对话历史和短期记忆**
    - 按当前问题相关性压缩
-8. **执行反馈**
+9. **执行反馈**
    - 最近失败代码
    - 类型化诊断
    - 保持不变的原始洞察目标
@@ -271,7 +317,7 @@ Preparation 可以使用本地 Schema 关系或受限 Probe 验证 ER，但它�
 - 用 Preparation 字段范围裁剪正式 Schema
 - 用 report plan 或 report metric 冻结最终报告语义
 - 本地固定报告模板替代模型叙事
-- 解析 Markdown 数字来生成或校验 Evidence
+- 仅凭 Markdown 数字推断计算边界，或将候选扫描用作正式分析的语义阻断；后置候选定位按第 3.6 节处理
 - 为单个会话添加字段字面量、单位字面量或业务状态补丁
 - 为通过校验而禁止合法图表、指标或叙事能力
 - 将 Probe 样本当作正式分析结果

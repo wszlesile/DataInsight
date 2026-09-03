@@ -208,6 +208,21 @@ operation 的 QuerySnapshot 闭包确定。越界操作被剔除，无法证明�
 不会清空其他合法绑定。最终 output node、calculation signature、Evidence ID 和 ref 均由
 Compiler 生成。
 
+本地计算候选构建过程中恢复出的边界不是临时提示。只要 AST/dataflow 已经证明
+`report output -> operation -> successful QuerySnapshot`，恢复出的 operation、query 和字段
+关系必须同步回 canonical output node，再进入 verified completion。典型场景包括动态键写入后
+通过固定键读取的嵌套映射，例如 `summary[column]["sum"]` 写入、
+`summary["alarm_count"]["sum"]` 展示。此类位置由本地直接完成绑定，不进入 Planner 目录；
+否则会出现“候选层已证明、输出层仍未决”的协议断裂，并造成无意义的 LLM 补漏或 partial。
+
+本地恢复时使用的 Python 变量名和表达式只属于审计血缘，不能直接成为用户可见的指标名称。
+用户可见名称与说明从最终报告的业务语境生成，描述统计对象与计算口径；编译器、AST、
+QuerySnapshot 和本地补全过程只保留在诊断与审计信息中。
+
+Planner 仅处理 canonical output 仍未证明的候选。第一次输出漏分类时只允许一次聚焦修复，
+修复仍未覆盖的位置单独进入 unresolved；不能把全部已证明的报告指标重新交给 LLM 复核，
+也不能因为一个补漏位置失败而清空图表、表格或其他报告 Evidence。
+
 ### 5.3.1 结构化产物的语义补漏边界
 
 图表和表格的可点击位置始终由产物结构确定：图表按数值字段，表格按业务数值列，
@@ -220,12 +235,20 @@ Compiler 生成。
    不接收完整图表/表格数据，也不能增加或修改分析产物；
 4. Resolver 返回 `output_node_id`、精确源码位置、查询声明和真实字段声明；
 5. 本地重新解析源码位置，并用 QuerySnapshot、变量依赖图和查询可达字段验真。
-   不存在的查询、字段或相互矛盾的声明进入 `unresolved`，不能生成 Evidence；
+   不存在的查询、字段或相互矛盾的声明进入 `unresolved`，不能生成 Evidence；当本地
+   只能证明部分查询边界时，只有 Resolver 对缺失查询、字段和源码边界给出高置信声明
+   且通过事实校验，才允许标记为 `attested`，否则整个槽位保持 `unresolved`，不得用
+   残缺的本地边界生成 Evidence；
 6. 通过验真的恢复结果仍由本地生成 calculation signature、EvidenceDefinition 和 ref。
 
 因此，结构化产物不依赖 LLM 决定“哪里可以点击”，同时也不会因为本地尚未覆盖某种
 等价 Python 写法而永久漏掉 Evidence。确定性快路径不触发额外 LLM 调用，只有真实的
 本地解析缺口才进入补漏路径。
+
+结构化产物上的跨类别可比性属于正式分析语义，不由后置血缘编译器根据 AST 形状作业务
+裁决。Compiler 可以记录诊断，但不能仅因不同分母、不同表达式写法或组合排序就阻断
+Runtime；只有列/series 内存在可确定的多个计算边界、空值或结构契约冲突时，才按对应的
+结构化契约处理。
 
 ### 5.4 EvidenceBundle
 
@@ -244,9 +267,13 @@ Compiler 将通过验证的 Plan 编译为现有前端可消费的结构：
 
 ### 6.1 图表
 
-图表 helper 在标准化时将 `chart_document.encoding` 保留为轻量 `chart_data_contract`，不复制数据集。后置编译从该结构获得数值字段，不从 ECharts 展示 JSON 反推。一个 value field 对应一个计算签名；
-同字段下所有点共享 Evidence，并通过图表维度值形成 selector。不能按数据点生成
-Evidence。
+图表 helper 在标准化时将 `chart_document.encoding` 保留为轻量 `chart_data_contract`，
+不复制数据集。后置编译从该结构获得数值字段，不从 ECharts 展示 JSON 反推。通常一个
+value field 对应一个计算签名，同字段下各点共享 Evidence，并由点击上下文定位当前值。
+当图表明确以“指标名称”作为类别、同一个 value field 的各点来自不同计算边界时，Compiler
+按真实数据流为每个类别点生成独立 Evidence，并在字段级 ref 上增加 `point_selector`。这不是
+把每个数据点都固化成 Evidence；只有计算边界确实不同的点才拆分，同一 grouped 指标的普通
+类别点仍共享一个 Evidence。
 
 ### 6.2 表格
 

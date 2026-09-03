@@ -124,6 +124,7 @@ class InsightNsConversationPromptService:
             InsightNsConversation.insight_namespace_id == namespace_id_int,
             InsightNsConversation.is_deleted == 0,
             InsightNamespace.username == username,
+            InsightNamespace.namespace_kind == 'interactive',
             InsightNamespace.is_deleted == 0,
         ).first()
 

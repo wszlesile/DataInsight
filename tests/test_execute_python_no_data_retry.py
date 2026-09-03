@@ -1,4 +1,5 @@
 import json
+import multiprocessing as mp
 import sys
 import unittest
 from pathlib import Path
@@ -13,7 +14,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from agent import load_system_prompt  # noqa: E402
+from agent.runtime_contract_registry import load_runtime_contract_text  # noqa: E402
 from agent.tools import (  # noqa: E402
     NoDataFoundError,
     CURRENT_CONFIRMED_NO_DATA_RESULT,
@@ -26,7 +27,12 @@ from agent.tools import (  # noqa: E402
     _classify_execution_error,
     _extract_error_signature,
     _extract_confirmed_no_data_query_snapshots,
+    _execute_generated_code_worker,
     _inspect_zero_population_aggregate,
+    _read_worker_result_payload,
+    _remove_worker_result_payload,
+    probe_analysis_data,
+    submit_analysis_program,
     raise_no_data_error,
     load_data_with_sql,
     save_analysis_result,
@@ -35,6 +41,42 @@ from agent.tools import (  # noqa: E402
 
 
 class ExecutePythonNoDataRetryTestCase(unittest.TestCase):
+    def test_observations_and_repairs_continue_in_the_same_agent_graph(self) -> None:
+        self.assertFalse(probe_analysis_data.return_direct)
+        self.assertFalse(submit_analysis_program.return_direct)
+
+    def test_composed_query_validation_retry_returns_as_tool_result(self) -> None:
+        queue: mp.Queue = mp.Queue()
+        code = '''
+execution_intent = "analysis"
+query_constraints = {
+    "time_range": None,
+    "target_filters": [{"semantic_role": "primary_entity"}],
+    "aggregation": None,
+}
+data = query_data_with_sql(
+    query_key="q_invalid",
+    query_constraints=query_constraints,
+    sql="SELECT 1",
+)
+'''
+
+        _execute_generated_code_worker(code, "tester", {}, queue)
+        envelope = queue.get(timeout=2)
+        result_path = envelope["result_file_path"]
+        try:
+            payload = _read_worker_result_payload(result_path)
+        finally:
+            _remove_worker_result_payload(result_path)
+            queue.close()
+
+        self.assertEqual(payload["status"], "success")
+        self.assertEqual(payload["exec_result"]["result_kind"], "retry")
+        self.assertEqual(
+            payload["exec_result"]["payload"]["retry_type"],
+            "invalid_query_constraints",
+        )
+
     def test_no_data_feedback_routes_the_next_attempt_to_an_independent_probe(self) -> None:
         feedback = _build_no_data_feedback("筛选后无数据")
 
@@ -96,12 +138,11 @@ class ExecutePythonNoDataRetryTestCase(unittest.TestCase):
         )
 
     def test_system_prompt_mentions_no_data_retry_contract(self) -> None:
-        load_system_prompt.cache_clear()
-        prompt = load_system_prompt()
+        prompt = load_runtime_contract_text(("execution.core",))
 
         self.assertIn("raise_no_data_error", prompt)
-        self.assertIn("不要继续生成空图表", prompt)
-        self.assertIn("返回给 `execute_python` 上层", prompt)
+        self.assertIn("不能生成全零报告", prompt)
+        self.assertIn("部分路径为空时保留成功路径", prompt)
 
     def test_mysql_cast_failure_gets_dialect_specific_repair(self) -> None:
         instructions = _augment_repair_instructions(
@@ -119,6 +160,26 @@ class ExecutePythonNoDataRetryTestCase(unittest.TestCase):
         self.assertTrue(any("总体统计口径不变" in item for item in instructions))
         self.assertTrue(any("稳定排序键" in item and "LIMIT/OFFSET" in item for item in instructions))
         self.assertTrue(any("无业务依据的 LIMIT" in item for item in instructions))
+
+    def test_timeout_repair_optimizes_cross_source_scope_without_dropping_it(self) -> None:
+        instructions = _build_repair_instructions("execution_timeout")
+
+        self.assertTrue(any("各来源分别完成过滤" in item for item in instructions))
+        self.assertTrue(any("不得删除用户问题所需来源" in item for item in instructions))
+        self.assertFalse(any("退化成单表分析" in item for item in instructions))
+
+    def test_missing_constraints_repair_matches_composed_query_contract(self) -> None:
+        instructions = _build_repair_instructions("missing_query_constraints")
+
+        self.assertTrue(any("每条物理查询" in item for item in instructions))
+        self.assertTrue(any("不要求存在固定顶层变量" in item for item in instructions))
+        self.assertFalse(any("必须在顶部声明 query_constraints" in item for item in instructions))
+
+    def test_repair_guidance_does_not_forbid_the_advertised_source_patch(self) -> None:
+        for error_type in ("schema_or_column_mismatch", "runtime_error", "undefined_name"):
+            instructions = _build_repair_instructions(error_type)
+            self.assertTrue(any("repair_target.allowed_ranges" in item for item in instructions))
+            self.assertFalse(any("不要只修改局部片段" in item for item in instructions))
 
     def test_oversized_query_has_a_stable_failure_memory_signature(self) -> None:
         signature = _extract_error_signature(

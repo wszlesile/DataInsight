@@ -40,6 +40,13 @@ class EvidenceAssemblyService:
     ) -> None:
         if execution is None:
             return
+        if str(getattr(execution, 'execution_status', '') or '') != 'success':
+            logger.warning(
+                'skip post-analysis evidence for non-successful execution: execution_id=%s status=%s',
+                int(getattr(execution, 'id', 0) or 0),
+                str(getattr(execution, 'execution_status', '') or ''),
+            )
+            return
 
         payload = safe_json_loads(getattr(execution, 'result_payload_json', '') or '{}', {})
         if not isinstance(payload, dict):

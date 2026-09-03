@@ -295,6 +295,60 @@
                 </div>
               </div>
 
+              <div v-if="currentClarification" class="chat-message ai">
+                <div class="message-avatar ai">AI</div>
+                <div class="message-body">
+                  <div class="clarification-card">
+                    <div class="clarification-title">
+                      {{ clarificationItems.length > 1 ? '需要确认几项关键业务语义' : '需要确认一项关键业务语义' }}
+                    </div>
+                    <div
+                      v-for="(item, itemIndex) in clarificationItems"
+                      :key="item.item_id"
+                      class="clarification-item"
+                    >
+                      <div class="clarification-question">
+                        <span v-if="clarificationItems.length > 1">{{ itemIndex + 1 }}.</span>
+                        {{ item.question }}
+                      </div>
+                      <div v-if="item.options?.length" class="clarification-options">
+                        <button
+                          v-for="option in item.options"
+                          :key="option.id"
+                          class="clarification-option"
+                          :class="{ selected: clarificationDraft(item).option_id === option.id }"
+                          type="button"
+                          :disabled="clarificationSubmitting"
+                          @click="selectClarificationOption(item, option)"
+                        >
+                          <strong>{{ option.label }}</strong>
+                          <span v-if="option.description">{{ option.description }}</span>
+                        </button>
+                      </div>
+                      <div v-if="item.allow_free_text" class="clarification-free-text">
+                        <el-input
+                          :model-value="clarificationDraft(item).answer_text"
+                          :disabled="clarificationSubmitting"
+                          placeholder="也可以直接补充你的口径"
+                          @update:model-value="updateClarificationText(item, $event)"
+                          @keyup.enter="submitClarificationAnswer"
+                        />
+                      </div>
+                    </div>
+                    <div class="clarification-actions">
+                      <button
+                        class="action-btn primary"
+                        type="button"
+                        :disabled="clarificationSubmitting || !clarificationReady"
+                        @click="submitClarificationAnswer"
+                      >
+                        {{ clarificationSubmitting ? '正在继续...' : '继续分析' }}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div v-if="currentCharts.length || currentTables.length || currentReport" class="chat-message ai">
                 <div class="message-avatar ai">AI</div>
                 <div class="message-body">
@@ -1079,6 +1133,7 @@ import {
   resolveEvidence,
   selectLlmModel,
   submitAgentTask,
+  submitTaskClarification,
   submitRerunTurnTask,
   streamTurnEvents,
   getAnalysisTask,
@@ -1108,6 +1163,9 @@ const currentStreamController = ref(null)
 const currentTaskId = ref('')
 const currentTurnId = ref(0)
 const currentRunMode = ref('new')
+const currentClarification = ref(null)
+const clarificationAnswers = ref({})
+const clarificationSubmitting = ref(false)
 const rerunSourceTurnId = ref(0)
 const localRerunLoading = ref(false)
 const localRerunTurnId = ref(0)
@@ -1120,6 +1178,48 @@ const turnVersionsLoading = ref(false)
 const turnVersions = ref([])
 const selectedVersionKey = ref('')
 const selectedVersionDetail = ref(null)
+
+const clarificationItems = computed(() => {
+  if (!currentClarification.value) return []
+  const items = Array.isArray(currentClarification.value.items)
+    ? currentClarification.value.items.filter(item => item && typeof item === 'object')
+    : []
+  const normalized = items.length ? items : [currentClarification.value]
+  return normalized.map((item, index) => ({
+    ...item,
+    item_id: String(item.item_id || `item_${index + 1}`)
+  }))
+})
+
+const clarificationDraft = (item) => clarificationAnswers.value[item.item_id] || {
+  option_id: '',
+  answer_text: ''
+}
+
+const clarificationReady = computed(() => (
+  clarificationItems.value.length > 0
+  && clarificationItems.value.every(item => clarificationDraft(item).answer_text.trim())
+))
+
+const selectClarificationOption = (item, option) => {
+  clarificationAnswers.value = {
+    ...clarificationAnswers.value,
+    [item.item_id]: {
+      option_id: String(option?.id || ''),
+      answer_text: String(option?.label || option?.value || '').trim()
+    }
+  }
+}
+
+const updateClarificationText = (item, value) => {
+  clarificationAnswers.value = {
+    ...clarificationAnswers.value,
+    [item.item_id]: {
+      option_id: '',
+      answer_text: String(value || '')
+    }
+  }
+}
 const turnVersionDetailLoading = ref(false)
 const previewArtifact = ref(null)
 const evidenceDrawerVisible = ref(false)
@@ -1679,16 +1779,30 @@ const chartRefMatchesField = (ref, valueFields, seriesName) => {
   )
 }
 
+const chartRefMatchesPoint = (ref, params = {}) => {
+  const selector = ref?.point_selector
+  if (!selector || typeof selector !== 'object' || Array.isArray(selector)) return true
+  const point = isPlainObject(params?.data) ? params.data : {}
+  const pointName = String(params?.name ?? '').trim()
+  return Object.entries(selector).every(([field, expected]) => {
+    if (field in point) return String(point[field]) === String(expected)
+    return pointName !== '' && String(expected) === pointName
+  })
+}
+
 const findChartEvidenceRef = (chart, chartIndex, params = {}) => {
   const refs = chart?.evidenceRefs?.chart_trace_refs || []
   const candidates = chartRefsForInteraction(refs, chartIndex, chart?.id)
   if (!candidates.length) return null
+  const pointCandidates = candidates.filter((ref) => chartRefMatchesPoint(ref, params))
+  const scopedCandidates = pointCandidates.length ? pointCandidates : candidates.filter((ref) => !ref?.point_selector)
+  if (!scopedCandidates.length) return null
   const valueFields = chartEventValueFields(chart?.chartSpec, params)
-  const semanticMatch = candidates.find((ref) => chartRefMatchesField(ref, valueFields, params.seriesName))
+  const semanticMatch = scopedCandidates.find((ref) => chartRefMatchesField(ref, valueFields, params.seriesName))
   if (semanticMatch) return semanticMatch
-  if (candidates.length === 1) return candidates[0]
+  if (scopedCandidates.length === 1) return scopedCandidates[0]
   const seriesIndex = Number(params?.seriesIndex ?? -1)
-  return seriesIndex >= 0 && seriesIndex < candidates.length ? candidates[seriesIndex] : null
+  return seriesIndex >= 0 && seriesIndex < scopedCandidates.length ? scopedCandidates[seriesIndex] : null
 }
 
 const structuredChartValue = (value, field) => {
@@ -1758,6 +1872,7 @@ const onChartEvidenceClick = (item, chart, chartIndex, params) => {
       data_index: Number(params?.dataIndex ?? -1),
       series_index: Number(params?.seriesIndex ?? -1),
       value_field: getRefValueField(ref),
+      point_selector: ref?.point_selector || undefined,
       raw_value: chartEventRawValue(chart?.chartSpec, params, getRefValueField(ref))
     }
   })
@@ -1962,6 +2077,9 @@ const resetCurrentConversationState = () => {
   currentTaskId.value = ''
   currentTurnId.value = 0
   currentRunMode.value = 'new'
+  currentClarification.value = null
+  clarificationAnswers.value = {}
+  clarificationSubmitting.value = false
   rerunSourceTurnId.value = 0
 }
 
@@ -2021,7 +2139,9 @@ const attachRunningTurn = (task) => {
   loading.value = true
   const resumeMessage = task.status === 'queued'
     ? '检测到当前会话有排队中的分析任务，正在等待执行...'
-    : '检测到当前会话有正在进行的分析，正在重新订阅实时输出...'
+    : task.status === 'waiting_clarification'
+      ? '检测到当前分析正在等待补充口径...'
+      : '检测到当前会话有正在进行的分析，正在重新订阅实时输出...'
   addProgressItem({
     type: 'status',
     level: 'info',
@@ -3548,6 +3668,18 @@ const handleStreamEvent = async (event) => {
     await finalizeStreamRound()
     return
   }
+  if (event.type === 'clarification_required') {
+    currentClarification.value = event.clarification || null
+    clarificationAnswers.value = {}
+    currentStreamController.value = null
+    addProgressItem({
+      type: 'status',
+      level: 'info',
+      message: '需要补充一个关键分析口径后继续。'
+    })
+    scrollToBottom()
+    return
+  }
   if (event.type === 'error') {
     addProgressItem(event)
     if (!currentReport.value) currentReport.value = event.message || '分析过程中发生错误。'
@@ -3569,7 +3701,7 @@ const handleStreamError = async (error) => {
     try {
       const response = await getAnalysisTask(currentTaskId.value)
       const task = response.data?.data
-      if (['queued', 'running'].includes(task?.status)) {
+      if (['queued', 'running', 'waiting_clarification'].includes(task?.status)) {
         addProgressItem({ type: 'status', level: 'warning', message: '实时连接中断，正在尝试重新订阅...' })
         subscribeTurnStream(task.conversation_id, task.turn_id)
         return
@@ -3588,12 +3720,49 @@ const handleStreamError = async (error) => {
 
 const handleStreamDone = async () => {
   if (!loading.value) return
+  if (currentClarification.value) return
   if (!currentReport.value && currentAssistantMessage.value) {
     currentReport.value = currentAssistantMessage.value
   } else if (!currentReport.value && currentCharts.value.length === 0) {
     currentReport.value = '本轮分析未生成可展示的图表或分析报告，请重试。'
   }
   await finalizeStreamRound()
+}
+
+const submitClarificationAnswer = async () => {
+  if (!currentTaskId.value || !currentClarification.value) return
+  if (!clarificationReady.value) return
+  const answers = clarificationItems.value.map((item) => ({
+    item_id: item.item_id,
+    option_id: clarificationDraft(item).option_id,
+    answer_text: clarificationDraft(item).answer_text.trim()
+  }))
+  const singleAnswer = answers.length === 1 ? answers[0] : null
+  clarificationSubmitting.value = true
+  try {
+    const response = await submitTaskClarification(currentTaskId.value, {
+      clarification_id: currentClarification.value.clarification_id,
+      option_id: singleAnswer?.option_id || '',
+      answer_text: singleAnswer?.answer_text || '',
+      answers: answers.length > 1 ? answers : undefined
+    })
+    const task = response.data?.data
+    if (!response.data?.success || !task?.turn_id) {
+      throw new Error(response.data?.message || '提交澄清回答失败')
+    }
+    currentClarification.value = null
+    clarificationAnswers.value = {}
+    addProgressItem({
+      type: 'status',
+      level: 'info',
+      message: '已补充分析口径，正在继续本轮分析。'
+    })
+    subscribeTurnStream(task.conversation_id, task.turn_id)
+  } catch (error) {
+    ElMessage.error(error?.message || '提交澄清回答失败')
+  } finally {
+    clarificationSubmitting.value = false
+  }
 }
 
 const onSendMessage = async (content) => {
@@ -3754,6 +3923,19 @@ onUnmounted(() => {
 .progress-item.error { background: #fff0f0; color: #c45656; }
 .progress-item.assistant { background: #f5f3ff; color: #5b45b0; }
 .progress-empty { font-size: 12px; color: #64748b; }
+.clarification-card { max-width: 720px; padding: 16px; border: 1px solid #bfdbfe; border-radius: 8px; background: #f8fbff; }
+.clarification-title { color: #1d4ed8; font-weight: 700; }
+.clarification-item { padding-top: 12px; }
+.clarification-item + .clarification-item { margin-top: 14px; border-top: 1px solid #dbeafe; }
+.clarification-question { margin-top: 8px; color: #0f172a; line-height: 1.7; }
+.clarification-options { display: grid; gap: 8px; margin-top: 12px; }
+.clarification-option { display: flex; flex-direction: column; gap: 3px; padding: 10px 12px; border: 1px solid #dbeafe; border-radius: 6px; background: #fff; color: #1e3a8a; text-align: left; cursor: pointer; }
+.clarification-option:hover { border-color: #60a5fa; background: #eff6ff; }
+.clarification-option.selected { border-color: #2563eb; background: #eff6ff; box-shadow: 0 0 0 1px #2563eb; }
+.clarification-option span { color: #64748b; font-size: 12px; }
+.clarification-free-text { display: flex; gap: 8px; margin-top: 12px; }
+.clarification-free-text .el-input { flex: 1; }
+.clarification-actions { display: flex; justify-content: flex-end; margin-top: 16px; }
 .result-card { margin: 14px 0 18px 48px; }
 .answer-card { width: 100%; margin: 0; }
 .answer-chart { margin-bottom: 14px; }

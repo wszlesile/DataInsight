@@ -225,6 +225,7 @@ Content-Type: application/json
 {
   "chart_index": 0,
   "value_field": "毛利_元",
+  "point_scope": "all",
   "ref_id": "ref_0214c1a61e",
   "evidence_id": "ev_476_796c2f0b0947",
   "artifact_id": 212,
@@ -236,6 +237,8 @@ Content-Type: application/json
 
 - `chart_index` 是当前轮次图表列表中的 0 基下标。
 - `value_field` 对应图表数据字段，通常来自 `chart_document.encoding.value_field` 或 `value_fields`。
+- `point_scope=all` 表示整个数值字段共享计算边界；`point_scope=selector` 时，ref 还会包含
+  `point_selector`，例如 `{"指标":"OOS批次率"}`，前端必须先按当前点击点的类别值筛选 ref。
 - 前端先按当前产物的 `artifact_id` 或轮次级 `chart_index` 收敛候选 refs，不能跨图表仅按字段名匹配。
 - 字段匹配需要综合 ECharts 事件 `encode.x/encode.y`、系列自身 `series.encode`、`dataset.dimensions`、`seriesName` 和数据点名称；字段比较可忽略空白、下划线和中英文括号差异。
 - 如果当前图只有一个候选 ref，可直接使用；多候选字段仍无法区分时，才按 `seriesIndex` 选择对应 ref。
@@ -251,8 +254,12 @@ const findChartEvidenceRef = (chart, chartIndex, params = {}) => {
     ? refs
     : refs.filter((ref) => Number(ref.chart_index || 0) === Number(chartIndex || 0))
   const valueFields = collectEventAndSeriesFields(chart.chartSpec, params)
-  return candidates.find((ref) => semanticallyMatches(ref.value_field, valueFields, params.seriesName))
-    || (candidates.length === 1 ? candidates[0] : candidates[params.seriesIndex])
+  const pointCandidates = candidates.filter((ref) => matchesPointSelector(ref, params))
+  const scoped = pointCandidates.length
+    ? pointCandidates
+    : candidates.filter((ref) => !ref.point_selector)
+  return scoped.find((ref) => semanticallyMatches(ref.value_field, valueFields, params.seriesName))
+    || (scoped.length === 1 ? scoped[0] : scoped[params.seriesIndex])
 }
 ```
 
@@ -542,9 +549,13 @@ const getEvidenceDisplayValue = (detail) => {
 
 同一个报告、表格或图表中可能出现多个相同数值。仅按真实值反查会出现一值多义或错误命中。当前方案使用产物位置 ref 绑定证据链，避免同值冲突。
 
-### 图表和表格为什么是字段级 ref？
+### 图表和表格为什么主要是字段级 ref？
 
-图表点和表格单元格可能很多，但同一指标字段通常共享同一套计算逻辑。后端按字段级 ref 记录计算逻辑，前端点击具体点位时把 `data_index/row_index/raw_value` 作为 `selection` 传给详情接口，用于展示当前点击上下文。
+图表点和表格单元格可能很多，但同一指标字段通常共享同一套计算逻辑。后端优先按字段级 ref
+记录计算逻辑，前端点击具体点位时把 `data_index/row_index/raw_value` 作为 `selection` 传给
+详情接口。仅当“指标名称作为类别”使同一 value field 的不同点实际代表不同计算边界时，图表
+ref 使用 `point_selector` 区分这些点；表格仍按列为默认边界，只有真实行级计算边界不同才使用
+`row_selector`。
 
 ### 报告为什么要 start/end？
 

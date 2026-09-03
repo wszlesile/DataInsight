@@ -52,6 +52,7 @@ class InsightNamespaceService:
         duplicated = self.session.query(InsightNamespace.id).filter(
             InsightNamespace.username == username,
             InsightNamespace.name == normalized_name,
+            InsightNamespace.namespace_kind == 'interactive',
             InsightNamespace.is_deleted == 0,
         ).first()
         if duplicated is not None:
@@ -60,6 +61,7 @@ class InsightNamespaceService:
         namespace = InsightNamespace(
             username=username,
             name=normalized_name,
+            namespace_kind='interactive',
             is_deleted=0,
             created_at=_now(),
         )
@@ -100,6 +102,7 @@ class InsightNamespaceService:
         namespace = self.session.query(InsightNamespace).filter(
             InsightNamespace.id == int(namespace_id),
             InsightNamespace.username == username,
+            InsightNamespace.namespace_kind == 'interactive',
             InsightNamespace.is_deleted == 0,
         ).first()
         if namespace is None:
@@ -108,6 +111,7 @@ class InsightNamespaceService:
         duplicated = self.session.query(InsightNamespace.id).filter(
             InsightNamespace.username == username,
             InsightNamespace.name == normalized_name,
+            InsightNamespace.namespace_kind == 'interactive',
             InsightNamespace.is_deleted == 0,
             InsightNamespace.id != namespace.id,
         ).first()
@@ -128,6 +132,7 @@ class InsightNamespaceService:
         namespace = self.session.query(InsightNamespace).filter(
             InsightNamespace.id == int(namespace_id),
             InsightNamespace.username == username,
+            InsightNamespace.namespace_kind == 'interactive',
             InsightNamespace.is_deleted == 0,
         ).first()
         if namespace is None:
@@ -240,6 +245,7 @@ class InsightNamespaceService:
     def _query_namespaces(self, username: str) -> list[InsightNamespace]:
         return self.session.query(InsightNamespace).filter(
             InsightNamespace.username == username,
+            InsightNamespace.namespace_kind == 'interactive',
             InsightNamespace.is_deleted == 0,
         ).order_by(
             InsightNamespace.created_at.desc(),
@@ -250,6 +256,7 @@ class InsightNamespaceService:
         existing_default = self.session.query(InsightNamespace.id).filter(
             InsightNamespace.username == username,
             InsightNamespace.name == self.DEFAULT_NAMESPACE_NAME,
+            InsightNamespace.namespace_kind == 'interactive',
             InsightNamespace.is_deleted == 0,
         ).first()
         if existing_default is not None:

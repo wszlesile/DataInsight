@@ -4,9 +4,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 from zoneinfo import ZoneInfo
+import json
 import re
 
 from langchain.agents import AgentState, create_agent
+from langchain.agents.middleware import before_model
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
@@ -16,7 +18,23 @@ from agent.context_engineering_runtime import (
     get_history_messages,
     get_memory_messages,
 )
-from agent.tools import execute_python
+from agent.tools import (
+    probe_analysis_data,
+    request_analysis_clarification,
+    submit_analysis_program,
+)
+from agent.runtime_prompt_loader import (
+    describe_runtime_prompt,
+    load_runtime_contract_prompt,
+    load_runtime_prompt,
+    load_runtime_semantic_prompt,
+)
+from agent.runtime_contract_registry import (
+    infer_query_capabilities_from_snapshot,
+    required_runtime_contract_ids,
+)
+from agent.invocation_policy import normalize_output_contract
+from agent.runtime_reference import read_runtime_reference
 from config import Config
 from utils import logger
 from utils.llm_model_factory import (
@@ -27,7 +45,6 @@ from utils.llm_model_factory import (
 from utils.token_budget import describe_budget_split, estimate_message_tokens, estimate_messages_tokens
 
 MessageT = TypeVar("MessageT", bound=BaseMessage, covariant=True)
-SYS_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "runtime" / "sys_prompt.md"
 GENERAL_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "runtime" / "general_chat.md"
 
 
@@ -40,6 +57,15 @@ class CustomAgentState(AgentState):
     """
 
     username: str
+    analysis_complete: bool
+
+
+@before_model(can_jump_to=["end"])
+def stop_after_saved_analysis(state, runtime):
+    """Stop before another model request once the execution tool saved the result."""
+    if state.get("analysis_complete"):
+        return {"jump_to": "end"}
+    return None
 
 
 class InputMessage(BaseModel, Generic[MessageT]):
@@ -53,11 +79,19 @@ class InputMessage(BaseModel, Generic[MessageT]):
     messages: list[MessageT] = Field(default_factory=list, description="传入 Agent 的消息列表")
 
 
-@lru_cache(maxsize=1)
-def load_system_prompt() -> str:
+@lru_cache(maxsize=16)
+def load_system_prompt(
+    query_capabilities: tuple[str, ...] = (),
+    context_mode: str = "fresh_analysis",
+) -> str:
     """从磁盘加载系统提示词，并做进程级缓存。"""
-    # 系统提示词由独立文档维护，这里只负责读取与缓存。
-    return SYS_PROMPT_PATH.read_text(encoding='utf-8').strip()
+    return load_runtime_prompt(query_capabilities, context_mode)
+
+
+def _runtime_query_capabilities(
+    snapshot: dict[str, Any] | None,
+) -> tuple[str, ...]:
+    return infer_query_capabilities_from_snapshot(snapshot)
 
 
 @lru_cache(maxsize=1)
@@ -76,13 +110,24 @@ def create_data_insight_model(runtime_config: LlmRuntimeConfig | None = None):
     return _create_data_insight_model(runtime_config)
 
 
-def create_data_insight_agent(runtime_config: LlmRuntimeConfig | None = None):
+def create_data_insight_agent(
+    runtime_config: LlmRuntimeConfig | None = None,
+    *,
+    clarification_mode: str = "same_turn",
+):
     """创建数据洞察 Agent，并保持现有工具契约不变。"""
+    tools = []
+    if clarification_mode == "same_turn":
+        tools.append(request_analysis_clarification)
+    tools.append(probe_analysis_data)
+    tools.append(submit_analysis_program)
+    tools.append(read_runtime_reference)
     return create_agent(
         model=create_data_insight_model(runtime_config),
         state_schema=CustomAgentState,
         context_schema=CustomContext,
-        tools=[execute_python],
+        tools=tools,
+        middleware=[stop_after_saved_analysis],
     )
 
 
@@ -101,17 +146,27 @@ def clear_data_insight_agent_cache() -> None:
     _GENERAL_AGENT_CACHE.clear()
 
 
-def get_data_insight_agent(runtime_config: LlmRuntimeConfig | None = None):
+def get_data_insight_agent(
+    runtime_config: LlmRuntimeConfig | None = None,
+    *,
+    clarification_mode: str = "same_turn",
+):
     """Lazy-create and reuse DataInsight Agents by model runtime config."""
     runtime_config = runtime_config or create_runtime_config()
-    cache_key = runtime_config.cache_key
+    normalized_clarification_mode = (
+        "same_turn" if clarification_mode == "same_turn" else "disabled"
+    )
+    cache_key = f"{runtime_config.cache_key}|clarification={normalized_clarification_mode}"
     cached = _AGENT_CACHE.get(cache_key)
     if cached is not None:
         _AGENT_CACHE.move_to_end(cache_key)
         return cached
 
     try:
-        agent = create_data_insight_agent(runtime_config)
+        agent = create_data_insight_agent(
+            runtime_config,
+            clarification_mode=normalized_clarification_mode,
+        )
     except Exception as exc:
         logger.error("Agent 初始化失败: %s", exc, exc_info=True)
         raise
@@ -301,6 +356,8 @@ def build_prompt_messages(
     history_turn_limit: int | None = None,
     datasource_snapshot_override: dict[str, Any] | None = None,
     context_mode: str | None = None,
+    output_contract: dict[str, Any] | None = None,
+    clarification_mode: str = "same_turn",
 ) -> list[BaseMessage]:
     """
     为单次分析请求组装完整 Prompt 上下文。
@@ -324,9 +381,26 @@ def build_prompt_messages(
     # Keep these sections mandatory. MiniMax still receives one merged
     # SystemMessage, but budget trimming must not drop system rules,
     # current datasource context, runtime repair hints, or the user tail.
-    base_system_messages: list[BaseMessage] = [
-        SystemMessage(load_system_prompt()),
-    ]
+    query_capabilities = _runtime_query_capabilities(datasource_snapshot_override)
+    if datasource_message is not None:
+        delivered_capabilities = datasource_message.additional_kwargs.get('runtime_query_capabilities')
+        if delivered_capabilities is not None:
+            query_capabilities = tuple(delivered_capabilities)
+    normalized_output_contract = normalize_output_contract(output_contract).to_dict()
+    output_format = str(normalized_output_contract.get("type") or "standard")
+    semantic_prompt = load_runtime_semantic_prompt(
+        query_capabilities,
+        context_mode or "fresh_analysis",
+        output_format,
+        clarification_mode,
+    )
+    contract_prompt = load_runtime_contract_prompt(
+        query_capabilities,
+        context_mode or "fresh_analysis",
+        output_format,
+        clarification_mode,
+    )
+    base_system_messages: list[BaseMessage] = []
     conversation_prompt_message = _build_conversation_prompt_message(namespace_id, conversation_id)
     if conversation_prompt_message is not None:
         base_system_messages.append(conversation_prompt_message)
@@ -338,6 +412,16 @@ def build_prompt_messages(
     current_system_messages: list[BaseMessage] = []
     if datasource_message is not None:
         current_system_messages.append(datasource_message)
+    current_system_messages.append(SystemMessage(
+        "<analysis-output-contract>\n"
+        + json.dumps(normalized_output_contract, ensure_ascii=False, separators=(",", ":"))
+        + "\n</analysis-output-contract>"
+    ))
+    current_system_messages.append(SystemMessage(contract_prompt))
+    # Keep the analytical role and decision method adjacent to the current
+    # request. Long Schema and mechanical API packs otherwise push the semantic
+    # kernel into the least-attended middle of the merged system message.
+    current_system_messages.append(SystemMessage(semantic_prompt))
     current_system_messages.append(_build_user_visible_language_message())
     current_system_messages.extend(runtime_messages)
 
@@ -351,9 +435,32 @@ def build_prompt_messages(
         mandatory_messages.append(mandatory_system_message)
     mandatory_messages.append(user_tail_message)
 
+    fixed_token_count = estimate_messages_tokens(mandatory_messages)
+    prompt_diagnostics = describe_runtime_prompt(
+        query_capabilities,
+        context_mode or "fresh_analysis",
+        output_format,
+        clarification_mode,
+    )
+    logger.info(
+        "Runtime上下文清单 query_capabilities=%s contract_ids=%s context_mode=%s compiled_prompt=%s semantic_kernel=%s contract_packs=%s fixed_tokens=%s",
+        list(query_capabilities),
+        list(required_runtime_contract_ids(
+            query_capabilities,
+            context_mode or "fresh_analysis",
+            output_format,
+            clarification_mode,
+        )),
+        context_mode or "fresh_analysis",
+        prompt_diagnostics["compiled"],
+        prompt_diagnostics["semantic_kernel"],
+        prompt_diagnostics["contract_packs"],
+        fixed_token_count,
+    )
+
     budget_split = describe_budget_split(
         max_prompt_tokens=Config.CONTEXT_COMPRESSION_PROMPT_MAX_TOKENS,
-        fixed_tokens=estimate_messages_tokens(mandatory_messages),
+        fixed_tokens=fixed_token_count,
         history_ratio=Config.CONTEXT_COMPRESSION_HISTORY_TOKEN_RATIO,
         min_history_tokens=Config.CONTEXT_COMPRESSION_MIN_HISTORY_TOKENS,
         min_memory_tokens=Config.CONTEXT_COMPRESSION_MIN_MEMORY_TOKENS,
@@ -410,6 +517,8 @@ def get_input(
     history_turn_limit: int | None = None,
     datasource_snapshot_override: dict[str, Any] | None = None,
     context_mode: str | None = None,
+    output_contract: dict[str, Any] | None = None,
+    clarification_mode: str = "same_turn",
 ) -> Any:
     """构建供 invoke/stream 调用使用的 Agent 输入载荷。"""
     return InputMessage(
@@ -421,6 +530,8 @@ def get_input(
             history_turn_limit=history_turn_limit,
             datasource_snapshot_override=datasource_snapshot_override,
             context_mode=context_mode,
+            output_contract=output_contract,
+            clarification_mode=clarification_mode,
         )
     )
 
@@ -496,6 +607,12 @@ def build_general_prompt_messages(
             budget_split["history_budget"],
         ))
     messages.append(user_tail_message)
+    logger.info(
+        "Runtime最终上下文 message_count=%s estimated_tokens=%s budget=%s",
+        len(messages),
+        estimate_messages_tokens(messages),
+        budget_split,
+    )
     return messages
 
 

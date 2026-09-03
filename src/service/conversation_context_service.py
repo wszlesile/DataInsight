@@ -1,6 +1,7 @@
 ﻿from dataclasses import dataclass
 from dataclasses import field
 from datetime import datetime
+import re
 from typing import Any
 
 from sqlalchemy import func
@@ -17,6 +18,7 @@ from model import (
     InsightNsRelDatasource,
     InsightNsRelKnowledge,
     InsightNsTurn,
+    InsightNamespace,
 )
 from utils.context_compression import (
     build_llm_turn_summarizer,
@@ -90,6 +92,11 @@ class ConversationRunContext:
     analysis_task_id: int | None = None
     short_term_memory: dict[str, Any] = field(default_factory=dict)
     context_mode: str = ''
+    output_contract: dict[str, Any] = field(
+        default_factory=lambda: {"type": "standard"}
+    )
+    clarification_mode: str = "same_turn"
+    evidence_enabled: bool = True
 
 
 class ConversationContextService:
@@ -112,16 +119,28 @@ class ConversationContextService:
         namespace_id: Any,
         user_message: str,
         conversation_id: Any = None,
+        allow_internal_namespace: bool = False,
     ) -> ConversationRunContext:
         """创建或恢复会话，并开启新一轮分析。"""
         requested_conversation_id = to_int(conversation_id, 0)
-        conversation = self._get_conversation_for_run(conversation_id)
+        conversation = self._get_conversation_for_run(
+            conversation_id,
+            username=username,
+            allow_internal_namespace=allow_internal_namespace,
+        )
         if requested_conversation_id > 0 and conversation is None:
             raise ValueError('当前会话不存在，请重新选择会话后再分析')
         if conversation is None:
+            namespace = self._get_namespace_for_run(
+                namespace_id,
+                username=username,
+                allow_internal_namespace=allow_internal_namespace,
+            )
+            if namespace is None:
+                raise ValueError('当前洞察空间不存在，请重新选择空间后再分析')
             conversation = self._create_conversation(
                 username=username,
-                namespace_id=namespace_id,
+                namespace_id=namespace.id,
                 user_message=user_message,
             )
 
@@ -182,7 +201,11 @@ class ConversationContextService:
         turn_id: Any,
     ) -> ConversationRunContext | None:
         """在同一轮次内重新执行分析，复用原始问题并刷新当前数据源选择。"""
-        conversation = self._get_conversation_for_run(conversation_id)
+        conversation = self._get_conversation_for_run(
+            conversation_id,
+            username=username,
+            allow_internal_namespace=False,
+        )
         if conversation is None:
             return None
 
@@ -254,6 +277,64 @@ class ConversationContextService:
         self.session.flush()
         return message
 
+    def suspend_for_clarification(
+        self,
+        *,
+        conversation_id: int,
+        turn_id: int,
+        clarification: dict[str, Any],
+        analysis_task_id: int | None = None,
+    ) -> None:
+        """Persist a clarification request without completing the current turn."""
+        conversation = self._get_conversation_by_id(conversation_id)
+        turn = self._get_turn_by_id(turn_id)
+        if not conversation or not turn:
+            return
+        turn.status = "waiting_clarification"
+        turn.error_message = ""
+        turn.finished_at = None
+        conversation.status = "active"
+        conversation.last_message_at = _now()
+        conversation.updated_at = _now()
+        self.add_message(
+            conversation=conversation,
+            turn=turn,
+            role="assistant",
+            message_kind="clarification_request",
+            content=str(clarification.get("question") or ""),
+            content_json={"clarification": clarification},
+            analysis_task_id=analysis_task_id,
+        )
+
+    def resume_from_clarification(
+        self,
+        *,
+        conversation_id: int,
+        turn_id: int,
+        answer: dict[str, Any],
+        analysis_task_id: int | None = None,
+    ) -> None:
+        """Append the answer to the same turn and make that turn runnable again."""
+        conversation = self._get_conversation_by_id(conversation_id)
+        turn = self._get_turn_by_id(turn_id)
+        if not conversation or not turn:
+            return
+        turn.status = "running"
+        turn.error_message = ""
+        turn.finished_at = None
+        conversation.status = "active"
+        conversation.last_message_at = _now()
+        conversation.updated_at = _now()
+        self.add_message(
+            conversation=conversation,
+            turn=turn,
+            role="user",
+            message_kind="clarification_answer",
+            content=str(answer.get("answer_text") or ""),
+            content_json={"clarification_answer": answer},
+            analysis_task_id=analysis_task_id,
+        )
+
     def complete_run(
         self,
         conversation_id: int,
@@ -264,6 +345,7 @@ class ConversationContextService:
         tables: list[dict[str, Any]] | None = None,
         replace_existing_results: bool = False,
         analysis_task_id: int | None = None,
+        evidence_enabled: bool = True,
     ) -> dict[str, Any]:
         """结束一次成功轮次，并刷新会话记忆。"""
         if analysis_task_id and is_analysis_task_cancelled(task_pk=int(analysis_task_id or 0)):
@@ -278,6 +360,7 @@ class ConversationContextService:
             turn.id,
             started_at=turn.started_at if replace_existing_results else None,
             analysis_task_id=analysis_task_id,
+            successful_only=True,
         )
         if replace_existing_results:
             self._archive_previous_turn_results(
@@ -374,22 +457,23 @@ class ConversationContextService:
         # Commit the successful analysis before optional Evidence post-processing.
         # Evidence persistence uses the next transaction and cannot roll the result back.
         self.session.commit()
-        try:
-            EvidenceAssemblyService(self.session).assemble_for_execution(
-                conversation_id=conversation.id,
-                turn_id=turn.id,
-                execution=latest_execution,
-                artifacts=artifacts,
-            )
-            self.session.commit()
-        except Exception as exc:
-            self.session.rollback()
-            logger.warning(
-                "post-analysis evidence persistence failed without affecting analysis: execution_id=%s error=%s",
-                int(getattr(latest_execution, 'id', 0) or 0),
-                exc,
-                exc_info=True,
-            )
+        if evidence_enabled:
+            try:
+                EvidenceAssemblyService(self.session).assemble_for_execution(
+                    conversation_id=conversation.id,
+                    turn_id=turn.id,
+                    execution=latest_execution,
+                    artifacts=artifacts,
+                )
+                self.session.commit()
+            except Exception as exc:
+                self.session.rollback()
+                logger.warning(
+                    "post-analysis evidence persistence failed without affecting analysis: execution_id=%s error=%s",
+                    int(getattr(latest_execution, 'id', 0) or 0),
+                    exc,
+                    exc_info=True,
+                )
         chart_artifacts = [artifact for artifact in artifacts if artifact.get('artifact_type') == 'chart']
         return {
             "conversation": conversation,
@@ -600,6 +684,127 @@ class ConversationContextService:
 
         return list(reversed(filtered_rows))
 
+    def get_turn_clarification_answers(self, turn_id: Any) -> list[dict[str, Any]]:
+        """Return persisted answers without collapsing complementary clarification items."""
+        turn_id_int = to_int(turn_id, 0)
+        if turn_id_int <= 0:
+            return []
+
+        rows = self.session.query(InsightNsMessage).filter(
+            InsightNsMessage.turn_id == turn_id_int,
+            InsightNsMessage.message_kind.in_([
+                'clarification_request',
+                'clarification_answer',
+            ]),
+            InsightNsMessage.is_deleted == 0,
+            InsightNsMessage.content_enabled == 1,
+        ).order_by(
+            InsightNsMessage.seq_no.asc(),
+            InsightNsMessage.id.asc(),
+        ).all()
+
+        # One turn may have been rerun and clarified several times. Each rerun
+        # owns an independent clarification branch through analysis_task_id;
+        # replaying every historical branch mixes superseded answers into one
+        # Runtime context. Restore the latest branch as a whole instead, while
+        # retaining every complementary answer produced inside that branch.
+        latest_answer_task_id = next(
+            (
+                row.analysis_task_id
+                for row in reversed(rows)
+                if row.message_kind == 'clarification_answer'
+                and row.analysis_task_id is not None
+            ),
+            None,
+        )
+        if latest_answer_task_id is not None:
+            rows = [
+                row for row in rows
+                if row.analysis_task_id == latest_answer_task_id
+            ]
+
+        request_by_id: dict[str, dict[str, Any]] = {}
+        latest_by_item: dict[str, dict[str, Any]] = {}
+        key_order: list[str] = []
+        unkeyed_items: list[dict[str, Any]] = []
+        for row in rows:
+            payload = safe_json_loads(row.content_json, {})
+            if row.message_kind == 'clarification_request':
+                request = payload.get('clarification') if isinstance(payload, dict) else None
+                if isinstance(request, dict):
+                    clarification_id = str(request.get('clarification_id') or '').strip()
+                    if clarification_id:
+                        request_by_id[clarification_id] = request
+                continue
+            answer = (
+                payload.get('clarification_answer')
+                if isinstance(payload, dict)
+                else None
+            )
+            if not isinstance(answer, dict):
+                continue
+            answer_items = [
+                item for item in answer.get('answers') or [] if isinstance(item, dict)
+            ] or [answer]
+            for item in answer_items:
+                clarification_id = str(
+                    item.get('clarification_id')
+                    or answer.get('clarification_id')
+                    or ''
+                ).strip()
+                request = request_by_id.get(clarification_id, {})
+                answer_text = str(
+                    item.get('resolved_value') or item.get('answer_text') or ''
+                ).strip()
+                if not answer_text:
+                    continue
+                semantic_scope = (
+                    dict(item.get('semantic_scope') or {})
+                    if isinstance(item.get('semantic_scope'), dict)
+                    else dict(request.get('semantic_scope') or {})
+                    if isinstance(request.get('semantic_scope'), dict)
+                    else {}
+                )
+                subject = str(
+                    semantic_scope.get('subject')
+                    or semantic_scope.get('metric_name')
+                    or ''
+                ).strip()
+                ambiguity_kind = str(
+                    semantic_scope.get('ambiguity_kind')
+                    or semantic_scope.get('clarification_kind')
+                    or ''
+                ).strip()
+                item_id = str(item.get('clarification_item_id') or '').strip()
+                question = str(
+                    item.get('question') or request.get('question') or ''
+                ).strip()
+                normalized = {
+                    **item,
+                    'clarification_id': clarification_id,
+                    'clarification_item_id': item_id,
+                    'answer_text': str(item.get('answer_text') or answer_text).strip(),
+                    'resolved_value': answer_text,
+                    'semantic_scope': {
+                        **semantic_scope,
+                        **({'subject': subject} if subject else {}),
+                        **({'ambiguity_kind': ambiguity_kind} if ambiguity_kind else {}),
+                    },
+                }
+                if item_id:
+                    key = f'item:{item_id}'
+                elif clarification_id and question:
+                    key = f'question:{clarification_id}:{question}'
+                else:
+                    unkeyed_items.append(normalized)
+                    continue
+                if key in latest_by_item:
+                    key_order.remove(key)
+                latest_by_item[key] = normalized
+                key_order.append(key)
+
+        return [latest_by_item[key] for key in key_order] + unkeyed_items
+
     def get_recent_artifacts(
         self,
         conversation_id: Any,
@@ -664,6 +869,7 @@ class ConversationContextService:
         turn_id: Any,
         started_at: datetime | None = None,
         analysis_task_id: int | None = None,
+        successful_only: bool = False,
     ) -> InsightNsExecution | None:
         turn_id_int = to_int(turn_id, 0)
         if turn_id_int <= 0:
@@ -678,6 +884,8 @@ class ConversationContextService:
             query = query.filter(InsightNsExecution.created_at >= started_at)
         if analysis_task_id:
             query = query.filter(InsightNsExecution.analysis_task_id == int(analysis_task_id))
+        if successful_only:
+            query = query.filter(InsightNsExecution.execution_status == 'success')
 
         return query.order_by(
             InsightNsExecution.created_at.desc(),
@@ -947,15 +1155,48 @@ class ConversationContextService:
         ).scalar()
         return max(int(current_turn_no or 0), int(max_turn_no or 0)) + 1
 
-    def _get_conversation_for_run(self, conversation_id: Any) -> InsightNsConversation | None:
-        """Agent 执行链按会话 ID 恢复会话，避免请求态用户名波动导致误建新会话。"""
+    def _get_conversation_for_run(
+        self,
+        conversation_id: Any,
+        *,
+        username: str,
+        allow_internal_namespace: bool,
+    ) -> InsightNsConversation | None:
+        """按调用用户和调用通道恢复会话，隐藏工作流上下文不进入交互链路。"""
         conversation_id_int = to_int(conversation_id, 0)
         if conversation_id_int <= 0:
             return None
-        return self.session.query(InsightNsConversation).filter(
+        query = self.session.query(InsightNsConversation).join(
+            InsightNamespace,
+            InsightNamespace.id == InsightNsConversation.insight_namespace_id,
+        ).filter(
             InsightNsConversation.id == conversation_id_int,
             InsightNsConversation.is_deleted == 0,
-        ).first()
+            InsightNamespace.username == (username or 'anonymous'),
+            InsightNamespace.is_deleted == 0,
+        )
+        if not allow_internal_namespace:
+            query = query.filter(InsightNamespace.namespace_kind == 'interactive')
+        return query.first()
+
+    def _get_namespace_for_run(
+        self,
+        namespace_id: Any,
+        *,
+        username: str,
+        allow_internal_namespace: bool,
+    ) -> InsightNamespace | None:
+        namespace_id_int = to_int(namespace_id, 0)
+        if namespace_id_int <= 0:
+            return None
+        query = self.session.query(InsightNamespace).filter(
+            InsightNamespace.id == namespace_id_int,
+            InsightNamespace.username == (username or 'anonymous'),
+            InsightNamespace.is_deleted == 0,
+        )
+        if not allow_internal_namespace:
+            query = query.filter(InsightNamespace.namespace_kind == 'interactive')
+        return query.first()
 
     def _get_conversation_namespace_id_subquery(self, conversation_id: int):
         return self.session.query(InsightNsConversation.insight_namespace_id).filter(

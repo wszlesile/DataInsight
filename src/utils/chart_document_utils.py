@@ -151,7 +151,7 @@ def build_multi_metric_chart_result(
     category_field: str,
     value_fields: list[str] | tuple[str, ...],
     description: str = "",
-    value_labels: list[str] | tuple[str, ...] | None = None,
+    value_labels: list[str] | tuple[str, ...] | dict[str, str] | None = None,
     chart_kind: str = "bar",
     series_field: str | None = None,
     sort_field: str | None = None,
@@ -171,7 +171,23 @@ def build_multi_metric_chart_result(
     if not normalized_value_fields:
         raise ValueError("build_multi_metric_chart_result requires at least one value_field.")
 
-    normalized_value_labels = _normalize_string_list(value_labels or [], dedupe=False)
+    if isinstance(value_labels, dict):
+        unknown_label_fields = [
+            str(field)
+            for field in value_labels
+            if str(field) not in normalized_value_fields
+        ]
+        if unknown_label_fields:
+            raise ValueError(
+                "value_labels mapping contains fields not present in value_fields: "
+                + ", ".join(unknown_label_fields)
+            )
+        normalized_value_labels = [
+            str(value_labels.get(field) or field).strip()
+            for field in normalized_value_fields
+        ]
+    else:
+        normalized_value_labels = _normalize_string_list(value_labels or [], dedupe=False)
     if normalized_value_labels and len(normalized_value_labels) != len(normalized_value_fields):
         raise ValueError("value_labels length must match value_fields length.")
 
@@ -445,19 +461,6 @@ def _validate_chart_semantic_encoding(document: dict[str, Any]) -> None:
     value_fields = [str(item or "").strip() for item in (encoding.get("value_fields") or [])]
     category_field = str(encoding.get("category_field") or "").strip()
     rows = (document.get("dataset") or {}).get("rows") or []
-    metric_category_names = {"指标", "指标名称", "metric", "metric_name"}
-    if (
-        chart_kind in {"bar", "line"}
-        and category_field.lower() in metric_category_names
-        and value_field
-        and len(value_fields) <= 1
-        and len({str(row.get(category_field) or "").strip() for row in rows}) > 1
-    ):
-        raise ValueError(
-            "chart_semantic_error: 图表把多个业务指标放在类别行中，并共用一个通用数值列，"
-            "无法形成稳定的指标级计算边界。请把每个业务指标放入独立数值列，"
-            "再使用 build_multi_metric_chart_result(..., value_fields=[...]) 表达对比。"
-        )
     value_field_candidates = [value_field] + [item for item in value_fields if item != value_field]
     if not any(_looks_like_identifier_field(item) for item in value_field_candidates):
         return
