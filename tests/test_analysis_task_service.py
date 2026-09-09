@@ -98,6 +98,7 @@ class AnalysisTaskServiceTestCase(unittest.TestCase):
             request_payload={},
         )
         task.created_at = datetime.now() - timedelta(seconds=600)
+        task.updated_at = task.created_at
         self.session.commit()
 
         active_count = self.service.count_active_tasks("alice")

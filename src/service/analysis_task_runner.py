@@ -10,6 +10,7 @@ from config import Config
 from config.database import session_scope
 from service.analysis_stream_queue import AnalysisStreamQueue
 from service.analysis_task_service import AnalysisTaskService
+from service.analysis_progress_service import save_progress
 from utils import logger
 from utils.analysis_task_cancel import AnalysisTaskCancelled, CANCELLED_MESSAGE
 from utils.redis_client import get_redis_client
@@ -80,6 +81,7 @@ class AnalysisTaskRunner:
                 analysis_task_id=analysis_task_id,
             ):
                 event.setdefault("task_id", task_id)
+                self._persist_progress_event(event, analysis_task_id)
                 if event.get("type") == "clarification_required":
                     clarification = (
                         dict(event.get("clarification") or {})
@@ -190,6 +192,18 @@ class AnalysisTaskRunner:
             "level": "error",
             "message": message,
         })
+
+    @staticmethod
+    def _persist_progress_event(event: dict[str, Any], analysis_task_id: int | None) -> None:
+        if event.get('stage') != 'work_progress':
+            return
+        try:
+            with session_scope() as session:
+                save_progress(session, event, analysis_task_id)
+                session.commit()
+        except Exception:
+            # Display progress is best-effort and must not fail the analysis.
+            logger.warning('持久化分析进展失败: event_id=%s', event.get('event_id'), exc_info=True)
 
     def _publish_cancelled(self, queue: AnalysisStreamQueue, turn_id: int, task_id: str) -> None:
         queue.push_event(turn_id, {

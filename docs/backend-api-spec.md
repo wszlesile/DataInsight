@@ -444,6 +444,19 @@ data: {"type":"status","message":"已收到请求，正在理解分析需求。"
       "selected_datasource_snapshot": [],
       "latest_execution": {},
       "execution_count": 1,
+      "progress": [
+        {
+          "type": "status",
+          "stage": "work_progress",
+          "event_id": "event-uuid",
+          "message": "正在核实时间字段格式。",
+          "progress": {
+            "activity_id": "tool:tool-call-id",
+            "title": "核实数据与查询口径",
+            "state": "running"
+          }
+        }
+      ],
       "status": "success",
       "started_at": "2026-04-09T13:51:24",
       "finished_at": "2026-04-09T13:56:26"
@@ -497,6 +510,10 @@ data: {"type":"status","message":"已收到请求，正在理解分析需求。"
   - 最近一次执行摘要
 - `execution_count`
   - 当前轮的执行次数
+- `progress`
+  - 当前轮最新分析任务的可公开工作进展。相同 `progress.activity_id` 的后续事件更新同一工作项。
+  - `progress.state` 为 `running`、`completed`、`failed` 或 `finished`。
+  - 仅包含计划、资料读取、探测、程序生成/执行和修复的简明说明，不包含 Python 代码、原始样本、凭证或模型内部推理。
 - `status`
   - 轮次状态，常见值：
     - `running`
@@ -539,7 +556,8 @@ data: {"type":"status","message":"已收到请求，正在理解分析需求。"
   "messages": [],
   "executions": [],
   "latest_execution": {},
-  "artifacts": []
+  "artifacts": [],
+  "progress": []
 }
 ```
 
@@ -557,6 +575,8 @@ data: {"type":"status","message":"已收到请求，正在理解分析需求。"
   - 当前轮最新执行记录
 - `artifacts`
   - 当前轮产物列表
+- `progress`
+  - 与会话历史中的当前轮 `progress` 定义一致，仅返回该轮最新分析任务版本。
 
 `turn` 重点字段：
 
@@ -1752,9 +1772,13 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
 
 - `clarification_id` 必须与 SSE `clarification_required` 事件中的值一致。
 - 批量澄清必须回答 `clarification.items` 中的全部项目；缺少任一项时返回 `409`，任务继续保持 `waiting_clarification`。
+- `answers` 若提供必须是非空对象数组；格式错误返回 HTTP `400`。`item_id` 必须逐一匹配待答项目，不能重复或包含其他项目，否则返回 HTTP `409`。
+- 选择选项时建议仅提交 `option_id`；同时提交的 `answer_text` 只允许与该选项的 label 或 value 一致。自行补充文本时清空 `option_id`，避免同一回答形成冲突的语义值。
 - `allow_free_text=false` 的项目只能提交服务端给出的 `option_id`；未知选项或任意文本返回 `409`。
 - 服务端原子地写入全部回答，并把任务恢复为 `queued`。同一澄清请求只能成功恢复一次。
+- 恢复后仍异步执行，前端继续订阅原轮次 SSE；若后台派发失败，返回 HTTP `500` 并将尚未被领取的任务标为 failed，不会保留无人执行的 queued 任务。原回答仍被保存。
 - SSE 澄清事件中的每个 `items[]` 项包含稳定的 `item_id`、`question`、`options`、`allow_free_text` 和 `semantic_scope`。
+- 后端私有保存本次挂起时的 Runtime 消息以供同轮次恢复；这部分不属于接口返回字段，不在 SSE 或任务详情中暴露。恢复仍需调用方当前有效身份凭据。
 
 ### 5.7 查询当前会话运行中轮次
 
@@ -1827,10 +1851,29 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
   - `result`
   - `done`
   - `error`
+  - 工作进展使用 `type=status`、`stage=work_progress`，示例：
+
+```json
+{
+  "type": "status",
+  "stage": "work_progress",
+  "event_id": "event-uuid",
+  "occurred_at": "2026-09-09T02:10:00+00:00",
+  "level": "info",
+  "message": "核实时间字段格式后再计算趋势。",
+  "progress": {
+    "activity_id": "tool:tool-call-id",
+    "title": "核实数据与查询口径",
+    "state": "running"
+  }
+}
+```
 
 说明：
 
 - Redis List 是临时输出队列，事件被消费后会从队列中移除。
+- `work_progress` 同时持久化为轮次公开进展。页面刷新后通过会话历史恢复，再订阅 SSE 获取后续更新。
+- 前端以 `progress.activity_id` 合并状态，使用 `event_id` 辅助去重；不能把同一工作的开始和完成显示为两项互不相关的工作。
 - 任务结束后，前端收到 `done` 或 `error` 应关闭当前 SSE 连接，并重新拉取会话历史。
 - 如果队列暂时没有事件，后端会保持 SSE 连接并输出 heartbeat。
 
@@ -2909,3 +2952,7 @@ JSON Schema 根节点必须是 `object`。其属性可使用本地可验证子�
 ```
 
 可选值为 `same_turn` 或 `disabled`，省略时保持现有默认值 `same_turn`。该字段只控制是否允许当前轮次挂起澄清，不改变标准产物和 Evidence 行为。
+
+异步刷新入口 `POST /api/insight/conversations/{conversation_id}/turns/{turn_id}/rerun/task` 同样接受此字段，并持久化至该次任务。外部 workflow/jobs 仍固定禁用澄清。
+
+当前前端新增分析与刷新共用澄清开关。等待单项、允许文本的澄清时，主输入框提交到原任务的 clarification 接口，不新建轮次；多项或仅选项问题在澄清区域逐项回答。等待时仍可取消原任务。

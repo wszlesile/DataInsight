@@ -92,8 +92,20 @@ class CustomContext(BaseModel):
     output_contract: dict[str, Any] = Field(
         default_factory=lambda: {"type": "standard"}
     )
+    # This is a runtime-owned work-state attribute. The request compiler must
+    # carry it into every projected model view instead of silently falling
+    # back to the fresh-analysis contract set on follow-up turns.
+    context_mode: str = "fresh_analysis"
     clarification_mode: str = "same_turn"
     evidence_enabled: bool = True
+    # Local-only metadata used by the request compiler. It is intentionally
+    # excluded from the LLM-facing datasource envelope.
+    working_memory_catalog: list[dict[str, Any]] = Field(default_factory=list)
+    # Bodies are held separately from the catalog so the working-context
+    # compiler can project them once for the active work, rather than the
+    # outer ReAct recovery prompt replaying the same payloads as free text.
+    runtime_probe_fact_ledgers: list[dict[str, Any]] = Field(default_factory=list)
+    runtime_schema_detail_workspace: list[dict[str, Any]] = Field(default_factory=list)
 
 
 def classify_analysis_context_mode(user_message: str) -> str:
@@ -516,13 +528,16 @@ def get_datasource_message(
     if namespace_id_int > 0:
         payload["namespace_id"] = namespace_id_int
     payload["datasources"] = datasource_items
+    if isinstance(snapshot.get("runtime_schema_workspace"), dict):
+        payload["runtime_schema_workspace"] = copy.deepcopy(snapshot["runtime_schema_workspace"])
 
     instruction_lines = [
         "<runtime-context-instructions>",
-        "以下 JSON 是本轮完整分析上下文，包含原始 Schema、业务规则与带确认状态的准备信息，不是报告模板或指标计划：",
-        "- `datasources` 是 Preparation 选定的完整数据源上下文；每个 `metadata_schema.properties` 都是完整字段定义，没有按 Prompt 预算截断。",
+        "以下 JSON 是本轮完整分析上下文，包含 Schema 工作视图、业务规则与带确认状态的准备信息，不是报告模板或指标计划：",
+        "- `datasources` 是 Preparation 选定的完整数据源范围。默认工作视图保留全部字段名、已绑定事实字段和关系键；若 `runtime_schema_workspace.mode=indexed`，未展开字段的精确定义可用 `read_runtime_datasource_context` 本地读取，不会改变分析范围。",
         "- `datasource_name` 是用户可读名称；`query_contract.datasource_identifier` 是物理访问标识。`allowed_fields` 是显式字段边界；若为 `allowed_fields_ref=metadata_schema.properties`，则完整 properties 键集合就是字段边界。",
         "- `analysis_semantic_context` 是用户业务目标、开放式问题和已确认血缘的准备信息。Runtime 仍自主决定查询、指标、产物和叙事。",
+        "- `analysis_semantic_context.question_fact_coverage` 是 Selection 已完成的每个问题/业务事实/数据源覆盖状态；`runtime_probe_agenda` 是后端据此生成的技术工作状态。二者都不预先规定指标、图表、结论或报告章节。",
         "- Schema 中关系、observed_value_profile、requested_value_resolutions、aggregation_safety 等状态按其原始含义使用；unresolved/unknown 不等同于已确认事实。",
         "- `runtime_capabilities.query_execution` 是当前执行环境的确定性容量与查询能力；容量边界作用于每次物理查询。具体 API 和方言由 Runtime Contract Pack 提供。",
     ]
@@ -535,6 +550,9 @@ def get_datasource_message(
         )
         instruction_lines.append(
             "- `analysis_semantic_context.analytical_facets` 是开放式洞察方向，不规定报告章节或结论。"
+        )
+        instruction_lines.append(
+            "- `runtime_probe_agenda.pending_technical_checks` 汇总准备信息中已知的待核实点；结合实际查询是否依赖它决定探测，已有观察直接复用。"
         )
     elif selected_ids:
         instruction_lines.append(
@@ -559,14 +577,481 @@ def get_datasource_message(
         len(payload.get("datasources") or []),
     )
     return SystemMessage(
-        "\n".join(instruction_lines) + "\n</runtime-context-instructions>\n"
-        + payload_json,
+        "<runtime-datasource-envelope>\n"
+        + "\n".join(instruction_lines) + "\n</runtime-context-instructions>\n"
+        + payload_json
+        + "\n</runtime-datasource-envelope>",
         additional_kwargs={
             "runtime_query_capabilities": list(infer_query_capabilities_from_snapshot({
                 "selected_datasource_snapshot": datasource_items,
             })),
         },
     )
+
+
+def build_runtime_datasource_working_message(
+    prompt_snapshot: dict[str, Any] | None,
+    execution_snapshot: dict[str, Any] | None,
+    *,
+    work: str,
+    datasource_ids: list[int] | tuple[int, ...] = (),
+    field_names_by_datasource: dict[str, list[str]] | None = None,
+    material_plan: dict[str, Any] | None = None,
+    schema_detail_workspace: list[dict[str, Any]] | None = None,
+    omit_replayed_details: bool = False,
+) -> SystemMessage:
+    """Build the state-specific Runtime datasource carrier.
+
+    Preparation's full snapshot remains the execution authority.  This function
+    only changes how that authority is presented to the model: every selected
+    datasource is always present in a compact index, while exact field
+    definitions are loaded only for the current Probe/program work selection.
+    """
+    prompt_snapshot = prompt_snapshot if isinstance(prompt_snapshot, dict) else {}
+    execution_snapshot = (
+        execution_snapshot if isinstance(execution_snapshot, dict) else prompt_snapshot
+    )
+    prompt_rows = _runtime_snapshot_rows(prompt_snapshot)
+    execution_rows = _runtime_snapshot_rows(execution_snapshot)
+    if not prompt_rows:
+        prompt_rows = execution_rows
+    execution_by_id = {
+        _runtime_datasource_id(row): row
+        for row in execution_rows
+        if _runtime_datasource_id(row) > 0
+    }
+    selected_ids = _runtime_selected_ids(prompt_snapshot, prompt_rows)
+    requested_ids = [
+        datasource_id
+        for datasource_id in dict.fromkeys(to_int(value, 0) for value in datasource_ids)
+        if datasource_id > 0 and datasource_id in set(selected_ids)
+    ]
+    fields_by_id = _runtime_requested_fields(field_names_by_datasource or {})
+    workspace_by_id = {
+        _runtime_datasource_id(source): source
+        for source in (schema_detail_workspace or [])
+        if isinstance(source, dict) and _runtime_datasource_id(source) > 0
+    }
+    if work == 'plan':
+        requested_ids = list(dict.fromkeys([*requested_ids, *workspace_by_id]))
+    # A material plan is intentionally only a compact candidate index during
+    # Probe/implementation. Replaying Preparation lineage fields here would
+    # silently turn that index back into a full schema packet; exact fields are
+    # supplied only by an explicit work selection or the detail reader.
+    lineage_defaults = {} if (
+        material_plan and work in {"probe", "probe_repair", "implement", "repair"}
+    ) else _runtime_lineage_field_defaults(
+        prompt_snapshot.get("analysis_semantic_context"),
+    )
+    if not requested_ids and work not in {"understand", "review"}:
+        requested_ids = [
+            datasource_id for datasource_id in selected_ids
+            if datasource_id in lineage_defaults
+        ]
+    for datasource_id in requested_ids:
+        if datasource_id not in fields_by_id and lineage_defaults.get(datasource_id):
+            fields_by_id[datasource_id] = lineage_defaults[datasource_id]
+        workspace_schema = workspace_by_id.get(datasource_id, {}).get('metadata_schema')
+        workspace_properties = (
+            workspace_schema.get('properties')
+            if isinstance(workspace_schema, dict) and isinstance(workspace_schema.get('properties'), dict)
+            else {}
+        )
+        # A detail read is useful while composing the material plan, where the
+        # model is deciding which exact fields belong to the next unit of
+        # work.  Once the plan exists, replaying every field from every prior
+        # detail read defeats that projection and makes implementation grow
+        # with exploratory reads.  The planned field set remains authoritative
+        # for Probe/implementation; a newly discovered dependency can still
+        # be fetched through the detail reader in that focused work state.
+        if workspace_properties and work == 'plan':
+            fields_by_id[datasource_id] = tuple(dict.fromkeys([
+                *fields_by_id.get(datasource_id, ()),
+                *[str(field) for field in workspace_properties],
+            ]))
+    datasource_index = [
+        _runtime_source_identity(row) if work == "review" else _runtime_datasource_index_item(row)
+        for row in prompt_rows
+    ]
+    # After a successful reader call the exact field definitions live in the
+    # typed workspace.  Reuse that canonical copy for the current material
+    # scope instead of making the model reconstruct its state from one or
+    # more historical ToolMessages.  The complete execution snapshot remains
+    # the fallback and the source of the complete field-name index.
+    detail_sources = workspace_by_id if omit_replayed_details else execution_by_id
+    datasource_details = [
+        _runtime_datasource_detail_item(
+            detail_sources.get(datasource_id) or execution_by_id.get(datasource_id)
+            or _runtime_row_by_id(prompt_rows, datasource_id),
+            requested_fields=fields_by_id.get(datasource_id, ()),
+            fallback_index=_runtime_row_by_id(prompt_rows, datasource_id),
+        )
+        for datasource_id in requested_ids
+        if detail_sources.get(datasource_id) is not None
+            or execution_by_id.get(datasource_id) is not None
+            or _runtime_row_by_id(prompt_rows, datasource_id) is not None
+    ]
+    payload = {
+        "runtime_capabilities": {
+            "query_execution": copy.deepcopy(QUERY_EXECUTION_CAPABILITIES),
+        },
+        "analysis_semantic_context": _runtime_semantic_work_view(
+            prompt_snapshot.get("analysis_semantic_context"),
+            requested_ids=requested_ids,
+            material_plan=material_plan,
+        ),
+        "selected_datasource_ids": selected_ids,
+        "datasource_index": datasource_index,
+        "datasource_details": datasource_details,
+        "runtime_schema_workspace": {
+            "mode": "state_scoped",
+            "current_work": str(work or "understand"),
+            "detail_tool": "read_runtime_datasource_context",
+            "detail_datasource_ids": requested_ids,
+            "detail_fields_by_datasource": {
+                str(datasource_id): list(fields)
+                for datasource_id, fields in fields_by_id.items()
+                if datasource_id in requested_ids and fields
+            },
+        },
+    }
+    # ``runtime_material_plan`` is deliberately carried by
+    # ``runtime-working-context`` below, not duplicated inside this datasource
+    # envelope.  The envelope owns source facts; the work context owns the
+    # current decision and plan.  Keeping both copies made an implementation
+    # request grow linearly with the plan without adding a new fact.
+    instruction = [
+        "<runtime-datasource-envelope>",
+        "<runtime-context-instructions>",
+        "以下 JSON 是当前 Runtime 工作视图。它保持 Preparation 已确认的完整分析范围，但按当前工作提供不同粒度的材料。",
+        (
+            "- `selected_datasource_ids` 和 `datasource_index` 是本轮完整数据源语义空间；Review 只需使用来源身份核对程序、查询事实与候选产物，不重新展开 Schema。"
+            if work == "review" else
+            "- `selected_datasource_ids` 和 `datasource_index` 是本轮完整数据源语义空间；索引中的字段名可用于决定后续需要哪些精确定义，不能据此缩小分析范围。"
+        ),
+        "- `datasource_details` 只展开当前工作明确声明的数据源和字段，字段定义、枚举、公式、格式及来源描述以这里为准。它可能来自刚读取的 canonical Schema 工作区；需要新的精确字段或关系时，调用 `read_runtime_datasource_context`，该读取不改变完整数据源范围。",
+        "- 如果 `datasource_details` 为空，说明当前材料尚未形成足够的精确 Schema；先读取实际依赖，不能猜测字段。",
+        "- `analysis_semantic_context` 是 Preparation 的紧凑业务血缘视图。完整推导依据、事实绑定和关系安全条件可通过 `read_runtime_datasource_context(include_relationships=true)` 按数据源读取。",
+        "- `runtime_capabilities.query_execution` 是每次物理查询的确定性容量边界，具体查询 API 由当前 Runtime Contract Pack 提供。",
+        "</runtime-context-instructions>",
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        "</runtime-datasource-envelope>",
+    ]
+    return SystemMessage(
+        "\n".join(instruction),
+        additional_kwargs={
+            "runtime_query_capabilities": list(infer_query_capabilities_from_snapshot({
+                "selected_datasource_snapshot": prompt_rows,
+            })),
+        },
+    )
+
+
+def runtime_schema_workspace_covers_material_scope(
+    schema_detail_workspace: list[dict[str, Any]] | None,
+    datasource_ids: list[int] | tuple[int, ...],
+    field_names_by_datasource: dict[str, list[str]] | None,
+) -> bool:
+    """Whether canonical exact Schema covers every field of the active work.
+
+    A reader may be invoked several times while the model refines a material
+    plan.  Only compact its historical ToolMessages after the typed workspace
+    itself can reproduce every active source/field dependency.  This keeps
+    compaction lossless and lets a new dependency remain visible until it has
+    actually been read.
+    """
+    requested_ids = [
+        datasource_id
+        for datasource_id in dict.fromkeys(to_int(value, 0) for value in datasource_ids)
+        if datasource_id > 0
+    ]
+    if not requested_ids:
+        return False
+    fields_by_id = _runtime_requested_fields(field_names_by_datasource or {})
+    workspace_by_id = {
+        _runtime_datasource_id(source): source
+        for source in (schema_detail_workspace or [])
+        if isinstance(source, dict) and _runtime_datasource_id(source) > 0
+    }
+    for datasource_id in requested_ids:
+        required_fields = fields_by_id.get(datasource_id, ())
+        if not required_fields:
+            return False
+        source = workspace_by_id.get(datasource_id)
+        schema = source.get('metadata_schema') if isinstance(source, dict) else {}
+        properties = (
+            schema.get('properties')
+            if isinstance(schema, dict) and isinstance(schema.get('properties'), dict)
+            else {}
+        )
+        if any(not isinstance(properties.get(field), dict) for field in required_fields):
+            return False
+    return True
+
+
+def _runtime_snapshot_rows(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        row for row in snapshot.get("selected_datasource_snapshot") or []
+        if isinstance(row, dict)
+    ]
+
+
+def _runtime_datasource_id(row: dict[str, Any]) -> int:
+    return to_int(row.get("datasource_id") or row.get("id"), 0)
+
+
+def _runtime_selected_ids(snapshot: dict[str, Any], rows: list[dict[str, Any]]) -> list[int]:
+    declared = [to_int(value, 0) for value in snapshot.get("selected_datasource_ids") or []]
+    return list(dict.fromkeys([
+        *[value for value in declared if value > 0],
+        *[_runtime_datasource_id(row) for row in rows if _runtime_datasource_id(row) > 0],
+    ]))
+
+
+def _runtime_row_by_id(rows: list[dict[str, Any]], datasource_id: int) -> dict[str, Any] | None:
+    return next((row for row in rows if _runtime_datasource_id(row) == datasource_id), None)
+
+
+def _runtime_requested_fields(raw: dict[str, list[str]]) -> dict[int, tuple[str, ...]]:
+    normalized: dict[int, tuple[str, ...]] = {}
+    for datasource_id, values in raw.items():
+        normalized_id = to_int(datasource_id, 0)
+        if normalized_id <= 0 or not isinstance(values, list):
+            continue
+        fields = tuple(dict.fromkeys(
+            str(value).strip() for value in values if str(value).strip()
+        ))
+        if fields:
+            normalized[normalized_id] = fields
+    return normalized
+
+
+def _runtime_lineage_field_defaults(semantic_context: Any) -> dict[int, tuple[str, ...]]:
+    """Return the exact Preparation-bound fields for a compatibility fallback."""
+    semantic = semantic_context if isinstance(semantic_context, dict) else {}
+    fields: dict[int, list[str]] = {}
+    for lineage in semantic.get("insight_lineage") or []:
+        if not isinstance(lineage, dict):
+            continue
+        for binding in lineage.get("fact_bindings") or []:
+            if not isinstance(binding, dict):
+                continue
+            datasource_id = to_int(binding.get("datasource_id"), 0)
+            if datasource_id <= 0:
+                continue
+            fields.setdefault(datasource_id, []).extend(
+                str(field).strip() for field in binding.get("fields") or []
+                if str(field).strip()
+            )
+    return {
+        datasource_id: tuple(dict.fromkeys(values))
+        for datasource_id, values in fields.items() if values
+    }
+
+
+def _runtime_source_identity(row: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "datasource_id", "datasource_name", "datasource_identifier", "datasource_type",
+        "table_engine", "ts_query_source", "time_field", "sheet_name", "recommended_loader",
+    )
+    return {
+        key: copy.deepcopy(row[key])
+        for key in keys
+        if row.get(key) not in (None, "", [], {})
+    }
+
+
+def _clip_runtime_work_text(value: str, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def _runtime_datasource_index_item(row: dict[str, Any]) -> dict[str, Any]:
+    schema = row.get("metadata_schema") if isinstance(row.get("metadata_schema"), dict) else {}
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    fields: dict[str, dict[str, Any]] = {}
+    for field_name, definition in properties.items():
+        definition = definition if isinstance(definition, dict) else {}
+        fields[str(field_name)] = {
+            key: copy.deepcopy(definition[key])
+            for key in ("type", "format", "title", "displayName")
+            if key in definition
+        }
+    item = _runtime_source_identity(row)
+    item["schema_summary"] = {
+        "name": schema.get("name"),
+        "description": _clip_runtime_work_text(str(schema.get("description") or ""), 320),
+        "fields": fields,
+    }
+    return item
+
+
+def _runtime_datasource_detail_item(
+    row: dict[str, Any] | None,
+    *,
+    requested_fields: tuple[str, ...],
+    fallback_index: dict[str, Any] | None,
+) -> dict[str, Any]:
+    row = row or fallback_index or {}
+    schema = row.get("metadata_schema") if isinstance(row.get("metadata_schema"), dict) else {}
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    fallback_schema = (
+        (fallback_index or {}).get("metadata_schema")
+        if isinstance((fallback_index or {}).get("metadata_schema"), dict)
+        else {}
+    )
+    fallback_properties = (
+        fallback_schema.get("properties")
+        if isinstance(fallback_schema.get("properties"), dict)
+        else {}
+    )
+    # A work selection normally provides the exact fields.  Bound fields from
+    # Preparation remain visible in the compact index and can be explicitly
+    # added through the local reader when a new dependency is discovered.
+    detail_properties = {
+        field: copy.deepcopy(properties.get(field, fallback_properties.get(field)))
+        for field in requested_fields
+        if isinstance(properties.get(field, fallback_properties.get(field)), dict)
+    }
+    item = {
+        key: copy.deepcopy(value) for key, value in row.items()
+        if key not in {'metadata_schema', 'field_capabilities'}
+    }
+    item["metadata_schema"] = {
+        **copy.deepcopy(schema),
+        "name": schema.get("name") or fallback_schema.get("name"),
+        "description": str(schema.get("description") or fallback_schema.get("description") or ""),
+        "properties": detail_properties,
+    }
+    item["loaded_field_names"] = list(detail_properties)
+    item["all_field_names"] = list(dict.fromkeys([*fallback_properties, *properties]))
+    return item
+
+
+def _runtime_semantic_work_view(
+    semantic_context: Any,
+    *,
+    requested_ids: list[int],
+    material_plan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    semantic = semantic_context if isinstance(semantic_context, dict) else {}
+    requested = set(requested_ids)
+    plan = material_plan if isinstance(material_plan, dict) else {}
+    plan_units = [item for item in plan.get("material_units") or [] if isinstance(item, dict)]
+    planned_relationship_ids = {
+        str(relationship_id) for unit in plan_units for relationship_id in unit.get("relationship_ids") or []
+        if str(relationship_id).strip()
+    }
+    result = {
+        key: copy.deepcopy(semantic.get(key))
+        for key in (
+            "analysis_as_of_date", "explicit_time_range", "business_goal",
+            "business_subjects", "analytical_facets", "business_questions",
+        )
+        if semantic.get(key) not in (None, "", [], {})
+    }
+    # The lineage below already carries the source/field binding for each
+    # business fact.  Keep only the coverage verdict here; repeating every
+    # source mapping and its Selection rationale would make the first work
+    # view large without adding another decision fact.
+    result["question_fact_coverage"] = [
+        {
+            "question_id": item.get("question_id"),
+            "coverage_status": item.get("coverage_status"),
+        }
+        for item in semantic.get("question_fact_coverage") or []
+        if isinstance(item, dict)
+    ]
+    result["insight_lineage"] = [
+        {
+            "question_id": item.get("question_id"),
+            "lineage_status": item.get("lineage_status"),
+            "datasource_ids": list(item.get("datasource_ids") or []),
+            "fact_bindings": [
+                {
+                    key: copy.deepcopy(binding.get(key))
+                    for key in ("fact_id", "datasource_id", "fields", "derived_from_fact_ids")
+                    if binding.get(key) not in (None, "", [], {})
+                }
+                for binding in item.get("fact_bindings") or []
+                if isinstance(binding, dict)
+            ],
+            "relationship_ids": list(item.get("relationship_ids") or []),
+            "synthesis_path": _clip_runtime_work_text(str(item.get("synthesis_path") or ""), 420),
+            "unresolved_business_facts": [
+                {
+                    "fact_id": fact.get("fact_id"),
+                    "business_impact": _clip_runtime_work_text(
+                        str(fact.get("business_impact") or ""), 240,
+                    ),
+                }
+                for fact in item.get("unresolved_business_facts") or []
+                if isinstance(fact, dict)
+            ],
+        }
+        for item in semantic.get("insight_lineage") or []
+        if isinstance(item, dict)
+    ]
+    relationships = []
+    for item in semantic.get("relationships") or []:
+        if not isinstance(item, dict):
+            continue
+        related_ids = {
+            to_int(item.get("left_datasource_id"), 0),
+            to_int(item.get("right_datasource_id"), 0),
+        }
+        if requested and not related_ids.intersection(requested):
+            continue
+        if planned_relationship_ids and str(item.get("relationship_id") or "") not in planned_relationship_ids:
+            continue
+        relationship = {
+            key: copy.deepcopy(item.get(key))
+            for key in (
+                "relationship_id", "left_datasource_id", "right_datasource_id",
+                "relationship_type", "joinability", "left_fields", "right_fields",
+                "business_meaning", "cardinality",
+            )
+            if item.get(key) not in (None, "", [], {})
+        }
+        # Detailed join strategies belong to the query contract, not this
+        # semantic carrier.  Preserve the safety verdict so the Runtime will
+        # not silently aggregate across a fan-out, without duplicating an
+        # entire execution playbook once per relationship.
+        aggregation_safety = item.get("aggregation_safety")
+        if isinstance(aggregation_safety, dict):
+            relationship["aggregation_safety"] = {
+                side: value.get("status")
+                for side, value in aggregation_safety.items()
+                if isinstance(value, dict) and value.get("status")
+            }
+            if not relationship["aggregation_safety"]:
+                relationship.pop("aggregation_safety")
+        relationships.append(relationship)
+    result["relationships"] = relationships
+    agenda = semantic.get("runtime_probe_agenda")
+    if isinstance(agenda, dict):
+        result["runtime_probe_agenda"] = {
+            "version": agenda.get("version"),
+            "pending_technical_checks": [
+                copy.deepcopy(item)
+                for item in agenda.get("pending_technical_checks") or []
+                if isinstance(item, dict)
+            ],
+        }
+    references = semantic.get("semantic_references")
+    if isinstance(references, list) and references:
+        result["semantic_references"] = [
+            {
+                key: copy.deepcopy(item.get(key))
+                for key in ("datasource_id", "datasource_name", "description", "field_names")
+                if item.get(key) not in (None, "", [], {})
+            }
+            for item in references
+            if isinstance(item, dict)
+        ]
+    return result
 
 
 def get_history_messages(

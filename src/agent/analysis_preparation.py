@@ -1124,6 +1124,17 @@ class PreparationResult:
                 if relationship_id in runtime_relationship_ids
             ]
 
+        # Selection already established which factual inputs cover every business
+        # question.  Keep that compact, source-level work state for Runtime rather
+        # than making the model reconstruct it from narrative lineage on every
+        # ReAct turn.  It is advisory preparation context, not a metric/report
+        # plan: Runtime still owns the calculations and presentation.
+        runtime_question_coverage = _build_runtime_question_coverage(
+            self.selection,
+            runtime_datasource_ids=runtime_datasource_ids,
+            semantic_reference_ids=semantic_reference_ids,
+        )
+
         if runtime_datasource_ids:
             snapshot["selected_datasource_ids"] = [
                 datasource_id
@@ -1147,7 +1158,7 @@ class PreparationResult:
                         in runtime_datasource_ids
                     ]
 
-        snapshot["analysis_semantic_context"] = {
+        analysis_semantic_context = {
             "analysis_as_of_date": datetime.now(
                 ZoneInfo("Asia/Shanghai")
             ).date().isoformat(),
@@ -1160,11 +1171,332 @@ class PreparationResult:
                 item.model_dump()
                 for item in self.intent.business_questions
             ],
+            "question_fact_coverage": runtime_question_coverage,
             "relationships": runtime_relationships,
             "insight_lineage": runtime_lineage,
         }
+        analysis_semantic_context["runtime_probe_agenda"] = _build_runtime_probe_agenda(
+            semantic_context=analysis_semantic_context,
+            selected_snapshot=snapshot,
+        )
+        snapshot["analysis_semantic_context"] = analysis_semantic_context
         snapshot["query_capabilities"] = list(self.query_capabilities)
         return snapshot
+
+    def runtime_prompt_snapshot(self) -> dict[str, Any]:
+        """Return the bounded Schema workspace delivered to the Runtime model.
+
+        ``selected_snapshot`` remains the execution authority.  The model only
+        needs an initial index of every selected source, the exact fields that
+        Preparation already bound to a business fact or relationship, and the
+        semantic handoff.  All remaining exact field definitions stay available
+        through the local Runtime Schema reader instead of being duplicated into
+        every ReAct request.
+        """
+        return _build_runtime_prompt_snapshot(self.prompt_snapshot())
+
+
+def _build_runtime_question_coverage(
+    selection: DatasourceSelectionContract,
+    *,
+    runtime_datasource_ids: set[int],
+    semantic_reference_ids: set[int],
+) -> list[dict[str, Any]]:
+    """Project Selection's factual coverage into Runtime work state.
+
+    The projection intentionally keeps only canonical IDs and datasource scope.
+    Business fact wording remains owned by ``IntentContract`` and calculations
+    remain owned by Runtime.  This lets a Runtime plan see what Preparation has
+    already resolved without turning Selection into an analysis-plan authority.
+    """
+    coverage: list[dict[str, Any]] = []
+    for question in selection.question_coverage:
+        facts: list[dict[str, Any]] = []
+        for fact in question.fact_coverage:
+            direct_ids = [
+                datasource_id
+                for datasource_id in fact.datasource_ids
+                if datasource_id in runtime_datasource_ids
+            ]
+            supporting_ids = [
+                datasource_id
+                for datasource_id in fact.supporting_datasource_ids
+                if datasource_id in runtime_datasource_ids
+            ]
+            semantic_ids = [
+                datasource_id
+                for datasource_id in fact.semantic_reference_datasource_ids
+                if datasource_id in semantic_reference_ids
+            ]
+            facts.append({
+                "fact_id": fact.fact_id,
+                "coverage_status": fact.coverage_status,
+                "datasource_ids": direct_ids,
+                "supporting_datasource_ids": supporting_ids,
+                "semantic_reference_datasource_ids": semantic_ids,
+                "derived_from_fact_ids": list(fact.derived_from_fact_ids),
+                "coverage_reason": fact.coverage_reason,
+            })
+        coverage.append({
+            "question_id": question.question_id,
+            "coverage_status": question.coverage_status,
+            "datasource_ids": [
+                datasource_id
+                for datasource_id in question.datasource_ids
+                if datasource_id in runtime_datasource_ids
+            ],
+            "fact_coverage": facts,
+            "coverage_reason": question.coverage_reason,
+        })
+    return coverage
+
+
+def _build_runtime_probe_agenda(
+    *,
+    semantic_context: dict[str, Any],
+    selected_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the bounded, backend-owned technical work state for Runtime.
+
+    It distinguishes preparation-confirmed business coverage from technical
+    facts that still need a Probe (for example an unverified join).  The agenda
+    never prescribes metrics, calculations, charts, tables or report chapters.
+    """
+    pending_checks: list[dict[str, Any]] = []
+    for relationship in semantic_context.get("relationships") or []:
+        if not isinstance(relationship, dict):
+            continue
+        relationship_id = str(relationship.get("relationship_id") or "").strip()
+        if not relationship_id:
+            continue
+        if (
+            relationship.get("joinability") != "unknown"
+            or not relationship.get("left_fields")
+            or not relationship.get("right_fields")
+            or relationship.get("relationship_type") in {"independent", "comparable"}
+        ):
+            continue
+        pending_checks.append({
+            "check_id": f"relationship:{relationship_id}",
+            "kind": "relationship_joinability",
+            "relationship_id": relationship_id,
+            "datasource_ids": [
+                relationship.get("left_datasource_id"),
+                relationship.get("right_datasource_id"),
+            ],
+            "fields": {
+                "left": list(relationship.get("left_fields") or []),
+                "right": list(relationship.get("right_fields") or []),
+            },
+            "purpose": "确认该关系是否可作为正式查询中的连接路径。",
+        })
+
+    # Preparation has already sampled some categorical fields.  Preserve only
+    # unresolved requested-value mappings as technical facts; do not forward
+    # raw samples or require Runtime to repeat completed Schema inspection.
+    for datasource in selected_snapshot.get("selected_datasource_snapshot") or []:
+        if not isinstance(datasource, dict):
+            continue
+        datasource_id = int(datasource.get("datasource_id") or datasource.get("id") or 0)
+        schema = datasource.get("metadata_schema") or {}
+        properties = schema.get("properties") if isinstance(schema, dict) else {}
+        if not isinstance(properties, dict):
+            continue
+        for field, definition in properties.items():
+            profile = (
+                definition.get("observed_value_profile")
+                if isinstance(definition, dict)
+                else None
+            )
+            resolutions = (
+                profile.get("requested_value_resolutions")
+                if isinstance(profile, dict)
+                else None
+            )
+            unresolved = [
+                item for item in resolutions or []
+                if isinstance(item, dict)
+                and str(item.get("status") or "unresolved").strip()
+                not in {"exact", "supported", "resolved", "verified"}
+            ]
+            if not unresolved:
+                continue
+            pending_checks.append({
+                "check_id": f"field_resolution:{datasource_id}:{field}",
+                "kind": "field_value_resolution",
+                "datasource_ids": [datasource_id],
+                "field": str(field),
+                "requested_values": [
+                    str(item.get("requested_value") or "").strip()
+                    for item in unresolved
+                    if str(item.get("requested_value") or "").strip()
+                ],
+                "purpose": "确认用户业务条件与字段真实取值是否可对应。",
+            })
+
+    return {
+        "version": 1,
+        "pending_technical_checks": pending_checks,
+    }
+
+
+def _build_runtime_prompt_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Project a full Preparation handoff into a non-lossy Runtime index.
+
+    This is deliberately a prompt projection, not a new datasource contract:
+    every selected datasource id and field name remains visible, while complete
+    definitions are retained in ``execution_datasource_snapshot`` for on-demand
+    local retrieval.
+    """
+    projected = copy.deepcopy(snapshot)
+    semantic_context = projected.get("analysis_semantic_context")
+    semantic_context = semantic_context if isinstance(semantic_context, dict) else {}
+
+    detailed_fields_by_source: dict[int, set[str]] = {}
+
+    def add_fields(datasource_id: Any, fields: Any) -> None:
+        try:
+            normalized_id = int(datasource_id or 0)
+        except (TypeError, ValueError):
+            return
+        if normalized_id <= 0:
+            return
+        normalized_fields = {
+            str(field).strip()
+            for field in fields or []
+            if str(field).strip()
+        }
+        if normalized_fields:
+            detailed_fields_by_source.setdefault(normalized_id, set()).update(
+                normalized_fields
+            )
+
+    for lineage in semantic_context.get("insight_lineage") or []:
+        if not isinstance(lineage, dict):
+            continue
+        for binding in lineage.get("fact_bindings") or []:
+            if isinstance(binding, dict):
+                add_fields(binding.get("datasource_id"), binding.get("fields"))
+    for relationship in semantic_context.get("relationships") or []:
+        if not isinstance(relationship, dict):
+            continue
+        add_fields(
+            relationship.get("left_datasource_id"),
+            relationship.get("left_fields") or relationship.get("source_fields"),
+        )
+        add_fields(
+            relationship.get("right_datasource_id"),
+            relationship.get("right_fields") or relationship.get("target_fields"),
+        )
+
+    rows = [
+        item
+        for item in projected.get("selected_datasource_snapshot") or []
+        if isinstance(item, dict)
+    ]
+    projected["selected_datasource_snapshot"] = [
+        _project_runtime_datasource_schema(
+            item,
+            detailed_fields=detailed_fields_by_source.get(
+                int(item.get("datasource_id") or item.get("id") or 0), set()
+            ),
+        )
+        for item in rows
+    ]
+
+    semantic_references = semantic_context.get("semantic_references") or []
+    if isinstance(semantic_references, list):
+        semantic_context["semantic_references"] = [
+            _project_runtime_semantic_reference(item)
+            for item in semantic_references
+            if isinstance(item, dict)
+        ]
+    projected["analysis_semantic_context"] = semantic_context
+    projected["runtime_schema_workspace"] = {
+        "mode": "indexed",
+        "detail_tool": "read_runtime_datasource_context",
+        "instruction": (
+            "初始上下文包含全部选定数据源、全部字段名、已绑定事实字段和关系键。"
+            "需要其他字段的完整语义、枚举、格式或关系定义时，调用本地详情工具读取对应数据源字段；"
+            "该读取不改变分析范围。"
+        ),
+    }
+    return projected
+
+
+def _project_runtime_datasource_schema(
+    datasource: dict[str, Any],
+    *,
+    detailed_fields: set[str],
+) -> dict[str, Any]:
+    projected = {
+        key: copy.deepcopy(value)
+        for key, value in datasource.items()
+        if key not in {"metadata_schema", "field_capabilities"}
+    }
+    schema = datasource.get("metadata_schema")
+    schema = schema if isinstance(schema, dict) else {}
+    projected_schema = {
+        key: copy.deepcopy(value)
+        for key, value in schema.items()
+        if key not in {"properties", "definitions", "$defs", "examples"}
+    }
+    if isinstance(projected_schema.get("description"), str):
+        projected_schema["description"] = _clip_runtime_schema_text(
+            projected_schema["description"], 600
+        )
+
+    properties = schema.get("properties")
+    properties = properties if isinstance(properties, dict) else {}
+    projected_properties: dict[str, dict[str, Any]] = {}
+    for field_name, definition in properties.items():
+        normalized_name = str(field_name)
+        source_definition = definition if isinstance(definition, dict) else {}
+        field_projection = {
+            key: copy.deepcopy(source_definition[key])
+            for key in ("type", "format", "title", "displayName")
+            if key in source_definition
+        }
+        if normalized_name in detailed_fields:
+            field_projection = copy.deepcopy(source_definition)
+        elif "observed_value_profile" in source_definition:
+            field_projection["observed_value_profile"] = copy.deepcopy(
+                source_definition["observed_value_profile"]
+            )
+        projected_properties[normalized_name] = field_projection
+    projected_schema["properties"] = projected_properties
+    projected_schema["runtime_field_detail_mode"] = {
+        "indexed_fields": list(projected_properties),
+        "detailed_fields": sorted(detailed_fields.intersection(projected_properties)),
+        "detail_tool": "read_runtime_datasource_context",
+    }
+    projected["metadata_schema"] = projected_schema
+    return projected
+
+
+def _project_runtime_semantic_reference(reference: dict[str, Any]) -> dict[str, Any]:
+    projected = {
+        key: copy.deepcopy(value)
+        for key, value in reference.items()
+        if key != "metadata_schema"
+    }
+    schema = reference.get("metadata_schema")
+    if isinstance(schema, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            projected["field_names"] = list(properties)
+    if isinstance(projected.get("description"), str):
+        projected["description"] = _clip_runtime_schema_text(
+            projected["description"], 600
+        )
+    return projected
+
+
+def _clip_runtime_schema_text(value: str, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
 
 
 @dataclass(frozen=True)
@@ -3530,9 +3862,10 @@ class AnalysisPreparationWorkflow:
                         for datasource_id, field in sorted(observed_fields)
                     ],
                 ))
-            lineages.append(lineage.model_copy(update={
-                "fact_bindings": bindings,
-                "unresolved_business_facts": unresolved,
+            lineages.append(InsightLineageContract.model_validate({
+                **lineage.model_dump(),
+                "fact_bindings": [binding.model_dump() for binding in bindings],
+                "unresolved_business_facts": [fact.model_dump() for fact in unresolved],
                 "lineage_status": "partial" if unresolved else "direct",
             }))
         return candidate.model_copy(update={"insight_lineage": lineages})

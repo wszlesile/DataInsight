@@ -312,8 +312,10 @@ export function streamTurnEvents(conversationId, turnId, onMessage, onError, onD
   )
 }
 
-export function submitRerunTurnTask(conversationId, turnId) {
-  return api.post(`/insight/conversations/${conversationId}/turns/${turnId}/rerun/task`, {})
+export function submitRerunTurnTask(conversationId, turnId, clarificationMode = 'same_turn') {
+  return api.post(`/insight/conversations/${conversationId}/turns/${turnId}/rerun/task`, {
+    clarification_mode: clarificationMode
+  })
 }
 
 export function rerunExecutionLocally(conversationId, turnId, executionId, analysisParameters = {}) {

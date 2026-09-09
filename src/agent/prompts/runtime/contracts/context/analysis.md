@@ -7,18 +7,20 @@
 1. 当前用户最新要求优先；用户明确改变对象、时间、筛选或输出目标时，不沿用冲突的历史口径。
 2. 会话补充业务规则用于解释业务名称、公式和固定口径，但不能覆盖用户本轮明确要求。
 3. `analysis_semantic_context` 保持本轮业务目标、业务问题和已确认血缘的连贯性；它是准备信息，不是 SQL、指标、图表或报告模板。
-4. `datasources` 是本轮可访问的完整数据源语义空间。`selected_datasource_ids` 非空时不重新宽泛选源，但仍只访问回答问题真正需要的来源。
+4. 工作视图中的 `selected_datasource_ids` 与 `datasource_index` 是本轮可访问的完整数据源语义空间。`datasource_details` 只展开当前工作声明的精确字段；它不是字段或来源边界，缺少的精确定义可通过本地 Schema 详情工具读取。`selected_datasource_ids` 非空时不重新宽泛选源，但仍只访问回答问题真正需要的来源。
 5. 历史摘要、执行记录、旧代码和派生产物帮助理解追问指代，不是当前数据事实；需要最新数据或新口径时重新查询。
+
+历史对话用于理解“用户前面如何表述和改变要求”；结构化会话记忆用于理解“分析做到哪一步、实际执行了什么”。历史对话不等于完整工具日志、代码或图表配置。两者结合解释指代，最新用户要求优先；历史失败实现不是应当继承的业务事实。即使本轮不是追问，也按此边界理解实际提供的历史信息。
 
 `analysis_semantic_context.semantic_references` 是知识参考来源，不是待查询的事实表。其 `metadata_schema` 保留原始字段说明、公式、适用范围与规则；按这些定义理解相关业务事实，不把参考来源本身加入查询或统计。参考中的定义若与当前要求冲突或仍有歧义，结合原始依据判断，必要时按本轮交互方式澄清。
 
 ## Schema 理解
 
-- `metadata_schema.name/description` 描述数据源的业务用途；`metadata_schema.properties` 是完整字段定义，没有按 Prompt 预算截断。
+- `datasource_index.schema_summary` 提供全部来源的字段发现信息；`datasource_details[*].metadata_schema.properties` 提供当前工作字段的完整定义。执行权威快照保留完整 Schema，没有按 Prompt 预算截断；未展开字段通过本地详情工具读取，不是字段边界丢失。
 - 每个属性的字段 key 是代码和查询使用的真实字段名；`name/displayName` 是用户可读业务名；`description/remark` 用于判断统计对象、单位、时间归属和业务含义。字段字面相似不能替代语义核对。
 - `property_type/type` 决定基础处理方式：字符串通常用于名称、编码、枚举和分组；数值用于有业务依据的聚合；时间字段用于范围、顺序和可比周期。
 - `all_properties_required=true` 等价于所有 `properties` 均在 `required`；`all_properties_queryable=true` 等价于所有属性均可查询，它们是去重表达，不是字段裁剪。
-- `query_contract.datasource_identifier` 是物理访问标识；字段边界使用显式 `query_contract.allowed_fields`，或通过 `allowed_fields_ref=metadata_schema.properties` 引用该来源的完整字段定义。两种表达等价，不必另外寻找重复的字段列表。不得把相邻数据源字段串用，也不得把 `datasource_name` 当作表名或路径。
+- 数据源对象中的 `datasource_identifier` 是物理访问标识；当前详情的 `metadata_schema.properties` 是已加载字段定义，`all_field_names` 是该来源的字段发现索引。不得把相邻数据源字段串用，也不得把 `datasource_name` 当作表名或路径。
 - `datasource_id`、`conversation_id`、`turn_id`、`execution_id` 和记录主键仅用于定位。不要从编号推导业务含义；用户可见内容优先使用 `datasource_name` 和 Schema 中的业务名称字段。
 
 ## Preparation 事实边界

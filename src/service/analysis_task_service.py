@@ -174,6 +174,20 @@ class AnalysisTaskService:
         self.session.flush()
         return bool(updated)
 
+    def mark_dispatch_failed(self, task_id: str, error_message: str) -> bool:
+        now = _now()
+        updated = self.session.query(InsightAnalysisTask).filter(
+            InsightAnalysisTask.task_id == task_id,
+            InsightAnalysisTask.status == 'queued',
+        ).update({
+            InsightAnalysisTask.status: 'failed',
+            InsightAnalysisTask.error_message: error_message,
+            InsightAnalysisTask.finished_at: now,
+            InsightAnalysisTask.updated_at: now,
+        }, synchronize_session='fetch')
+        self.session.flush()
+        return bool(updated)
+
     def mark_waiting_clarification(
         self,
         task_id: str,
@@ -233,8 +247,12 @@ class AnalysisTaskService:
         pending_items = [
             item for item in pending.get("items") or [] if isinstance(item, dict)
         ] or [pending]
-        submitted_items = [item for item in (answers or []) if isinstance(item, dict)]
-        if not submitted_items:
+        if answers is not None and (not isinstance(answers, list) or not answers or any(not isinstance(item, dict) for item in answers)):
+            return None, {}
+        submitted_items = list(answers or [])
+        if answers is None:
+            if len(pending_items) != 1:
+                return None, {}
             submitted_items = [{
                 "item_id": str(pending_items[0].get("item_id") or ""),
                 "option_id": str(option_id or ""),
@@ -243,12 +261,13 @@ class AnalysisTaskService:
         submitted_by_id = {
             str(item.get("item_id") or ""): item for item in submitted_items
         }
+        expected_ids = {str(item.get('item_id') or '') for item in pending_items}
+        if len(submitted_by_id) != len(submitted_items) or set(submitted_by_id) != expected_ids:
+            return None, {}
         resolved_answers: list[dict[str, Any]] = []
         for index, pending_item in enumerate(pending_items):
             item_id = str(pending_item.get("item_id") or "")
             submitted = submitted_by_id.get(item_id)
-            if submitted is None and len(pending_items) == 1:
-                submitted = submitted_items[0]
             if submitted is None:
                 return None, {}
             submitted_option_id = str(submitted.get("option_id") or "")
@@ -264,6 +283,12 @@ class AnalysisTaskService:
             if submitted_option_id and selected_option is None:
                 return None, {}
             normalized_answer = str(submitted.get("answer_text") or "").strip()
+            if selected_option is not None and normalized_answer and normalized_answer not in {
+                str(selected_option.get('label') or '').strip(),
+                str(selected_option.get('value') or '').strip(),
+            }:
+                # Do not persist two conflicting answers for the same question.
+                return None, {}
             if not normalized_answer and selected_option is not None:
                 normalized_answer = str(
                     selected_option.get("label")
@@ -371,7 +396,7 @@ class AnalysisTaskService:
     def _mark_stale_if_needed(self, task: InsightAnalysisTask) -> bool:
         now = _now()
         if task.status == "queued":
-            last_seen = task.created_at or now
+            last_seen = task.updated_at or task.created_at or now
             stale_seconds = max(5, int(Config.ANALYSIS_TASK_QUEUED_STALE_SECONDS or 30))
         elif task.status == "running":
             last_seen = task.heartbeat_at or task.started_at or task.created_at or now

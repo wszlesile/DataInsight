@@ -19,13 +19,16 @@ from agent.context_engineering_runtime import (
     get_memory_messages,
 )
 from agent.tools import (
+    accept_analysis_result,
     probe_analysis_data,
     request_analysis_clarification,
+    request_analysis_revision,
     submit_analysis_program,
 )
 from agent.runtime_prompt_loader import (
     describe_runtime_prompt,
     load_runtime_contract_prompt,
+    load_runtime_initial_contract_prompt,
     load_runtime_prompt,
     load_runtime_semantic_prompt,
 )
@@ -34,7 +37,14 @@ from agent.runtime_contract_registry import (
     required_runtime_contract_ids,
 )
 from agent.invocation_policy import normalize_output_contract
-from agent.runtime_reference import read_runtime_reference
+from agent.runtime_workspace import read_runtime_datasource_context
+from agent.runtime_working_context import (
+    RuntimeWorkingContextMiddleware,
+    plan_runtime_materials,
+    read_runtime_query_context,
+    request_runtime_probe,
+    select_runtime_work,
+)
 from config import Config
 from utils import logger
 from utils.llm_model_factory import (
@@ -116,18 +126,21 @@ def create_data_insight_agent(
     clarification_mode: str = "same_turn",
 ):
     """创建数据洞察 Agent，并保持现有工具契约不变。"""
-    tools = []
+    tools = [select_runtime_work, plan_runtime_materials, request_runtime_probe]
     if clarification_mode == "same_turn":
         tools.append(request_analysis_clarification)
     tools.append(probe_analysis_data)
     tools.append(submit_analysis_program)
-    tools.append(read_runtime_reference)
+    tools.append(accept_analysis_result)
+    tools.append(request_analysis_revision)
+    tools.append(read_runtime_datasource_context)
+    tools.append(read_runtime_query_context)
     return create_agent(
         model=create_data_insight_model(runtime_config),
         state_schema=CustomAgentState,
         context_schema=CustomContext,
         tools=tools,
-        middleware=[stop_after_saved_analysis],
+        middleware=[stop_after_saved_analysis, RuntimeWorkingContextMiddleware()],
     )
 
 
@@ -394,7 +407,7 @@ def build_prompt_messages(
         output_format,
         clarification_mode,
     )
-    contract_prompt = load_runtime_contract_prompt(
+    contract_prompt = load_runtime_initial_contract_prompt(
         query_capabilities,
         context_mode or "fresh_analysis",
         output_format,
@@ -443,7 +456,7 @@ def build_prompt_messages(
         clarification_mode,
     )
     logger.info(
-        "Runtime上下文清单 query_capabilities=%s contract_ids=%s context_mode=%s compiled_prompt=%s semantic_kernel=%s contract_packs=%s fixed_tokens=%s",
+        "Runtime上下文清单 query_capabilities=%s contract_ids=%s context_mode=%s compiled_prompt=%s initial_contracts=%s semantic_kernel=%s contract_packs=%s fixed_tokens=%s",
         list(query_capabilities),
         list(required_runtime_contract_ids(
             query_capabilities,
@@ -453,6 +466,7 @@ def build_prompt_messages(
         )),
         context_mode or "fresh_analysis",
         prompt_diagnostics["compiled"],
+        prompt_diagnostics["initial_contracts"],
         prompt_diagnostics["semantic_kernel"],
         prompt_diagnostics["contract_packs"],
         fixed_token_count,

@@ -6,6 +6,7 @@ from pathlib import Path
 from agent.runtime_contract_registry import (
     load_runtime_contract_pack,
     load_runtime_contract_text,
+    load_runtime_initial_contract_text,
     render_runtime_contract_manifest,
     required_runtime_contract_ids,
 )
@@ -49,6 +50,24 @@ def load_runtime_contract_prompt(
     )
     contract_text = load_runtime_contract_text(required)
     return f"<runtime-contracts>\n{contract_text}\n</runtime-contracts>".strip()
+
+
+@lru_cache(maxsize=16)
+def load_runtime_initial_contract_prompt(
+    query_capabilities: tuple[str, ...] = (),
+    context_mode: str = "fresh_analysis",
+    output_format: str = "standard",
+    clarification_mode: str = "same_turn",
+) -> str:
+    """Load the bounded first-turn view; full packs stay available locally."""
+    required = required_runtime_contract_ids(
+        query_capabilities,
+        context_mode,
+        output_format,
+        clarification_mode,
+    )
+    contract_text = load_runtime_initial_contract_text(required)
+    return f"<runtime-contract-summaries>\n{contract_text}\n</runtime-contract-summaries>".strip()
 
 
 @lru_cache(maxsize=16)
@@ -102,6 +121,14 @@ def describe_runtime_prompt(
             "estimated_tokens": estimate_text_tokens(semantic_kernel),
         },
         "contract_packs": packs,
+        "initial_contracts": {
+            "chars": len(load_runtime_initial_contract_prompt(
+                query_capabilities, context_mode, output_format, clarification_mode,
+            )),
+            "estimated_tokens": estimate_text_tokens(load_runtime_initial_contract_prompt(
+                query_capabilities, context_mode, output_format, clarification_mode,
+            )),
+        },
         "compiled": {
             "chars": len(compiled),
             "estimated_tokens": estimate_text_tokens(compiled),

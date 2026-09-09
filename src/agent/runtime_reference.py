@@ -1,6 +1,7 @@
 import hashlib
 
-from langchain.tools import ToolRuntime, tool
+from langchain.tools import tool
+from langgraph.prebuilt import ToolRuntime
 from pydantic import BaseModel, Field
 
 from agent.context_engineering_runtime import CustomContext
@@ -11,17 +12,20 @@ from agent.runtime_contract_registry import (
 
 
 class RuntimeReferenceInput(BaseModel):
-    contract_ids: list[str] = Field(
+    contract_id: str = Field(
         min_length=1,
-        description="Contract IDs from runtime-contract-manifest; request related references together.",
+        description=(
+            "One contract ID from runtime-contract-manifest for the current concrete code gap. "
+            "Read one reference, use it, then request another only if the next work still lacks a specific detail."
+        ),
     )
 
 
 @tool(args_schema=RuntimeReferenceInput)
 def read_runtime_reference(
-    runtime: ToolRuntime[CustomContext], contract_ids: list[str],
+    runtime: ToolRuntime[CustomContext], contract_id: str,
 ) -> dict:
-    """Read complete Python API usage and worked examples by contract ID when needed.
+    """Read one complete Python API usage reference when the current work needs it.
 
     Core rules are already supplied. This optional, local reference lookup does not
     query data or execute code. Examples are not business facts or report templates;
@@ -40,7 +44,8 @@ def read_runtime_reference(
         if (not item.startswith("result.") or item == result_pack)
         and (not item.startswith("interaction.") or item == interaction_pack)
     ]
-    requested = list(dict.fromkeys(item.strip() for item in contract_ids))
+    requested = [str(contract_id or '').strip()]
+    requested = [item for item in requested if item]
     references = []
     for contract_id in requested:
         if contract_id not in available:

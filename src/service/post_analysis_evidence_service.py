@@ -1722,6 +1722,7 @@ class LineageIndexer:
                 "datasource_identifier": implementation.get("datasource_identifier") or "",
                 "loader_options": implementation.get("loader_options") or {},
                 "filter_expressions": implementation.get("filter_expressions") or [],
+                "file_filters": implementation.get("file_filters") or [],
                 "aggregation_hints": implementation.get("aggregation_hints") or [],
                 "sql_context": implementation.get("sql_context") or {},
             }

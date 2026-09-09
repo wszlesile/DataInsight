@@ -51,6 +51,14 @@ def test_json_output_is_validated_locally():
         )
 
 
+@pytest.mark.parametrize('value', [float('nan'), float('inf'), float('-inf')])
+def test_json_output_rejects_nonfinite_values(value):
+    with pytest.raises(ValueError, match='NaN'):
+        validate_json_output({'nested': [value]}, {
+            'type': 'object', 'properties': {'nested': {'type': 'array', 'items': {'type': 'number'}}},
+        })
+
+
 def test_json_output_contract_requires_schema():
     with pytest.raises(ValueError, match="必须提供非空 JSON Schema"):
         normalize_output_contract({"type": "json"})

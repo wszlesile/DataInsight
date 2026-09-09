@@ -128,7 +128,7 @@
                 <div class="message-avatar ai">AI</div>
                 <div class="message-body">
                   <div class="progress-card">
-                    <div class="progress-title">系统工作流</div>
+                    <div class="progress-title">分析过程</div>
                     <div class="progress-list">
                       <div
                         v-for="progress in item.progressItems"
@@ -136,7 +136,8 @@
                         class="progress-item"
                         :class="progress.level"
                       >
-                        {{ progress.message }}
+                        <strong v-if="progress.title">{{ progress.title }}</strong>
+                        <span>{{ progress.message }}</span>
                       </div>
                     </div>
                   </div>
@@ -279,7 +280,7 @@
                 <div class="message-avatar ai">AI</div>
                 <div class="message-body">
                   <div class="progress-card">
-                    <div class="progress-title">系统工作流</div>
+                    <div class="progress-title">分析过程</div>
                     <div v-if="currentProgressItems.length" class="progress-list">
                       <div
                         v-for="progress in currentProgressItems"
@@ -287,7 +288,8 @@
                         class="progress-item"
                         :class="progress.level"
                       >
-                        {{ progress.message }}
+                        <strong v-if="progress.title">{{ progress.title }}</strong>
+                        <span>{{ progress.message }}</span>
                       </div>
                     </div>
                     <div v-else class="progress-empty">正在准备分析上下文...</div>
@@ -336,6 +338,7 @@
                       </div>
                     </div>
                     <div class="clarification-actions">
+                      <button class="action-btn" type="button" :disabled="clarificationSubmitting" @click="onStopAnalysis">停止分析</button>
                       <button
                         class="action-btn primary"
                         type="button"
@@ -466,7 +469,8 @@
             </template>
           </div>
 
-          <ChatInput :loading="loading" @send="onSendMessage" @stop="onStopAnalysis" />
+          <el-switch v-model="clarificationEnabled" active-text="允许轮内澄清" :disabled="loading || !!currentClarification" />
+          <ChatInput :loading="loading && !currentClarification" @send="onSendMessage" @stop="onStopAnalysis" />
         </section>
       </div>
     </div>
@@ -1149,6 +1153,7 @@ const conversations = ref([])
 const collects = ref([])
 const activeConversationId = ref(0)
 const loading = ref(false)
+const clarificationEnabled = ref(true)
 const chatHistory = ref([])
 const currentQuestion = ref('')
 const currentChartArtifactId = ref(0)
@@ -2018,10 +2023,29 @@ const downloadChartAsImage = async (chart, filename) => {
 }
 
 const createProgressItem = (event) => ({
-  id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+  id: event.progress?.activity_id || event.event_id || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+  eventId: event.event_id || '',
+  title: event.progress?.title || '',
+  state: event.progress?.state || '',
   level: event.level || (event.type === 'assistant' ? 'assistant' : 'info'),
   message: event.message
 })
+
+const normalizeProgressEvents = (events = []) => {
+  const items = []
+  const positions = new Map()
+  for (const event of events) {
+    if (!event?.message) continue
+    const item = createProgressItem(event)
+    if (positions.has(item.id)) {
+      items[positions.get(item.id)] = item
+    } else {
+      positions.set(item.id, items.length)
+      items.push(item)
+    }
+  }
+  return items
+}
 
 const isInternalAssistantMessage = (message) => {
   if (!message) return false
@@ -2053,9 +2077,16 @@ const scrollToBottom = () => {
 
 const addProgressItem = (event) => {
   if (!event?.message) return
+  const item = createProgressItem(event)
+  const existingIndex = currentProgressItems.value.findIndex((value) => value.id === item.id)
+  if (existingIndex >= 0) {
+    currentProgressItems.value.splice(existingIndex, 1, item)
+    scrollToBottom()
+    return
+  }
   const lastItem = currentProgressItems.value[currentProgressItems.value.length - 1]
   if (lastItem?.message === event.message) return
-  currentProgressItems.value.push(createProgressItem(event))
+  currentProgressItems.value.push(item)
   scrollToBottom()
 }
 
@@ -2135,6 +2166,8 @@ const attachRunningTurn = (task) => {
   currentTurnId.value = Number(task.turn_id)
   currentRunMode.value = task.task_type === 'rerun' ? 'rerun' : 'new'
   currentQuestion.value = task.request?.user_message || currentQuestion.value || '正在分析中...'
+  const runningHistory = chatHistory.value.find((item) => Number(item.turnId) === Number(task.turn_id))
+  currentProgressItems.value = [...(runningHistory?.progressItems || [])]
   removeHistoryTurn(task.turn_id)
   loading.value = true
   const resumeMessage = task.status === 'queued'
@@ -2171,7 +2204,7 @@ const mapHistoryItem = (item) => ({
   tables: normalizeTables(item.tables || []),
   report: item.report,
   reportEvidenceRefs: item.report_evidence_refs || {},
-  progressItems: []
+  progressItems: normalizeProgressEvents(item.progress || [])
 })
 
 const fetchConversations = async () => {
@@ -3055,7 +3088,7 @@ const onRerunTurn = async (item) => {
   scrollToBottom()
 
   try {
-    const response = await submitRerunTurnTask(activeConversationId.value, item.turnId)
+    const response = await submitRerunTurnTask(activeConversationId.value, item.turnId, clarificationEnabled.value ? 'same_turn' : 'disabled')
     const task = response.data?.data
     if (!response.data?.success || !task?.turn_id) {
       throw new Error(response.data?.message || '提交刷新分析任务失败')
@@ -3730,6 +3763,7 @@ const handleStreamDone = async () => {
 }
 
 const submitClarificationAnswer = async () => {
+  if (clarificationSubmitting.value) return
   if (!currentTaskId.value || !currentClarification.value) return
   if (!clarificationReady.value) return
   const answers = clarificationItems.value.map((item) => ({
@@ -3767,6 +3801,16 @@ const submitClarificationAnswer = async () => {
 
 const onSendMessage = async (content) => {
   if (!content.trim()) return
+  if (currentClarification.value) {
+    if (clarificationSubmitting.value) return
+    if (clarificationItems.value.length !== 1 || !clarificationItems.value[0].allow_free_text) {
+      ElMessage.info('请在上方澄清区域逐项补充或选择答案')
+      return
+    }
+    updateClarificationText(clarificationItems.value[0], content.trim())
+    await submitClarificationAnswer()
+    return
+  }
   if (!activeNamespace.value) {
     ElMessage.warning('请先创建或选择一个洞察空间')
     return
@@ -3784,6 +3828,7 @@ const onSendMessage = async (content) => {
       namespace_id: activeNamespace.value,
       conversation_id: activeConversationId.value || '',
       user_message: content,
+      clarification_mode: clarificationEnabled.value ? 'same_turn' : 'disabled',
       datasource: currentDataSource.value
     })
     const task = response.data?.data
@@ -3809,9 +3854,11 @@ const onSendMessage = async (content) => {
 }
 
 const onStopAnalysis = async () => {
-  if (!loading.value || !currentTaskId.value) return
+  if ((!loading.value && !currentClarification.value) || !currentTaskId.value) return
   try {
     await cancelAnalysisTask(currentTaskId.value)
+    currentClarification.value = null
+    clarificationAnswers.value = {}
     stopCurrentStream()
     addProgressItem({
       type: 'status',
@@ -3916,7 +3963,8 @@ onUnmounted(() => {
 .progress-card, .result-card { border-radius: 18px; padding: 16px; background: #fff; border: 1px solid #dbe3ef; }
 .progress-title, .result-title { font-size: 14px; font-weight: 700; color: #0f172a; margin-bottom: 12px; }
 .progress-list, .detail-list, .turn-detail, .detail-section { display: flex; flex-direction: column; gap: 12px; }
-.progress-item { padding: 10px 12px; border-radius: 12px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+.progress-item { padding: 10px 12px; border-radius: 12px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; display: flex; flex-direction: column; gap: 2px; }
+.progress-item strong { font-size: 12px; }
 .progress-item.info { background: #eef5ff; color: #245b9f; }
 .progress-item.success { background: #edf9f0; color: #2f7d4d; }
 .progress-item.warning { background: #fff7e8; color: #9a6700; }

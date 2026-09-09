@@ -14,18 +14,102 @@ from agent.tools import (
     _extend_query_dependency_ranges,
     _tool_error_message,
     _resolve_execute_python_source,
+    _review_source_patch_range,
     _validate_generated_code_contract,
     execute_python,
 )
 
 
 class RuntimeSourcePatchRepairTest(unittest.TestCase):
+    def test_review_anchor_resolves_to_smallest_complete_statement(self):
+        source = (
+            'rate = revenue / cost\n'
+            'report = f"gross margin is {rate:.2%}"\n'
+            'result = save_analysis_result(analysis_report=report)\n'
+        )
+
+        target = _review_source_patch_range(source, 'gross margin is')
+
+        self.assertEqual((target['start_line'], target['end_line']), (2, 2))
+        self.assertEqual(target['source'], 'report = f"gross margin is {rate:.2%}"')
+
+    def test_review_patch_uses_latest_authorized_successful_candidate(self):
+        source = 'value = 1\nreport = f"value={value}"\n'
+        base = SimpleNamespace(
+            id=17,
+            execution_status='success',
+            generated_code=source,
+            used_datasource_ids_json='[3, 4]',
+            result_payload_json=json.dumps({'review_revision_target': {
+                'mode': 'review_line_patch',
+                'base_execution_id': 17,
+                'base_source_sha256': __import__('hashlib').sha256(source.strip().encode()).hexdigest(),
+                'allowed_ranges': [{'start_line': 2, 'end_line': 2}],
+            }}),
+        )
+        session = MagicMock()
+        session.query.return_value.filter.return_value.first.return_value = base
+        session.query.return_value.filter.return_value.order_by.return_value.first.return_value = base
+        with patch('config.database.SessionLocal', return_value=session):
+            repaired, ids, parent, kind = _resolve_execute_python_source(
+                conversation_id=1,
+                turn_id=2,
+                code='',
+                used_datasource_ids=[],
+                base_execution_id=17,
+                patches=[SourceCodePatch(
+                    start_line=2,
+                    end_line=2,
+                    replacement='report = f"corrected={value}"',
+                )],
+            )
+
+        self.assertEqual(repaired, 'value = 1\nreport = f"corrected={value}"\n')
+        self.assertEqual(ids, [3, 4])
+        self.assertEqual(parent, 17)
+        self.assertEqual(kind, 'llm_review_patch')
+
+    def test_review_patch_rejects_unapproved_statement(self):
+        source = 'value = 1\nreport = f"value={value}"\n'
+        base = SimpleNamespace(
+            id=17,
+            execution_status='success',
+            generated_code=source,
+            used_datasource_ids_json='[3]',
+            result_payload_json=json.dumps({'review_revision_target': {
+                'mode': 'review_line_patch',
+                'base_execution_id': 17,
+                'base_source_sha256': __import__('hashlib').sha256(source.strip().encode()).hexdigest(),
+                'allowed_ranges': [{'start_line': 2, 'end_line': 2}],
+            }}),
+        )
+        session = MagicMock()
+        session.query.return_value.filter.return_value.first.return_value = base
+        session.query.return_value.filter.return_value.order_by.return_value.first.return_value = base
+        with patch('config.database.SessionLocal', return_value=session):
+            with self.assertRaisesRegex(ValueError, 'allowed_ranges'):
+                _resolve_execute_python_source(
+                    conversation_id=1,
+                    turn_id=2,
+                    code='',
+                    used_datasource_ids=[],
+                    base_execution_id=17,
+                    patches=[SourceCodePatch(
+                        start_line=1,
+                        end_line=1,
+                        replacement='value = 2',
+                    )],
+                )
+
     def test_failed_patch_returns_original_revision_and_all_input_errors(self):
         source = 'frame = load(\n    sql="select amount from records",\n)\nprint(frame["status"])\n'
         base = SimpleNamespace(
             execution_status='failed',
             generated_code=source,
             used_datasource_ids_json='[3, 4]',
+            result_payload_json=json.dumps({'repair_target': {
+                'base_execution_id': 17, 'mode': 'line_patch',
+            }}),
         )
         session = MagicMock()
         session.query.return_value.filter.return_value.first.return_value = base
@@ -38,11 +122,11 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
                 )
         error = caught.exception
         self.assertIn('used_datasource_ids', str(error))
-        self.assertIn('语法错误', str(error))
+        self.assertIn('完整替换一个 Python 语句', str(error))
         self.assertEqual(error.source, source)
         self.assertEqual(error.diagnostics['inherited_used_datasource_ids'], [3, 4])
         self.assertFalse(error.diagnostics['new_execution_created'])
-        self.assertEqual(error.diagnostics['candidate_syntax_error']['line_no'], 1)
+        self.assertNotIn('candidate_syntax_error', error.diagnostics)
 
         runtime = SimpleNamespace(context=SimpleNamespace(conversation_id=1, turn_id=2), tool_call_id='patch')
         with (
@@ -53,14 +137,19 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
         ):
             message = execute_python.func(runtime=runtime, base_execution_id=17)
         payload = json.loads(message.content)
-        self.assertEqual(payload['repair_target']['base_execution_id'], 17)
-        self.assertEqual(payload['repair_target']['allowed_ranges'][0]['source'], '\n'.join(source.splitlines()[:3]))
+        self.assertNotIn('repair_target', payload)
+        self.assertEqual(payload['current_failed_code'], source)
         self.assertEqual(payload['code_error_context']['location_domain'], 'python_source')
         create.assert_not_called()
         session.close.assert_called_once()
 
     def test_patch_scope_is_a_set_and_still_inherited_from_base(self):
-        base = SimpleNamespace(execution_status='failed', generated_code='value = 1\n', used_datasource_ids_json='[3, 4]')
+        base = SimpleNamespace(
+            execution_status='failed', generated_code='value = 1\n', used_datasource_ids_json='[3, 4]',
+            result_payload_json=json.dumps({'repair_target': {
+                'base_execution_id': 17, 'mode': 'line_patch',
+            }}),
+        )
         session = MagicMock()
         session.query.return_value.filter.return_value.first.return_value = base
         with patch('config.database.SessionLocal', return_value=session):
@@ -73,6 +162,21 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
         self.assertEqual(ids, [3, 4])
         self.assertEqual(parent, 17)
         self.assertEqual(kind, 'llm_patch_repair')
+
+    def test_patch_rejects_a_failure_without_backend_patch_authorization(self):
+        base = SimpleNamespace(
+            execution_status='failed', generated_code='value = 1\n',
+            used_datasource_ids_json='[3]', result_payload_json='{}',
+        )
+        session = MagicMock()
+        session.query.return_value.filter.return_value.first.return_value = base
+        with patch('config.database.SessionLocal', return_value=session):
+            with self.assertRaisesRegex(ValueError, '完整程序修复'):
+                _resolve_execute_python_source(
+                    conversation_id=1, turn_id=2, code='', used_datasource_ids=[3],
+                    base_execution_id=17,
+                    patches=[SourceCodePatch(start_line=1, end_line=1, replacement='value = 2')],
+                )
 
     def test_key_error_targets_mapping_construction_not_unrelated_namesakes(self):
         source = (
@@ -103,8 +207,12 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
             error_message="'status'", repair_instructions=[], current_failed_code=source,
             code_error_context=context,
         ).content)
-        self.assertEqual(len(payload['repair_target']['allowed_ranges']), 3)
-        self.assertNotIn('other', json.dumps(payload['repair_target']))
+        self.assertEqual(payload['repair_target']['base_execution_id'], 17)
+        self.assertEqual(
+            [(item['start_line'], item['end_line']) for item in payload['repair_target']['allowed_ranges']],
+            [(2, 4), (5, 5), (9, 9)],
+        )
+        self.assertEqual(payload['current_failed_code'], '')
 
     def test_patch_changes_only_the_addressed_lines(self):
         source = "a = 1\nb = (\n    2\n)\nc = a + b\nprint(c)\n"
@@ -159,15 +267,9 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
         )
         payload = json.loads(message.content)
 
-        self.assertEqual(payload["repair_target"]["base_execution_id"], 676)
-        self.assertEqual(payload["repair_target"]["line_count"], 2)
-        self.assertEqual(payload["repair_target"]["mode"], "line_patch")
-        self.assertEqual(payload["repair_target"]["allowed_ranges"][0]["start_line"], 2)
-        self.assertEqual(payload["current_failed_code"], "")
-        self.assertEqual(
-            payload["repair_target"]["full_source_location"],
-            "preceding assistant tool call arguments",
-        )
+        self.assertEqual(payload['repair_target']['base_execution_id'], 676)
+        self.assertEqual(payload['repair_target']['allowed_ranges'][0]['start_line'], 2)
+        self.assertEqual(payload['current_failed_code'], '')
 
     def test_key_error_feedback_locates_all_static_column_references(self):
         source = (
@@ -200,7 +302,11 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
             code_error_context=context,
         )
         payload = json.loads(message.content)
-        self.assertEqual(len(payload["repair_target"]["allowed_ranges"]), 3)
+        self.assertEqual(payload['repair_target']['base_execution_id'], 679)
+        self.assertEqual(
+            {(item['start_line'], item['end_line']) for item in payload['repair_target']['allowed_ranges']},
+            {(1, 1), (2, 2), (3, 3)},
+        )
         self.assertIn("一次核对并修复全部相关定义", payload["repair_instructions"][0])
 
     def test_name_error_feedback_locates_all_variable_references(self):
@@ -219,31 +325,27 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
         )
         self.assertEqual(len(context["suggested_patch_ranges"]), 2)
 
-    def test_patch_accepts_valid_expression_lines_within_a_statement(self):
+    def test_patch_rejects_expression_lines_within_a_statement(self):
         source = "query = (\n    'select * ' \n    'from demo'\n)\nresult = run(query)\n"
 
-        repaired = _apply_source_code_patches(
-            source,
-            [SourceCodePatch(start_line=2, end_line=3, replacement="    'select count(*) from demo'")],
-        )
-        self.assertEqual(repaired, "query = (\n    'select count(*) from demo'\n)\nresult = run(query)\n")
+        with self.assertRaisesRegex(ValueError, '完整替换一个 Python 语句'):
+            _apply_source_code_patches(
+                source,
+                [SourceCodePatch(start_line=2, end_line=3, replacement="    'select count(*) from demo'")],
+            )
 
-    def test_patch_accepts_adjacent_statements_and_preserves_other_source(self):
+    def test_patch_rejects_multiple_adjacent_statements_as_one_edit(self):
         source = 'first = 1\nsecond = 2\nresult = first + second\n'
-        repaired = _apply_source_code_patches(source, [
-            SourceCodePatch(start_line=1, end_line=2, replacement='first = 3\nsecond = 4'),
-        ])
-        self.assertEqual(repaired, 'first = 3\nsecond = 4\nresult = first + second\n')
-
-    def test_patch_preserves_indentation_and_rejects_invalid_argument_edits(self):
-        source = 'if True:\n    value = build(\n        field="wrong",\n    )\nresult = value\n'
-        repaired = _apply_source_code_patches(source, [
-            SourceCodePatch(start_line=3, end_line=3, replacement='        field="correct",'),
-        ])
-        self.assertIn('field="correct"', repaired)
-        with self.assertRaisesRegex(ValueError, '合成后的完整代码存在语法错误'):
+        with self.assertRaisesRegex(ValueError, '完整替换一个 Python 语句'):
             _apply_source_code_patches(source, [
-                SourceCodePatch(start_line=3, end_line=4, replacement='        field="correct",'),
+                SourceCodePatch(start_line=1, end_line=2, replacement='first = 3\nsecond = 4'),
+            ])
+
+    def test_patch_rejects_argument_edits_inside_a_statement(self):
+        source = 'if True:\n    value = build(\n        field="wrong",\n    )\nresult = value\n'
+        with self.assertRaisesRegex(ValueError, '完整替换一个 Python 语句'):
+            _apply_source_code_patches(source, [
+                SourceCodePatch(start_line=3, end_line=3, replacement='        field="correct",'),
             ])
 
     def test_patch_rejects_syntax_error_before_execution_is_created(self):
@@ -255,29 +357,20 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
                 [SourceCodePatch(start_line=1, end_line=1, replacement="query = '''select")],
             )
 
-    def test_patch_can_repair_the_compiler_located_line_of_invalid_source(self):
+    def test_patch_rejects_invalid_base_source(self):
         source = (
             'items = [{"name": "A"}]\n'
             'text = f"values: {\',\'.join([f\'{row[\\"name\\"]}\' for row in items])}"\n'
             'result = text\n'
         )
 
-        repaired = _apply_source_code_patches(
-            source,
-            [SourceCodePatch(
-                start_line=2,
-                end_line=2,
-                replacement=(
-                    'labels = [str(row["name"]) for row in items]\n'
-                    'text = f"values: {\',\'.join(labels)}"'
-                ),
-            )],
-        )
+        with self.assertRaisesRegex(ValueError, '无法建立可靠'):
+            _apply_source_code_patches(
+                source,
+                [SourceCodePatch(start_line=2, end_line=2, replacement='text = "values"')],
+            )
 
-        self.assertIn('labels = [str(row["name"])', repaired)
-        compile(repaired, '<test>', 'exec')
-
-    def test_syntax_repair_can_patch_multiple_nearby_same_root_failures(self):
+    def test_patch_rejects_syntax_error_even_when_lines_are_known(self):
         source = (
             'items = [{"name": "A"}]\n'
             "first = f\"values: {','.join([f'{row[\\\"name\\\"]}' for row in items])}\"\n"
@@ -285,30 +378,16 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
             'result = first + second\n'
         )
 
-        repaired = _apply_source_code_patches(
-            source,
-            [
-                SourceCodePatch(
-                    start_line=2,
-                    end_line=2,
-                    replacement='first = "values: " + ",".join(row["name"] for row in items)',
-                ),
-                SourceCodePatch(
-                    start_line=3,
-                    end_line=3,
-                    replacement='second = "values: " + ",".join(row["name"] for row in items)',
-                ),
-            ],
-        )
-
-        compile(repaired, '<test>', 'exec')
-        self.assertIn('first = "values: "', repaired)
-        self.assertIn('second = "values: "', repaired)
+        with self.assertRaisesRegex(ValueError, '无法建立可靠'):
+            _apply_source_code_patches(
+                source,
+                [SourceCodePatch(start_line=2, end_line=2, replacement='first = "values"')],
+            )
 
     def test_invalid_source_patch_must_cover_the_compiler_error_line(self):
         source = 'prefix = "ok"\ntext = f"{value[\\"name\\"]}"\nresult = text\n'
 
-        with self.assertRaisesRegex(ValueError, "必须覆盖编译器定位行"):
+        with self.assertRaisesRegex(ValueError, "无法建立可靠"):
             _apply_source_code_patches(
                 source,
                 [SourceCodePatch(start_line=1, end_line=1, replacement='prefix = "fixed"')],
@@ -337,7 +416,7 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
             current_failed_code=code,
         )
         payload = json.loads(message.content)
-        self.assertEqual(payload["repair_target"]["base_execution_id"], 678)
+        self.assertNotIn('repair_target', payload)
 
     def test_structural_contract_error_does_not_offer_line_patch(self):
         message = _tool_error_message(

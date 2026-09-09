@@ -1822,7 +1822,39 @@ def test_preparation_result_exposes_only_enriched_selected_schema_to_formal_anal
         "结构",
         "业务含义",
     ]
-    assert "question_coverage" not in prompt_snapshot["analysis_semantic_context"]
+    question_coverage = prompt_snapshot["analysis_semantic_context"][
+        "question_fact_coverage"
+    ]
+    assert question_coverage == [{
+        "question_id": "question_1",
+        "coverage_status": "direct",
+        "datasource_ids": [11, 12],
+        "fact_coverage": [
+            {
+                "fact_id": f"question_1_fact_{index}",
+                "coverage_status": "direct",
+                "datasource_ids": [11, 12],
+                "supporting_datasource_ids": [],
+                "semantic_reference_datasource_ids": [],
+                "derived_from_fact_ids": [],
+                "coverage_reason": "合同与客户来源共同支撑该事实",
+            }
+            for index in range(1, 4)
+        ],
+        "coverage_reason": "合同提供事实，客户提供业务归属",
+    }]
+    probe_agenda = prompt_snapshot["analysis_semantic_context"][
+        "runtime_probe_agenda"
+    ]
+    assert "question_work" not in probe_agenda
+    assert probe_agenda["pending_technical_checks"] == [{
+        "check_id": "relationship:contract_customer",
+        "kind": "relationship_joinability",
+        "relationship_id": "contract_customer",
+        "datasource_ids": [11, 12],
+        "fields": {"left": ["customer_id"], "right": ["id"]},
+        "purpose": "确认该关系是否可作为正式查询中的连接路径。",
+    }]
     assert prompt_snapshot["analysis_semantic_context"]["insight_lineage"][0][
         "relationship_ids"
     ] == ["contract_customer"]
@@ -1887,6 +1919,63 @@ def test_preparation_result_exposes_only_enriched_selected_schema_to_formal_anal
         "declared_relationships" not in item
         for item in prompt_snapshot["selected_datasource_snapshot"]
     )
+
+
+def test_runtime_probe_agenda_keeps_only_unresolved_technical_field_mapping():
+    context = _business_context().model_copy(update={
+        "relationships": [
+            _business_context().relationships[0].model_copy(update={
+                "joinability": "joinable",
+                "evidence_basis": "schema",
+            })
+        ],
+    })
+    result = PreparationResult(
+        intent=_intent(),
+        selection=_selection(),
+        business_context=context,
+        selected_snapshot=enrich_selected_datasource_schemas(
+            _snapshot(),
+            selection=_selection(),
+            business_context=context,
+        ),
+        query_capabilities=("sql",),
+        probe_observations=({
+            "kind": "distinct_values",
+            "status": "verified",
+            "complete": True,
+            "datasource_id": 11,
+            "field": "status",
+            "facts": {
+                "values": [{"value": "active"}],
+                "requested_value_resolutions": [
+                    {
+                        "requested_value": "在途",
+                        "status": "unresolved",
+                        "observed_value": "",
+                    },
+                    {
+                        "requested_value": "有效",
+                        "status": "exact",
+                        "observed_value": "active",
+                    },
+                ],
+            },
+        },),
+    )
+
+    agenda = result.prompt_snapshot()["analysis_semantic_context"][
+        "runtime_probe_agenda"
+    ]
+
+    assert agenda["pending_technical_checks"] == [{
+        "check_id": "field_resolution:11:status",
+        "kind": "field_value_resolution",
+        "datasource_ids": [11],
+        "field": "status",
+        "requested_values": ["在途"],
+        "purpose": "确认用户业务条件与字段真实取值是否可对应。",
+    }]
 
 
 def test_prompt_snapshot_keeps_selected_datasource_when_lineage_binding_is_unsupported():
@@ -3045,6 +3134,22 @@ def test_probe_fact_resolution_merges_supported_observation_locally():
         binding.datasource_id == 11 and "status" in binding.fields
         for binding in result.insight_lineage[0].fact_bindings
     )
+    keys = [(binding.fact_id, binding.datasource_id)
+            for binding in result.insight_lineage[0].fact_bindings]
+    assert len(keys) == len(set(keys))
+    assert result.relationships == candidate.relationships
+    assert candidate.insight_lineage[0].unresolved_business_facts
+    original_fields = {
+        field for binding in lineage.fact_bindings
+        if binding.fact_id == "question_1_fact_1" and binding.datasource_id == 11
+        for field in binding.fields
+    }
+    resolved_fields = {
+        field for binding in result.insight_lineage[0].fact_bindings
+        if binding.fact_id == "question_1_fact_1" and binding.datasource_id == 11
+        for field in binding.fields
+    }
+    assert resolved_fields == original_fields | {"status"}
 
 
 def test_probe_fact_resolution_removes_only_unsupported_observed_field():

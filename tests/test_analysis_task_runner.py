@@ -15,7 +15,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from agent.invoker import AgentRequest
 from config.database import Base
-from model import InsightAnalysisTask, InsightNsConversation, InsightNsTurn
+from model import InsightAnalysisTask, InsightNsConversation, InsightNsMessage, InsightNsTurn
 from service.analysis_task_runner import AnalysisTaskRunner
 from service.analysis_task_service import AnalysisTaskService
 
@@ -232,6 +232,62 @@ class AnalysisTaskRunnerTestCase(unittest.TestCase):
         saved_turn = self.session.query(InsightNsTurn).filter_by(id=40).first()
         self.assertEqual("waiting_clarification", saved_task.status)
         self.assertEqual("waiting_clarification", saved_turn.status)
+
+    def test_work_progress_event_is_persisted_for_refresh_recovery(self):
+        self.session.add(InsightNsConversation(
+            id=21,
+            insight_namespace_id=7,
+            title="test",
+            status="active",
+            summary_text="",
+            active_datasource_snapshot="{}",
+            last_turn_no=1,
+            user_message="分析趋势",
+            insight_result="",
+        ))
+        self.session.add(InsightNsTurn(
+            id=41,
+            conversation_id=21,
+            turn_no=1,
+            user_query="分析趋势",
+            selected_datasource_ids_json="[]",
+            selected_datasource_snapshot_json="[]",
+            final_answer="",
+            status="running",
+            error_message="",
+        ))
+        task = AnalysisTaskService(self.session).create_task(
+            username="alice",
+            namespace_id=7,
+            conversation_id=21,
+            turn_id=41,
+            task_type="new_analysis",
+            request_payload={"user_message": "分析趋势"},
+        )
+        self.session.commit()
+
+        event = {
+            "type": "status",
+            "stage": "work_progress",
+            "event_id": "event-1",
+            "conversation_id": 21,
+            "turn_id": 41,
+            "message": "正在核实数据与查询口径。",
+            "progress": {
+                "activity_id": "tool:probe-1",
+                "title": "核实数据与查询口径",
+                "state": "running",
+            },
+        }
+        with patch("config.database.SessionLocal", self.session_factory):
+            AnalysisTaskRunner._persist_progress_event(event, task.id)
+
+        saved = self.session.query(InsightNsMessage).filter_by(
+            turn_id=41,
+            message_kind="analysis_progress",
+        ).one()
+        self.assertEqual(task.id, saved.analysis_task_id)
+        self.assertIn("tool:probe-1", saved.content_json)
 
 
 if __name__ == "__main__":

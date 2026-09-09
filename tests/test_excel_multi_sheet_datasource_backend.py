@@ -147,7 +147,11 @@ class ExcelMultiSheetDatasourceBackendTestCase(unittest.TestCase):
         )
 
         self.assertIsNotNone(message)
-        self.assertIn('"sheet_name": "detail"', message.content)
+        runtime_payload = json.loads(
+            message.content.split("</runtime-context-instructions>\n", 1)[1]
+            .rsplit("\n</runtime-datasource-envelope>", 1)[0]
+        )
+        self.assertEqual(runtime_payload["datasources"][0]["sheet_name"], "detail")
         self.assertIn("sheet_name", message.content)
         self.assertIn("load_local_file", message.content)
 
@@ -227,7 +231,14 @@ class ExcelMultiSheetDatasourceBackendTestCase(unittest.TestCase):
             )
 
             self.assertIsNotNone(message)
-            self.assertIn('"recommended_loader": "load_local_file_low_memory"', message.content)
+            runtime_payload = json.loads(
+                message.content.split("</runtime-context-instructions>\n", 1)[1]
+                .rsplit("\n</runtime-datasource-envelope>", 1)[0]
+            )
+            self.assertEqual(
+                runtime_payload["datasources"][0]["recommended_loader"],
+                "load_local_file_low_memory",
+            )
             self.assertNotIn("file_size_bytes", message.content)
         finally:
             Config.LOCAL_FILE_LOW_MEMORY_THRESHOLD_BYTES = original_threshold

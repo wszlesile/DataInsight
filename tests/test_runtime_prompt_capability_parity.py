@@ -3,6 +3,9 @@ from pathlib import Path
 import re
 import sys
 
+import pandas as pd
+import pytest
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -10,6 +13,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from agent.runtime_contract_registry import (
+    infer_query_capabilities_from_snapshot,
     load_runtime_contract_text,
     runtime_contract_pack_ids,
 )
@@ -52,7 +56,7 @@ def test_every_exposed_runtime_api_is_documented_by_a_contract():
 
 
 def test_execution_contract_preserves_baseline_closed_loop_capabilities():
-    contract = _contract("execution_core.md")
+    contract = _contract("execution/core.md")
 
     markers = (
         'execution_intent = "analysis"',
@@ -75,8 +79,14 @@ def test_execution_contract_preserves_baseline_closed_loop_capabilities():
         assert marker in contract
 
 
+def test_file_query_contract_uses_injected_functions_not_contract_id_as_import_path():
+    contract = _contract("query/local_file.md")
+    assert "已直接注入代码执行命名空间" in contract
+    assert "不能从 `query.local_file`、`runtime_api`" in contract
+
+
 def test_time_series_contract_preserves_native_dialect_capabilities():
-    contract = _contract("query_time_series.md")
+    contract = _contract("query/time_series.md")
 
     markers = (
         "time_bucket('1 minute'",
@@ -97,9 +107,9 @@ def test_time_series_contract_preserves_native_dialect_capabilities():
 
 
 def test_context_and_artifact_contracts_preserve_semantic_capabilities():
-    context = _contract("context_analysis.md")
-    artifacts = _contract("result_artifacts.md")
-    followup = _contract("context_followup.md")
+    context = _contract("context/analysis.md")
+    artifacts = _contract("result/artifacts.md")
+    followup = _contract("context/followup.md")
 
     for marker in (
         "metadata_schema.properties",
@@ -167,8 +177,8 @@ def test_runtime_prompt_keeps_evidence_out_of_formal_analysis():
 
 def test_canonical_runtime_examples_satisfy_static_contracts():
     for filename, example_id in (
-        ("query_relational.md", "relational"),
-        ("query_local_file.md", "local_file"),
+        ("query/relational.md", "relational"),
+        ("query/local_file.md", "local_file"),
     ):
         contract = _contract(filename)
         match = re.search(
@@ -178,3 +188,89 @@ def test_canonical_runtime_examples_satisfy_static_contracts():
         )
         assert match is not None
         assert _validate_generated_code_contract(match.group(1)) is None
+
+
+@pytest.mark.parametrize("capabilities", [
+    ("sql",), ("time_series",), ("local_file",),
+    ("minio_file",), ("api",), ("sql", "time_series", "local_file"),
+])
+@pytest.mark.parametrize("output_format", ["standard", "text", "json"])
+@pytest.mark.parametrize("context_mode", ["fresh_analysis", "followup"])
+@pytest.mark.parametrize("clarification_mode", ["same_turn", "disabled"])
+def test_delivered_prompt_preserves_common_semantics_across_modes(
+    capabilities, output_format, context_mode, clarification_mode,
+):
+    prompt = load_runtime_prompt(
+        capabilities, context_mode, output_format, clarification_mode,
+    )
+    for marker in (
+        "真实列、字段类型、分组粒度和排序键",
+        "多维聚合结果继续显式保留全部维度",
+        "排序使用原始时间、数值或等级键",
+        "不能用 `head(N)`",
+        "有效样本量",
+        "分子复用同一数量或筛选结果",
+        "analysis_semantic_context.analysis_as_of_date",
+        "实际最大日期或最大已完成周期",
+        "`COUNT` 为 0",
+        "某个金额、比率或其他指标为 0 不等于总体为空",
+    ):
+        assert marker in prompt
+    assert ("# context.followup" in prompt) == (context_mode == "followup")
+    assert ("# result.artifacts" in prompt) == (output_format == "standard")
+    if output_format == "standard":
+        for marker in (
+            "支持 0 到 10 的整数", "不保证用字符串补齐末尾的 0",
+            "多个业务上彼此独立的数据源", "只有编码而无法取得名称",
+            "只有 helper 确实无法表达的图表类型",
+        ):
+            assert marker in prompt
+
+
+@pytest.mark.parametrize("values,expected", [
+    ([10.0], "当前只有一个类别"),
+    ([10.0, 10.0], "并列最高"),
+    ([10.0, 4.0], "高 6.00"),
+])
+def test_file_example_judgment_uses_actual_results(values, expected):
+    match = re.search(
+        r"<!-- canonical-runtime-example: local_file -->\s*```python\s*(.*?)\s*```",
+        _contract("query/local_file.md"), re.DOTALL,
+    )
+    assert match is not None
+    data = pd.DataFrame({
+        "category": ["类别A", "类别B"][:len(values)], "metric_value": values,
+    })
+    def fail_no_data(*args, **kwargs):
+        raise AssertionError("Nonempty example unexpectedly reported no data")
+
+    namespace = {
+        "get_analysis_parameters": lambda defaults: defaults,
+        "query_local_file": lambda **kwargs: data.copy(),
+        "raise_no_data_error": fail_no_data,
+        "build_chart_result": lambda **kwargs: kwargs,
+        "build_table_result": lambda **kwargs: kwargs,
+        "save_analysis_result": lambda **kwargs: kwargs,
+    }
+    exec(compile(match.group(1), "<local-file-contract-example>", "exec"), namespace)
+    result = namespace["result"]
+    assert expected in result["analysis_report"]
+    assert result["charts"] and result["tables"]
+    assert len(result["tables"][0]["data"]) == len(values)
+
+
+@pytest.mark.parametrize("source", [
+    {"datasource_type": "table", "table_engine": "relational"},
+    {"datasource_type": "table", "table_engine": "time_series"},
+    {"datasource_type": "local_file"},
+])
+def test_same_type_multiple_sources_receive_independent_analysis_guidance(source):
+    capabilities = infer_query_capabilities_from_snapshot({
+        "selected_datasource_snapshot": [
+            {**source, "datasource_id": 1}, {**source, "datasource_id": 2},
+        ],
+    })
+    prompt = load_runtime_prompt(capabilities)
+    assert "# query.cross_source" not in prompt
+    assert "多个业务上彼此独立的数据源默认分别分析、一源一图" in prompt
+    assert "用户要求对比、关联或叠加" in prompt

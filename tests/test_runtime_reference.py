@@ -43,16 +43,13 @@ def test_complete_references_are_reachable_and_have_live_api_signatures():
     assert "canonical-runtime-example" not in load_runtime_prompt(("sql",))
 
 
-def test_batch_lookup_keeps_valid_results_and_never_reads_arbitrary_paths():
-    result = read_runtime_reference.func(
-        reference_runtime(), ["query.relational", "../../.env", "query.relational", "query.time_series"],
-    )
-    assert result["status"] == "partial"
-    assert result["unavailable_contract_ids"] == ["../../.env"]
-    assert [item["contract_id"] for item in result["references"]] == ["query.relational", "query.time_series"]
+def test_single_lookup_returns_one_valid_reference_and_never_reads_arbitrary_paths():
+    result = read_runtime_reference.func(reference_runtime(), "query.relational")
+    assert result["status"] == "success"
+    assert [item["contract_id"] for item in result["references"]] == ["query.relational"]
     for item in result["references"]:
         assert item["sha256"] == hashlib.sha256(item["content"].encode()).hexdigest()
-    assert read_runtime_reference.func(reference_runtime(), ["unknown"])["status"] == "unavailable"
+    assert read_runtime_reference.func(reference_runtime(), "../../.env")["status"] == "unavailable"
 
 
 @pytest.mark.parametrize("output_type,result_id", [
@@ -60,29 +57,26 @@ def test_batch_lookup_keeps_valid_results_and_never_reads_arbitrary_paths():
 ])
 @pytest.mark.parametrize("clarification_mode", ["same_turn", "disabled"])
 def test_reference_does_not_introduce_a_conflicting_invocation_policy(output_type, result_id, clarification_mode):
-    result = read_runtime_reference.func(reference_runtime(output_type, clarification_mode), [
-        "result.artifacts", "result.text", "result.json", "interaction.clarification", "interaction.no_clarification",
-    ])
+    result = read_runtime_reference.func(reference_runtime(output_type, clarification_mode), result_id)
     interaction_id = "interaction.clarification" if clarification_mode == "same_turn" else "interaction.no_clarification"
-    assert {item["contract_id"] for item in result["references"]} == {result_id, interaction_id}
+    assert {item["contract_id"] for item in result["references"]} == {result_id}
     assert "context.followup" in result["available_contract_ids"]
+    assert interaction_id in result["available_contract_ids"]
 
 
 @pytest.mark.parametrize("output_type", ["text", "json"])
 def test_query_reference_does_not_reintroduce_standard_output_through_an_example(output_type):
-    result = read_runtime_reference.func(reference_runtime(output_type, "disabled"), [
-        "query.relational", "query.local_file", "result." + output_type,
-    ])
+    result = read_runtime_reference.func(reference_runtime(output_type, "disabled"), "query.relational")
     assert result["status"] == "success"
     text = "\n".join(item["content"] for item in result["references"])
     assert "canonical-runtime-example" not in text
     assert "charts=charts" not in text
     assert "query_data_with_sql(*," in text
-    assert "query_local_file(*," in text
+    assert "query_local_file(*," not in text
 
 
 @pytest.mark.parametrize("clarification_mode", ["same_turn", "disabled"])
-def test_reference_observation_stays_in_real_react_with_probe_and_repair(monkeypatch, clarification_mode):
+def test_execution_observation_stays_in_real_react_with_probe_and_repair(monkeypatch, clarification_mode):
     class ScriptedModel(FakeMessagesListChatModel):
         seen: list = Field(default_factory=list)
 
@@ -94,7 +88,6 @@ def test_reference_observation_stays_in_real_react_with_probe_and_repair(monkeyp
             return super()._generate(messages, **kwargs)
 
     calls = [
-        ("read_runtime_reference", {"contract_ids": ["query.relational", "execution.core"]}),
         ("probe_analysis_data", {"code": "result = None", "used_datasource_ids": [1]}),
         ("submit_analysis_program", {"code": "result = None", "used_datasource_ids": [1]}),
         ("submit_analysis_program", {"code": "result = None", "used_datasource_ids": [1]}),
@@ -115,11 +108,10 @@ def test_reference_observation_stays_in_real_react_with_probe_and_repair(monkeyp
     result = graph.invoke({"messages": [HumanMessage("Analyze with the supplied business definitions")]},
                           context=reference_runtime(clarification_mode=clarification_mode).context)
     assert observed == ["probe", "analysis", "analysis"]
-    assert len(llm.seen) == 4
+    assert len(llm.seen) == 3
     last_observations = [msg for msg in llm.seen[-1] if isinstance(msg, ToolMessage)]
-    assert [msg.tool_call_id for msg in last_observations] == ["0", "1", "2"]
-    assert json.loads(last_observations[0].content)["tool"] == "read_runtime_reference"
-    assert "save_analysis_result(" in last_observations[0].content
+    assert [msg.tool_call_id for msg in last_observations] == ["0", "1"]
+    assert all("read_runtime_reference" not in str(msg.content) for msg in last_observations)
     assert result["analysis_complete"] is True
     assert len([msg for msg in result["messages"] if isinstance(msg, HumanMessage)]) == 1
 
@@ -127,14 +119,14 @@ def test_reference_observation_stays_in_real_react_with_probe_and_repair(monkeyp
 def test_reference_does_not_pollute_execution_feedback_or_frontend_progress():
     runtime = SimpleNamespace(short_term_memory={})
     invoker._update_short_term_memory_from_tool_payload(runtime, read_runtime_reference.func(
-        reference_runtime(), ["query.relational"],
+        reference_runtime(), "query.relational",
     ))
     assert runtime.short_term_memory == {}
     progress = invoker._format_tool_call_message({"name": "read_runtime_reference"})
     assert "用法说明" in progress
     assert "分析代码" not in progress
     reference_message = ToolMessage(content=json.dumps(read_runtime_reference.func(
-        reference_runtime(), ["context.followup"],
+        reference_runtime(), "context.followup",
     )), tool_call_id="reference")
     assert invoker._extract_invoke_result([reference_message]) == ("", "", [], [], False)
     previous = [HumanMessage("Use the supplied business definitions"), reference_message]
@@ -143,11 +135,12 @@ def test_reference_does_not_pollute_execution_feedback_or_frontend_progress():
 
 
 def test_core_and_complete_reference_explain_the_actual_field_scope_projection():
-    for contract_id in ("context.analysis", "query.relational"):
-        for loader in (load_runtime_contract_pack, load_runtime_contract_reference):
-            text = loader(contract_id)
-            assert "allowed_fields_ref=metadata_schema.properties" in text
-            assert "query_contract.allowed_fields" in text
+    for loader in (load_runtime_contract_pack, load_runtime_contract_reference):
+        context_text = loader("context.analysis")
+        assert "datasource_details" in context_text
+        query_text = loader("query.relational")
+        assert "allowed_fields_ref=metadata_schema.properties" in query_text
+        assert "query_contract.allowed_fields" in query_text
 
 
 @pytest.mark.parametrize("is_analysis", [True, False])

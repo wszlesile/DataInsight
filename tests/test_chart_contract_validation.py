@@ -1932,14 +1932,146 @@ result = save_analysis_result(analysis_report="Pattern distribution.", charts=[c
     def test_valid_analysis_result_terminates_the_agent_graph(self) -> None:
         message = _tool_success_message(
             tool_call_id="call-1",
+            execution_id=42,
             analysis_report="# report",
             charts=[{"title": "trend"}],
+            used_datasource_ids=[12, 13],
+            query_snapshots={
+                "monthly_profit": {
+                    "execution": {
+                        "status": "success",
+                        "row_count": 3,
+                        "columns": ["product", "profit"],
+                    },
+                },
+            },
+        )
+
+        payload = json.loads(message.content)
+        self.assertEqual(payload["execution_id"], 42)
+        self.assertTrue(payload["review_required"])
+        self.assertEqual(payload["execution_review"]["used_datasource_ids"], [12, 13])
+        self.assertEqual(payload["execution_review"]["queries"], [{
+            "query_key": "monthly_profit",
+            "status": "success",
+            "row_count": 3,
+            "columns": ["product", "profit"],
+        }])
+        self.assertEqual(
+            payload["candidate_review_contract"]["required_checks"],
+            [
+                "question_coverage",
+                "population_and_grain",
+                "formula_and_unit",
+                "artifact_consistency",
+                "claim_support",
+            ],
         )
 
         command = _terminal_tool_success(message)
 
         self.assertTrue(command.update["analysis_complete"])
         self.assertEqual(command.update, {"messages": [message], "analysis_complete": True})
+
+    def test_success_message_delivers_bounded_static_advisories_to_review(self) -> None:
+        message = _tool_success_message(
+            tool_call_id="call-1",
+            execution_id=42,
+            analysis_report="# report",
+            static_analysis_advisories=[{
+                "violated_contract": "grouped_visible_dimension_functional_dependency",
+                "group_fields": ["product_id"],
+                "risky_dimensions": [{"output_field": "company", "reducer": "first"}],
+                "code_location": {"line_no": 12, "error_line": "summary = data.groupby(...)"},
+            }],
+        )
+
+        payload = json.loads(message.content)
+        assert payload["static_analysis_advisories"][0]["group_fields"] == ["product_id"]
+
+    def test_static_unproven_risk_is_collected_without_rejecting_program(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"dimensions": ["product_id"]}}
+validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT product_id, company, amount FROM t")
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql("SELECT product_id, company, amount FROM t")
+    summary = data.groupby("product_id", as_index=False).agg({"company": "first", "amount": "sum"})
+    table = build_table_result(data=summary, columns=[{"key": "company", "label": "Company"}])
+    result = save_analysis_result(analysis_report=f"{len(summary)} products", charts=[], tables=[table])
+'''
+        advisories = []
+
+        retry = _validate_generated_code_contract(code, advisory_sink=advisories)
+
+        self.assertIsNone(retry)
+        grouped = next(
+            item for item in advisories
+            if item.get("violated_contract") == "grouped_visible_dimension_functional_dependency"
+        )
+        self.assertEqual(grouped["group_fields"], ["product_id"])
+        self.assertEqual(
+            grouped["risky_dimensions"][0]["visibility"],
+            "confirmed_user_visible",
+        )
+        self.assertNotIn("context_lines", json.dumps(grouped))
+
+    def test_grouped_first_is_advisory_when_artifact_columns_are_dynamic(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {"aggregation": {"dimensions": ["product_id"]}}
+validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT product_id, company, amount FROM t")
+if validation is not None:
+    result = validation
+else:
+    data = load_data_with_sql("SELECT product_id, company, amount FROM t")
+    summary = data.groupby("product_id", as_index=False).agg(company=("company", "first"), amount=("amount", "sum"))
+    report_columns = {"product_id": "Product", "company": "Company", "amount": "Amount"}
+    table = build_table_result(data=summary, columns=[{"key": key, "label": label} for key, label in report_columns.items()])
+    result = save_analysis_result(analysis_report=f"{summary.iloc[0]['company']}", charts=[], tables=[table])
+'''
+        advisories = []
+
+        retry = _validate_generated_code_contract(code, advisory_sink=advisories)
+
+        self.assertIsNone(retry)
+        grouped = next(
+            item for item in advisories
+            if item.get("violated_contract") == "grouped_visible_dimension_functional_dependency"
+        )
+        self.assertEqual(grouped["group_fields"], ["product_id"])
+        self.assertEqual(grouped["risky_dimensions"], [{
+            "output_field": "company",
+            "source_field": "company",
+            "reducer": "first",
+            "visibility": "unknown",
+        }])
+
+    def test_result_review_packet_reads_normalized_echarts_series(self) -> None:
+        chart = build_chart_result(
+            data=pd.DataFrame({"product": ["A", "B"], "profit": [12.0, 8.0]}),
+            chart_kind="bar",
+            category_field="product",
+            value_field="profit",
+            title="Product profit",
+        )
+        normalized = _normalize_chart_items([chart])
+
+        message = _tool_success_message(
+            tool_call_id="call-1",
+            execution_id=42,
+            analysis_report="# report",
+            charts=normalized,
+        )
+
+        review = json.loads(message.content)["artifact_review"]["charts"][0]
+        self.assertEqual(review["point_count"], 2)
+        self.assertEqual(review["category_count"], 2)
+        self.assertEqual(review["sample_categories"], ["A", "B"])
+        self.assertEqual(review["series"][0]["sample_values"], [12.0, 8.0])
+        self.assertNotIn("row_count", review)
 
     def test_probe_rejects_a_static_inspection_plan_without_data_access(self) -> None:
         code = '''
@@ -3051,6 +3183,45 @@ result = save_analysis_result(...)
         )
 
         self.assertIsNone(retry)
+
+    def test_static_implementation_failure_preserves_declared_analysis_scope(self) -> None:
+        history = [SimpleNamespace(
+            generated_code='''execution_intent = "analysis"
+quality = load_data_with_sql(sql="SELECT * FROM warehouse.fact_quality")
+products = load_data_with_sql(sql="SELECT * FROM warehouse.dim_product")
+result = save_analysis_result(...)
+''',
+            result_payload_json=json.dumps({
+                "error_type": "contract_error",
+                "diagnostics": {
+                    "violated_contract": "runtime_helper_signature_mismatch",
+                    "failure_domain": "implementation",
+                    "failure_phase": "static_contract_validation",
+                    "scope_change_authorized": False,
+                },
+            }),
+            used_datasource_ids_json='[61, 62]',
+        )]
+
+        retry = _validate_analysis_scope_against_execution_history(
+            previous_executions=history,
+            current_used_datasource_ids=[61],
+            current_code='''execution_intent = "analysis"
+quality = load_data_with_sql(sql="SELECT * FROM warehouse.fact_quality")
+result = save_analysis_result(...)
+''',
+            selected_datasource_snapshot=[
+                {"datasource_id": 61, "datasource_identifier": "warehouse.fact_quality"},
+                {"datasource_id": 62, "datasource_identifier": "warehouse.dim_product"},
+            ],
+        )
+
+        self.assertIsNotNone(retry)
+        self.assertEqual(
+            retry.diagnostics["violated_contract"],
+            "analysis_scope_regression_after_technical_repair",
+        )
+        self.assertEqual(retry.diagnostics["missing_datasource_ids"], [62])
 
     def test_unproven_scope_is_not_preserved_by_direct_validator(self) -> None:
         retry = _validate_scope_preserving_technical_repair(

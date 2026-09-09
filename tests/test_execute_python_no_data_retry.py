@@ -19,20 +19,29 @@ from agent.tools import (  # noqa: E402
     NoDataFoundError,
     CURRENT_CONFIRMED_NO_DATA_RESULT,
     CURRENT_EXECUTION_INTENT,
+    CURRENT_PROBE_QUERY_OBSERVATIONS,
     CURRENT_QUERY_SNAPSHOTS,
     _augment_repair_instructions,
     _build_query_capacity_failure_diagnostics,
+    _build_implicit_probe_feedback,
     _build_repair_instructions,
     _build_no_data_feedback,
     _classify_execution_error,
     _extract_error_signature,
     _extract_confirmed_no_data_query_snapshots,
     _execute_generated_code_worker,
+    ExePythonCodeInput,
     _inspect_zero_population_aggregate,
+    _program_requests_probe_feedback,
+    _program_uses_probe_api,
     _read_worker_result_payload,
     _remove_worker_result_payload,
     probe_analysis_data,
+    probe_data_with_sql,
+    ProbeAnalysisDataInput,
     submit_analysis_program,
+    _tool_error_message,
+    execute_python,
     raise_no_data_error,
     load_data_with_sql,
     save_analysis_result,
@@ -44,6 +53,42 @@ class ExecutePythonNoDataRetryTestCase(unittest.TestCase):
     def test_observations_and_repairs_continue_in_the_same_agent_graph(self) -> None:
         self.assertFalse(probe_analysis_data.return_direct)
         self.assertFalse(submit_analysis_program.return_direct)
+
+    def test_formal_submission_detects_probe_feedback_shape(self) -> None:
+        self.assertTrue(_program_requests_probe_feedback(
+            'result = request_retry(retry_type="probe_feedback", message="observe")'
+        ))
+        self.assertFalse(_program_requests_probe_feedback(
+            'result = request_retry(retry_type="no_data_found", message="empty")'
+        ))
+        self.assertTrue(_program_uses_probe_api(
+            'outcome = probe_data_with_sql("SELECT DISTINCT status FROM quality.batch")'
+        ))
+        self.assertFalse(_program_uses_probe_api(
+            'frame = load_data_with_sql("SELECT status FROM quality.batch")'
+        ))
+
+    def test_formal_submission_rejects_probe_source_before_creating_execution(self) -> None:
+        runtime = SimpleNamespace(
+            context=SimpleNamespace(conversation_id=1, turn_id=2),
+            tool_call_id='formal-probe-source',
+        )
+        with patch('agent.tools._raise_if_runtime_task_cancelled'), patch(
+            'agent.tools._create_execution_record'
+        ) as create_execution:
+            result = execute_python.func(
+                runtime=runtime,
+                code='outcome = probe_data_with_sql("SELECT DISTINCT status FROM quality.batch")',
+                execution_mode='analysis',
+            )
+
+        payload = json.loads(result.content)
+        self.assertEqual(payload['error_type'], 'contract_error')
+        self.assertEqual(
+            payload['diagnostics']['violated_contract'],
+            'formal_tool_received_probe_program',
+        )
+        create_execution.assert_not_called()
 
     def test_composed_query_validation_retry_returns_as_tool_result(self) -> None:
         queue: mp.Queue = mp.Queue()
@@ -76,6 +121,92 @@ data = query_data_with_sql(
             payload["exec_result"]["payload"]["retry_type"],
             "invalid_query_constraints",
         )
+
+    def test_injected_runtime_helpers_are_also_available_via_runtime_module(self) -> None:
+        queue: mp.Queue = mp.Queue()
+        code = '''
+from runtime import get_analysis_parameters
+result = get_analysis_parameters({"window": "last_7_days"})
+'''
+
+        try:
+            _execute_generated_code_worker(code, "tester", {}, queue)
+            envelope = queue.get(timeout=2)
+            result_path = envelope["result_file_path"]
+            try:
+                payload = _read_worker_result_payload(result_path)
+            finally:
+                _remove_worker_result_payload(result_path)
+            self.assertEqual(payload["status"], "success")
+            self.assertEqual(payload["exec_result"]["result_kind"], "raw")
+        finally:
+            queue.close()
+            sys.modules.pop("runtime", None)
+
+    def test_execution_tool_inputs_accept_gateway_serialized_datasource_id_arrays(self) -> None:
+        self.assertEqual(
+            ProbeAnalysisDataInput(code='pass', used_datasource_ids='[62, 76, 79]').used_datasource_ids,
+            [62, 76, 79],
+        )
+        self.assertEqual(
+            ProbeAnalysisDataInput(program='pass').code,
+            'pass',
+        )
+        self.assertEqual(
+            ProbeAnalysisDataInput(probe_code='pass').code,
+            'pass',
+        )
+        probe_schema = ProbeAnalysisDataInput.model_json_schema()
+        self.assertTrue(
+            {'code', 'program', 'probe_code', 'probe'}
+            <= set(probe_schema['properties'])
+        )
+        self.assertEqual(
+            ExePythonCodeInput(code='pass', used_datasource_ids='[12]').used_datasource_ids,
+            [12],
+        )
+
+    def test_probe_callable_normalizes_gateway_program_aliases(self) -> None:
+        with patch('agent.tools.execute_python.func', return_value='ok') as execute:
+            result = probe_analysis_data.func(
+                runtime=SimpleNamespace(), probe_code='print(1)',
+                used_datasource_ids='[62, 76]',
+            )
+
+        self.assertEqual(result, 'ok')
+        self.assertEqual(execute.call_args.kwargs['code'], 'print(1)')
+        self.assertEqual(execute.call_args.kwargs['used_datasource_ids'], [62, 76])
+
+    def test_probe_helper_promotes_bounded_rows_to_structured_feedback(self) -> None:
+        frame = pd.DataFrame({"status": ["open", "closed"], "record_count": [2, 1]})
+        intent_token = CURRENT_EXECUTION_INTENT.set("probe")
+        observation_token = CURRENT_PROBE_QUERY_OBSERVATIONS.set([])
+        try:
+            with patch("agent.tools.load_data_with_sql", return_value=frame):
+                outcome = probe_data_with_sql(
+                    "SELECT status, COUNT(*) AS record_count FROM quality.batch GROUP BY status"
+                )
+            retry = _build_implicit_probe_feedback(
+                {}, "", CURRENT_PROBE_QUERY_OBSERVATIONS.get(),
+            )
+        finally:
+            CURRENT_EXECUTION_INTENT.reset(intent_token)
+            CURRENT_PROBE_QUERY_OBSERVATIONS.reset(observation_token)
+
+        self.assertTrue(outcome.success)
+        self.assertEqual(retry.diagnostics["query_observations"][0]["value_samples"], [
+            {"status": "open", "record_count": 2},
+            {"status": "closed", "record_count": 1},
+        ])
+        payload = json.loads(_tool_error_message(
+            tool_call_id="probe", error_type="probe_feedback", execution_id=1,
+            error_message="Probe complete", repair_instructions=[], diagnostics=retry.diagnostics,
+        ).content)
+        ledger = payload["diagnostics"]["probe_fact_ledger"]
+        self.assertEqual(ledger["observations"][0]["value_samples"], [
+            {"status": "open", "record_count": 2},
+            {"status": "closed", "record_count": 1},
+        ])
 
     def test_no_data_feedback_routes_the_next_attempt_to_an_independent_probe(self) -> None:
         feedback = _build_no_data_feedback("筛选后无数据")

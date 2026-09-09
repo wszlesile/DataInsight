@@ -299,7 +299,7 @@ def test_parent_scope_example_returns_detail_rows_without_claiming_aggregation(m
     loader = Mock(side_effect=recorded_loader(details))
     monkeypatch.setattr(tools, 'load_data_with_sql', loader)
     namespace = {**tools._build_execution_namespace(), 'parent_data': parent_data}
-    exec(example('execution_core.md', 'parent-detail-scope'), namespace)
+    exec(example('execution/core.md', 'parent-detail-scope'), namespace)
     assert namespace['child_data'].equals(details)
     assert loader.call_args.kwargs['params'] == ['A', 'B']
     snapshots = tools.CURRENT_QUERY_SNAPSHOTS.get()
@@ -312,11 +312,11 @@ def test_parent_scope_example_does_not_query_an_empty_id_set(monkeypatch):
     monkeypatch.setattr(tools, 'load_data_with_sql', loader)
     namespace = {**tools._build_execution_namespace(), 'parent_data': pd.DataFrame({'batch_id': []})}
     with pytest.raises(tools.NoDataFoundError):
-        exec(example('execution_core.md', 'parent-detail-scope'), namespace)
+        exec(example('execution/core.md', 'parent-detail-scope'), namespace)
     loader.assert_not_called()
 
 
-@pytest.mark.parametrize('filename,name', [('query_relational.md', 'relational'), ('query_local_file.md', 'local_file')])
+@pytest.mark.parametrize('filename,name', [('query/relational.md', 'relational'), ('query/local_file.md', 'local_file')])
 def test_complete_examples_execute_real_validation_helpers_and_build_real_artifacts(monkeypatch, filename, name):
     data = pd.DataFrame({'category': ['类别A', '类别B'], 'metric_value': [30.0, 70.0]})
     monkeypatch.setattr(tools, 'load_data_with_sql', recorded_loader(data))
@@ -344,7 +344,7 @@ def test_reference_example_computes_comparisons_without_invented_thresholds(monk
     data = pd.DataFrame({'category': ['类别A', '类别B'][:len(values)], 'metric_value': values})
     monkeypatch.setattr(tools, 'load_data_with_sql', recorded_loader(data))
     namespace = tools._build_execution_namespace()
-    exec(example('query_relational.md', 'relational', 'canonical-runtime-example'), namespace)
+    exec(example('query/relational.md', 'relational', 'canonical-runtime-example'), namespace)
     report = namespace['result'].analysis_report
     assert all(value in report for value in expected)
     assert all(value not in report for value in unexpected)
@@ -365,7 +365,7 @@ def test_query_helpers_work_in_functions_and_loops_without_losing_snapshots(monk
 
 
 def test_function_wrapped_query_remains_valid_in_a_complete_analysis_program(monkeypatch):
-    tree = ast.parse(example('query_relational.md', 'relational', 'canonical-runtime-example'))
+    tree = ast.parse(example('query/relational.md', 'relational', 'canonical-runtime-example'))
     for index, node in enumerate(tree.body):
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id == 'query_data_with_sql':
             function = ast.parse('def read_summary():\n    return None').body[0]

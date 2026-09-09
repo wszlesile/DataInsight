@@ -4,6 +4,7 @@
 
 <!-- runtime-helper-reference -->
 
+- `query_local_file(...)`、`query_local_file_low_memory(...)`、`load_local_file(...)`、`load_local_file_low_memory(...)` 已直接注入代码执行命名空间，按函数名直接调用，不需要也不能从 `query.local_file`、`runtime_api` 或其他模块 import。`query.local_file` 只是本契约的标识，不是 Python 包路径。
 - 本地文件使用 `datasource_identifier` 作为路径，不使用 `load_data_with_sql`。
 - 普通文件优先使用 `query_local_file(...)`，由后端一次完成约束校验、QuerySnapshot 注册和 `load_local_file(...)` 加载。
 - 当查询范围是完整文件、没有时间或对象筛选且粒度为 `detail` 时，组合 helper 会直接确认全量明细读取；不需要为了通过校验重复填写 `aggregation_hints=["detail"]`。存在筛选或非明细聚合时，仍须提供与真实 DataFrame 实现一致的 `filter_expressions` / `aggregation_hints`。
@@ -23,9 +24,20 @@
 
 ## 过滤与校验
 
-- 正式文件分析先由 `analysis_parameters` 构造真实 `filter_expressions`，再交给组合查询 API；校验通过后才会加载文件，代码随后对 DataFrame 应用同一过滤。
+- 正式文件分析优先由 `analysis_parameters` 构造 `file_filters`，再交给组合查询 API；校验通过后 loader 会对 DataFrame 实际执行这些结构化过滤，并把它们写入 QuerySnapshot。
+- `file_filters` 是 `list[dict]`，每项为 `{field, op, value}`；支持 `eq`、`in`、`gt`、`gte`、`lt`、`lte`、`is_null`、`not_null`。字段必须来自当前文件 Schema。`is_null` / `not_null` 不传 `value`。
+- `filter_expressions` 的类型仍是 `list[str]`，仅用于复杂派生 DataFrame 过滤的约束校验，不由 loader 执行。使用它时，代码必须在读取后对 DataFrame 实际应用同一表达式；不要把结构化筛选对象塞进 `filter_expressions`。
+- 最小调用与执行关系如下：
+
+```python
+file_filters = [{"field": "category", "op": "eq", "value": category}]
+data = query_local_file(query_key=query_key, query_constraints=query_constraints,
+                       file_path=file_path, file_filters=file_filters)
+filtered = data
+```
+
 - 精确匹配使用 `==/.eq/.isin`。`str.contains`、正则和候选集合用于 Probe 发现真实值，不能未经收敛直接作为正式统计口径。
-- 月粒度字符串字段可用 `>= '2026-03' AND < '2026-04'` 或 `== '2026-03'` 的等价 DataFrame 表达；`filter_expressions` 必须带真实字面量，不能只写校验器无法解析的变量名。
+- 月粒度字符串字段优先使用 `file_filters=[{"field": "month", "op": "eq", "value": "2026-03"}]`；复杂月份派生表达才使用带真实字面量的 `filter_expressions`，不能只写校验器无法解析的变量名。
 - 大文件 Probe 可以流式遍历以累计总行数、时间覆盖、命中数和 Top 分布，但不保存样本行作为正式结果。
 
 <!-- runtime-prompt-omit-start -->
@@ -83,6 +95,15 @@ summary = (
 )
 total_value = float(summary["metric_value"].sum())
 top_row = summary.iloc[0]
+leader_rows = summary[summary["metric_value"] == top_row["metric_value"]]
+if len(summary) == 1:
+    comparison = "当前只有一个类别，尚不能比较类别差异。"
+elif len(leader_rows) > 1:
+    comparison = f"{'、'.join(leader_rows['category'].astype(str))}并列最高，当前数值不能区分它们的领先次序。"
+else:
+    second_row = summary.iloc[1]
+    gap = float(top_row["metric_value"] - second_row["metric_value"])
+    comparison = f"{top_row['category']}比第二名{second_row['category']}高 {gap:,.2f}；该差额是后续核查明细构成的依据，不直接证明原因。"
 charts = [build_chart_result(
     chart_kind="bar",
     data=summary,
@@ -104,9 +125,9 @@ tables = [build_table_result(
 analysis_report = "\n\n".join([
     "## 核心结论",
     f"目标类别核心指标合计为 {total_value:,.2f}，"
-    f"其中 {top_row['category']} 排名第一（{top_row['metric_value']:,.2f}）。",
-    "## 业务建议",
-    "建议结合头部类别的明细构成和后续变化判断其贡献是否可持续。",
+    f"最高类别值为 {top_row['metric_value']:,.2f}。",
+    "## 类别比较与判断边界",
+    comparison,
 ])
 result = save_analysis_result(
     analysis_report=analysis_report,

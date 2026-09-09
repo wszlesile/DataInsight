@@ -37,7 +37,7 @@ def test_runtime_keeps_complete_insight_narrative_and_parent_population():
 
 
 def test_clarification_stays_in_same_react_without_second_semantic_tool():
-    prompt = _contract("interaction_clarification.md")
+    prompt = _contract("interaction/clarification.md")
 
     assert "<user-clarification-answers>" in prompt
     assert "直接在当前 ReAct 中映射到完整 Schema" in prompt
@@ -50,14 +50,32 @@ def test_runtime_receives_mechanical_contracts_before_execution():
 
     prompt = load_runtime_prompt(("sql",), "fresh_analysis")
 
-    assert "injected_by_backend_before_model_invocation" in prompt
+    assert "initial_summaries_injected_before_model_invocation" in prompt
     assert "# execution.core" in prompt
     assert "# query.relational" in prompt
     assert "load_runtime_contracts" not in prompt
 
 
+def test_state_owned_non_code_contracts_are_loaded_in_full():
+    from agent.runtime_contract_registry import load_runtime_work_contract_text
+
+    planning = load_runtime_work_contract_text(
+        ("context.analysis", "execution.planning"),
+        work="plan",
+    )
+    review = load_runtime_work_contract_text(
+        ("context.analysis", "execution.result_review"),
+        work="review",
+    )
+
+    assert "当前工作只把完整洞察语义组织成一份可执行前的数据模型" in planning
+    assert "正式程序已经成功执行" in review
+    assert "报告中的指标公式、总体、时间、粒度、比较方向和单位" in review
+    assert "当前工作进入对应执行状态后" in planning  # surrounding context stays summarized
+
+
 def test_execution_contract_keeps_probe_no_data_and_independent_queries():
-    contract = _contract("execution_core.md")
+    contract = _contract("execution/core.md")
 
     assert 'execution_intent = "probe"' in contract
     assert "每条物理查询使用独立稳定的 `query_key`" in contract
@@ -67,7 +85,7 @@ def test_execution_contract_keeps_probe_no_data_and_independent_queries():
 
 
 def test_artifact_contract_uses_real_helpers_and_business_labels():
-    contract = _contract("result_artifacts.md")
+    contract = _contract("result/artifacts.md")
 
     assert "build_chart_result" in contract
     assert "build_table_result(...)" in contract
@@ -79,7 +97,7 @@ def test_runtime_prompt_does_not_restore_evidence_authoring():
     prompt = _semantic_prompt()
     contracts = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in (RUNTIME_ROOT / "contracts").glob("*.md")
+        for path in (RUNTIME_ROOT / "contracts").rglob("*.md")
     )
 
     assert "EvidenceDefinition" not in prompt + contracts

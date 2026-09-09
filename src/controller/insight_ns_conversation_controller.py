@@ -474,6 +474,15 @@ class InsightNsConversationController(BaseController):
     def rerun_turn_task(self, conversation_id: int, turn_id: int):
         """提交原轮次异步重跑任务。"""
         from agent.invoker import AgentRequest
+        from agent.invocation_policy import normalize_clarification_mode
+
+        payload = self.get_json_data() if request.get_data() else {}
+        if not isinstance(payload, dict):
+            return self.error_response('请求体必须为 JSON 对象', 400), 400
+        try:
+            clarification_mode = normalize_clarification_mode(payload.get('clarification_mode'))
+        except ValueError as exc:
+            return self.error_response(str(exc), 400), 400
 
         username = self._get_username()
         platform_authorization, fedquery_authorization, selected_llm_model_id, database_conn_info = self._build_request_runtime_context()
@@ -504,6 +513,7 @@ class InsightNsConversationController(BaseController):
                 namespace_id=str(runtime.conversation.insight_namespace_id),
                 conversation_id=str(runtime.conversation.id),
                 user_message=runtime.turn.user_query,
+                clarification_mode=clarification_mode,
                 platform_authorization=platform_authorization,
                 fedquery_authorization=fedquery_authorization,
                 selected_llm_model_id=selected_llm_model_id,
@@ -520,6 +530,7 @@ class InsightNsConversationController(BaseController):
                     'conversation_id': runtime.conversation.id,
                     'turn_id': runtime.turn.id,
                     'user_message': runtime.turn.user_query,
+                    'clarification_mode': clarification_mode,
                 },
             )
             session.commit()

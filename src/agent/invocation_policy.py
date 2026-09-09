@@ -173,6 +173,10 @@ def validate_output_schema(schema: dict[str, Any]) -> None:
 
 
 def validate_json_output(value: Any, schema: dict[str, Any]) -> None:
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('JSON 输出必须可序列化，且不能包含 NaN 或 Infinity') from exc
     errors: list[str] = []
 
     def fail(path: str, message: str) -> None:

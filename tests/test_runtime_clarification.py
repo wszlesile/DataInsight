@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END
 
 from agent import invoker
@@ -419,6 +419,40 @@ def test_clarification_resume_context_keeps_probe_observations(monkeypatch):
     assert "quality_status_candidates" in instruction
 
 
+def test_resume_restores_tool_calls_and_accepts_a_second_clarification(monkeypatch):
+    monkeypatch.setattr(invoker, '_load_turn_executions_fresh', lambda _: [])
+    transcript = [
+        SystemMessage('Full schema and contracts'),
+        HumanMessage('Analyze'),
+        AIMessage(content='Inspect the date format', tool_calls=[{
+            'name': 'probe_analysis_data', 'args': {'code': 'print("observed")'},
+            'id': 'probe-1', 'type': 'tool_call',
+        }]),
+        ToolMessage(content='observed dates', tool_call_id='probe-1'),
+    ]
+    context = invoker._build_clarification_resume_context(
+        preparation=None, runtime=SimpleNamespace(context_mode='fresh_analysis'), transcript=transcript)
+    context['user_clarifications'] = [{'clarification_id': 'one', 'answer_text': 'Use July'}]
+    request = SimpleNamespace(clarification_context=context)
+    def unexpected_input(*args, **kwargs):
+        raise AssertionError('Resume must not rebuild or shorten the previous input')
+    monkeypatch.setattr(invoker, 'get_input', unexpected_input)
+    resumed = invoker._build_agent_input_with_runtime_instruction(agent_request=request, runtime=SimpleNamespace())
+    assert [message.content for message in resumed.messages[:4]] == [message.content for message in transcript]
+    assert resumed.messages[2].tool_calls == transcript[2].tool_calls
+    assert resumed.messages[3].tool_call_id == 'probe-1'
+    assert 'Use July' in resumed.messages[-1].content
+    assert len(resumed.messages) == 5
+    repeated = invoker._build_agent_input_with_runtime_instruction(
+        agent_request=request, runtime=SimpleNamespace(), prior_messages=resumed.messages)
+    assert len(repeated.messages) == 5
+    context['user_clarifications'].append({'clarification_id': 'two', 'answer_text': 'Count unique batches'})
+    continued = invoker._build_agent_input_with_runtime_instruction(
+        agent_request=request, runtime=SimpleNamespace(), prior_messages=resumed.messages)
+    assert len(continued.messages) == 6
+    assert 'Count unique batches' in continued.messages[-1].content
+
+
 def test_resumed_probe_observations_are_injected_once_into_react_history():
     request = SimpleNamespace(
         user_message="分析批次率",
@@ -453,10 +487,11 @@ def test_resumed_probe_observations_are_injected_once_into_react_history():
     assert "quality_status_candidates" in merged
 
 
-def test_continued_react_recovery_reuses_existing_tool_feedback():
+def test_continued_react_recovery_uses_bounded_backend_feedback():
     instruction = invoker._build_continued_react_recovery_instruction()
 
-    assert "最近一次分析工具 ToolMessage" in instruction
+    assert "后端归纳" in instruction
+    assert "完整工具转录" in instruction
     assert "diagnostics" in instruction
     assert "submit_analysis_program" in instruction
     assert len(instruction) < 420
@@ -488,8 +523,8 @@ def test_runtime_prompt_keeps_clarification_inside_unified_runtime():
     runtime_root = Path(invoker.__file__).resolve().parent.joinpath("prompts", "runtime")
     prompt = "\n".join([
         runtime_root.joinpath("sys_prompt.md").read_text(encoding="utf-8"),
-        runtime_root.joinpath("contracts", "interaction_clarification.md").read_text(encoding="utf-8"),
-        runtime_root.joinpath("contracts", "execution_core.md").read_text(encoding="utf-8"),
+        runtime_root.joinpath("contracts", "interaction/clarification.md").read_text(encoding="utf-8"),
+        runtime_root.joinpath("contracts", "execution/core.md").read_text(encoding="utf-8"),
     ])
 
     assert "request_analysis_clarification" in prompt

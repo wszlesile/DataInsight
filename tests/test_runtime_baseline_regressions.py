@@ -9,6 +9,99 @@ import pytest
 from agent import tools
 
 
+def test_complete_analysis_artifacts_receive_canonical_result_terminal():
+    source = '''execution_intent = "analysis"
+query_constraints = {"time_range": None, "target_filters": [], "aggregation": None}
+frame = query_data_with_sql(query_key="summary", query_constraints=query_constraints, sql="SELECT 1 AS value")
+analysis_report = "## Summary\\n\\nValue: 1"
+charts = []
+tables = [build_table_result("Summary", data=[{"value": 1}])]
+'''
+
+    completed, changed = tools._complete_analysis_result_terminal(source)
+
+    assert changed is True
+    assert completed.endswith(
+        "result = save_analysis_result(analysis_report=analysis_report, charts=charts, tables=tables)\n"
+    )
+    assert tools._validate_generated_code_contract(completed) is None
+
+
+def test_legacy_report_variable_receives_canonical_result_terminal():
+    source = '''execution_intent = "analysis"
+query_constraints = {"time_range": None, "target_filters": [], "aggregation": None}
+frame = query_data_with_sql(query_key="summary", query_constraints=query_constraints, sql="SELECT 1 AS value")
+report = "## Summary\\n\\nValue: 1"
+charts = []
+tables = [build_table_result("Summary", data=[{"value": 1}])]
+'''
+
+    completed, changed = tools._complete_analysis_result_terminal(source)
+
+    assert changed is True
+    assert "analysis_report=report" in completed
+    assert tools._validate_generated_code_contract(completed) is None
+
+
+@pytest.mark.parametrize(
+    ("output_format", "assignment", "expected"),
+    [
+        ("text", 'output_text = "answer"', "output_text=output_text"),
+        ("json", 'output_json = {"answer": 1}', "output_json=output_json"),
+    ],
+)
+def test_external_output_artifacts_receive_matching_result_terminal(
+    output_format,
+    assignment,
+    expected,
+):
+    source = f'''execution_intent = "analysis"
+query_constraints = {{"time_range": None, "target_filters": [], "aggregation": None}}
+frame = query_data_with_sql(query_key="summary", query_constraints=query_constraints, sql="SELECT 1 AS value")
+{assignment}
+'''
+
+    completed, changed = tools._complete_analysis_result_terminal(
+        source,
+        output_format=output_format,
+    )
+
+    assert changed is True
+    assert expected in completed
+    assert tools._validate_generated_code_contract(completed, output_format=output_format) is None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '''execution_intent = "analysis"
+query_constraints = {"time_range": None, "target_filters": [], "aggregation": None}
+frame = query_data_with_sql(query_key="summary", query_constraints=query_constraints, sql="SELECT 1 AS value")
+analysis_report = "## Summary"
+''',
+        '''execution_intent = "analysis"
+query_constraints = {"time_range": None, "target_filters": [], "aggregation": None}
+frame = query_data_with_sql(query_key="summary", query_constraints=query_constraints, sql="SELECT 1 AS value")
+if len(frame):
+    analysis_report = "## Summary"
+    tables = []
+''',
+        '''execution_intent = "analysis"
+query_constraints = {"time_range": None, "target_filters": [], "aggregation": None}
+frame = query_data_with_sql(query_key="summary", query_constraints=query_constraints, sql="SELECT 1 AS value")
+analysis_report = "## Summary"
+tables = []
+result = build_table_result("Summary", data=[])
+''',
+    ],
+)
+def test_result_terminal_is_not_inferred_for_incomplete_or_conditional_artifacts(source):
+    completed, changed = tools._complete_analysis_result_terminal(source)
+
+    assert changed is False
+    assert completed == source
+
+
 @pytest.mark.parametrize('body', [
     'detail = source[["value"]].copy()\ndetail = source.copy()\nanswer = detail["extra"].sum()',
     'detail = source[["value"]].copy()\ndetail = detail.assign(extra=source["extra"])\nanswer = detail["extra"].sum()',
@@ -67,11 +160,11 @@ def test_report_feedback_locates_source_beyond_code_preview_without_rewriting_an
         current_failed_code=source,
     )
     payload = json.loads(message.content)
-    target = payload['repair_target']
-    assert target['location_domain'] == 'python_source'
-    assert target['base_execution_id'] == 9
-    assert target['allowed_ranges'][0]['start_line'] == 20
-    assert '## Detail' in target['allowed_ranges'][0]['source']
+    assert 'repair_target' not in payload
+    assert payload['code_error_context']['location_domain'] == 'python_source'
+    ranges = tools._verified_source_patch_ranges(source, retry.code_error_context)
+    assert ranges[0]['start_line'] == 20
+    assert '## Detail' in ranges[0]['source']
 
 
 def test_current_repair_instructions_are_not_truncated_like_old_history():
@@ -107,7 +200,10 @@ def test_static_contexts_are_flattened_to_verified_source_ranges():
         error_message='local contract', repair_instructions=[], current_failed_code=source,
         code_error_context={'related_contexts': [context], 'suggested_patch_ranges': [context]},
     )
-    ranges = json.loads(message.content)['repair_target']['allowed_ranges']
+    assert 'repair_target' not in json.loads(message.content)
+    ranges = tools._verified_source_patch_ranges(source, {
+        'related_contexts': [context], 'suggested_patch_ranges': [context],
+    })
     assert len(ranges) == 1
     assert ranges[0]['source'] == 'report = str(value)' and ranges[0]['start_line'] == 2
 

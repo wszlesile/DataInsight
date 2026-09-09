@@ -6,6 +6,11 @@ import agent
 import agent.context_engineering_runtime as runtime_context
 
 
+def _runtime_payload(message):
+    content = message.content
+    return json.loads(content[content.index("{"):content.rindex("}") + 1])
+
+
 def test_runtime_contracts_follow_delivered_sources_when_snapshot_is_loaded_internally(monkeypatch):
     snapshot = {'selected_datasource_snapshot': [
         {'datasource_id': 1, 'datasource_type': 'table', 'table_engine': 'time_series',
@@ -56,7 +61,7 @@ def test_datasource_context_keeps_full_snapshot_for_preparation_to_narrow(monkey
     )
 
     assert message is not None
-    payload = json.loads(message.content[message.content.index("{"):])
+    payload = _runtime_payload(message)
     assert payload["selected_datasource_ids"] == list(range(1, 32))
     assert len(payload["datasources"]) == 31
     assert payload["runtime_capabilities"]["query_execution"] == {
@@ -136,7 +141,7 @@ def test_datasource_context_preserves_preparation_semantic_handoff(monkeypatch):
     )
 
     assert message is not None
-    payload = json.loads(message.content[message.content.index("{"):])
+    payload = _runtime_payload(message)
     assert payload["analysis_semantic_context"] == semantic_context
     assert message.content.index('"analysis_semantic_context"') < message.content.index('"datasources"')
     assert "正式分析不再重新选源" in message.content
@@ -178,7 +183,7 @@ def test_datasource_context_compacts_only_redundant_schema_indexes(monkeypatch):
         snapshot_override=snapshot,
     )
 
-    payload = json.loads(message.content[message.content.index("{"):])
+    payload = _runtime_payload(message)
     datasource = payload["datasources"][0]
     assert datasource["query_contract"] == {
         "datasource_id": 78,
@@ -228,7 +233,7 @@ def test_datasource_query_contract_localizes_verified_key_cardinality(monkeypatc
         snapshot_override=snapshot,
     )
 
-    payload = json.loads(message.content[message.content.index("{"):])
+    payload = _runtime_payload(message)
     assert payload["datasources"][0]["query_contract"]["known_key_cardinalities"] == [{
         "fields": ["batch_id"],
         "observed_distinct_count": 18653,
@@ -425,7 +430,7 @@ def test_current_semantic_context_closes_merged_system_message(monkeypatch):
         return "MECHANICAL_CONTRACTS"
 
     monkeypatch.setattr(agent, "load_runtime_semantic_prompt", fake_load_semantic_prompt)
-    monkeypatch.setattr(agent, "load_runtime_contract_prompt", fake_load_contract_prompt)
+    monkeypatch.setattr(agent, "load_runtime_initial_contract_prompt", fake_load_contract_prompt)
     monkeypatch.setattr(agent, "_build_conversation_prompt_message", lambda *_: None)
     monkeypatch.setattr(
         agent,

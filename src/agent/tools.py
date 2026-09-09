@@ -1,4 +1,5 @@
 import ast
+import copy
 import hashlib
 import inspect
 import json
@@ -24,7 +25,7 @@ from langgraph.graph import END
 from langgraph.config import get_stream_writer
 from langgraph.prebuilt import ToolRuntime
 from langgraph.types import Command
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from agent.context_engineering_runtime import CustomContext
 from analysis_runtime.parameters import (
@@ -50,6 +51,7 @@ CURRENT_EXPECTED_TIME_RANGE = ContextVar('current_expected_time_range', default=
 CURRENT_TIME_RANGE_GUARD_ACTIVE = ContextVar('current_time_range_guard_active', default=False)
 CURRENT_ANALYSIS_PARAMETERS_OVERRIDE = ContextVar('current_analysis_parameters_override', default={})
 CURRENT_QUERY_SNAPSHOTS = ContextVar('current_query_snapshots', default={})
+CURRENT_PROBE_QUERY_OBSERVATIONS = ContextVar('current_probe_query_observations', default=[])
 CURRENT_LAST_QUERY_KEY = ContextVar('current_last_query_key', default='')
 CURRENT_DATASOURCE_NUMERIC_FIELDS = ContextVar('current_datasource_numeric_fields', default=[])
 CURRENT_EXECUTION_INTENT = ContextVar('current_execution_intent', default='')
@@ -1076,6 +1078,41 @@ def _year_grain_filter_satisfies_time_range(
     return False
 
 
+def _python_filter_requires_value(expression: str, value: str) -> bool:
+    """Recognize an equality predicate, not literals in prose or dead branches."""
+    try:
+        node = ast.parse(expression.strip(), mode='eval').body
+    except (SyntaxError, ValueError):
+        return False
+
+    def literal(item):
+        return isinstance(item, ast.Constant) and item.value == value
+
+    def column(item):
+        return isinstance(item, ast.Subscript) and isinstance(item.slice, ast.Constant)
+
+    def required(item):
+        if isinstance(item, ast.Compare) and len(item.ops) == 1 and isinstance(item.ops[0], ast.Eq):
+            return (column(item.left) and literal(item.comparators[0])) or (
+                literal(item.left) and column(item.comparators[0]))
+        if isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute) and column(item.func.value):
+            if item.func.attr == 'eq' and len(item.args) == 1 and not item.keywords:
+                return literal(item.args[0])
+            if item.func.attr == 'isin' and len(item.args) == 1 and not item.keywords:
+                values = item.args[0]
+                return isinstance(values, (ast.List, ast.Tuple, ast.Set)) and bool(values.elts) and all(
+                    literal(part) for part in values.elts)
+        if isinstance(item, ast.BinOp) and isinstance(item.op, (ast.BitAnd, ast.BitOr)):
+            parts = [required(item.left), required(item.right)]
+            return any(parts) if isinstance(item.op, ast.BitAnd) else all(parts)
+        if isinstance(item, ast.BoolOp):
+            parts = [required(part) for part in item.values]
+            return any(parts) if isinstance(item.op, ast.And) else all(parts)
+        return False
+
+    return required(node)
+
+
 def _month_grain_filter_satisfies_time_range(
     start: str,
     end: str,
@@ -1122,6 +1159,9 @@ def _month_grain_filter_satisfies_time_range(
     next_month = 1 if start_date.month == 12 else start_date.month + 1
     if end_date.year != next_month_year or end_date.month != next_month or end_date.day != 1:
         return False
+
+    if any(_python_filter_requires_value(line, start_month) for line in code.splitlines()):
+        return True
 
     if re.search(rf"['\"]{re.escape(start_month)}['\"]", code):
         if re.search(rf"==\s*['\"]{re.escape(start_month)}['\"]", code) or re.search(
@@ -2310,6 +2350,8 @@ def probe_data_with_sql(
     params: Optional[list[Any]] = None,
     numeric_columns: Optional[list[str]] = None,
     text_columns: Optional[list[str]] = None,
+    *,
+    query_key: Optional[str] = None,
 ) -> ProbeQueryOutcome:
     """Execute one diagnostic SQL query without hiding its outcome.
 
@@ -2330,20 +2372,60 @@ def probe_data_with_sql(
     except Exception as exc:
         error_message = str(exc)
         error_type = _classify_execution_error(exc, error_message)
-        return ProbeQueryOutcome({
+        outcome = ProbeQueryOutcome({
             "status": "no_data" if error_type == "no_data_found" else "query_error",
             "data": None,
             "row_count": 0 if error_type == "no_data_found" else None,
             "error_type": error_type,
             "error_message": error_message,
         })
-    return ProbeQueryOutcome({
+        _record_probe_query_observation(sql, outcome, query_key=query_key)
+        return outcome
+    outcome = ProbeQueryOutcome({
         "status": "success",
         "data": data,
         "row_count": int(len(data)),
         "error_type": "",
         "error_message": "",
     })
+    _record_probe_query_observation(sql, outcome, query_key=query_key)
+    return outcome
+
+
+def _record_probe_query_observation(
+    sql: str,
+    outcome: ProbeQueryOutcome,
+    *,
+    query_key: Optional[str] = None,
+) -> None:
+    """Promote bounded helper observations into the Probe fact channel."""
+    observations = list(CURRENT_PROBE_QUERY_OBSERVATIONS.get() or [])
+    data = outcome.get('data')
+    columns = [str(column) for column in getattr(data, 'columns', [])]
+    samples: list[dict[str, Any]] = []
+    if outcome.success and hasattr(data, 'head'):
+        try:
+            samples = _copy_jsonable(data.head(32).to_dict(orient='records'), [])
+        except Exception:
+            samples = []
+    identifiers = list(dict.fromkeys(re.findall(
+        r'\b(?:FROM|JOIN)\s+([A-Za-z0-9_$.]+)', str(sql or ''), flags=re.IGNORECASE,
+    )))
+    observation = {
+        'query_key': str(query_key or '').strip()
+        or 'probe_' + hashlib.sha256(str(sql or '').encode('utf-8')).hexdigest()[:16],
+        'datasource_identifiers': identifiers[:8],
+        'status': str(outcome.get('status') or ''),
+        'row_count': outcome.get('row_count'),
+        'columns': columns[:64],
+        'value_samples': samples,
+        'error_type': str(outcome.get('error_type') or ''),
+    }
+    observations.append({
+        key: value for key, value in observation.items()
+        if value not in (None, '', [], {})
+    })
+    CURRENT_PROBE_QUERY_OBSERVATIONS.set(observations[-32:])
 
 
 def _restore_sql_projection_column_names(sql: str, data: Any) -> Any:
@@ -2644,6 +2726,30 @@ def _infer_sql_aggregate_numeric_columns(sql: str) -> list[str]:
                 alias = str(projection.alias_or_name or "").strip()
                 if alias and alias not in result:
                     result.append(alias)
+        # Resolve derived-table/CTE types before interpreting driver strings.
+        # Unknown types remain unchanged; no schema or column-name guessing.
+        if statement.find(exp.Subquery) is None and statement.find(exp.With) is None:
+            continue
+        try:
+            from sqlglot.optimizer.annotate_types import annotate_types
+            from sqlglot.optimizer.qualify import qualify
+
+            typed = annotate_types(qualify(
+                statement.copy(), validate_qualify_columns=False,
+            ))
+            for projection in typed.selects:
+                dtype = projection.type
+                alias = str(projection.alias_or_name or '').strip()
+                if (
+                    dtype is not None
+                    and dtype.this in exp.DataType.NUMERIC_TYPES
+                    and alias
+                    and alias not in result
+                ):
+                    result.append(alias)
+        except Exception:
+            # Dialect/type inference is optional, never a query admission gate.
+            pass
     return result
 
 def load_local_data_with_sql(sql: str, params: Optional[list[Any]] = None):
@@ -2796,6 +2902,7 @@ def _register_query_snapshot(
     sql: str = '',
     query_params: Any = None,
     filter_expressions: Optional[list[str]] = None,
+    file_filters: Optional[list[dict[str, Any]]] = None,
     aggregation_hints: Optional[list[str]] = None,
     sql_context: Optional[dict[str, Any]] = None,
     query_scope: Optional[dict[str, Any]] = None,
@@ -2835,6 +2942,7 @@ def _register_query_snapshot(
             "projection_semantics": _extract_sql_projection_semantics(sql),
             "query_params": _copy_jsonable(query_params, None),
             "filter_expressions": _copy_jsonable(filter_expressions or [], []),
+            "file_filters": _copy_jsonable(file_filters or [], []),
             "aggregation_hints": _copy_jsonable(aggregation_hints or [], []),
             "sql_context": sql_context_json,
             "sql_context_truncated": sql_context_truncated,
@@ -3177,6 +3285,8 @@ def _mark_latest_query_snapshot_execution(
                 execution["columns"] = [str(column) for column in list(columns)]
             except Exception:
                 pass
+        if CURRENT_EXECUTION_INTENT.get() == 'probe':
+            execution['probe_profile'] = _build_probe_data_profile(data)
     if row_count is not None:
         execution["row_count"] = max(int(row_count), 0)
     if columns is not None:
@@ -3203,6 +3313,81 @@ def _mark_latest_query_snapshot_execution(
     snapshot["execution"] = execution
     snapshots[query_key] = snapshot
     CURRENT_QUERY_SNAPSHOTS.set(snapshots)
+
+
+def _probe_profile_scalar(value: Any) -> Any:
+    """Convert a sampled probe value into a compact JSON-safe scalar."""
+    if value is None:
+        return None
+    try:
+        import pandas as pd
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, (str, bool, int, float)):
+        return value
+    if hasattr(value, 'isoformat'):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return str(value)[:240]
+
+
+def _build_probe_data_profile(data: Any) -> dict[str, Any]:
+    """Record bounded, typed Probe observations beside the executed query.
+
+    Printing a DataFrame is useful for a human debugging a worker but it is an
+    unstable transport for the next LLM turn.  The profile retains the same
+    practical facts (shape, values, enumeration hints and numeric ranges) in
+    a data-source-neutral protocol that can be deduplicated by Runtime.
+    """
+    try:
+        columns = [str(column) for column in list(getattr(data, 'columns', []) or [])][:24]
+        sample = data.loc[:, columns].head(8) if columns else data.head(8)
+        sample_rows = []
+        for raw_row in sample.to_dict(orient='records'):
+            sample_rows.append({
+                str(key): _probe_profile_scalar(value)
+                for key, value in raw_row.items()
+            })
+        profiles = []
+        for column in columns[:16]:
+            series = data[column]
+            sample_values = []
+            for value in series.head(128):
+                normalized = _probe_profile_scalar(value)
+                if normalized is None or normalized in sample_values:
+                    continue
+                sample_values.append(normalized)
+                if len(sample_values) >= 8:
+                    break
+            profile: dict[str, Any] = {
+                'field': column,
+                'dtype': str(getattr(series, 'dtype', '')),
+                'non_null_count': int(series.notna().sum()),
+                'sample_values': sample_values,
+            }
+            try:
+                if bool(getattr(series, 'dtype', None).kind in {'i', 'u', 'f'}):
+                    numeric = series.dropna()
+                    if not numeric.empty:
+                        profile['min'] = _probe_profile_scalar(numeric.min())
+                        profile['max'] = _probe_profile_scalar(numeric.max())
+            except Exception:
+                pass
+            profiles.append(profile)
+        return {
+            'schema_version': 1,
+            'sample_rows': sample_rows,
+            'column_profiles': profiles,
+            'truncated_columns': max(len(getattr(data, 'columns', []) or []) - len(columns), 0),
+        }
+    except Exception:
+        # Profiling must never make a valid Probe fail. The query snapshot
+        # still records its status, row count and columns.
+        return {}
 
 def load_data_with_api(
     endpoint: str,
@@ -6525,7 +6710,14 @@ def _validate_grouped_visible_dimension_contract(
     tree: ast.AST,
     code: str,
 ) -> RetryResult | None:
-    """Reject unproven first/last values exposed as grouped dimensions."""
+    """Surface unproven first/last values carried across a grouped boundary.
+
+    Static syntax can prove that ``first``/``last`` selects an arbitrary member
+    of a group, but it cannot prove the business functional dependency.  It
+    also cannot reliably prove whether a dynamically constructed artifact or
+    report exposes that field.  Return an advisory for result review instead of
+    making artifact syntax coverage a prerequisite for detecting the risk.
+    """
     visible_dimension_fields: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Dict):
@@ -6547,9 +6739,6 @@ def _validate_grouped_visible_dimension_contract(
                     and isinstance(keyword.value.value, str)
                 ):
                     visible_dimension_fields.add(keyword.value.value)
-    if not visible_dimension_fields:
-        return None
-
     for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
         if not isinstance(call.func, ast.Attribute) or call.func.attr not in {"agg", "aggregate"}:
             continue
@@ -6563,8 +6752,6 @@ def _validate_grouped_visible_dimension_contract(
         group_fields = _static_string_values(group_call.args[0] if group_call.args else None)
         risky_dimensions: list[dict[str, str]] = []
         for keyword in call.keywords:
-            if keyword.arg not in visible_dimension_fields:
-                continue
             if not isinstance(keyword.value, (ast.Tuple, ast.List)) or len(keyword.value.elts) < 2:
                 continue
             source_fields = _static_string_values(keyword.value.elts[0])
@@ -6578,6 +6765,11 @@ def _validate_grouped_visible_dimension_contract(
                 "output_field": str(keyword.arg),
                 "source_field": source_field,
                 "reducer": next(iter(reducers & {"first", "last"})),
+                "visibility": (
+                    "confirmed_user_visible"
+                    if keyword.arg in visible_dimension_fields
+                    else "unknown"
+                ),
             })
         if call.args and isinstance(call.args[0], ast.Dict):
             for key, value in zip(call.args[0].keys, call.args[0].values):
@@ -6586,12 +6778,17 @@ def _validate_grouped_visible_dimension_contract(
                 if not source_fields or not (reducers & {"first", "last"}):
                     continue
                 source_field = next(iter(source_fields))
-                if source_field not in visible_dimension_fields or source_field in group_fields:
+                if source_field in group_fields:
                     continue
                 risky_dimensions.append({
                     "output_field": source_field,
                     "source_field": source_field,
                     "reducer": next(iter(reducers & {"first", "last"})),
+                    "visibility": (
+                        "confirmed_user_visible"
+                        if source_field in visible_dimension_fields
+                        else "unknown"
+                    ),
                 })
         if not risky_dimensions:
             continue
@@ -6599,7 +6796,7 @@ def _validate_grouped_visible_dimension_contract(
         return request_retry(
             retry_type="query_constraint_violation",
             message=_format_error_message_with_code_location(
-                "分组结果把未证明唯一的首值或末值作为用户可见维度，可能给汇总指标附上错误标签。",
+                "分组结果使用首值或末值携带未证明函数依赖的字段，若该字段进入产物，可能给汇总指标附上错误标签。",
                 code_error_context,
             ),
             diagnostics={
@@ -6775,6 +6972,9 @@ def _validate_runtime_helper_signature_contract(
         ),
         diagnostics={
             'violated_contract': 'runtime_helper_signature_mismatch',
+            'failure_domain': 'implementation',
+            'failure_phase': 'static_contract_validation',
+            'scope_change_authorized': False,
             'findings': findings,
         },
         repair_instructions=[
@@ -7021,11 +7221,92 @@ def _save_analysis_result_keywords(tree: ast.AST) -> set[str]:
     return keywords
 
 
+def _top_level_assigned_names(tree: ast.Module) -> set[str]:
+    """Return names assigned unconditionally in the module body."""
+    names: set[str] = set()
+    for statement in tree.body:
+        targets: list[ast.expr] = []
+        if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            targets = (
+                list(statement.targets)
+                if isinstance(statement, ast.Assign)
+                else [statement.target]
+            )
+        elif isinstance(statement, ast.AugAssign):
+            targets = [statement.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+    return names
+
+
+def _complete_analysis_result_terminal(
+    code: str,
+    *,
+    output_format: str = "standard",
+) -> tuple[str, bool]:
+    """Add the canonical result adapter when a complete artifact set already exists.
+
+    The adapter is deliberately narrower than a code repair. It does not infer
+    calculations, reports, or artifacts and only references values assigned at
+    module scope, where they are guaranteed to exist when execution reaches the
+    appended statement.
+    """
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return code, False
+    if _extract_static_string_assignment(tree, "execution_intent") != "analysis":
+        return code, False
+    calls = _called_function_names(tree)
+    if "save_analysis_result" in calls or "request_retry" in calls:
+        return code, False
+
+    assigned = _top_level_assigned_names(tree)
+    if "result" in assigned:
+        return code, False
+
+    normalized_format = str(output_format or "standard").strip().lower()
+    arguments: list[str]
+    if normalized_format == "standard":
+        report_name = next(
+            (name for name in ("analysis_report", "report") if name in assigned),
+            "",
+        )
+        if not report_name or not ({"charts", "tables"} & assigned):
+            return code, False
+        arguments = [f"analysis_report={report_name}"]
+        for name in (
+            "charts",
+            "tables",
+            "analysis_parameters_schema",
+            "analysis_parameters",
+        ):
+            if name in assigned:
+                arguments.append(f"{name}={name}")
+    elif normalized_format == "text":
+        if "output_text" not in assigned:
+            return code, False
+        arguments = ["output_text=output_text"]
+    elif normalized_format == "json":
+        if "output_json" not in assigned:
+            return code, False
+        arguments = ["output_json=output_json"]
+    else:
+        return code, False
+
+    newline = "\r\n" if "\r\n" in code else "\n"
+    completed = str(code or "").rstrip() + newline * 2
+    completed += f"result = save_analysis_result({', '.join(arguments)}){newline}"
+    return completed, True
+
+
 def _validate_generated_code_contract(
     code: str,
     *,
     output_format: str = "standard",
     allow_implicit_probe_feedback: bool = False,
+    advisory_sink: list[dict[str, Any]] | None = None,
 ) -> RetryResult | None:
     """Validate the static tool contract of generated Python code before execution."""
     try:
@@ -7208,11 +7489,12 @@ def _validate_generated_code_contract(
             _validate_report_bounded_time_window_contract(tree, code or ''),
             _validate_report_paired_metric_population_contract(tree, code or ''),
             (
-                _validate_analysis_query_result_consumption_contract(tree, code or '')
+            _validate_analysis_query_result_consumption_contract(tree, code or '')
                 if incomplete_analysis_retry is None
                 else None
             ),
             _validate_dataframe_subset_column_contract(tree, code or ''),
+            _validate_analysis_parameter_defaults_contract(tree, code or ''),
             _validate_runtime_helper_signature_contract(tree, code or ''),
             _validate_query_dataframe_projection_contract(code or ''),
             _validate_static_composed_query_constraints_contract(tree, code or ''),
@@ -7229,17 +7511,27 @@ def _validate_generated_code_contract(
         # These checks expose real data-quality risks, but syntax alone cannot
         # prove the runtime values are wrong. Keep the diagnostics without
         # forcing a speculative model repair.
-        for advisory in (
+        all_static_advisories = [advisory for advisory in (
             *static_advisories,
             _validate_query_mapping_default_contract(tree),
             _validate_grouped_visible_dimension_contract(tree, code or ''),
-        ):
-            if advisory is not None:
-                logger.info(
-                    "Runtime static advisory contract=%s diagnostics=%s",
-                    (advisory.diagnostics or {}).get("violated_contract"),
-                    advisory.diagnostics or {},
-                )
+        ) if advisory is not None]
+        for advisory in all_static_advisories:
+            logger.info(
+                "Runtime static advisory contract=%s diagnostics=%s",
+                (advisory.diagnostics or {}).get("violated_contract"),
+                advisory.diagnostics or {},
+            )
+            if advisory_sink is not None:
+                diagnostics = copy.deepcopy(advisory.diagnostics or {})
+                code_context = diagnostics.pop('code_error_context', None)
+                if isinstance(code_context, dict):
+                    diagnostics['code_location'] = {
+                        key: code_context.get(key)
+                        for key in ('line_no', 'column_no', 'error_line')
+                        if code_context.get(key) not in (None, '')
+                    }
+                advisory_sink.append(diagnostics)
 
         if static_semantic_retry is not None:
             if static_advisories:
@@ -7293,6 +7585,7 @@ def validate_query_constraints(
     query_params: Any = None,
     sql_params: Any = None,
     filter_expressions: Optional[list[str]] = None,
+    file_filters: Optional[list[dict[str, Any]]] = None,
     aggregation_hints: Optional[list[str]] = None,
     sql_context: Optional[dict[str, Any]] = None,
     scope_source_query_key: str = '',
@@ -7587,6 +7880,7 @@ def validate_query_constraints(
         sql=sql,
         query_params=effective_query_params,
         filter_expressions=filter_expressions,
+        file_filters=file_filters,
         aggregation_hints=aggregation_hints,
         sql_context=sql_context,
         query_scope=query_scope,
@@ -7637,10 +7931,11 @@ def query_data_with_sql(
 def _local_file_validation_hints(
     query_constraints: Any,
     filter_expressions: Optional[list[str]],
+    file_filters: Optional[list[dict[str, Any]]],
     aggregation_hints: Optional[list[str]],
 ) -> Optional[list[str]]:
     """Describe a provable full-file detail read without duplicated model hints."""
-    if aggregation_hints or filter_expressions:
+    if aggregation_hints or filter_expressions or file_filters:
         return aggregation_hints
     if not isinstance(query_constraints, dict):
         return aggregation_hints
@@ -7655,6 +7950,185 @@ def _local_file_validation_hints(
     return aggregation_hints
 
 
+def _validate_file_filter_expressions(filter_expressions: Any) -> None:
+    if filter_expressions is None:
+        return
+    if not isinstance(filter_expressions, list) or any(
+        not isinstance(item, str) or not item.strip()
+        for item in filter_expressions
+    ):
+        raise ValueError(
+            'filter_expressions must be a list of non-empty Python expression strings, '
+            'not field/op/value objects. It describes validation only; query_local_file '
+            'returns the full file and does not execute these expressions. '
+            'Apply the same filter to the returned DataFrame before computing metrics. '
+            'For example: filter_expressions=["data[\'category\'].eq(\'A\')"], '
+            'then filtered = data.loc[data["category"].eq("A")].copy().'
+        )
+
+
+_FILE_FILTER_OPERATORS = frozenset({'eq', 'in', 'gt', 'gte', 'lt', 'lte', 'is_null', 'not_null'})
+
+
+def _normalize_file_filters(file_filters: Any) -> list[dict[str, Any]]:
+    """Validate the executable, datasource-local subset of DataFrame filters."""
+    if file_filters is None:
+        return []
+    if not isinstance(file_filters, list):
+        raise ValueError('file_filters must be a list of {field, op, value} objects.')
+    normalized: list[dict[str, Any]] = []
+    for raw in file_filters:
+        if not isinstance(raw, dict):
+            raise ValueError('Each file_filters item must be an object.')
+        field = str(raw.get('field') or '').strip()
+        operator = str(raw.get('op') or '').strip().lower()
+        if not field or operator not in _FILE_FILTER_OPERATORS:
+            raise ValueError(
+                'file_filters requires a non-empty field and op in: '
+                + ', '.join(sorted(_FILE_FILTER_OPERATORS))
+            )
+        has_value = 'value' in raw
+        value = raw.get('value')
+        if operator in {'is_null', 'not_null'}:
+            if has_value and value is not None:
+                raise ValueError(f'file_filters op={operator} does not accept a value.')
+            normalized.append({'field': field, 'op': operator})
+            continue
+        if not has_value or value is None:
+            raise ValueError(f'file_filters op={operator} requires a non-null value.')
+        if operator == 'in':
+            if not isinstance(value, list) or not value:
+                raise ValueError('file_filters op=in requires a non-empty value list.')
+            normalized.append({'field': field, 'op': operator, 'value': list(value)})
+        elif isinstance(value, (str, int, float, bool)):
+            normalized.append({'field': field, 'op': operator, 'value': value})
+        else:
+            raise ValueError(f'file_filters op={operator} value must be a scalar.')
+    return normalized
+
+
+def _file_filter_expressions(file_filters: list[dict[str, Any]]) -> list[str]:
+    """Render only validated literals for the existing query-constraint checker."""
+    rendered = []
+    operator_source = {
+        'eq': '==', 'gt': '>', 'gte': '>=', 'lt': '<', 'lte': '<=',
+    }
+    for item in file_filters:
+        field = repr(item['field'])
+        operator = item['op']
+        if operator in operator_source:
+            rendered.append(f"data[{field}] {operator_source[operator]} {item['value']!r}")
+        elif operator == 'in':
+            rendered.append(f"data[{field}].isin({item['value']!r})")
+        elif operator == 'is_null':
+            rendered.append(f"data[{field}].isna()")
+        else:
+            rendered.append(f"data[{field}].notna()")
+    return rendered
+
+
+def _apply_file_filters(data: Any, file_filters: list[dict[str, Any]]):
+    """Apply deterministic filters without evaluating generated Python text."""
+    if not file_filters:
+        return data
+    import pandas as pd
+
+    if not isinstance(data, pd.DataFrame):
+        raise TypeError('file_filters can only be applied to a pandas DataFrame.')
+    missing = [item['field'] for item in file_filters if item['field'] not in data.columns]
+    if missing:
+        raise KeyError('file_filters references unavailable file columns: ' + ', '.join(dict.fromkeys(missing)))
+    mask = pd.Series(True, index=data.index, dtype=bool)
+    for item in file_filters:
+        series = data[item['field']]
+        operator = item['op']
+        if operator == 'eq':
+            current = series.eq(item['value'])
+        elif operator == 'in':
+            current = series.isin(item['value'])
+        elif operator == 'gt':
+            current = series.gt(item['value'])
+        elif operator == 'gte':
+            current = series.ge(item['value'])
+        elif operator == 'lt':
+            current = series.lt(item['value'])
+        elif operator == 'lte':
+            current = series.le(item['value'])
+        elif operator == 'is_null':
+            current = series.isna()
+        else:
+            current = series.notna()
+        mask &= current.fillna(False)
+    return data.loc[mask].copy()
+
+
+def _mark_file_filter_execution(file_filters: list[dict[str, Any]], data: Any) -> None:
+    if not file_filters:
+        return
+    _mark_latest_query_snapshot_execution(
+        status='success',
+        duration_ms=-1,
+        data=data,
+        diagnostics={
+            'file_filters_applied': _copy_jsonable(file_filters, []),
+        },
+    )
+
+
+def _validate_analysis_parameter_defaults_contract(
+    tree: ast.AST,
+    code: str,
+) -> RetryResult | None:
+    """Catch the statically provable schema/defaults mix-up before execution."""
+    findings: list[dict[str, Any]] = []
+    contexts: list[dict[str, Any]] = []
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if not isinstance(call.func, ast.Name) or call.func.id != 'get_analysis_parameters':
+            continue
+        argument = call.args[0] if call.args else next(
+            (keyword.value for keyword in call.keywords if keyword.arg == 'defaults'),
+            None,
+        )
+        is_schema_name = isinstance(argument, ast.Name) and argument.id == 'analysis_parameters_schema'
+        is_schema_literal = (
+            isinstance(argument, ast.Dict)
+            and {
+                key.value
+                for key in argument.keys
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            } >= {'parameters', 'defaults'}
+        )
+        if not (is_schema_name or is_schema_literal):
+            continue
+        context = _static_node_code_context(code, call)
+        findings.append({
+            'line': int(getattr(call, 'lineno', 0) or 0),
+            'call': ast.unparse(call),
+            'expected_argument': 'analysis_parameters_schema["defaults"]',
+        })
+        if context and context not in contexts:
+            contexts.append(context)
+    if not findings:
+        return None
+    return request_retry(
+        retry_type='contract_error',
+        message='get_analysis_parameters(...) 收到了参数 Schema，而不是参数默认值映射。',
+        diagnostics={
+            'violated_contract': 'analysis_parameter_defaults_argument',
+            'findings': findings,
+        },
+        repair_instructions=[
+            '使用 analysis_parameters = get_analysis_parameters(analysis_parameters_schema["defaults"])。',
+            '后续所有查询、过滤、标题和口径都从 analysis_parameters 读取；不要为了绕过参数读取错误而写死当前时间、对象或筛选值。',
+            '保留已有参数 Schema，尤其是相对时间参数的可复跑语义。',
+        ],
+        code_error_context={
+            'related_contexts': contexts,
+            'suggested_patch_ranges': contexts,
+        },
+    )
+
+
 def query_local_file(
     *,
     query_key: str,
@@ -7662,27 +8136,41 @@ def query_local_file(
     file_path: str,
     sheet_name: Optional[str] = None,
     filter_expressions: Optional[list[str]] = None,
+    file_filters: Optional[list[dict[str, Any]]] = None,
     aggregation_hints: Optional[list[str]] = None,
 ):
     """Validate, register and load one local file as a single operation."""
+    _validate_file_filter_expressions(filter_expressions)
+    normalized_file_filters = _normalize_file_filters(file_filters)
+    effective_filter_expressions = [
+        *_file_filter_expressions(normalized_file_filters),
+        *(filter_expressions or []),
+    ]
     effective_aggregation_hints = _local_file_validation_hints(
         query_constraints,
-        filter_expressions,
+        effective_filter_expressions,
+        normalized_file_filters,
         aggregation_hints,
     )
-    validation = validate_query_constraints(
-        query_key=query_key,
-        query_constraints=query_constraints,
-        sql="",
-        filter_expressions=filter_expressions,
-        aggregation_hints=effective_aggregation_hints,
-    )
+    validation_kwargs = {
+        'query_key': query_key,
+        'query_constraints': query_constraints,
+        'sql': '',
+        'filter_expressions': effective_filter_expressions,
+        'aggregation_hints': effective_aggregation_hints,
+    }
+    if normalized_file_filters:
+        validation_kwargs['file_filters'] = normalized_file_filters
+    validation = validate_query_constraints(**validation_kwargs)
     if validation is not None:
         raise QueryConstraintRetrySignal(validation)
-    return load_local_file(
+    data = load_local_file(
         file_path=file_path,
         sheet_name=sheet_name,
     )
+    data = _apply_file_filters(data, normalized_file_filters)
+    _mark_file_filter_execution(normalized_file_filters, data)
+    return data
 
 
 def query_local_file_low_memory(
@@ -7692,6 +8180,7 @@ def query_local_file_low_memory(
     file_path: str,
     sheet_name: Optional[str] = None,
     filter_expressions: Optional[list[str]] = None,
+    file_filters: Optional[list[dict[str, Any]]] = None,
     aggregation_hints: Optional[list[str]] = None,
     chunk_size: int = 50000,
     usecols: Optional[list[str] | list[int] | str] = None,
@@ -7700,21 +8189,31 @@ def query_local_file_low_memory(
     low_memory: bool = True,
 ):
     """Validate, register and stream one local file as a single operation."""
+    _validate_file_filter_expressions(filter_expressions)
+    normalized_file_filters = _normalize_file_filters(file_filters)
+    effective_filter_expressions = [
+        *_file_filter_expressions(normalized_file_filters),
+        *(filter_expressions or []),
+    ]
     effective_aggregation_hints = _local_file_validation_hints(
         query_constraints,
-        filter_expressions,
+        effective_filter_expressions,
+        normalized_file_filters,
         aggregation_hints,
     )
-    validation = validate_query_constraints(
-        query_key=query_key,
-        query_constraints=query_constraints,
-        sql="",
-        filter_expressions=filter_expressions,
-        aggregation_hints=effective_aggregation_hints,
-    )
+    validation_kwargs = {
+        'query_key': query_key,
+        'query_constraints': query_constraints,
+        'sql': '',
+        'filter_expressions': effective_filter_expressions,
+        'aggregation_hints': effective_aggregation_hints,
+    }
+    if normalized_file_filters:
+        validation_kwargs['file_filters'] = normalized_file_filters
+    validation = validate_query_constraints(**validation_kwargs)
     if validation is not None:
         raise QueryConstraintRetrySignal(validation)
-    return load_local_file_low_memory(
+    stream = load_local_file_low_memory(
         file_path=file_path,
         sheet_name=sheet_name,
         chunk_size=chunk_size,
@@ -7723,6 +8222,26 @@ def query_local_file_low_memory(
         parse_dates=parse_dates,
         low_memory=low_memory,
     )
+    if not normalized_file_filters:
+        return stream
+
+    def _filtered_stream():
+        row_count = 0
+        columns: list[str] = []
+        for chunk in stream:
+            filtered = _apply_file_filters(chunk, normalized_file_filters)
+            row_count += len(filtered)
+            columns = [str(column) for column in filtered.columns]
+            yield filtered
+        _mark_latest_query_snapshot_execution(
+            status='success',
+            duration_ms=-1,
+            row_count=row_count,
+            columns=columns,
+            diagnostics={'file_filters_applied': _copy_jsonable(normalized_file_filters, [])},
+        )
+
+    return _filtered_stream()
 
 
 def save_empty_analysis_result(
@@ -7921,6 +8440,13 @@ def build_table_result(
 
 def get_analysis_parameters(defaults: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Return generated-code defaults merged with local rerun overrides."""
+    if isinstance(defaults, dict) and isinstance(defaults.get('parameters'), list) and isinstance(defaults.get('defaults'), dict):
+        raise ValueError(
+            'get_analysis_parameters expects parameter default values, not the parameter schema. '
+            'Use get_analysis_parameters(analysis_parameters_schema["defaults"]) and derive '
+            'query/filter values from the returned mapping; do not replace parameter reads '
+            'with hard-coded values.'
+        )
     base = dict(defaults or {})
     override = CURRENT_ANALYSIS_PARAMETERS_OVERRIDE.get() or {}
     if isinstance(override, dict):
@@ -8093,8 +8619,8 @@ class ExePythonCodeInput(BaseModel):
             "一份独立、完整、可执行的 Python 代码。execution_intent='analysis' 时必须在同一次调用内完成"
             "查询、计算、图表/表格、报告并以 result = save_analysis_result(...) 收口；"
             "execution_intent='probe' 时必须以 result = request_retry(...) 返回结构化探测反馈。"
-            "不同 execute_python 调用之间不会保留 DataFrame、变量或中间状态。首次生成或整体调整时填写；"
-            "对上一执行中的局部技术错误做修复时，改用 base_execution_id + patches，避免重写整份代码。"
+            "不同 execute_python 调用之间不会保留 DataFrame、变量或中间状态。首次生成及查询、字段、聚合、计算或产物调整时"
+            "都填写完整 code；仅反馈明确提供 repair_target 的孤立 API 调用错误可使用 base_execution_id + patches。"
         )
     )
     title: str = Field(default='', description="本次代码执行任务的简短标题；省略时使用默认任务标题。")
@@ -8114,14 +8640,25 @@ class ExePythonCodeInput(BaseModel):
         default_factory=list,
         description=(
             "针对 base_execution_id 完整源码的非重叠行区间替换。start_line/end_line 使用原版本行号，"
-            "参考错误定位及 repair_target.allowed_ranges；可以修改参数行或相邻语句，保留缩进。"
+            "只能使用反馈明确提供的 repair_target.allowed_ranges，且必须完整替换一个 Python 语句或代码块。"
             "后端合成并验证完整代码，未覆盖区域保持原样。"
         ),
     )
 
+    @field_validator('used_datasource_ids', mode='before')
+    @classmethod
+    def _decode_used_datasource_ids(cls, value):
+        return _decode_tool_id_list(value)
+
 
 class ProbeAnalysisDataInput(BaseModel):
+    progress_summary: str = Field(
+        default='',
+        max_length=600,
+        description='面向用户的一句话工作说明：本次要核实什么以及原因。不要包含代码、原始数据或内部推理。',
+    )
     code: str = Field(
+        default='',
         description=(
             "一份独立、只读、有界的 Probe Python 代码。执行用途由此工具确定，无需重复声明 execution_intent；"
             "只查询确认正式分析所需的真实枚举、格式、时间覆盖、关联可达性或有无数据，"
@@ -8136,9 +8673,31 @@ class ProbeAnalysisDataInput(BaseModel):
         default_factory=list,
         description="Probe 代码实际读取或查询的数据源 datasource_id 列表，只能取自当前候选范围。",
     )
+    # OpenAI-compatible gateways do not consistently honor Pydantic
+    # validation aliases while preserving a model tool call. Keep every
+    # documented legacy spelling as a first-class optional field at this
+    # boundary, then canonicalize to ``code`` before invoking the worker.
+    program: str = Field(default='', description="兼容字段：等同于 code。")
+    probe_code: str = Field(default='', description="兼容字段：等同于 code。")
+    probe: str = Field(default='', description="兼容字段：等同于 code。")
+
+    @field_validator('used_datasource_ids', mode='before')
+    @classmethod
+    def _decode_used_datasource_ids(cls, value):
+        return _decode_tool_id_list(value)
+
+    @model_validator(mode='after')
+    def _canonicalize_code(self):
+        self.code = str(self.code or self.program or self.probe_code or self.probe or '')
+        return self
 
 
 class SubmitAnalysisProgramInput(BaseModel):
+    progress_summary: str = Field(
+        default='',
+        max_length=600,
+        description='面向用户的一句话工作说明：本次分析或修复的目标。不要包含代码、原始数据或内部推理。',
+    )
     code: str = Field(
         default='',
         description=(
@@ -8146,7 +8705,7 @@ class SubmitAnalysisProgramInput(BaseModel):
             "并在同一次提交内完成查询、计算、空数据处理、当前结果协议要求的产物构造，"
             "最后以 result = save_analysis_result(...) 收口。此工具不是数据观察工作台；"
             "如果还需要观察真实枚举、格式、覆盖或关联，请先调用 probe_analysis_data。"
-            "首次生成或整体调整时填写；局部技术错误修复时使用 base_execution_id + patches。"
+            "首次生成及查询、字段、聚合、计算或产物调整时填写完整 code；仅反馈明确提供 repair_target 的孤立 API 调用错误可使用 base_execution_id + patches。"
         ),
     )
     title: str = Field(default='', description="正式洞察分析任务的简短标题。")
@@ -8168,8 +8727,35 @@ class SubmitAnalysisProgramInput(BaseModel):
     )
     patches: list[SourceCodePatch] = Field(
         default_factory=list,
-        description="针对 base_execution_id 完整源码的非重叠语句替换；范围必须来自错误反馈。",
+        description="针对 base_execution_id 完整源码的非重叠完整语句或代码块替换；范围必须来自错误反馈的 repair_target。",
     )
+    program: str = Field(default='', description="兼容字段：等同于 code。")
+    analysis_code: str = Field(default='', description="兼容字段：等同于 code。")
+    analysis_program: str = Field(default='', description="兼容字段：等同于 code。")
+
+    @field_validator('used_datasource_ids', mode='before')
+    @classmethod
+    def _decode_used_datasource_ids(cls, value):
+        return _decode_tool_id_list(value)
+
+    @model_validator(mode='after')
+    def _canonicalize_code(self):
+        self.code = str(self.code or self.program or self.analysis_code or self.analysis_program or '')
+        return self
+
+
+def _decode_tool_id_list(value: Any) -> Any:
+    """Accept gateway-serialized JSON arrays without accepting ambiguous text."""
+    if not isinstance(value, str):
+        return value
+    normalized = value.strip()
+    if not (normalized.startswith('[') and normalized.endswith(']')):
+        return value
+    try:
+        decoded = json.loads(normalized)
+    except (TypeError, ValueError):
+        return value
+    return decoded if isinstance(decoded, list) else value
 
 
 def _serialize_exec_result(exec_result: Any) -> dict[str, Any]:
@@ -10192,6 +10778,47 @@ def _bind_program_execution_mode(code: str, execution_mode: str) -> str:
     return prefix + f'execution_intent = "{execution_mode}"{newline}' + suffix
 
 
+def _program_requests_probe_feedback(code: str) -> bool:
+    """Return whether source is structurally a Probe result, not formal output."""
+    try:
+        tree = ast.parse(code or '')
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function_name = node.func.id if isinstance(node.func, ast.Name) else (
+            node.func.attr if isinstance(node.func, ast.Attribute) else ''
+        )
+        if function_name != 'request_retry':
+            continue
+        for keyword in node.keywords:
+            if (
+                keyword.arg == 'retry_type'
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value == 'probe_feedback'
+            ):
+                return True
+    return False
+
+
+def _program_uses_probe_api(code: str) -> bool:
+    """Return whether source invokes a helper reserved for Probe execution."""
+    try:
+        tree = ast.parse(code or '')
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function_name = node.func.id if isinstance(node.func, ast.Name) else (
+            node.func.attr if isinstance(node.func, ast.Attribute) else ''
+        )
+        if function_name == 'probe_data_with_sql':
+            return True
+    return False
+
+
 def _build_analysis_logic_signature(code: str) -> str:
     normalized_code = (code or '').replace('\r\n', '\n').strip()
     if not normalized_code:
@@ -10200,22 +10827,29 @@ def _build_analysis_logic_signature(code: str) -> str:
 
 
 def _apply_source_code_patches(code: str, patches: list[SourceCodePatch]) -> str:
-    """Apply atomic line edits and validate the complete immutable source revision."""
+    """Apply complete-statement edits to a syntactically valid source revision."""
     source_lines = str(code or '').splitlines()
     if not source_lines:
         raise ValueError('base_execution_id 对应的执行记录没有可修复代码。')
     if not patches:
         raise ValueError('使用 base_execution_id 修复时必须提供至少一个 patches 行区间替换。')
 
-    source_syntax_error: SyntaxError | None = None
     try:
-        ast.parse(code or '')
+        source_tree = ast.parse(code or '')
     except SyntaxError as exc:
-        source_syntax_error = exc
+        raise ValueError(
+            '失败代码本身无法建立可靠的 Python 语句边界，请提交完整 code 重新生成，不能使用 patches。'
+        ) from exc
+    valid_statement_ranges = {
+        (
+            int(getattr(node, 'lineno', 0) or 0),
+            int(getattr(node, 'end_lineno', 0) or 0),
+        )
+        for node in ast.walk(source_tree)
+        if isinstance(node, ast.stmt)
+    }
 
     normalized = sorted(patches, key=lambda item: (item.start_line, item.end_line))
-    syntax_line = int(source_syntax_error.lineno or 0) if source_syntax_error is not None else 0
-    syntax_patch_seen = False
     previous_end = 0
     for patch in normalized:
         if patch.start_line < 1 or patch.end_line < patch.start_line:
@@ -10226,25 +10860,11 @@ def _apply_source_code_patches(code: str, patches: list[SourceCodePatch]) -> str
             )
         if patch.start_line <= previous_end:
             raise ValueError('patches 不能包含重叠的源码行区间。')
-        if source_syntax_error is not None:
-            local_start = max(1, syntax_line - GENERATED_CODE_CONTEXT_RADIUS)
-            local_end = min(len(source_lines), syntax_line + GENERATED_CODE_CONTEXT_RADIUS)
-            if (
-                syntax_line <= 0
-                or patch.start_line < local_start
-                or patch.end_line > local_end
-                or patch.end_line - patch.start_line > GENERATED_CODE_CONTEXT_RADIUS * 2
-            ):
-                raise ValueError(
-                    '语法错误代码的 patches 只能替换编译器定位行附近的有限代码块。'
-                )
-            syntax_patch_seen = syntax_patch_seen or (
-                patch.start_line <= syntax_line <= patch.end_line
+        if (patch.start_line, patch.end_line) not in valid_statement_ranges:
+            raise ValueError(
+                'patches 必须完整替换一个 Python 语句或代码块，不能从字典、字符串、调用参数或缩进块中间截断。'
             )
         previous_end = patch.end_line
-
-    if source_syntax_error is not None and not syntax_patch_seen:
-        raise ValueError('语法错误代码的 patches 至少有一项必须覆盖编译器定位行。')
 
     for patch in reversed(normalized):
         source_lines[patch.start_line - 1:patch.end_line] = patch.replacement.splitlines()
@@ -10257,7 +10877,7 @@ def _apply_source_code_patches(code: str, patches: list[SourceCodePatch]) -> str
     except SyntaxError as exc:
         raise ValueError(
             f'patches 合成后的完整代码存在语法错误（第 {exc.lineno or 0} 行：{exc.msg}）；'
-            '本次补丁未创建执行，请核对原版本行号、缩进和括号后修复，或提交完整 code。'
+            '本次补丁未创建执行，请按完整语句边界重新修复或提交完整 code。'
         ) from exc
     return rendered
 
@@ -10351,8 +10971,50 @@ def _resolve_execute_python_source(
         ).first()
         if base_execution is None:
             raise ValueError('base_execution_id 不属于当前会话轮次或执行记录不存在。')
-        if str(base_execution.execution_status or '') == 'success':
-            raise ValueError('不能以已成功执行的代码作为错误修复基线。')
+        base_status = str(base_execution.execution_status or '')
+        try:
+            base_payload = json.loads(base_execution.result_payload_json or '{}')
+        except (TypeError, ValueError, json.JSONDecodeError):
+            base_payload = {}
+        repair_target = base_payload.get('repair_target') if isinstance(base_payload, dict) else None
+        if base_status == 'success':
+            latest_execution = session.query(InsightNsExecution).filter(
+                InsightNsExecution.conversation_id == int(conversation_id or 0),
+                InsightNsExecution.turn_id == int(turn_id or 0),
+                InsightNsExecution.is_deleted == 0,
+            ).order_by(InsightNsExecution.id.desc()).first()
+            if latest_execution is None or int(latest_execution.id or 0) != base_execution_id:
+                raise ValueError('语义修订只能使用当前轮次最新的成功候选作为 base_execution_id。')
+            review_target = (
+                base_payload.get('review_revision_target')
+                if isinstance(base_payload, dict) else None
+            )
+            if not isinstance(review_target, dict) or review_target.get('mode') != 'review_line_patch':
+                raise ValueError('该成功候选没有经过 Review 授权局部修订，请提交完整 code。')
+            if int(review_target.get('base_execution_id') or 0) != base_execution_id:
+                raise ValueError('成功候选的 Review 修订基线不匹配，请提交完整 code。')
+            source = str(base_execution.generated_code or '')
+            if str(review_target.get('base_source_sha256') or '') != _build_analysis_logic_signature(source):
+                raise ValueError('成功候选源码与 Review 修订目标不一致，请重新复核候选。')
+            allowed_ranges = {
+                (int(item.get('start_line') or 0), int(item.get('end_line') or 0))
+                for item in review_target.get('allowed_ranges') or []
+                if isinstance(item, dict)
+            }
+            requested_ranges = {
+                (int(item.start_line), int(item.end_line))
+                for item in normalized_patches
+            }
+            if not requested_ranges or not requested_ranges.issubset(allowed_ranges):
+                raise ValueError('语义修订 patches 只能使用 Review 返回的 allowed_ranges。')
+        else:
+            if not isinstance(repair_target, dict) or repair_target.get('mode') != 'line_patch':
+                raise ValueError(
+                    '该失败属于查询、计算、范围或产物结构的完整程序修复，'
+                    '不允许使用 base_execution_id + patches；请提交完整 code。'
+                )
+            if int(repair_target.get('base_execution_id') or 0) != base_execution_id:
+                raise ValueError('base_execution_id 的 repair_target 不匹配，必须提交完整 code。')
         try:
             base_ids = _normalize_used_datasource_ids(json.loads(base_execution.used_datasource_ids_json or '[]'))
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -10385,7 +11047,8 @@ def _resolve_execute_python_source(
                 datasource_ids=base_ids,
                 syntax_error=syntax_error,
             )
-        return resolved_code, base_ids, base_execution_id, 'llm_patch_repair'
+        execution_source = 'llm_review_patch' if base_status == 'success' else 'llm_patch_repair'
+        return resolved_code, base_ids, base_execution_id, execution_source
     finally:
         session.close()
 
@@ -10701,6 +11364,7 @@ def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -
         payload.get('initial_query_snapshots') or {},
         {},
     ))
+    CURRENT_PROBE_QUERY_OBSERVATIONS.set([])
     CURRENT_LAST_QUERY_KEY.set('')
     CURRENT_EXECUTION_INTENT.set('')
     CURRENT_CONFIRMED_NO_DATA_RESULT.set(bool(payload.get('confirmed_no_data_result')))
@@ -11532,6 +12196,16 @@ def _execute_generated_code_worker(
     except (SyntaxError, ValueError):
         CURRENT_EXECUTION_INTENT.set('')
     namespace = _build_execution_namespace()
+    # Generated programs normally call these helpers directly. Some models use
+    # the equally conventional ``from runtime import helper`` spelling. The
+    # worker is an isolated process, so exposing the exact injected namespace
+    # as its local ``runtime`` module makes that style semantically identical
+    # without broadening the executable capability surface.
+    import sys as worker_sys
+    import types as worker_types
+    runtime_module = worker_types.ModuleType('runtime')
+    runtime_module.__dict__.update(namespace)
+    worker_sys.modules['runtime'] = runtime_module
     exec_result: Any = None
     with _capture_runtime_io(username) as (stdout_buffer, stderr_buffer):
         try:
@@ -11545,6 +12219,10 @@ def _execute_generated_code_worker(
                 'query_snapshots': _copy_jsonable(
                     CURRENT_QUERY_SNAPSHOTS.get() or {},
                     {},
+                ),
+                'probe_query_observations': _copy_jsonable(
+                    CURRENT_PROBE_QUERY_OBSERVATIONS.get() or [],
+                    [],
                 ),
             })
             result_queue.put({
@@ -11560,6 +12238,10 @@ def _execute_generated_code_worker(
                 'query_snapshots': _copy_jsonable(
                     CURRENT_QUERY_SNAPSHOTS.get() or {},
                     {},
+                ),
+                'probe_query_observations': _copy_jsonable(
+                    CURRENT_PROBE_QUERY_OBSERVATIONS.get() or [],
+                    [],
                 ),
             })
             result_queue.put({
@@ -11604,6 +12286,10 @@ def _execute_generated_code_worker(
                 'query_snapshots': _copy_jsonable(
                     CURRENT_QUERY_SNAPSHOTS.get() or {},
                     {},
+                ),
+                'probe_query_observations': _copy_jsonable(
+                    CURRENT_PROBE_QUERY_OBSERVATIONS.get() or [],
+                    [],
                 ),
                 'stdout_text': _sanitize_tool_output(stdout_buffer.getvalue()),
                 'stderr_text': _sanitize_tool_output(
@@ -13123,6 +13809,53 @@ def _validate_analysis_query_result_consumption_contract(
     )
 
 
+def _build_derived_query_projection_diagnostics(code: str) -> dict[str, Any]:
+    """Explain proven missing fields in closed, single-derived-source scopes."""
+    from sqlglot import exp, parse_one
+    from sqlglot.optimizer.scope import Scope, traverse_scope
+
+    mismatches = []
+    for candidate in _static_sql_candidates(code):
+        try:
+            statement = parse_one(candidate.get('sql') or '')
+            scopes = traverse_scope(statement)
+        except Exception:
+            continue
+        for scope in scopes:
+            try:
+                selected_sources = scope.selected_sources
+                columns = scope.columns
+            except Exception:
+                continue
+            if not isinstance(scope.expression, exp.Select) or len(selected_sources) != 1:
+                continue
+            alias, (_, source) = next(iter(selected_sources.items()))
+            if not isinstance(source, Scope) or not isinstance(source.expression, exp.Select):
+                continue
+            if source.outer_columns or source.expression.is_star or scope.is_correlated_subquery:
+                continue
+            projected = source.expression.named_selects
+            if not projected or '*' in projected or any(not name for name in projected):
+                continue
+            available = {name.casefold() for name in projected}
+            output_aliases = {item.alias.casefold() for item in scope.expression.expressions if item.alias}
+            missing = sorted({
+                column.name for column in columns
+                if (not column.table or column.table.casefold() == alias.casefold())
+                and column.name.casefold() not in available
+                and column.name.casefold() not in output_aliases
+            })
+            if missing:
+                mismatches.append({
+                    'start_line': candidate.get('start_line'),
+                    'end_line': candidate.get('end_line'),
+                    'derived_source_alias': alias,
+                    'available_projection_fields': projected,
+                    'missing_projection_fields': missing,
+                })
+    return {'derived_query_projection_mismatches': mismatches} if mismatches else {}
+
+
 def _augment_schema_field_mismatch_feedback(
     *,
     code: str,
@@ -13143,7 +13876,8 @@ def _augment_schema_field_mismatch_feedback(
         code_error_context=code_error_context,
     )
     projection = _build_dataframe_projection_mismatch_diagnostics(code)
-    if not ownership and not projection:
+    derived_projection = _build_derived_query_projection_diagnostics(code)
+    if not ownership and not projection and not derived_projection:
         return error_type, error_signature, diagnostics, repair_instructions, code_error_context
 
     incompatible_fields = ownership.get('incompatible_fields') or []
@@ -13174,6 +13908,7 @@ def _augment_schema_field_mismatch_feedback(
     enriched_diagnostics = dict(diagnostics or {})
     enriched_diagnostics.update(ownership)
     enriched_diagnostics.update(projection)
+    enriched_diagnostics.update(derived_projection)
     enriched_context = dict(code_error_context or {})
     patch_ranges = list(enriched_context.get('suggested_patch_ranges') or [])
     sql_range = ownership.get('sql_assignment_range')
@@ -13185,6 +13920,13 @@ def _augment_schema_field_mismatch_feedback(
             patch_ranges.append(sql_range)
     enriched_context['suggested_patch_ranges'] = patch_ranges
     instruction_parts = []
+    if derived_projection:
+        instruction_parts.append(
+            "derived_query_projection_mismatches lists SQL scopes whose referenced fields "
+            "are absent from their derived source projection. These are SQL alias/scope "
+            "mismatches, not missing datasource Schema fields. Review every listed query "
+            "and use its actual projected columns while preserving the calculation meaning."
+        )
     if ownership:
         instruction_parts.append(
             f"The failed query targets datasource {ownership.get('query_datasource_id')} "
@@ -13671,6 +14413,33 @@ def _proven_datasource_ids_from_execution_payload(
     return _normalize_used_datasource_ids(proven_ids)
 
 
+def _declared_scope_anchor_from_implementation_failure(
+    execution: Any,
+    payload: dict[str, Any] | None,
+) -> list[int]:
+    """Keep analytical intent stable across a purely technical code repair.
+
+    A failed physical query cannot prove that a datasource was read. A static
+    implementation failure is different: helper binding, syntax or another
+    explicitly classified implementation defect says nothing about the
+    analytical scope already expressed by the program. Only producers that
+    mark that boundary explicitly may establish this repair anchor.
+    """
+    if not isinstance(payload, dict):
+        return []
+    diagnostics = payload.get('diagnostics')
+    diagnostics = dict(diagnostics) if isinstance(diagnostics, dict) else {}
+    if diagnostics.get('failure_domain') != 'implementation':
+        return []
+    if diagnostics.get('scope_change_authorized') is not False:
+        return []
+    try:
+        declared = json.loads(getattr(execution, 'used_datasource_ids_json', '') or '[]')
+    except (TypeError, ValueError):
+        return []
+    return _normalize_used_datasource_ids(declared)
+
+
 def _validate_analysis_scope_against_execution_history(
     *,
     previous_executions: list[Any],
@@ -13721,13 +14490,24 @@ def _validate_analysis_scope_against_execution_history(
             payload,
             selected_datasource_snapshot,
         )
+        previous_scope_is_proven = bool(previous_used_ids)
+        if not previous_used_ids:
+            previous_used_ids = _declared_scope_anchor_from_implementation_failure(
+                previous,
+                payload,
+            )
         if not previous_used_ids:
             continue
         return _validate_scope_preserving_technical_repair(
             previous_used_datasource_ids=previous_used_ids,
             current_used_datasource_ids=effective_current_used_ids,
             previous_failure_payload=payload,
-            previous_scope_is_proven=True,
+            # A producer-classified implementation failure is authoritative
+            # for repair continuity even though no physical query ran.
+            previous_scope_is_proven=(
+                previous_scope_is_proven
+                or bool(_declared_scope_anchor_from_implementation_failure(previous, payload))
+            ),
         )
     return None
 
@@ -14072,7 +14852,8 @@ def _apply_probe_no_data_retry_limit(
 def _build_repair_instructions(error_type: str) -> list[str]:
     """根据错误类型生成定向修复建议。"""
     common_instructions = [
-        '局部技术修复可按原版本行号提交 patches，参考 repair_target.allowed_ranges；整体分析设计调整也可提交完整可执行 code。',
+        '只有反馈明确提供 repair_target 的孤立 API 调用错误，才可按 repair_target.allowed_ranges 中的原版本行号提交 patches；'
+        '查询、字段、范围、聚合、计算、结果结构或报告表达变化必须提交完整可执行 code。',
         '正式分析代码应以 result = save_analysis_result(...) 收口；专用 probe_analysis_data 会返回查询事实与打印摘要，'
         '也可通过 result = request_retry(...) 返回自定义结构化观察。',
         '修复技术错误时保留当前业务问题、已确认规则及已有分析内容；依据 Schema、真实查询观察和用户澄清修正错误假设，不把技术错误当作缩减分析范围的理由。',
@@ -14149,13 +14930,13 @@ def _build_repair_instructions(error_type: str) -> list[str]:
         'chart_contract_error': [
             '如果错误提示 bar/line 存在 duplicate plotting keys，必须自行按业务语义选择一种修复：先聚合到每个绘图键一行、补充 series_field 使 (category_field, series_field) 唯一，或构造唯一复合类别；禁止丢弃重复行或依赖后写覆盖前写。',
             '当前失败是图表产物契约错误，不是数据查询失败；不要改成 no_data_found，也不要只输出自然语言报告。',
-            '下一版禁止继续使用 matplotlib/base64 图片、手写 chart_spec 或自造 chart_type/chart_kind 结构。',
+            '对于 helper 已覆盖的类型，下一版使用图表 helper，不使用 matplotlib/base64 图片或自造 chart_type/chart_kind；只有 helper 无法表达的图表类型才使用原始 chart_spec。',
             '必须优先用 build_chart_result(...)、build_multi_metric_chart_result(...) 或 build_chart_suite(...) 生成 charts；bar/line 需要 category_field 和 value_field，多指标柱图需要 category_field 和 value_fields，pie 需要 category_field 和 value_field，scatter 需要 x_field 和 y_field，boxplot 用于异常值/分布/四分位数场景，需要 category_field 和 value_field。',
             'charts 应直接等于 helper 的返回结果，例如 charts = [build_chart_result(...)]、charts = [build_multi_metric_chart_result(...)] 或 charts = build_chart_suite(...)，然后调用 save_analysis_result(analysis_report=..., charts=charts, tables=...)。',
             '如果确实不适合生成图表，也必须用 tables 返回结构化汇总，不能让 charts 和 tables 同时为空。',
         ],
         'result_contract_error': [
-            '如果错误与 charts/chart_spec/chart_document 有关，下一版不要手写图表 JSON，直接改用 build_chart_result(...)、build_multi_metric_chart_result(...) 或 build_chart_suite(...)。',
+            '如果错误与 charts/chart_spec/chart_document 有关，helper 已覆盖的类型改用 build_chart_result(...)、build_multi_metric_chart_result(...) 或 build_chart_suite(...)；helper 未覆盖的类型按错误定位修正原始 chart_spec，不改变分析目的。',
             '按本轮输出协议修正 save_analysis_result 的参数：standard 使用分析报告与相应产物，text 使用 output_text，json 使用符合指定 Schema 的 output_json。',
             '将 save_analysis_result 的返回值赋给 result，保留已有业务分析内容。',
         ],
@@ -14278,8 +15059,15 @@ def _tool_error_message(
     previous_failure_hints: list[str] | None = None,
     stdout_text: str = '',
     stderr_text: str = '',
+    formal_program_work_packet: dict[str, Any] | None = None,
 ) -> ToolMessage:
     """构造统一的结构化工具错误反馈，供 Agent 循环继续修正。"""
+    if error_type == 'probe_feedback':
+        diagnostics = dict(diagnostics or {})
+        diagnostics['probe_fact_ledger'] = _build_probe_fact_ledger(
+            query_snapshots=query_snapshots,
+            diagnostics=diagnostics,
+        )
     repair_instructions = _augment_repair_instructions(
         error_type,
         error_message,
@@ -14304,6 +15092,12 @@ def _tool_error_message(
     if patch_ranges:
         clipped_code_error_context['location_domain'] = 'python_source'
         clipped_code_error_context['suggested_patch_ranges'] = patch_ranges
+    # A line patch is an implementation optimization for failures whose
+    # affected Python statements were located and verified above. It preserves
+    # the last executed program instead of asking the model to regenerate an
+    # unrelated query/calculation/report graph. Structural and semantic
+    # failures remain full-program repairs because their impact is not bounded
+    # by a source range.
     patch_available_error_types = {
         'chart_contract_error',
         'data_type_or_time_mismatch',
@@ -14318,24 +15112,11 @@ def _tool_error_message(
         'schema_or_column_mismatch',
         'undefined_name',
     }
-    syntax_contract_patch = bool(
-        error_type == 'contract_error'
-        and isinstance(diagnostics, dict)
-        and diagnostics.get('violated_contract') == 'invalid_python_syntax'
-    )
-    localized_contract_patch = bool(
-        error_type in {
-            'contract_error',
-            'result_contract_error',
-            'incomplete_result',
-        }
-        and clipped_code_error_context.get('location_domain') == 'python_source'
-    )
     patch_available = bool(
         execution_id > 0
         and current_failed_code
         and patch_ranges
-        and (error_type in patch_available_error_types or syntax_contract_patch or localized_contract_patch)
+        and error_type in patch_available_error_types
     )
     patch_required = patch_available and error_type in patch_required_error_types
 
@@ -14355,6 +15136,38 @@ def _tool_error_message(
                 ),
                 *repair_instructions,
             ]
+
+    if error_type == 'probe_feedback':
+        # Probe is an observation, not a failed program. Keep the full stdout
+        # and query snapshots on the persisted execution record, but return a
+        # compact fact ledger to the in-graph ReAct loop so its working memory
+        # remains focused and bounded.
+        probe_diagnostics = dict(diagnostics or {})
+        # Preserve caller-defined typed observations, but do not replay a
+        # printed DataFrame. ``probe_fact_ledger`` is the canonical handoff.
+        compact_diagnostics = {
+            key: value for key, value in probe_diagnostics.items()
+            if key not in {
+                '_query_execution_outcomes', 'confirmed_facts', 'unresolved_facts',
+                'printed_observations', 'printed_observations_truncated',
+            }
+        }
+        if formal_program_work_packet:
+            compact_diagnostics['formal_program_work_packet'] = formal_program_work_packet
+        return ToolMessage(
+            content=json.dumps({
+                'tool': 'execute_python',
+                'status': 'observation',
+                'execution_id': int(execution_id or 0),
+                'error_type': 'probe_feedback',
+                'error_message': clipped_error_message,
+                'repair_instructions': [],
+                'feedback_kind': 'observation',
+                'message': clipped_error_message,
+                'diagnostics': compact_diagnostics,
+            }, ensure_ascii=False),
+            tool_call_id=tool_call_id,
+        )
 
     payload = {
         'tool': 'execute_python',
@@ -14394,16 +15207,13 @@ def _tool_error_message(
             'mode': 'line_patch',
             'allowed_ranges': patch_ranges,
             'usage': (
-                '局部修复令 code 为空并提交 base_execution_id 与 patches。allowed_ranges 是相关源码定位，'
-                '不要求一个 patch 恰好等于一个语句；行号基于完整原版本，合成后统一校验语法。'
+                '局部修复令 code 为空并提交 base_execution_id 与 patches。每个 patch 必须完整替换一个 '
+                'Python 语句或代码块；行号基于不可变原版本，合成后统一校验完整程序。'
             ),
             'full_source_location': 'preceding assistant tool call arguments',
         }
     if feedback_kind:
         payload['feedback_kind'] = feedback_kind
-    if error_type == 'probe_feedback':
-        payload['status'] = 'observation'
-        payload['feedback_kind'] = 'observation'
     if query_snapshots:
         payload['query_snapshots'] = query_snapshots
     if retry_reason_code:
@@ -14456,9 +15266,92 @@ def _compact_probe_query_snapshots_for_feedback(
     return compact
 
 
+def _build_probe_fact_ledger(
+    *,
+    query_snapshots: dict[str, Any] | None,
+    diagnostics: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return bounded, execution-derived facts for the next ReAct decision.
+
+    Probe output is an observation, not a second prompt.  Keep only facts that
+    the worker can prove from executed queries; free-form printed text remains
+    supplementary diagnostics and never becomes an inferred business rule.
+    """
+    observations: list[dict[str, Any]] = []
+    for fallback_key, raw_snapshot in (query_snapshots or {}).items():
+        if not isinstance(raw_snapshot, dict):
+            continue
+        execution = raw_snapshot.get('execution')
+        implementation = raw_snapshot.get('implementation')
+        execution = execution if isinstance(execution, dict) else {}
+        implementation = implementation if isinstance(implementation, dict) else {}
+        observation = {
+            'query_key': str(raw_snapshot.get('query_key') or fallback_key),
+            'datasource_identifiers': (
+                implementation.get('datasource_identifiers')
+                or ([implementation.get('datasource_identifier')]
+                    if implementation.get('datasource_identifier') else [])
+            ),
+            'query_constraints': raw_snapshot.get('query_constraints') or {},
+            'query_scope': raw_snapshot.get('query_scope') or {},
+            'status': execution.get('status'),
+            'row_count': execution.get('row_count'),
+            'effective_no_data': execution.get('effective_no_data'),
+            'columns': execution.get('columns') or [],
+            'probe_profile': execution.get('probe_profile') or {},
+            'error_type': execution.get('error_type'),
+        }
+        observations.append({
+            key: value for key, value in observation.items()
+            if value not in (None, '', [], {})
+        })
+
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    # Explicit observations supplied by a generated Probe are useful only as
+    # typed facts. Carry a bounded subset into the ledger instead of replaying
+    # the free-form stdout that happened to print them.
+    for raw in diagnostics.get('query_observations') or []:
+        if not isinstance(raw, dict):
+            continue
+        query_key = str(raw.get('query_key') or '')
+        if query_key and any(item.get('query_key') == query_key for item in observations):
+            continue
+        observation = {
+            key: raw.get(key)
+            for key in (
+                'query_key', 'datasource_id', 'datasource_name', 'status', 'row_count',
+                'columns', 'value_samples', 'distinct_values', 'value_profile', 'error_type',
+            )
+            if raw.get(key) not in (None, '', [], {})
+        }
+        if observation:
+            observations.append(observation)
+    for outcome in diagnostics.get('_query_execution_outcomes') or []:
+        if not isinstance(outcome, dict):
+            continue
+        query_key = str(outcome.get('query_key') or '')
+        if query_key and any(item.get('query_key') == query_key for item in observations):
+            continue
+        observations.append({
+            key: value for key, value in outcome.items()
+            if key in {'query_key', 'status', 'row_count', 'effective_no_data', 'columns', 'error_type'}
+            and value not in (None, '', [], {})
+        })
+
+    declared_facts = diagnostics.get('confirmed_facts')
+    unresolved_facts = diagnostics.get('unresolved_facts')
+    return {
+        'schema_version': 1,
+        'observations': observations,
+        'confirmed_facts': declared_facts if isinstance(declared_facts, list) else [],
+        'unresolved_facts': unresolved_facts if isinstance(unresolved_facts, list) else [],
+    }
+
+
 def _build_implicit_probe_feedback(
     query_snapshots: dict[str, Any] | None,
     stdout_text: str,
+    probe_query_observations: list[dict[str, Any]] | None = None,
 ) -> RetryResult:
     """Convert a successful dedicated Probe call into its standard observation."""
     outcomes: list[dict[str, Any]] = []
@@ -14483,11 +15376,15 @@ def _build_implicit_probe_feedback(
             if value not in (None, '', [], {})
         })
 
-    diagnostics: dict[str, Any] = {}
-    printed = _clip_retry_context_text(stdout_text, 6000)
-    if printed:
-        diagnostics['printed_observations'] = printed
-        diagnostics['printed_observations_truncated'] = printed != str(stdout_text or '')
+    # stdout is retained with the worker execution for audit only. Query
+    # snapshots now contain a typed Probe profile, so putting terminal tables
+    # back into the ReAct transcript would only recreate an unbounded prompt.
+    diagnostics: dict[str, Any] = {
+        'query_observations': [
+            dict(item) for item in (probe_query_observations or [])
+            if isinstance(item, dict)
+        ][:32],
+    }
     retry = request_retry(
         retry_type='probe_feedback',
         message='专用 Probe 已完成只读探测，以下为本轮真实观察。',
@@ -14500,12 +15397,83 @@ def _build_implicit_probe_feedback(
     return retry
 
 
+def _build_artifact_review_packet(
+    charts: list[dict[str, Any]] | None,
+    tables: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Build a bounded view of evaluated artifacts for semantic review."""
+    chart_items = []
+    for chart in charts or []:
+        if not isinstance(chart, dict):
+            continue
+        chart_spec = chart.get('chart_spec')
+        chart_spec = chart_spec if isinstance(chart_spec, dict) else {}
+        contract = chart.get('chart_data_contract')
+        contract = contract if isinstance(contract, dict) else {}
+        encoding = contract.get('encoding')
+        encoding = encoding if isinstance(encoding, dict) else {}
+        raw_series = chart_spec.get('series') or []
+        series_items = [raw_series] if isinstance(raw_series, dict) else raw_series
+        series_review = []
+        for series in series_items if isinstance(series_items, list) else []:
+            if not isinstance(series, dict):
+                continue
+            values = series.get('data') if isinstance(series.get('data'), list) else []
+            series_review.append({
+                'name': str(series.get('name') or '').strip(),
+                'type': str(series.get('type') or '').strip(),
+                'point_count': len(values),
+                'sample_values': _copy_jsonable(values[:8], []),
+            })
+        category_values: list[Any] = []
+        for axis_name in ('xAxis', 'yAxis'):
+            axis = chart_spec.get(axis_name)
+            axes = axis if isinstance(axis, list) else [axis]
+            for axis_item in axes:
+                if not isinstance(axis_item, dict) or not isinstance(axis_item.get('data'), list):
+                    continue
+                category_values = axis_item['data']
+                if category_values:
+                    break
+            if category_values:
+                break
+        chart_items.append({
+            'title': str(chart.get('title') or '').strip(),
+            'description': str(chart.get('description') or '').strip(),
+            'encoding': _copy_jsonable(encoding, {}),
+            'point_count': _chart_point_count(chart),
+            'category_count': len(category_values),
+            'sample_categories': _copy_jsonable(category_values[:8], []),
+            'series': series_review[:8],
+        })
+
+    table_items = []
+    for table in tables or []:
+        if not isinstance(table, dict):
+            continue
+        value = table.get('table') if isinstance(table.get('table'), dict) else table
+        rows = value.get('rows') if isinstance(value.get('rows'), list) else []
+        columns = value.get('columns') if isinstance(value.get('columns'), list) else []
+        table_items.append({
+            'title': str(value.get('title') or '').strip(),
+            'description': str(value.get('description') or '').strip(),
+            'columns': _copy_jsonable(columns[:16], []),
+            'row_count': len(rows),
+            'sample_rows': _copy_jsonable(rows[:8], []),
+        })
+    return {'charts': chart_items[:8], 'tables': table_items[:8]}
+
+
 def _tool_success_message(
     *,
     tool_call_id: str,
+    execution_id: int,
     analysis_report: str,
     charts: list[dict[str, Any]] | None = None,
     tables: list[dict[str, Any]] | None = None,
+    used_datasource_ids: list[int] | None = None,
+    query_snapshots: dict[str, Any] | None = None,
+    static_analysis_advisories: list[dict[str, Any]] | None = None,
 ) -> ToolMessage:
     """
     构造成功的工具结果反馈。
@@ -14518,6 +15486,8 @@ def _tool_success_message(
     payload = {
         'tool': 'execute_python',
         'status': 'success',
+        'execution_id': int(execution_id or 0),
+        'review_required': True,
         'analysis_report': (analysis_report or '').strip(),
         'chart_count': len(charts or []),
         'table_count': len(tables or []),
@@ -14531,6 +15501,34 @@ def _tool_success_message(
             for item in (tables or [])
             if isinstance(item, dict) and str(item.get('title') or '').strip()
         ][:5],
+        'artifact_review': _build_artifact_review_packet(charts, tables),
+        'execution_review': {
+            'used_datasource_ids': _normalize_used_datasource_ids(used_datasource_ids or []),
+            'queries': [
+                {
+                    'query_key': str(query_key),
+                    'status': str((snapshot.get('execution') or {}).get('status') or ''),
+                    'row_count': (snapshot.get('execution') or {}).get('row_count'),
+                    'columns': list((snapshot.get('execution') or {}).get('columns') or [])[:24],
+                }
+                for query_key, snapshot in (query_snapshots or {}).items()
+                if isinstance(snapshot, dict)
+            ][:32],
+        },
+        'candidate_review_contract': {
+            'required_checks': [
+                'question_coverage',
+                'population_and_grain',
+                'formula_and_unit',
+                'artifact_consistency',
+                'claim_support',
+            ],
+            'decision': 'accept only when every required check passes; otherwise request one revision containing every material issue',
+        },
+        'static_analysis_advisories': _copy_jsonable(
+            static_analysis_advisories or [],
+            [],
+        ),
     }
     return ToolMessage(
         content=json.dumps(payload, ensure_ascii=False),
@@ -14541,6 +15539,328 @@ def _tool_success_message(
 def _terminal_tool_success(message: ToolMessage) -> Command:
     """Finish the agent graph after a fully validated analysis result."""
     return Command(update={"messages": [message], "analysis_complete": True})
+
+
+class AnalysisResultCheck(BaseModel):
+    check: Literal[
+        'question_coverage',
+        'population_and_grain',
+        'formula_and_unit',
+        'artifact_consistency',
+        'claim_support',
+    ]
+    evidence: str = Field(
+        min_length=1,
+        max_length=500,
+        description=(
+            'Concrete candidate fact inspected for this check, such as the covered question, '
+            'result grain, recomputed formula, artifact values, or claim denominator.'
+        ),
+    )
+
+
+class AnalysisResultReviewInput(BaseModel):
+    checks: list[AnalysisResultCheck] = Field(
+        min_length=5,
+        max_length=5,
+        description='One concrete passing check for every required candidate-review dimension.',
+    )
+    review_summary: str = Field(
+        default='',
+        max_length=1000,
+        description='Concise confirmation of the checked calculation and narrative boundaries.',
+    )
+    progress_summary: str = Field(
+        default='',
+        max_length=600,
+        description='Brief user-facing completion summary in the user language.',
+    )
+
+    @model_validator(mode='after')
+    def require_complete_review_dimensions(self):
+        required = {
+            'question_coverage',
+            'population_and_grain',
+            'formula_and_unit',
+            'artifact_consistency',
+            'claim_support',
+        }
+        actual = {item.check for item in self.checks}
+        if actual != required:
+            missing = sorted(required - actual)
+            repeated = sorted(
+                name for name in actual
+                if sum(item.check == name for item in self.checks) > 1
+            )
+            raise ValueError(
+                f'candidate review checks must cover every dimension exactly once; '
+                f'missing={missing}, repeated={repeated}'
+            )
+        return self
+
+
+@tool(
+    args_schema=AnalysisResultReviewInput,
+    description=(
+        'Accept the latest successfully executed candidate analysis after checking its calculations, '
+        'artifact meanings, conclusions and coverage against the user question. This tool is only '
+        'available in the result-review work state.'
+    ),
+)
+def accept_analysis_result(
+    runtime: ToolRuntime[CustomContext],
+    checks: list[AnalysisResultCheck],
+    review_summary: str = '',
+    progress_summary: str = '',
+) -> Command:
+    """Finalize the latest candidate without regenerating or mutating it."""
+    emit = _get_stream_emitter()
+    emit(
+        'status',
+        stage='tool_result',
+        level='success',
+        tool='accept_analysis_result',
+        message='分析结果已完成一致性复核，正在整理最终报告。',
+    )
+    return _terminal_tool_success(ToolMessage(
+        content=json.dumps({
+            'tool': 'accept_analysis_result',
+            'status': 'success',
+            'checks': [
+                item.model_dump() if isinstance(item, BaseModel) else dict(item)
+                for item in checks
+            ],
+            'review_summary': str(review_summary or '').strip(),
+        }, ensure_ascii=False),
+        tool_call_id=runtime.tool_call_id,
+    ))
+
+
+class AnalysisRevisionIssue(BaseModel):
+    issue_type: Literal[
+        'coverage', 'calculation', 'scope', 'artifact', 'narrative', 'recommendation'
+    ]
+    description: str = Field(min_length=1, max_length=800)
+    required_correction: str = Field(min_length=1, max_length=800)
+    change_scope: Literal[
+        'presentation', 'calculation', 'artifact', 'query_or_population'
+    ] = Field(
+        description=(
+            'Smallest implementation boundary that can correct this issue. Use presentation for '
+            'report wording/conclusions only, calculation for an existing formula or derived value, '
+            'artifact for an existing chart/table construction, and query_or_population only when '
+            'the executed query, datasource range, population, or grain must change.'
+        ),
+    )
+    source_snippets: list[str] = Field(
+        default_factory=list,
+        max_length=4,
+        description=(
+            'Exact, short, unique snippets copied from the successful Python candidate that own the '
+            'problem. Provide snippets for presentation/calculation/artifact issues. They are anchors, '
+            'not replacement code. Omit only when the query/population design itself must be rebuilt.'
+        ),
+    )
+
+
+class AnalysisRevisionInput(BaseModel):
+    issues: list[AnalysisRevisionIssue] = Field(min_length=1, max_length=12)
+    progress_summary: str = Field(
+        default='',
+        max_length=600,
+        description='Brief user-facing summary that the candidate is being corrected.',
+    )
+
+
+def _latest_successful_review_execution(*, conversation_id: int, turn_id: int):
+    """Load the immutable successful candidate currently being reviewed."""
+    from config.database import SessionLocal
+    from model import InsightNsExecution
+
+    session = SessionLocal()
+    try:
+        execution = session.query(InsightNsExecution).filter(
+            InsightNsExecution.conversation_id == int(conversation_id or 0),
+            InsightNsExecution.turn_id == int(turn_id or 0),
+            InsightNsExecution.execution_status == 'success',
+            InsightNsExecution.is_deleted == 0,
+        ).order_by(InsightNsExecution.id.desc()).first()
+        if execution is None:
+            return None
+        session.expunge(execution)
+        return execution
+    finally:
+        session.close()
+
+
+def _review_source_patch_range(code: str, snippet: str) -> dict[str, Any] | None:
+    """Resolve one exact semantic anchor to its smallest enclosing Python statement."""
+    source = str(code or '')
+    anchor = str(snippet or '').strip()
+    if not source or not anchor or source.count(anchor) != 1:
+        return None
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+
+    offset = source.index(anchor)
+    start_line = source.count('\n', 0, offset) + 1
+    end_line = start_line + anchor.count('\n')
+    candidates = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.stmt):
+            continue
+        node_start = int(getattr(node, 'lineno', 0) or 0)
+        node_end = int(getattr(node, 'end_lineno', 0) or 0)
+        if node_start <= start_line and node_end >= end_line:
+            candidates.append((node_end - node_start, node_start, node_end))
+    if not candidates:
+        return None
+    _, node_start, node_end = min(candidates)
+    lines = source.splitlines()
+    return {
+        'start_line': node_start,
+        'end_line': node_end,
+        'source': '\n'.join(lines[node_start - 1:node_end]),
+        'anchor': anchor,
+    }
+
+
+def _persist_review_revision_target(execution_id: int, target: dict[str, Any]) -> None:
+    """Attach a bounded edit authorization without changing candidate source or artifacts."""
+    if int(execution_id or 0) <= 0:
+        return
+    from config.database import SessionLocal
+    from model import InsightNsExecution
+
+    session = SessionLocal()
+    try:
+        execution = session.query(InsightNsExecution).filter(
+            InsightNsExecution.id == int(execution_id),
+            InsightNsExecution.execution_status == 'success',
+            InsightNsExecution.is_deleted == 0,
+        ).first()
+        if execution is None:
+            return
+        try:
+            payload = json.loads(execution.result_payload_json or '{}')
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload['review_revision_target'] = _copy_jsonable(target, {})
+        execution.result_payload_json = json.dumps(payload, ensure_ascii=False)
+        execution.updated_at = datetime.now()
+        session.commit()
+    finally:
+        session.close()
+
+
+@tool(
+    args_schema=AnalysisRevisionInput,
+    description=(
+        'Reject the latest successfully executed candidate only for material coverage, calculation, '
+        'scope, artifact, narrative, or recommendation errors. Return all discovered issues together; '
+        'the next Runtime work state will receive the current program and implementation contracts.'
+    ),
+)
+def request_analysis_revision(
+    runtime: ToolRuntime[CustomContext],
+    issues: list[AnalysisRevisionIssue],
+    progress_summary: str = '',
+) -> ToolMessage:
+    """Move a reviewed candidate into one coherent formal-program repair."""
+    emit = _get_stream_emitter()
+    normalized = [
+        item.model_dump() if isinstance(item, BaseModel) else dict(item)
+        for item in issues
+        if isinstance(item, (BaseModel, dict))
+    ]
+    emit(
+        'status',
+        stage='tool_review_revision',
+        level='warning',
+        tool='request_analysis_revision',
+        message=(
+            str(progress_summary or '').strip()
+            or '候选结果存在会影响结论的实质问题，正在统一修正。'
+        ),
+    )
+    candidate = _latest_successful_review_execution(
+        conversation_id=int(getattr(runtime.context, 'conversation_id', 0) or 0),
+        turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+    )
+    source = str(getattr(candidate, 'generated_code', '') or '') if candidate is not None else ''
+    resolved_ranges = []
+    unresolved_anchors = []
+    full_program_revision_required = candidate is None
+    for issue_index, issue in enumerate(normalized):
+        if issue.get('change_scope') == 'query_or_population':
+            full_program_revision_required = True
+        snippets = issue.get('source_snippets') or []
+        if issue.get('change_scope') != 'query_or_population' and not snippets:
+            full_program_revision_required = True
+        for snippet in snippets:
+            resolved = _review_source_patch_range(source, snippet)
+            if resolved is None:
+                unresolved_anchors.append({
+                    'issue_index': issue_index,
+                    'source_snippet': str(snippet),
+                })
+                continue
+            resolved['issue_index'] = issue_index
+            resolved_ranges.append(resolved)
+
+    unique_ranges = []
+    seen_ranges = set()
+    for item in resolved_ranges:
+        identity = (item['start_line'], item['end_line'])
+        if identity in seen_ranges:
+            continue
+        seen_ranges.add(identity)
+        unique_ranges.append(item)
+    if unresolved_anchors:
+        full_program_revision_required = True
+    patch_mode_allowed = bool(unique_ranges and not full_program_revision_required)
+    revision_work_packet = {
+        'base_execution_id': int(getattr(candidate, 'id', 0) or 0),
+        'base_source_sha256': _build_analysis_logic_signature(source),
+        'patch_mode_allowed': patch_mode_allowed,
+        'full_program_revision_required': full_program_revision_required,
+        'allowed_ranges': unique_ranges if patch_mode_allowed else [],
+        'unresolved_anchors': unresolved_anchors,
+    }
+    if patch_mode_allowed:
+        _persist_review_revision_target(
+            revision_work_packet['base_execution_id'],
+            {
+                'mode': 'review_line_patch',
+                'base_execution_id': revision_work_packet['base_execution_id'],
+                'base_source_sha256': revision_work_packet['base_source_sha256'],
+                'allowed_ranges': [
+                    {'start_line': item['start_line'], 'end_line': item['end_line']}
+                    for item in unique_ranges
+                ],
+            },
+        )
+    instruction = (
+        '以 revision_work_packet.base_execution_id 为不可变成功基线，仅按 allowed_ranges 提交 patches；'
+        '不要重写未涉及的查询、计算和产物，也不要改变 used_datasource_ids。'
+        if patch_mode_allowed else
+        '列出的问题涉及查询/总体设计或无法可靠定位到局部源码；提交一份完整正式程序，'
+        '但保留候选中已验证正确的查询、计算和产物，不缩减分析范围。'
+    )
+    return ToolMessage(
+        content=json.dumps({
+            'tool': 'request_analysis_revision',
+            'status': 'revision_required',
+            'issues': normalized,
+            'revision_work_packet': revision_work_packet,
+            'instruction': instruction,
+        }, ensure_ascii=False),
+        tool_call_id=runtime.tool_call_id,
+    )
 
 
 def _message_text(message: Any) -> str:
@@ -14930,6 +16250,33 @@ def execute_python(
                     '保留原查询、计算和产物逻辑，不为执行标识重写或缩减分析。',
                 ],
             )
+    if execution_mode == 'analysis' and (
+        _program_requests_probe_feedback(code) or _program_uses_probe_api(code)
+    ):
+        return _tool_error_message(
+            tool_call_id=runtime.tool_call_id,
+            error_type='contract_error',
+            error_message=(
+                'submit_analysis_program 只能提交正式分析程序，不能提交 '
+                'Probe API 调用或以 request_retry(retry_type="probe_feedback") 返回探测结果。'
+            ),
+            diagnostics={
+                'violated_contract': 'formal_tool_received_probe_program',
+                'execution_mode': execution_mode,
+            },
+            repair_instructions=[
+                '若仍有影响正式结论的技术未知，先用 request_runtime_probe 声明探测目标，再调用 probe_analysis_data。',
+                '若观察已足够，提交同一轮完整查询、计算、图表、表格和报告，并以 save_analysis_result(...) 收口。',
+            ],
+        )
+    output_format = str(
+        (getattr(runtime.context, 'output_contract', {}) or {}).get('type')
+        or 'standard'
+    )
+    code, _ = _complete_analysis_result_terminal(
+        code,
+        output_format=output_format,
+    )
     execution_id = _create_execution_record(
         conversation_id=conversation_id,
         turn_id=turn_id,
@@ -14977,18 +16324,24 @@ def execute_python(
         current_execution_id=execution_id,
     )
     selected_datasource_snapshot = _get_runtime_selected_datasource_snapshot(runtime.context)
-    contract_retry = _validate_tool_used_datasource_ids(
+    # Probe is an observation step, not the final analytical scope
+    # declaration. Its real datasource access is recorded from query
+    # snapshots/feedback; requiring the model to repeat a used-id declaration
+    # here turns an otherwise valid observation into a repair loop. Formal
+    # analysis keeps the strict declaration contract below.
+    contract_retry = None if execution_mode == 'probe' else _validate_tool_used_datasource_ids(
         context=runtime.context,
         used_datasource_ids=normalized_used_datasource_ids,
     )
+
+
+    static_analysis_advisories: list[dict[str, Any]] = []
     if contract_retry is None:
         contract_retry = _validate_generated_code_contract(
             code,
             allow_implicit_probe_feedback=execution_mode == 'probe',
-            output_format=str(
-                (getattr(runtime.context, 'output_contract', {}) or {}).get('type')
-                or 'standard'
-            ),
+            output_format=output_format,
+            advisory_sink=static_analysis_advisories,
         )
     if contract_retry is None:
         contract_retry = _validate_technical_repair_scope_from_history(
@@ -15306,24 +16659,6 @@ def execute_python(
             turn_id=turn_id,
             current_execution_id=execution_id,
         )
-        _update_execution_record(
-            execution_id,
-            execution_status='failed',
-            result_payload_json=json.dumps({
-                'status': 'failed',
-                'error_type': error_type,
-                'error_message': error_message,
-                'error_signature': error_signature,
-                'diagnostics': worker_diagnostics,
-                'query_snapshots': worker_payload.get('query_snapshots') or {},
-                'code_error_context': code_error_context,
-                'repair_instructions': repair_instructions,
-            }, ensure_ascii=False),
-            stdout_text=stdout_text,
-            stderr_text=stderr_text,
-            execution_seconds=int((time.time() - start_time) * 1000),
-            error_message=error_message,
-        )
         repair_instructions, limit_diagnostics = _apply_probe_no_data_retry_limit(
             turn_id=turn_id,
             current_execution_id=execution_id,
@@ -15331,16 +16666,7 @@ def execute_python(
             repair_instructions=repair_instructions,
             diagnostics=worker_diagnostics,
         )
-        with logger.context(**execution_log_context):
-            logger.error(f"代码执行失败（{error_type}）：{error_message}")
-        emit(
-            'status',
-            stage='tool_error',
-            level='error',
-            tool='execute_python',
-            message=FRONTEND_TOOL_ERROR_MESSAGE,
-        )
-        return _tool_error_message(
+        tool_error_message = _tool_error_message(
             tool_call_id=runtime.tool_call_id,
             execution_id=execution_id,
             error_type=error_type,
@@ -15356,6 +16682,29 @@ def execute_python(
             stdout_text=stdout_text,
             stderr_text=stderr_text,
         )
+        # The persisted failure is the authorization source for a later
+        # base_execution_id + patches call. Persist the exact payload returned
+        # to the model; otherwise repair_target can be visible in ReAct memory
+        # while absent from the execution record that validates the patch.
+        _update_execution_record(
+            execution_id,
+            execution_status='failed',
+            result_payload_json=tool_error_message.content,
+            stdout_text=stdout_text,
+            stderr_text=stderr_text,
+            execution_seconds=int((time.time() - start_time) * 1000),
+            error_message=error_message,
+        )
+        with logger.context(**execution_log_context):
+            logger.error(f"代码执行失败（{error_type}）：{error_message}")
+        emit(
+            'status',
+            stage='tool_error',
+            level='error',
+            tool='execute_python',
+            message=FRONTEND_TOOL_ERROR_MESSAGE,
+        )
+        return tool_error_message
 
     exec_result = _deserialize_exec_result(worker_result.get('exec_result') or {})
     exec_result = _deserialize_exec_result(worker_payload.get('exec_result') or {})
@@ -15363,6 +16712,7 @@ def execute_python(
         exec_result = _build_implicit_probe_feedback(
             worker_payload.get('query_snapshots') or {},
             stdout_text,
+            worker_payload.get('probe_query_observations') or [],
         )
     if isinstance(exec_result, StructuredResult) and exec_result.output_format == "standard":
         from service.report_presentation_service import normalize_report_presentation
@@ -15612,22 +16962,25 @@ def execute_python(
         )
         emit(
             'status',
-            stage='tool_result',
+            stage='tool_candidate',
             level='success',
             tool='execute_python',
-            message='分析结果已生成，正在整理最终报告。',
+            message='候选分析结果已生成，正在复核计算与结论一致性。',
         )
         success_message = _tool_success_message(
             tool_call_id=runtime.tool_call_id,
+            execution_id=execution_id,
             analysis_report=exec_result.analysis_report,
             charts=exec_result.charts,
             tables=exec_result.tables,
+            used_datasource_ids=normalized_used_datasource_ids,
+            query_snapshots=worker_payload.get('query_snapshots') or {},
+            static_analysis_advisories=static_analysis_advisories,
         )
-        # A contract-valid StructuredResult is the terminal product of this
-        # agent run. Returning a graph command prevents another model turn from
-        # treating the lightweight success summary as a reason to probe again.
-        # Retry/error ToolMessages above still return to the same ReAct loop.
-        return _terminal_tool_success(success_message)
+        # A contract-valid StructuredResult is a candidate until the same
+        # Runtime owner checks its evaluated values and narrative claims.
+        # Evidence and outer finalization still run only after explicit accept.
+        return success_message
 
     _update_execution_record(
         execution_id,
@@ -15677,20 +17030,90 @@ def execute_python(
 )
 def probe_analysis_data(
     runtime: ToolRuntime[CustomContext],
-    code: str,
+    code: str = '',
     title: str = '',
     description: str = '',
-    used_datasource_ids: list[int] | None = None,
+    progress_summary: str = '',
+    used_datasource_ids: list[int] | str | None = None,
+    program: str = '',
+    probe_code: str = '',
+    probe: str = '',
 ) -> Optional[ToolMessage | Command]:
     """Run a bounded Probe through the shared Python execution implementation."""
+    # The model provider can occasionally emit a previously learned tool name
+    # even after the middleware has removed that tool from the current formal
+    # implementation surface.  Do not let that protocol drift execute the
+    # same Probe again or reopen the Probe state.  The observation is already
+    # durable in the working fact ledger; the only valid next action is the
+    # formal analysis program.
+    if _runtime_probe_is_closed(runtime):
+        return _tool_error_message(
+            tool_call_id=runtime.tool_call_id,
+            error_type='probe_not_allowed_after_observation',
+            error_message=(
+                '当前工作状态已经完成所需 Probe 观察；请停止重复探测，直接提交 '
+                'execution_intent="analysis" 的完整正式分析程序。'
+            ),
+            repair_instructions=[
+                '不要重复调用 Probe，也不要把正式分析程序提交为 Probe。',
+                '直接使用当前工作上下文中的 probe_fact_ledger 和已读取 Schema，'
+                '生成完整 analysis 代码，并以 save_analysis_result(...) 收口。',
+                '正式分析仍需重新查询并计算最终指标，不能把 Probe 输出直接当作正式指标。',
+            ],
+            diagnostics={
+                'violated_contract': 'probe_closed_for_formal_implementation',
+                'recommended_execution_intent': 'analysis',
+            },
+        )
+    # Some OpenAI-compatible gateways preserve the model's semantic key rather
+    # than the Pydantic validation alias. Normalize at the callable boundary so
+    # schema validation and actual invocation cannot disagree.
+    logger.debug(
+        'probe_analysis_data input normalized lengths code=%s program=%s probe_code=%s probe=%s',
+        len(str(code or '')),
+        len(str(program or '')),
+        len(str(probe_code or '')),
+        len(str(probe or '')),
+    )
+    code = str(code or program or probe_code or probe or '')
     return execute_python.func(
         runtime=runtime,
         code=code,
         title=title,
         description=description,
-        used_datasource_ids=used_datasource_ids,
+        used_datasource_ids=_decode_tool_id_list(used_datasource_ids),
         execution_mode='probe',
     )
+
+
+def _runtime_probe_is_closed(runtime: ToolRuntime[CustomContext]) -> bool:
+    """Return whether a completed Probe closes the current Probe tool path.
+
+    This is intentionally evaluated at the execution boundary as a second
+    line of defense.  Middleware controls the advertised tool set, but a
+    gateway may still return a stale or hallucinated tool call.  Importing
+    lazily avoids coupling the large tool module to the working-context
+    module's tool definitions during import.
+    """
+    try:
+        from agent.runtime_working_context import (
+            _has_completed_probe_observation,
+            _has_open_probe_replan,
+            resolve_work,
+        )
+
+        messages = list((getattr(runtime, 'state', {}) or {}).get('messages') or [])
+        work, _focus, _references = resolve_work(messages)
+        return (
+            work in {'implement', 'repair'}
+            and _has_completed_probe_observation(messages)
+            and not _has_open_probe_replan(messages)
+        )
+    except Exception:
+        # Tool execution must remain available if a non-standard test/runtime
+        # object does not expose the LangGraph state shape.  The middleware
+        # remains the primary visibility control in that case.
+        return False
 
 
 @tool(
@@ -15706,17 +17129,22 @@ def submit_analysis_program(
     code: str = '',
     title: str = '',
     description: str = '',
-    used_datasource_ids: list[int] | None = None,
+    progress_summary: str = '',
+    used_datasource_ids: list[int] | str | None = None,
     base_execution_id: int = 0,
     patches: list[SourceCodePatch] | None = None,
+    program: str = '',
+    analysis_code: str = '',
+    analysis_program: str = '',
 ) -> Optional[ToolMessage | Command]:
     """Submit one complete formal program through the shared execution implementation."""
+    code = str(code or program or analysis_code or analysis_program or '')
     return execute_python.func(
         runtime=runtime,
         code=code,
         title=title,
         description=description,
-        used_datasource_ids=used_datasource_ids,
+        used_datasource_ids=_decode_tool_id_list(used_datasource_ids),
         base_execution_id=base_execution_id,
         patches=patches,
         execution_mode='analysis',

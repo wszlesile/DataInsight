@@ -11,6 +11,7 @@ from typing import Any
 from markdown_it import MarkdownIt
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
+from service.analysis_progress_service import group_latest_progress, load_progress
 
 from model import (
     InsightAnalysisTask,
@@ -284,6 +285,7 @@ class InsightNsConversationService:
         ).all()
 
         execution_map = self._group_executions_by_turn(executions)
+        progress_map = group_latest_progress(self.session, conversation.id)
         artifact_map = self._group_artifacts_by_turn(artifacts)
 
         history: list[dict[str, Any]] = []
@@ -311,6 +313,7 @@ class InsightNsConversationService:
                 "error_message": turn.error_message or '',
                 "started_at": turn.started_at.isoformat() if turn.started_at else None,
                 "finished_at": turn.finished_at.isoformat() if turn.finished_at else None,
+                "progress": progress_map.get(turn.id, []),
             })
 
         return {
@@ -369,6 +372,7 @@ class InsightNsConversationService:
             "executions": [execution.to_dict() for execution in executions],
             "latest_execution": executions[-1].to_dict() if executions else None,
             "artifacts": [self._artifact_to_view(artifact) for artifact in artifacts],
+            "progress": load_progress(self.session, conversation.id, turn.id),
         }
 
     def resolve_evidence(

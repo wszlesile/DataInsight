@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import re
@@ -11,7 +12,7 @@ from queue import Empty, Queue
 from typing import Any, Callable, Iterator
 from zoneinfo import ZoneInfo
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, messages_from_dict, messages_to_dict
 from sqlalchemy.exc import SQLAlchemyError
 
 from agent import (
@@ -36,6 +37,8 @@ from agent.analysis_preparation import (
     prepare_analysis,
 )
 from agent.context_engineering_runtime import classify_analysis_context_mode, is_analysis_like_request
+from agent.runtime_working_context import build_short_term_memory_catalog
+from agent.runtime_schema_memory import merge_schema_sources
 from agent.intent_classifier import (
     PENDING_SCOPE_MEMORY_TYPE,
     resolve_context_mode_with_llm,
@@ -49,6 +52,7 @@ from config.database import session_scope
 from service.conversation_context_service import ConversationContextService, ConversationRunContext
 from service.semantic_datasource_selection_service import DatasourceSelectionProviderRouter
 from utils import logger
+from agent.runtime_progress import tool_progress
 from utils.datasource_utils import safe_json_loads
 from utils.analysis_task_cancel import AnalysisTaskCancelled, CANCELLED_MESSAGE, is_analysis_task_cancelled
 from utils.llm_error_utils import get_user_facing_agent_error
@@ -79,12 +83,16 @@ ANALYSIS_EXPLICIT_TIME_PATTERN = re.compile(
     r"(今天|昨天|前天|本周(?!期)|上周(?!期)|本月|上月|今年|去年|(?:近|最近|过去)\s*(?:\d+|[一二两三四五六七八九十]{1,3})\s*(?:天|日|周(?!期)|星期|月|个月|年)|"
     r"\d{4}[-/年]\d{1,2}([-/月]\d{1,2})?|\d{1,2}月\d{1,2}日)"
 )
-MAX_ANALYSIS_AGENT_ROUNDS = 3
+# A normal bounded Runtime work chain may require: Schema detail lookup, Probe,
+# a second targeted lookup, then a formal program submission. This ceiling is a
+# circuit breaker for stalled work, not a three-attempt retry policy.
+MAX_ANALYSIS_AGENT_ROUNDS = 6
 RETRY_LATEST_ERROR_LIMIT = 3
 RETRY_PATTERN_HINT_LIMIT = 5
 RETRY_ERROR_MAX_CHARS = 700
 RETRY_HINT_MAX_CHARS = 500
 RETRY_RECOVERY_INSTRUCTION_MAX_CHARS = 14000
+RUNTIME_SCHEMA_DETAIL_MEMORY_KEY = 'runtime_schema_detail_workspace'
 PROBE_NO_DATA_ERROR_TYPES = {'probe_feedback', 'no_data_found'}
 TIME_SERIES_EMPTY_SOURCE_ERROR_MARKERS = (
     'unknown tag',
@@ -704,7 +712,7 @@ def _build_agent_context(
         ),
         database_conn_info=dict(agent_request.database_conn_info or {}),
         active_datasource_snapshot=dict(
-            preparation.prompt_snapshot()
+            preparation.runtime_prompt_snapshot()
             if preparation is not None
             else runtime.active_datasource_snapshot or {}
         ),
@@ -717,10 +725,24 @@ def _build_agent_context(
         output_contract=dict(
             getattr(runtime, 'output_contract', None) or {"type": "standard"}
         ),
+        context_mode=str(
+            getattr(runtime, 'context_mode', 'fresh_analysis') or 'fresh_analysis'
+        ),
         clarification_mode=str(
             getattr(runtime, 'clarification_mode', 'same_turn') or 'same_turn'
         ),
         evidence_enabled=bool(getattr(runtime, 'evidence_enabled', True)),
+        working_memory_catalog=build_short_term_memory_catalog(
+            getattr(runtime, 'short_term_memory', {})
+        ),
+        runtime_probe_fact_ledgers=copy.deepcopy(
+            getattr(runtime, 'short_term_memory', {}).get('probe_fact_ledger', [])
+            if isinstance(getattr(runtime, 'short_term_memory', {}), dict) else []
+        ),
+        runtime_schema_detail_workspace=copy.deepcopy(
+            getattr(runtime, 'short_term_memory', {}).get(RUNTIME_SCHEMA_DETAIL_MEMORY_KEY, [])
+            if isinstance(getattr(runtime, 'short_term_memory', {}), dict) else []
+        ),
     )
 
 
@@ -738,18 +760,24 @@ def _build_agent_input_with_runtime_instruction(
     prior_messages: list[BaseMessage] | None = None,
 ):
     """Build the first Runtime input or continue the same ReAct conversation."""
+    resume = agent_request.clarification_context or {}
+    if prior_messages is None and resume.get('react_messages'):
+        prior_messages = messages_from_dict(resume['react_messages'])
     clarification_message = _build_runtime_clarification_answer_instruction(
         agent_request.clarification_context,
     )
     probe_observation_instruction = _build_resumed_probe_observation_instruction(
         agent_request.clarification_context
     )
+    if resume.get('react_messages'):
+        # The original tool observations are already in the restored transcript.
+        probe_observation_instruction = ''
     if prior_messages:
         prior_content = [
             str(getattr(message, 'content', '') or '') for message in prior_messages
         ]
         if clarification_message and any(
-            '<user-clarification-answers>' in content for content in prior_content
+            clarification_message == content for content in prior_content
         ):
             clarification_message = ''
         if probe_observation_instruction and any(
@@ -773,7 +801,7 @@ def _build_agent_input_with_runtime_instruction(
         extra_system_messages=extra_system_messages or None,
         history_turn_limit=runtime.history_turn_limit,
         datasource_snapshot_override=(
-            preparation.prompt_snapshot()
+            preparation.runtime_prompt_snapshot()
             if preparation is not None
             else runtime.active_datasource_snapshot
         ),
@@ -2406,7 +2434,11 @@ def _extract_execution_payload(execution: Any) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _build_structured_execution_feedback(executions: list[Any]) -> list[dict[str, Any]]:
+def _build_structured_execution_feedback(
+    executions: list[Any],
+    *,
+    include_probe_ledger: bool = True,
+) -> list[dict[str, Any]]:
     """Carry bounded tool contracts into the next Runtime ReAct turn."""
     feedback: list[dict[str, Any]] = []
     for execution in reversed(executions):
@@ -2429,17 +2461,157 @@ def _build_structured_execution_feedback(executions: list[Any]) -> list[dict[str
         message = str(payload.get('message') or getattr(execution, 'error_message', '') or '').strip()
         if message:
             item['message'] = _clip_retry_text(message, 700)
-        if isinstance(diagnostics, dict) and diagnostics:
-            item['diagnostics'] = diagnostics
+        if retry_type == 'probe_feedback' and include_probe_ledger:
+            probe_ledger = _extract_probe_fact_ledger(payload)
+            if probe_ledger:
+                item['probe_fact_ledger'] = probe_ledger
+        elif isinstance(diagnostics, dict) and diagnostics:
+            item['diagnostics'] = _compact_probe_diagnostic_facts(diagnostics)
+        if retry_type != 'probe_feedback':
+            failed_program = str(payload.get('current_failed_code') or '').strip()
+            if failed_program:
+                item['failed_program'] = _clip_retry_text(
+                    failed_program, TOOL_ERROR_CURRENT_CODE_MAX_CHARS
+                )
+                item['failed_program_truncated'] = bool(
+                    payload.get('current_failed_code_truncated')
+                )
         if isinstance(repair_instructions, list) and repair_instructions:
             item['repair_instructions'] = [str(value) for value in repair_instructions if str(value).strip()]
-        if isinstance(payload.get('query_snapshots'), dict):
-            item['query_snapshots'] = payload['query_snapshots']
         if item:
             feedback.append(item)
         if len(feedback) >= RETRY_LATEST_ERROR_LIMIT:
             break
     return list(reversed(feedback))
+
+
+def _extract_probe_fact_ledger(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep a canonical, bounded record of facts learned by Probe.
+
+    The next Runtime step needs executed query facts, not an accumulating replay
+    of stdout, SQL text and earlier speculative plans.  This adapter also
+    accepts historical Probe payloads that predate ``probe_fact_ledger``.
+    """
+    diagnostics = payload.get('diagnostics')
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    ledger = diagnostics.get('probe_fact_ledger')
+    if isinstance(ledger, dict):
+        return ledger
+
+    observations: list[dict[str, Any]] = []
+    for fallback_key, snapshot in (payload.get('query_snapshots') or {}).items():
+        if not isinstance(snapshot, dict):
+            continue
+        execution = snapshot.get('execution')
+        implementation = snapshot.get('implementation')
+        execution = execution if isinstance(execution, dict) else {}
+        implementation = implementation if isinstance(implementation, dict) else {}
+        observation = {
+            'query_key': str(snapshot.get('query_key') or fallback_key),
+            'datasource_identifiers': (
+                implementation.get('datasource_identifiers')
+                or ([implementation.get('datasource_identifier')]
+                    if implementation.get('datasource_identifier') else [])
+            ),
+            'query_constraints': snapshot.get('query_constraints') or {},
+            'query_scope': snapshot.get('query_scope') or {},
+            'status': execution.get('status'),
+            'row_count': execution.get('row_count'),
+            'effective_no_data': execution.get('effective_no_data'),
+            'columns': execution.get('columns') or [],
+            'error_type': execution.get('error_type'),
+        }
+        observations.append({
+            key: value for key, value in observation.items()
+            if value not in (None, '', [], {})
+        })
+    diagnostic_facts = _compact_probe_diagnostic_facts(diagnostics)
+    confirmed_facts = (
+        diagnostics.get('confirmed_facts')
+        if isinstance(diagnostics.get('confirmed_facts'), list) else []
+    )
+    unresolved_facts = (
+        diagnostics.get('unresolved_facts')
+        if isinstance(diagnostics.get('unresolved_facts'), list) else []
+    )
+    if not (observations or confirmed_facts or unresolved_facts or diagnostic_facts):
+        return {}
+    return {
+        'schema_version': 1,
+        'observations': observations,
+        'confirmed_facts': confirmed_facts,
+        'unresolved_facts': unresolved_facts,
+        'diagnostic_facts': diagnostic_facts,
+    }
+
+
+def _compact_probe_diagnostic_facts(diagnostics: dict[str, Any]) -> dict[str, Any]:
+    """Keep small Probe observations that predate the canonical fact ledger.
+
+    Historical Probe feedback frequently stores useful facts such as a status
+    enumeration directly in ``diagnostics``.  Dropping those fields makes a
+    clarification resume forget why it was asked.  Keep only JSON-shaped,
+    bounded values and deliberately exclude payloads that replay source code,
+    snapshots, or the ledger itself.
+    """
+    ignored_keys = {
+        'probe_fact_ledger', 'confirmed_facts', 'unresolved_facts',
+        'current_failed_code', 'code_error_context', 'query_snapshots',
+        'repair_target', 'repair_instructions',
+    }
+    facts: dict[str, Any] = {}
+    for key, value in diagnostics.items():
+        if key in ignored_keys or len(facts) >= 16:
+            continue
+        compact = _compact_probe_diagnostic_value(value)
+        if compact is not None:
+            facts[str(key)] = compact
+    return facts
+
+
+def _compact_probe_diagnostic_value(value: Any, *, depth: int = 0) -> Any:
+    """Return a JSON-safe bounded diagnostic value, or ``None`` when unsafe."""
+    if depth > 2:
+        return None
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _clip_retry_text(value, 300)
+    if isinstance(value, list):
+        items = [
+            compact for item in value[:20]
+            if (compact := _compact_probe_diagnostic_value(item, depth=depth + 1)) is not None
+        ]
+        return items
+    if isinstance(value, dict):
+        compact_items: dict[str, Any] = {}
+        for key, item in list(value.items())[:12]:
+            compact = _compact_probe_diagnostic_value(item, depth=depth + 1)
+            if compact is not None:
+                compact_items[str(key)] = compact
+        return compact_items
+    return None
+
+
+def _iter_stream_update_payloads(chunk: Any) -> Iterator[dict[str, Any]]:
+    """Yield message-bearing node updates, ignoring LangGraph control events.
+
+    With ``interrupt_after`` enabled, LangGraph can emit a tuple for an
+    interrupted node alongside ordinary update dictionaries. That tuple is a
+    graph-control envelope rather than a node state payload.
+    """
+    if not isinstance(chunk, dict):
+        return
+
+    for payload in chunk.values():
+        if isinstance(payload, dict):
+            yield payload
+            continue
+        if isinstance(payload, tuple):
+            for item in reversed(payload):
+                if isinstance(item, dict):
+                    yield item
+                    break
 
 
 def _message_identity(message: BaseMessage) -> tuple[Any, ...]:
@@ -2675,6 +2847,7 @@ def _build_clarification_resume_context(
     *,
     preparation: PreparationResult | None,
     runtime: ConversationRunContext,
+    transcript: list[BaseMessage] | None = None,
 ) -> dict[str, Any]:
     probe_observations = [
         item
@@ -2687,6 +2860,7 @@ def _build_clarification_resume_context(
         "preparation": preparation.resume_payload() if preparation is not None else None,
         "context_mode": getattr(runtime, "context_mode", "") or "fresh_analysis",
         "probe_observations": probe_observations,
+        **({'react_messages': messages_to_dict(transcript)} if transcript else {}),
     }
 
 
@@ -2782,7 +2956,11 @@ def _ensure_explicit_time_range_guard_memory(
 def _update_short_term_memory_from_tool_payload(runtime: ConversationRunContext, payload: dict[str, Any]) -> None:
     if not isinstance(payload, dict):
         return
-    if payload.get('tool') not in ('', None, 'execute_python'):
+    tool_name = str(payload.get('tool') or '').strip()
+    if tool_name == 'read_runtime_datasource_context':
+        _update_runtime_schema_detail_workspace(runtime, payload)
+        return
+    if tool_name not in ('', 'execute_python'):
         return
 
     error_type = str(
@@ -2803,6 +2981,7 @@ def _update_short_term_memory_from_tool_payload(runtime: ConversationRunContext,
             short_term_memory['seen_execution_feedback'] = []
             short_term_memory.pop('probe_no_data_retry', None)
             short_term_memory['probe_feedback_count'] = 0
+            short_term_memory['probe_fact_ledger'] = []
         execution_id = payload.get('execution_id')
         if execution_id:
             key = f'{execution_id}:{error_type}'
@@ -2814,6 +2993,10 @@ def _update_short_term_memory_from_tool_payload(runtime: ConversationRunContext,
             short_term_memory['probe_feedback_count'] = (
                 int(short_term_memory.get('probe_feedback_count') or 0) + 1
             )
+            probe_ledger = _extract_probe_fact_ledger(payload)
+            if probe_ledger:
+                ledgers = short_term_memory.setdefault('probe_fact_ledger', [])
+                ledgers.append(probe_ledger)
         else:
             diagnostics = payload.get('diagnostics') or {}
             if isinstance(diagnostics, dict) and 'probe_no_data_retry_count' in diagnostics:
@@ -2823,6 +3006,31 @@ def _update_short_term_memory_from_tool_payload(runtime: ConversationRunContext,
                     'limit_reached': diagnostics.get('probe_no_data_limit_reached', False),
                     'last_error_type': error_type,
                 }
+
+
+def _update_runtime_schema_detail_workspace(
+    runtime: ConversationRunContext,
+    payload: dict[str, Any],
+) -> None:
+    """Remember only exact Schema details explicitly opened by Runtime.
+
+    The outer ReAct loop deliberately rebuilds its messages after each tool
+    batch, rather than replaying raw ToolMessages. Schema reads therefore need
+    a compact canonical workspace entry so the next model turn can use the
+    fields it just requested. This does not broaden datasource scope or retain
+    query output.
+    """
+    raw_sources = payload.get('datasources')
+    if not isinstance(raw_sources, list):
+        return
+    memory = getattr(runtime, 'short_term_memory', None)
+    if not isinstance(memory, dict):
+        memory = {}
+        setattr(runtime, 'short_term_memory', memory)
+
+    memory[RUNTIME_SCHEMA_DETAIL_MEMORY_KEY] = merge_schema_sources(
+        memory.get(RUNTIME_SCHEMA_DETAIL_MEMORY_KEY), raw_sources,
+    )
 
 
 def _update_short_term_memory_from_messages(runtime: ConversationRunContext, messages: list[Any]) -> None:
@@ -2845,7 +3053,10 @@ def _build_analysis_recovery_instruction(
 ) -> str:
     """Recover exact execution feedback without introducing new business rules."""
     executions = _load_turn_executions_fresh(runtime)
-    feedback = _build_structured_execution_feedback(executions)
+    feedback = _build_structured_execution_feedback(
+        executions,
+        include_probe_ledger=False,
+    )
     lines = [_build_continued_react_recovery_instruction()]
     output = getattr(runtime, 'output_contract', None) or {'type': 'standard'}
     lines.append('继续遵循当前输出协议：' + json.dumps(output, ensure_ascii=False))
@@ -2856,9 +3067,15 @@ def _build_analysis_recovery_instruction(
     latest_repair_target = _get_latest_failed_repair_target(executions)
     if latest_repair_target:
         lines.extend([
-            'repair_target.allowed_ranges 是已核对的源码定位；可按该原版本行号提交局部 patches，合成后校验完整程序，不要求恰好替换整个定位范围。',
+            'repair_target 表示后端已把本次技术错误限定到可验证的 Python 语句范围；'
+            '每个 patch 必须完整替换一个允许的语句或代码块，并保留其余已执行程序。'
+            '查询范围、字段归属、JOIN、聚合、指标计算或报告语义发生变化时，不得借局部 patch 改变分析设计。',
             json.dumps(latest_repair_target, ensure_ascii=False),
         ])
+    if getattr(runtime, 'short_term_memory', {}).get('probe_fact_ledger'):
+        lines.append('已执行 Probe 的事实账本由当前 Runtime 工作视图统一投影；不要从旧恢复消息重建或重复粘贴它。')
+    if getattr(runtime, 'short_term_memory', {}).get(RUNTIME_SCHEMA_DETAIL_MEMORY_KEY):
+        lines.append('已按需读取的精确 Schema 由当前 Runtime 工作视图统一投影；直接使用该工作视图，不重复读取同一明细。')
     if feedback:
         lines.extend([
             '以下是本次任务真实执行的反馈；Probe 观察不是执行失败，也不自动确定业务筛选条件：',
@@ -2870,11 +3087,12 @@ def _build_analysis_recovery_instruction(
 
 
 def _build_continued_react_recovery_instruction() -> str:
-    """Continue from exact tool feedback already present in one transcript."""
+    """State the bounded recovery boundary for a fresh Runtime model turn."""
     return (
-        '继续完成同一分析任务。请直接消费上方最近一次分析工具 ToolMessage 中的 '
-        'diagnostics、repair_instructions、失败代码和源码位置，在保持原问题、数据范围及产物意图的前提下修复；'
-        '已有观察足以实现分析时直接调用 submit_analysis_program；'
+        '继续完成同一分析任务。上方提供的是后端归纳的真实 Probe 事实和执行反馈，而不是完整工具转录；'
+        '请消费事实账本、diagnostics、repair_instructions、失败程序和源码位置，在保持原问题、数据范围及产物意图的前提下修复；'
+        '已有 Probe 事实只能复用其已证明的范围和观察，不重复探测同一事实；'
+        '当已有观察足以实现分析时直接调用 submit_analysis_program，不能再提交局部或占位程序；'
         '若仍有影响答案的技术未知，可用 probe_analysis_data 核实，不重复已确认的观察。'
     )
 
@@ -3081,7 +3299,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 round_input_messages,
                 response_messages,
             )
-            agent_round_messages = _merge_agent_round_messages(
+            round_transcript = _merge_agent_round_messages(
                 round_input_messages,
                 response_messages,
             )
@@ -3090,9 +3308,14 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 round_index=round_index,
                 mode="invoke",
                 messages=round_output_messages,
-                transcript=agent_round_messages,
+                transcript=round_transcript,
                 duration_seconds=time.monotonic() - round_started_at,
             )
+            # The outer recovery loop is still one Runtime work session. Keep
+            # its lossless transcript so the request-view middleware can
+            # project current code, observations and failures on the next
+            # focused model call instead of reconstructing a fresh prompt.
+            agent_round_messages = round_transcript
             clarification = _extract_runtime_clarification(response_messages)
             if clarification is not None:
                 raise ValueError(
@@ -3406,9 +3629,9 @@ def _stream_with_runtime(
                     'status',
                     conversation_id=runtime.conversation.id,
                     turn_id=runtime.turn.id,
-                    stage='retry',
-                    level='warning',
-                    message='本轮分析尚未完成，正在根据最近执行错误继续修正代码。',
+                    stage='analysis_continue',
+                    level='info',
+                    message='正在基于已确认的 Schema 与执行观察继续完成分析。',
                 )
             elif runtime.is_rerun:
                 runtime_instruction = _build_rerun_instruction(
@@ -3463,6 +3686,9 @@ def _stream_with_runtime(
             )
             round_started_at = time.monotonic()
             streamed_messages: list[BaseMessage] = []
+            deferred_assistant_messages: list[str] = []
+            progress_calls = {}
+            active_progress_call_ids: set[str] = set()
             for stream_mode, chunk in agent.stream(
                 agent_input,
                 context=_build_agent_context(
@@ -3474,15 +3700,19 @@ def _stream_with_runtime(
             ):
                 _raise_if_analysis_task_cancelled(runtime)
                 if stream_mode == "updates":
-                    for _, payload in chunk.items():
-                        if payload is None:
-                            continue
+                    for payload in _iter_stream_update_payloads(chunk):
                         messages = payload.get("messages", [])
                         for message in messages:
                             streamed_messages.append(message)
                             tool_calls = getattr(message, 'tool_calls', None)
                             raw_tool_call = _extract_raw_tool_call(getattr(message, 'content', ''))
                             cleaned = _clean_message_content(getattr(message, 'content', ''))
+                            result_call_id = getattr(message, 'tool_call_id', None)
+                            if result_call_id in active_progress_call_ids:
+                                progress = tool_progress(progress_calls[result_call_id], getattr(message, 'content', ''))
+                                if progress:
+                                    yield {**progress, 'conversation_id': runtime.conversation.id, 'turn_id': runtime.turn.id}
+                                active_progress_call_ids.discard(result_call_id)
                             if isinstance(cleaned, str) and cleaned.strip().startswith('{'):
                                 try:
                                     tool_feedback_payload = json.loads(cleaned)
@@ -3492,16 +3722,13 @@ def _stream_with_runtime(
                                     _update_short_term_memory_from_tool_payload(runtime, tool_feedback_payload)
 
                             if tool_calls:
-                                if cleaned and not _is_internal_assistant_message(cleaned):
-                                    assistant_message = cleaned
-                                    yield _build_progress_event(
-                                        'assistant',
-                                        conversation_id=runtime.conversation.id,
-                                        turn_id=runtime.turn.id,
-                                        stage='planning',
-                                        message=cleaned,
-                                    )
                                 for tool_call in tool_calls:
+                                    progress_calls[tool_call['id']] = tool_call
+                                    progress = tool_progress(tool_call)
+                                    if progress:
+                                        active_progress_call_ids.add(tool_call['id'])
+                                        yield {**progress, 'conversation_id': runtime.conversation.id, 'turn_id': runtime.turn.id}
+                                        continue
                                     yield _build_progress_event(
                                         'status',
                                         conversation_id=runtime.conversation.id,
@@ -3542,19 +3769,36 @@ def _stream_with_runtime(
                                 continue
 
                             assistant_message = cleaned
-                            yield _build_progress_event(
-                                'assistant',
-                                conversation_id=runtime.conversation.id,
-                                turn_id=runtime.turn.id,
-                                stage='planning',
-                                message=cleaned,
-                            )
+                            deferred_assistant_messages.append(cleaned)
 
                 elif stream_mode == "custom":
                     if isinstance(chunk, dict):
                         chunk.setdefault('conversation_id', runtime.conversation.id)
                         chunk.setdefault('turn_id', runtime.turn.id)
                         yield chunk
+                        terminal_stage = str(chunk.get('stage') or '')
+                        if terminal_stage in {'tool_finished', 'tool_result', 'tool_error'}:
+                            execution_call_id = next((
+                                call_id
+                                for call_id, call in reversed(list(progress_calls.items()))
+                                if call_id in active_progress_call_ids
+                                and call.get('name') in {'submit_analysis_program', 'execute_python'}
+                            ), None)
+                            if execution_call_id:
+                                terminal_status = (
+                                    'error' if terminal_stage == 'tool_error' else 'success'
+                                )
+                                progress = tool_progress(
+                                    progress_calls[execution_call_id],
+                                    {'status': terminal_status},
+                                )
+                                active_progress_call_ids.discard(execution_call_id)
+                                if progress:
+                                    yield {
+                                        **progress,
+                                        'conversation_id': runtime.conversation.id,
+                                        'turn_id': runtime.turn.id,
+                                    }
                         if chunk.get('stage') == 'tool_result':
                             execution_report, execution_charts, execution_tables = _load_latest_execution_result(
                                 service=service,
@@ -3576,7 +3820,7 @@ def _stream_with_runtime(
                             message=str(chunk),
                         )
 
-            agent_round_messages = _merge_agent_round_messages(
+            round_transcript = _merge_agent_round_messages(
                 round_input_messages,
                 streamed_messages,
             )
@@ -3589,9 +3833,12 @@ def _stream_with_runtime(
                 round_index=round_index,
                 mode="stream",
                 messages=round_output_messages,
-                transcript=agent_round_messages,
+                transcript=round_transcript,
                 duration_seconds=time.monotonic() - round_started_at,
             )
+            # See the non-streaming path above. Streaming retries must retain
+            # the same work memory and tool-call identities as well.
+            agent_round_messages = round_transcript
 
             clarification = _extract_runtime_clarification(streamed_messages)
             if clarification is not None:
@@ -3605,9 +3852,26 @@ def _stream_with_runtime(
                     "_resume_context": _build_clarification_resume_context(
                         preparation=preparation,
                         runtime=runtime,
+                        transcript=round_transcript,
                     ),
                 }
                 return
+
+            # Tool-oriented Runtime prose is private execution scaffolding.
+            # Structured lifecycle/tool progress already describes that work
+            # without leaking chain-of-thought or language-inconsistent text.
+            # Only a tool-free answer is eligible for the assistant stream.
+            if deferred_assistant_messages and not any(
+                getattr(message, 'tool_calls', None) for message in streamed_messages
+            ):
+                for message_text in deferred_assistant_messages:
+                    yield _build_progress_event(
+                        'assistant',
+                        conversation_id=runtime.conversation.id,
+                        turn_id=runtime.turn.id,
+                        stage='planning',
+                        message=message_text,
+                    )
 
             if tool_result_ready:
                 analysis_flow_started = True
