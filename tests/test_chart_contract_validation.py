@@ -16,6 +16,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from agent.tools import (  # noqa: E402
+    AnalysisClaimAssessment,
     CURRENT_EXECUTION_INTENT,
     CURRENT_DATASOURCE_NUMERIC_FIELDS,
     CURRENT_QUERY_SNAPSHOTS,
@@ -31,6 +32,7 @@ from agent.tools import (  # noqa: E402
     _extract_dataframe_reduction_clauses,
     _extract_error_signature,
     _find_empty_markdown_leaf_sections,
+    _find_repeated_numeric_display_units,
     _classify_execution_error,
     _inspect_preparation_relationship,
     _inspect_preparation_schema_fact,
@@ -841,7 +843,7 @@ other = f"{another_mapping['display_end']}"
         self.assertEqual(diagnostics["usage_lines"], [3, 4])
         self.assertEqual(
             [item["start_line"] for item in context["suggested_patch_ranges"]],
-            [2, 3, 4],
+            [3, 4, 2],
         )
         self.assertIn("lines [3, 4]", instructions[0])
 
@@ -1967,11 +1969,34 @@ result = save_analysis_result(analysis_report="Pattern distribution.", charts=[c
                 "claim_support",
             ],
         )
+        self.assertIn(
+            "inference_level",
+            payload["candidate_review_contract"]["material_claim_fields"],
+        )
 
         command = _terminal_tool_success(message)
 
         self.assertTrue(command.update["analysis_complete"])
         self.assertEqual(command.update, {"messages": [message], "analysis_complete": True})
+
+    def test_review_claim_requires_qualification_for_descriptive_association(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires an explicit qualification"):
+            AnalysisClaimAssessment(
+                claim_text="报警批次与偏高存在关联",
+                inference_level="association",
+                support_method="computed_comparison",
+                evidence_basis="报警批次偏高 53.5%，无报警批次偏高 52.4%",
+                supported_as_written=True,
+            )
+
+        assessment = AnalysisClaimAssessment(
+            claim_text="报警批次的偏高比例略高",
+            inference_level="comparative",
+            support_method="computed_comparison",
+            evidence_basis="报警批次偏高 53.5%，无报警批次偏高 52.4%，差 1.1 个百分点",
+            supported_as_written=True,
+        )
+        self.assertEqual(assessment.inference_level, "comparative")
 
     def test_success_message_delivers_bounded_static_advisories_to_review(self) -> None:
         message = _tool_success_message(
@@ -3559,6 +3584,14 @@ result = save_analysis_result(analysis_report=report, charts=[chart], tables=[])
         self.assertEqual(
             retry.diagnostics["violated_contract"],
             "repeated_numeric_display_unit",
+        )
+
+    def test_report_allows_numeric_unit_followed_by_chinese_word(self) -> None:
+        self.assertEqual(
+            _find_repeated_numeric_display_units(
+                "## 分析口径\n\n本周期为2026年年内累计，截至当前日期。"
+            ),
+            [],
         )
 
     def test_report_does_not_block_on_ambiguous_duplicate_metric_table_values(self) -> None:

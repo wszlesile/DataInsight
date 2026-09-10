@@ -85,23 +85,57 @@ def test_known_day_range_behavior_is_not_changed_to_match_incorrect_documentatio
     assert '包含式终点' in load_runtime_contract_text(('execution.core',))
 
 
+def test_probe_shaped_formal_program_is_recognized_without_intent_marker():
+    source = '''
+df = query_local_file(query_key="device_overview", datasource_id=180, query_constraints={})
+print("rows", len(df))
+print("statuses", df["status"].value_counts().to_dict())
+execution_intent = "analysis"
+'''
+
+    assert tools._program_is_probe_shaped(source) is True
+
+
+def test_probe_shaped_local_file_program_is_recognized_without_query_helper():
+    source = '''
+df = load_local_file("devices.xlsx", sheet_name="Sheet1")
+print("rows", len(df))
+print(df["status"].value_counts().to_dict())
+execution_intent = "analysis"
+'''
+
+    assert tools._program_is_probe_shaped(source) is True
+
+
+def test_incomplete_formal_program_is_not_misclassified_as_probe():
+    source = '''
+df = query_local_file(query_key="device_overview", datasource_id=180, query_constraints={})
+summary = df.groupby("manufacturer").size().reset_index(name="count")
+execution_intent = "analysis"
+'''
+
+    assert tools._program_is_probe_shaped(source) is False
+
+
 @pytest.mark.parametrize('mode', ['analysis', 'probe'])
 @pytest.mark.parametrize('source', [
-    'result = execution_intent\n',
-    '# header\r\nresult = execution_intent\r\n',
-    '"""module doc"""\nfrom __future__ import annotations\nresult = execution_intent',
-    '"""中文说明"""; result = execution_intent',
+    'result = "ok"\n',
+    '# header\r\nresult = "ok"\r\n',
+    '"""module doc"""\nfrom __future__ import annotations\nresult = "ok"',
+    '"""中文说明"""; result = "ok"',
     '"""module doc"""',
-    '@(lambda function: function)\ndef report():\n    return execution_intent\nresult = report()',
-    '"""module doc"""\n@(lambda cls: cls)\nclass Report:\n    mode = execution_intent\nresult = Report.mode',
+    '@(lambda function: function)\ndef report():\n    return "ok"\nresult = report()',
+    '"""module doc"""\n@(lambda cls: cls)\nclass Report:\n    mode = "ok"\nresult = Report.mode',
 ])
-def test_tool_mode_is_persisted_as_valid_standalone_source(source, mode):
+def test_tool_mode_is_persisted_without_shifting_model_source_lines(source, mode):
     materialized = tools._bind_program_execution_mode(source, mode)
+    source_lines = source.splitlines()
+    assert materialized.splitlines()[:len(source_lines)] == source_lines
     namespace = {}
     exec(compile(materialized, '<analysis>', 'exec'), namespace)
     assert namespace['execution_intent'] == mode
     if 'result =' in source:
-        assert namespace['result'] == mode
+        assert namespace['result'] == 'ok'
     assert tools._bind_program_execution_mode(materialized, mode) == materialized
     assert ast.get_docstring(ast.parse(source)) == ast.get_docstring(ast.parse(materialized))
 
@@ -270,10 +304,10 @@ def test_source_is_materialized_before_record_validation_and_patch_feedback(monk
     runtime = SimpleNamespace(context=SimpleNamespace(conversation_id=1, turn_id=2), tool_call_id='test')
     message = tools.submit_analysis_program.func(runtime=runtime, code='value = 1\n', used_datasource_ids=[1])
     persisted = recorded[0]['code']
-    assert persisted == 'execution_intent = "analysis"\nvalue = 1\n'
+    assert persisted == 'value = 1\nexecution_intent = "analysis"\n'
     assert json.loads(message.content)['error_type'] != 'invalid_execution_intent'
     repaired = tools._apply_source_code_patches(
-        persisted, [tools.SourceCodePatch(start_line=2, end_line=2, replacement='value = 2')],
+        persisted, [tools.SourceCodePatch(start_line=1, end_line=1, replacement='value = 2')],
     )
     assert tools._bind_program_execution_mode(repaired, 'analysis') == repaired
 
@@ -362,6 +396,31 @@ def test_query_helpers_work_in_functions_and_loops_without_losing_snapshots(monk
     assert sum(len(frame) for frame in results) == 4
     assert set(tools.CURRENT_QUERY_SNAPSHOTS.get()) == {'q_one', 'q_two'}
     assert all(s['execution']['row_count'] == 2 for s in tools.CURRENT_QUERY_SNAPSHOTS.get().values())
+
+
+def test_query_helper_normalizes_named_parameters_before_validation_and_execution(monkeypatch):
+    loader = Mock(return_value=pd.DataFrame({'value': [1]}))
+    monkeypatch.setattr(tools, 'load_data_with_sql', loader)
+
+    result = tools.query_data_with_sql(
+        query_key='q_named',
+        query_constraints={
+            'time_range': None,
+            'target_filters': [],
+            'aggregation': None,
+        },
+        sql='SELECT value::numeric FROM measurements WHERE started_at >= :start_date',
+        params={'start_date': '2026-08-01'},
+    )
+
+    assert result['value'].tolist() == [1]
+    assert loader.call_args.kwargs['sql'] == (
+        'SELECT value::numeric FROM measurements WHERE started_at >= %(start_date)s'
+    )
+    assert loader.call_args.kwargs['params'] == {'start_date': '2026-08-01'}
+    snapshot = tools.CURRENT_QUERY_SNAPSHOTS.get()['q_named']
+    assert snapshot['implementation']['sql'] == loader.call_args.kwargs['sql']
+    assert snapshot['implementation']['query_params'] == {'start_date': '2026-08-01'}
 
 
 def test_function_wrapped_query_remains_valid_in_a_complete_analysis_program(monkeypatch):

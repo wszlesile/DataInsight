@@ -814,9 +814,12 @@ def _resolve_work_view(messages):
                     work = 'repair'
         elif call_name == 'probe_analysis_data':
             if (
-                payload.get('error_type') == 'probe_closed_for_formal_implementation'
+                payload.get('error_type') in {
+                    'probe_closed_for_formal_implementation',
+                    'duplicate_probe_request',
+                }
                 or (payload.get('diagnostics') or {}).get('violated_contract')
-                == 'probe_closed_for_formal_implementation'
+                in {'probe_closed_for_formal_implementation', 'duplicate_probe_request'}
             ):
                 # A stale provider call was blocked at the tool boundary. It
                 # must not reopen Probe or replace the current implementation
@@ -1221,12 +1224,91 @@ def _reference_replayed_source(context, source: str, call_id: str):
     return project(context)
 
 
+def _active_formal_program_chain(messages) -> tuple[str | None, frozenset[str]]:
+    """Return the current formal call and calls needed to reconstruct it."""
+    calls: dict[str, dict] = {}
+    execution_owner: dict[int, str] = {}
+    ordered: list[str] = []
+    for message in messages:
+        if isinstance(message, AIMessage):
+            for call in message.tool_calls:
+                if call.get('name') in {'submit_analysis_program', 'execute_python'}:
+                    call_id = str(call.get('id') or '')
+                    if call_id:
+                        calls[call_id] = call
+                        ordered.append(call_id)
+        elif isinstance(message, ToolMessage):
+            payload = _payload(message)
+            if not isinstance(payload, dict):
+                continue
+            try:
+                execution_id = int(payload.get('execution_id') or 0)
+            except (TypeError, ValueError):
+                execution_id = 0
+            if execution_id > 0 and str(message.tool_call_id or '') in calls:
+                execution_owner[execution_id] = str(message.tool_call_id)
+    if not ordered:
+        return None, frozenset()
+    latest = ordered[-1]
+    active = {latest}
+    current = latest
+    while current:
+        args = calls[current].get('args') or {}
+        try:
+            base_execution_id = int(args.get('base_execution_id') or 0)
+        except (TypeError, ValueError):
+            base_execution_id = 0
+        parent = execution_owner.get(base_execution_id)
+        if not parent or parent in active:
+            break
+        active.add(parent)
+        current = parent
+    return latest, frozenset(active)
+
+
+def _repair_uses_query_context(messages, work: str | None) -> bool:
+    """Whether exact executed-query details can help the current work."""
+    if work == 'review':
+        return True
+    if work != 'repair':
+        return False
+    call_names: dict[str, str] = {}
+    for message in messages:
+        if isinstance(message, AIMessage):
+            call_names.update({str(call.get('id') or ''): str(call.get('name') or '')
+                               for call in message.tool_calls})
+    for message in reversed(messages):
+        if not isinstance(message, ToolMessage):
+            continue
+        if call_names.get(str(message.tool_call_id or '')) not in {
+            'submit_analysis_program', 'execute_python',
+        }:
+            continue
+        payload = _payload(message) or {}
+        if not (payload.get('status') == 'failed' or payload.get('error_type')):
+            continue
+        error_type = str(payload.get('error_type') or payload.get('retry_type') or '').casefold()
+        diagnostics = payload.get('diagnostics') if isinstance(payload.get('diagnostics'), dict) else {}
+        violation = str(diagnostics.get('violated_contract') or '').casefold()
+        if error_type in {
+            'query_error', 'query_execution_error', 'query_result_too_large',
+            'query_constraint_violation', 'no_data_found', 'probe_feedback',
+            'connection_error', 'permission_error',
+        }:
+            return True
+        return any(token in violation for token in (
+            'query_', 'sql_', 'datasource_field_ownership', 'physical_execution',
+        ))
+    return False
+
+
 def project_history(
     messages,
     *,
     memory: WorkingMemoryIndex | None = None,
     work: str | None = None,
     compact_schema_reader_results: bool = False,
+    retain_query_context: bool = True,
 ):
     """Remove replaced code and repeated protocol material, never business facts."""
     memory = memory or build_working_memory_index(messages)
@@ -1251,16 +1333,7 @@ def project_history(
         if isinstance(message, AIMessage):
             for call in message.tool_calls:
                 call_indices[str(call['id'])] = index
-    latest_formal_call_id = next(
-        (
-            call['id']
-            for message in reversed(messages)
-            if isinstance(message, AIMessage)
-            for call in reversed(message.tool_calls)
-            if call['name'] in {'submit_analysis_program', 'execute_python'}
-        ),
-        None,
-    )
+    latest_formal_call_id, active_formal_call_ids = _active_formal_program_chain(messages)
     latest_revision_call_id = next(
         (
             str(call['id'])
@@ -1296,6 +1369,9 @@ def project_history(
             retained_calls = []
             covered_probe_call_count = 0
             for call in message.tool_calls:
+                if call['name'] == 'read_runtime_query_context' and not retain_query_context:
+                    archived += 1
+                    continue
                 if str(call.get('id') or '') in revision_events_to_archive:
                     archived += 1
                     continue
@@ -1305,7 +1381,7 @@ def project_history(
                 if (
                     work in {'repair', 'review'}
                     and call['name'] in {'submit_analysis_program', 'execute_python'}
-                    and call['id'] != latest_formal_call_id
+                    and call['id'] not in active_formal_call_ids
                 ):
                     # The current failure and current program are the only
                     # formal repair pair. Older programs remain in the audit
@@ -1349,6 +1425,12 @@ def project_history(
                 message = message.model_copy(update={'content': '', 'tool_calls': []})
         if (
             isinstance(message, ToolMessage)
+            and calls.get(message.tool_call_id) == 'read_runtime_query_context'
+            and not retain_query_context
+        ):
+            continue
+        if (
+            isinstance(message, ToolMessage)
             and str(message.tool_call_id or '') in obsolete_probe_events
         ):
             # The paired Probe tool result is represented by the canonical
@@ -1368,7 +1450,7 @@ def project_history(
             work in {'repair', 'review'}
             and isinstance(message, ToolMessage)
             and calls.get(message.tool_call_id) in {'submit_analysis_program', 'execute_python'}
-            and message.tool_call_id != latest_formal_call_id
+            and message.tool_call_id not in active_formal_call_ids
         ):
             # Keep only the current formal failure/result pair in the model
             # view; the complete historical execution remains queryable from
@@ -1429,6 +1511,18 @@ def project_history(
                                 'previous_failure_messages', 'previous_failure_hints'):
                         payload.pop(key, None)
                     payload['history_status'] = 'earlier_attempt_not_proof_of_resolution'
+                if (
+                    role == 'formal'
+                    and message.tool_call_id in active_formal_call_ids
+                    and message.tool_call_id != latest_formal_call_id
+                ):
+                    payload = {
+                        'tool': payload.get('tool') or 'execute_python',
+                        'status': payload.get('status'),
+                        'execution_id': payload.get('execution_id'),
+                        'error_type': payload.get('error_type'),
+                        'history_status': 'program_derivation_base',
+                    }
             message = message.model_copy(update={'content': json.dumps(payload, ensure_ascii=False)})
         result.append(message)
     return result, archived
@@ -1564,6 +1658,7 @@ def _compact_probe_ledger(ledger: dict) -> dict:
                 'query_key', 'datasource_id', 'datasource_identifiers', 'query_constraints', 'query_scope',
                 'status', 'row_count', 'effective_no_data', 'columns', 'error_type',
                 'probe_profile', 'value_profile', 'value_samples', 'distinct_values',
+                'projection_semantics', 'aggregate_facts', 'capacity_risks',
             )
             if raw.get(key) not in (None, '', [], {})
         }
@@ -1574,6 +1669,8 @@ def _compact_probe_ledger(ledger: dict) -> dict:
         'observations': observations,
         'confirmed_facts': list(ledger.get('confirmed_facts') or []),
         'unresolved_facts': list(ledger.get('unresolved_facts') or []),
+        'aggregate_facts': list(ledger.get('aggregate_facts') or []),
+        'capacity_risks': list(ledger.get('capacity_risks') or []),
     }
 
 
@@ -1587,6 +1684,8 @@ def _merge_probe_ledgers(ledgers: list[dict]) -> dict:
     observations: dict[str, dict] = {}
     confirmed: dict[str, object] = {}
     unresolved: dict[str, object] = {}
+    aggregates: dict[str, object] = {}
+    capacity_risks: dict[str, object] = {}
     def fact_identity(value):
         if isinstance(value, dict) and value.get('fact_id'):
             return _stable_revision({
@@ -1617,11 +1716,17 @@ def _merge_probe_ledgers(ledgers: list[dict]) -> dict:
             identity = fact_identity(value)
             unresolved[identity] = value
             confirmed.pop(identity, None)
+        for value in ledger.get('aggregate_facts') or []:
+            aggregates[fact_identity(value)] = value
+        for value in ledger.get('capacity_risks') or []:
+            capacity_risks[fact_identity(value)] = value
     return {
         'schema_version': schema_version,
         'observations': list(observations.values()),
         'confirmed_facts': list(confirmed.values()),
         'unresolved_facts': list(unresolved.values()),
+        'aggregate_facts': list(aggregates.values()),
+        'capacity_risks': list(capacity_risks.values()),
     }
 
 
@@ -1800,6 +1905,7 @@ def build_working_request(request):
         probe_facts,
         getattr(context, 'runtime_probe_fact_ledgers', []),
     )
+    retain_query_context = _repair_uses_query_context(request.messages, work)
     schema_detail_workspace = collect_runtime_schema_sources(
         request.messages, getattr(context, 'runtime_schema_detail_workspace', []),
     )
@@ -1820,6 +1926,7 @@ def build_working_request(request):
         # evidence and can make this deliberately focused state larger than
         # implementation itself.
         compact_schema_reader_results=(canonical_schema_covered or work == 'review'),
+        retain_query_context=retain_query_context,
     )
     memory = message_memory.with_items(build_context_memory_items(context, contract_ids))
     # The full transcript stays in graph state. This outbound view owns exactly
@@ -1866,6 +1973,7 @@ def build_working_request(request):
            '计划产物是后续 Probe、正式实现和修复共同复用的材料范围，不改变完整分析范围。'
            if work == 'understand' else
            '\n计划阶段使用 plan_runtime_materials 组织当前问题的事实、来源、字段和关系；技术未知才标记为需要 Probe。'
+           '计划只固化可读取的材料范围，不定义指标、图表或报告。'
            if work == 'plan' else
            work_schema_instruction)
         + ('每次 Probe 完成后必须先基于事实账本重新选择下一项工作；只有新的、未被账本覆盖的技术未知才选择 Probe。'
@@ -1878,7 +1986,7 @@ def build_working_request(request):
            + '工具消息中的 query_snapshot_refs 指向下列执行依据索引。不同版本分别保留，不代表旧失败已经解决。\n'
            + '需要实际执行语句或精确查询实现时，用 definition_id 调用 read_runtime_query_context；该工具只读取本轮记录，不执行查询。\n'
            + json.dumps(query_facts, ensure_ascii=False, separators=(',', ':'))
-           + '\n</executed-query-facts>' if query_facts else '')
+           + '\n</executed-query-facts>' if query_facts and retain_query_context else '')
         + ('\n<probe-fact-ledger>\n'
            + '以下事实来自已执行 Probe 的结构化观察；它们只证明各自记录的查询范围，不能替代正式计算。\n'
            + json.dumps(probe_facts, ensure_ascii=False, separators=(',', ':'))
@@ -1934,7 +2042,7 @@ def build_working_request(request):
         if name == 'read_runtime_reference' and work in {'understand', 'plan', 'review'}:
             return False
         if name == 'read_runtime_query_context':
-            return bool(query_facts)
+            return bool(query_facts) and retain_query_context
         # A material plan chooses business facts, sources and exact fields.
         # The compact index is sufficient to discover candidates but not to
         # establish a field's formula, enum, format or relationship meaning.
@@ -1964,18 +2072,34 @@ def build_working_request(request):
         for kind in WorkingMemoryKind
         if memory.of_kind(kind)
     }
-    logger.info('Runtime work view state=%s contracts=%s memory=%s archived_code=%s raw_tokens=%s view_tokens=%s',
+    base_system_tokens = estimate_work_messages([SystemMessage('\n\n'.join(system_parts))]) if system_parts else 0
+    datasource_tokens = estimate_work_messages([datasource_view])
+    work_context_tokens = estimate_work_messages([current])
+    history_tokens = estimate_work_messages(messages)
+    tool_schema_chars = sum(
+        len(json.dumps(item.args_schema.model_json_schema(), ensure_ascii=False))
+        for item in tools
+        if getattr(item, 'args_schema', None) is not None
+    )
+    logger.info('Runtime work view state=%s contracts=%s memory=%s archived_code=%s raw_tokens=%s view_tokens=%s components=%s',
                 work, list(contract_ids), memory_counts, archived,
                 estimate_work_messages([*([request.system_message] if request.system_message else []), *request.messages]),
-                estimate_work_messages([*([system] if system else []), *messages]))
+                estimate_work_messages([*([system] if system else []), *messages]),
+                {
+                    'base_system_tokens': base_system_tokens,
+                    'datasource_tokens': datasource_tokens,
+                    'work_context_tokens': work_context_tokens,
+                    'history_tokens': history_tokens,
+                    'tool_schema_chars': tool_schema_chars,
+                })
     return request.override(messages=messages, system_message=system, tools=tools)
 
 
 class RuntimeWorkingContextMiddleware(AgentMiddleware):
     def wrap_model_call(self, request, handler):
-        work = resolve_effective_work(request.messages)[0]
         activity = 'model:' + uuid.uuid4().hex
         projected = build_working_request(request)
+        work = resolve_effective_work(request.messages)[0]
         emit_model_progress(activity, work, 'running')
         try:
             result = handler(projected)
@@ -1986,9 +2110,9 @@ class RuntimeWorkingContextMiddleware(AgentMiddleware):
         return result
 
     async def awrap_model_call(self, request, handler):
-        work = resolve_effective_work(request.messages)[0]
         activity = 'model:' + uuid.uuid4().hex
         projected = build_working_request(request)
+        work = resolve_effective_work(request.messages)[0]
         emit_model_progress(activity, work, 'running')
         try:
             result = await handler(projected)

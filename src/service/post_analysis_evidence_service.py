@@ -3497,6 +3497,16 @@ class LineageIndexer:
     def _expression_base_frame(expression: ast.AST | None) -> str:
         if isinstance(expression, ast.Name):
             return expression.id
+        if isinstance(expression, ast.IfExp):
+            branch_frames = {
+                frame
+                for frame in (
+                    LineageIndexer._expression_base_frame(expression.body),
+                    LineageIndexer._expression_base_frame(expression.orelse),
+                )
+                if frame
+            }
+            return next(iter(branch_frames)) if len(branch_frames) == 1 else ""
         if isinstance(expression, ast.Call):
             function_name = (
                 expression.func.id
@@ -5109,6 +5119,24 @@ class LineageIndexer:
                 )
                 if isinstance(target, ast.Name)
             }
+            local_frame_sources = {name: name for name in parameter_names}
+            for statement in sorted(
+                local_assignments.values(),
+                key=lambda item: int(getattr(item, "lineno", 0) or 0),
+            ):
+                value = getattr(statement, "value", None)
+                source_name = cls._expression_base_frame(value)
+                source_parameter = local_frame_sources.get(source_name, "")
+                if not source_parameter:
+                    continue
+                targets = (
+                    statement.targets
+                    if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        local_frame_sources[target.id] = source_parameter
             for return_node in (
                 item for item in ast.walk(function) if isinstance(item, ast.Return)
             ):
@@ -5132,7 +5160,8 @@ class LineageIndexer:
                 ), None)
                 if groupby_call is None or aggregate_call is None:
                     continue
-                source_parameter = cls._expression_base_frame(groupby_call.func.value)
+                source_frame = cls._expression_base_frame(groupby_call.func.value)
+                source_parameter = local_frame_sources.get(source_frame, source_frame)
                 if source_parameter not in parameter_names:
                     continue
                 output_fields: dict[str, dict[str, Any]] = {}
@@ -11045,6 +11074,124 @@ class PostAnalysisEvidenceCompiler:
         return scored[0][1], scored[0][2]
 
     @staticmethod
+    def _expression_root_and_field(value: Any) -> tuple[str, str] | None:
+        try:
+            expression = ast.parse(str(value or ""), mode="eval").body
+        except SyntaxError:
+            return None
+        if not isinstance(expression, ast.Subscript):
+            return None
+        field_node = expression.slice
+        if not (
+            isinstance(field_node, ast.Constant)
+            and isinstance(field_node.value, str)
+            and str(field_node.value).strip()
+        ):
+            return None
+        container = expression.value
+        while isinstance(container, (ast.Subscript, ast.Attribute)):
+            container = container.value
+        if not isinstance(container, ast.Name):
+            return None
+        return container.id, str(field_node.value).strip()
+
+    @classmethod
+    def _structured_report_metric_match(
+        cls,
+        output: dict[str, Any],
+        source_outputs: list[tuple[PlannedMetric, dict[str, Any]]],
+        lineage_index: dict[str, Any],
+    ) -> tuple[PlannedMetric, dict[str, Any]] | None:
+        """Reuse a verified structured column for the same report frame field.
+
+        A report often iterates a DataFrame while a table renders a projected
+        copy of that same frame. The table already proves one column-level
+        calculation boundary. Reusing it is deterministic when the report row
+        field is identical and the two frames have a direct derivation path.
+        """
+        report_identity = cls._expression_root_and_field(output.get("field"))
+        if report_identity is None:
+            return None
+        report_row, report_field = report_identity
+        operation_by_id = {
+            str(item.get("operation_node_id") or ""): item
+            for item in lineage_index.get("operation_nodes") or []
+            if str(item.get("operation_node_id") or "")
+        }
+
+        report_frames: set[str] = set()
+        for operation_id in output.get("candidate_operation_node_ids") or []:
+            operation = operation_by_id.get(str(operation_id)) or {}
+            if operation.get("kind") != "container_iteration":
+                continue
+            targets = {str(item) for item in operation.get("targets") or []}
+            if report_row not in targets:
+                continue
+            report_frames.update(
+                str(item).strip()
+                for item in operation.get("loads") or []
+                if str(item).strip() and str(item).strip() != report_row
+            )
+        if not report_frames:
+            return None
+
+        def root_name(value: Any) -> str:
+            text = str(value or "").strip()
+            match = re.match(r"[A-Za-z_]\w*", text)
+            return match.group(0) if match else ""
+
+        frame_dependencies: dict[str, set[str]] = {}
+        for operation in operation_by_id.values():
+            if operation.get("semantic_kind") not in {
+                "presentation", "transformation", "ranking",
+            }:
+                continue
+            targets = {
+                root_name(item) for item in operation.get("targets") or []
+                if root_name(item)
+            }
+            loads = {
+                root_name(item) for item in operation.get("loads") or []
+                if root_name(item)
+            }
+            for target in targets:
+                frame_dependencies.setdefault(target, set()).update(loads - {target})
+
+        def derives_from(source: str, target: str) -> bool:
+            pending = [source]
+            visited: set[str] = set()
+            while pending:
+                current = pending.pop()
+                if current == target:
+                    return True
+                if current in visited:
+                    continue
+                visited.add(current)
+                pending.extend(frame_dependencies.get(current, set()) - visited)
+            return False
+
+        matches: dict[str, tuple[PlannedMetric, dict[str, Any]]] = {}
+        for metric, source in source_outputs:
+            source_field = str(source.get("field") or "").strip()
+            source_fields = {
+                source_field,
+                *(str(item).strip() for item in source.get("lineage_fields") or []),
+            }
+            if report_field not in source_fields:
+                continue
+            source_frame = str(source.get("source_frame") or "").strip()
+            if not source_frame or not any(
+                derives_from(source_frame, report_frame)
+                or derives_from(report_frame, source_frame)
+                for report_frame in report_frames
+            ):
+                continue
+            matches[str(metric.calculation_id or "")] = (metric, source)
+        if len(matches) != 1:
+            return None
+        return next(iter(matches.values()))
+
+    @staticmethod
     def _empty_result_operation(
         snapshot: AnalysisExecutionSnapshot,
         output: dict[str, Any],
@@ -11176,6 +11323,13 @@ class PostAnalysisEvidenceCompiler:
             and output_by_id[str(output_id)].get("artifact_type") == "report"
             and not output_by_id[str(output_id)].get("posthoc_report_candidate")
         ]
+        structured_source_outputs = [
+            (metric, output_by_id[str(output_id)])
+            for metric in plan.metrics
+            for output_id in metric.output_node_ids
+            if str(output_id) in output_by_id
+            and output_by_id[str(output_id)].get("artifact_type") in {"chart", "table"}
+        ]
         added_metrics: list[PlannedMetric] = []
         added_candidates: dict[str, dict[str, Any]] = {}
         filled: set[str] = set()
@@ -11190,6 +11344,28 @@ class PostAnalysisEvidenceCompiler:
             repeated = cls._repeated_report_metric_matches(output, source_outputs)
             if repeated is not None:
                 source_metric, _ = repeated
+                candidate = candidates.get(str(source_metric.calculation_id or ""))
+                if candidate is None:
+                    continue
+                candidate.setdefault("output_node_ids", []).append(output_id)
+                candidate["output_node_ids"] = list(dict.fromkeys(candidate["output_node_ids"]))
+                added_metrics.append(source_metric.model_copy(update={
+                    "output_node_ids": [output_id],
+                    "source_anchors": [],
+                    "report_candidate_ids": [
+                        str(output.get("report_candidate_group_id") or output_id)
+                    ],
+                }))
+                filled.add(output_id)
+                continue
+
+            structured = cls._structured_report_metric_match(
+                output,
+                structured_source_outputs,
+                lineage_index,
+            )
+            if structured is not None:
+                source_metric, _ = structured
                 candidate = candidates.get(str(source_metric.calculation_id or ""))
                 if candidate is None:
                     continue

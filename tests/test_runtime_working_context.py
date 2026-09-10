@@ -1,6 +1,7 @@
 import copy
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from langchain.agents.middleware import ModelRequest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -355,8 +356,8 @@ def test_blocked_stale_probe_call_does_not_reopen_probe_repair():
             'probe_fact_ledger': {'observations': [{'query_key': 'values'}]},
         }),
         call('probe_analysis_data', 'stale', code='repeat the same probe'),
-        answer('stale', status='failed', error_type='probe_closed_for_formal_implementation',
-               diagnostics={'violated_contract': 'probe_closed_for_formal_implementation'}),
+        answer('stale', status='failed', error_type='duplicate_probe_request',
+               diagnostics={'violated_contract': 'duplicate_probe_request'}),
     ]
     assert resolve_work(messages)[0] == 'implement'
 
@@ -376,17 +377,17 @@ def test_stale_probe_call_is_rejected_at_tool_boundary():
     ]
     runtime = SimpleNamespace(state={'messages': messages}, tool_call_id='stale')
 
-    result = probe_analysis_data.func(runtime=runtime, code='repeat the same probe')
+    result = probe_analysis_data.func(runtime=runtime, code='probe values')
     payload = json.loads(result.content)
 
-    assert payload['error_type'] == 'probe_not_allowed_after_observation'
-    assert payload['diagnostics']['violated_contract'] == 'probe_closed_for_formal_implementation'
+    assert payload['error_type'] == 'duplicate_probe_request'
+    assert payload['diagnostics']['violated_contract'] == 'duplicate_probe_request'
     assert resolve_work([
-        *messages, call('probe_analysis_data', 'stale', code='repeat the same probe'), result,
+        *messages, call('probe_analysis_data', 'stale', code='probe values'), result,
     ])[:2] == ('implement', 'Build the report')
 
     memory = build_working_memory_index([
-        *messages, call('probe_analysis_data', 'stale', code='repeat the same probe'), result,
+        *messages, call('probe_analysis_data', 'stale', code='probe values'), result,
     ])
     assert len(memory.of_kind(WorkingMemoryKind.PROBE_OBSERVATION)) == 1
     probe_failures = [
@@ -395,6 +396,44 @@ def test_stale_probe_call_is_rejected_at_tool_boundary():
     ]
     assert len(probe_failures) == 1
     assert probe_failures[0].source_event_id == 'stale'
+
+
+def test_distinct_probe_can_extend_a_completed_probe_observation():
+    """A new technical unknown may be probed without discarding prior facts."""
+    from agent.tools import probe_analysis_data
+
+    messages = [
+        call('probe_analysis_data', 'probe', code='observe_dates()'),
+        answer('probe', status='observation', diagnostics={
+            'probe_fact_ledger': {'observations': [{'query_key': 'dates'}]},
+        }),
+    ]
+    runtime = SimpleNamespace(state={'messages': messages}, tool_call_id='new-probe')
+
+    with patch('agent.tools.execute_python.func', return_value='executed') as execute:
+        result = probe_analysis_data.func(runtime=runtime, code='observe_categories()')
+
+    assert result == 'executed'
+    execute.assert_called_once()
+
+
+def test_distinct_probe_can_extend_a_completed_probe_observation():
+    """A new technical unknown may be probed without discarding prior facts."""
+    from agent.tools import probe_analysis_data
+
+    messages = [
+        call('probe_analysis_data', 'probe', code='observe_dates()'),
+        answer('probe', status='observation', diagnostics={
+            'probe_fact_ledger': {'observations': [{'query_key': 'dates'}]},
+        }),
+    ]
+    runtime = SimpleNamespace(state={'messages': messages}, tool_call_id='new-probe')
+
+    with patch('agent.tools.execute_python.func', return_value='executed') as execute:
+        result = probe_analysis_data.func(runtime=runtime, code='observe_categories()')
+
+    assert result == 'executed'
+    execute.assert_called_once()
 
 
 def test_structured_tool_dict_content_is_visible_to_runtime_state_machine():
@@ -831,6 +870,39 @@ def test_patch_base_stays_until_replaced_by_a_full_program():
     assert result[0].tool_calls[0]['args']['code'] == 'base'
 
 
+def test_repair_view_keeps_only_active_patch_derivation_chain():
+    messages = [
+        call('submit_analysis_program', 'base', code='base program'),
+        answer('base', status='failed', execution_id=11, error_type='runtime_error'),
+        call('submit_analysis_program', 'old-patch', base_execution_id=11,
+             patches=[{'start_line': 1, 'end_line': 1, 'replacement': 'old'}]),
+        answer('old-patch', status='failed', execution_id=12, error_type='runtime_error'),
+        call('submit_analysis_program', 'current-patch', base_execution_id=11,
+             patches=[{'start_line': 1, 'end_line': 1, 'replacement': 'current'}]),
+        answer('current-patch', status='failed', execution_id=13, error_type='runtime_error'),
+    ]
+
+    projected, _ = project_history(messages, work='repair')
+
+    retained = [
+        tool_call['id']
+        for message in projected if isinstance(message, AIMessage)
+        for tool_call in message.tool_calls
+    ]
+    assert retained == ['base', 'current-patch']
+    base_result = next(
+        json.loads(message.content) for message in projected
+        if isinstance(message, ToolMessage) and message.tool_call_id == 'base'
+    )
+    assert base_result == {
+        'tool': 'execute_python',
+        'status': 'failed',
+        'execution_id': 11,
+        'error_type': 'runtime_error',
+        'history_status': 'program_derivation_base',
+    }
+
+
 def test_accepted_source_aliases_share_program_revision_lifecycle():
     messages = [
         call('submit_analysis_program', 'first', program='first complete source'),
@@ -1094,7 +1166,14 @@ def test_probe_fact_ledger_merges_repeated_observations_and_rewrites_all_referen
         answer('probe-2', tool='execute_python', diagnostics={'probe_fact_ledger': {
             'observations': [{'query_key': 'status', 'datasource_identifiers': ['orders'],
                               'query_constraints': {'target_filters': []}, 'columns': ['status'],
-                              'row_count': 3}],
+                              'row_count': 3,
+                              'projection_semantics': [{'alias': 'population', 'expression': 'COUNT(*)'}],
+                              'aggregate_facts': [{'field': 'population', 'value': 18825}],
+                              'capacity_risks': [{
+                                  'observed_population_count': 18825,
+                                  'max_rows_per_physical_query': 10000,
+                                  'required_strategy': 'query_side_final_aggregation_or_stable_pagination',
+                              }]}],
         }}),
     ]
     projected, _, facts = collect_runtime_facts(messages)
@@ -1103,6 +1182,13 @@ def test_probe_fact_ledger_merges_repeated_observations_and_rewrites_all_referen
     assert fact['observations'] == [{
         'query_key': 'status', 'datasource_identifiers': ['orders'],
         'query_constraints': {'target_filters': []}, 'columns': ['status'], 'row_count': 3,
+        'projection_semantics': [{'alias': 'population', 'expression': 'COUNT(*)'}],
+        'aggregate_facts': [{'field': 'population', 'value': 18825}],
+        'capacity_risks': [{
+            'observed_population_count': 18825,
+            'max_rows_per_physical_query': 10000,
+            'required_strategy': 'query_side_final_aggregation_or_stable_pagination',
+        }],
     }]
     for index in (1, 3):
         assert json.loads(projected[index].content)['diagnostics']['probe_fact_refs'] == [fact_id]
@@ -1742,6 +1828,31 @@ def test_query_reader_does_not_change_repair_state_or_load_until_facts_exist():
     compiled = build_working_request(ModelRequest(model=None, messages=messages, runtime=context, tools=tools))
     assert resolve_work(messages) == before
     assert 'read_runtime_query_context' in [t.name for t in compiled.tools]
+
+
+def test_local_python_repair_does_not_replay_query_context():
+    tools = [SimpleNamespace(name=n) for n in ('read_runtime_query_context', 'submit_analysis_program')]
+    context = SimpleNamespace(context=CustomContext(username='test'))
+    messages = [
+        call('submit_analysis_program', 'code', code='frame.rename(columns={"a": "A"}).sort_values("a")'),
+        answer('code', status='failed', execution_id=21, error_type='schema_or_column_mismatch',
+               diagnostics={'violated_contract': 'missing_mapping_key'},
+               query_snapshots={'q': {
+                   'query_key': 'q',
+                   'implementation': {'sql': 'SELECT a FROM source'},
+               }}),
+        call('read_runtime_query_context', 'read', definition_ids=['q']),
+        answer('read', tool='read_runtime_query_context', status='success', queries={'q': {'large': 'detail'}}),
+    ]
+
+    compiled = build_working_request(ModelRequest(model=None, messages=messages, runtime=context, tools=tools))
+
+    assert 'read_runtime_query_context' not in [tool.name for tool in compiled.tools]
+    assert 'executed-query-facts' not in compiled.system_message.content
+    assert all(
+        not isinstance(message, ToolMessage) or message.tool_call_id != 'read'
+        for message in compiled.messages
+    )
 
 
 def test_actual_clarification_resume_preserves_work_materials_and_query_references(monkeypatch):

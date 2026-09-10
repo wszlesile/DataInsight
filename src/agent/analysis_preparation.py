@@ -3395,6 +3395,60 @@ class AnalysisPreparationWorkflow:
         })
 
     @staticmethod
+    def _normalize_lineage_datasource_sets(
+        candidate: BusinessContextContract,
+        selection: DatasourceSelectionContract,
+    ) -> BusinessContextContract:
+        """Keep the redundant lineage source index consistent with grounded facts.
+
+        ``fact_bindings`` and relationship endpoints are the detailed lineage;
+        ``datasource_ids`` is its question-level index. A model omission in that
+        index must not invalidate otherwise grounded Preparation output, while a
+        source outside Selection's question coverage must remain invalid.
+        """
+        coverage_by_question = {
+            item.question_id: set(item.datasource_ids)
+            for item in selection.question_coverage
+        }
+        selected_ids = set(selection.selected_datasource_ids)
+        relationships_by_id = {
+            item.relationship_id: item for item in candidate.relationships
+        }
+        normalized = []
+        for lineage in candidate.insight_lineage:
+            allowed_ids = selected_ids & coverage_by_question.get(
+                lineage.question_id,
+                selected_ids,
+            )
+            grounded_ids = {
+                binding.datasource_id
+                for binding in lineage.fact_bindings
+                if binding.datasource_id > 0 and binding.datasource_id in allowed_ids
+            }
+            for relationship_id in lineage.relationship_ids:
+                relationship = relationships_by_id.get(relationship_id)
+                if relationship is None:
+                    continue
+                endpoints = {
+                    relationship.left_datasource_id,
+                    relationship.right_datasource_id,
+                }
+                if endpoints.issubset(allowed_ids):
+                    grounded_ids.update(endpoints)
+            datasource_ids = [
+                datasource_id
+                for datasource_id in dict.fromkeys([
+                    *lineage.datasource_ids,
+                    *sorted(grounded_ids),
+                ])
+                if datasource_id in allowed_ids
+            ]
+            normalized.append(lineage.model_copy(update={
+                "datasource_ids": datasource_ids,
+            }))
+        return candidate.model_copy(update={"insight_lineage": normalized})
+
+    @staticmethod
     def _remove_intrasource_relationships(
         candidate: BusinessContextContract,
     ) -> BusinessContextContract:
@@ -3458,6 +3512,10 @@ class AnalysisPreparationWorkflow:
             recovered = self._complete_derived_fact_lineage(recovered, selection)
             recovered = self._remove_intrasource_relationships(recovered)
             recovered = self._scope_lineage_relationships(recovered)
+            recovered = self._normalize_lineage_datasource_sets(
+                recovered,
+                selection,
+            )
             if recovered.probe_requests:
                 recovered = recovered.model_copy(update={
                     "probe_requests": [],
@@ -4471,6 +4529,10 @@ class AnalysisPreparationWorkflow:
             )
             candidate = self._remove_intrasource_relationships(candidate)
             candidate = self._scope_lineage_relationships(candidate)
+            candidate = self._normalize_lineage_datasource_sets(
+                candidate,
+                selection,
+            )
             candidate, relationship_observations = self._probe_relationship_candidates(
                 candidate=candidate,
                 schemas=state["selected_schemas"],
@@ -4549,6 +4611,10 @@ class AnalysisPreparationWorkflow:
             )
             candidate = self._remove_intrasource_relationships(candidate)
             candidate = self._scope_lineage_relationships(candidate)
+            candidate = self._normalize_lineage_datasource_sets(
+                candidate,
+                selection,
+            )
             if candidate.probe_requests:
                 remaining = [
                     f"Schema fact Probe request {item.request_id} remains unresolved"

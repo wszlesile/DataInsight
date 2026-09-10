@@ -1,3 +1,4 @@
+import ast
 import json
 import unittest
 from types import SimpleNamespace
@@ -32,6 +33,24 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
 
         self.assertEqual((target['start_line'], target['end_line']), (2, 2))
         self.assertEqual(target['source'], 'report = f"gross margin is {rate:.2%}"')
+
+    def test_review_anchor_resolves_unique_elided_block(self):
+        source = (
+            'evidence = {\n'
+            '    "process": process_count,\n'
+            '    "equipment": equipment_count,\n'
+            '    "packaging": 0,\n'
+            '}\n'
+            'report = "done"\n'
+        )
+
+        target = _review_source_patch_range(
+            source,
+            'evidence = {\n    "process": process_count,\n    ...\n    "packaging": 0,\n}',
+        )
+
+        self.assertEqual((target['start_line'], target['end_line']), (1, 5))
+        self.assertIn('"equipment": equipment_count', target['source'])
 
     def test_review_patch_uses_latest_authorized_successful_candidate(self):
         source = 'value = 1\nreport = f"value={value}"\n'
@@ -143,6 +162,80 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
         create.assert_not_called()
         session.close.assert_called_once()
 
+    def test_authorized_syntax_patch_preserves_the_rest_of_the_program(self):
+        source = (
+            'items = [{"name": "A"}]\n'
+            'table = build_markdown_table(items, columns=[\n'
+            '    {"key": "name", "label": "Name")}])\n'
+            'result = table\n'
+        )
+
+        repaired = _apply_source_code_patches(
+            source,
+            [SourceCodePatch(
+                start_line=3,
+                end_line=3,
+                replacement='    {"key": "name", "label": "Name"}])',
+            )],
+            authorized_ranges={(3, 3)},
+        )
+
+        self.assertEqual(repaired.splitlines()[0], source.splitlines()[0])
+        self.assertEqual(repaired.splitlines()[1], source.splitlines()[1])
+        self.assertEqual(repaired.splitlines()[3], source.splitlines()[3])
+        ast.parse(repaired)
+
+    def test_authorized_syntax_patch_must_cover_compiler_error_line(self):
+        source = 'prefix = "ok"\ntext = f"{value[\\"name\\"]}"\nresult = text\n'
+
+        with self.assertRaisesRegex(ValueError, '必须覆盖'):
+            _apply_source_code_patches(
+                source,
+                [SourceCodePatch(start_line=1, end_line=1, replacement='prefix = "fixed"')],
+                authorized_ranges={(1, 1)},
+            )
+
+    def test_resolver_applies_authorized_syntax_patch_to_stored_revision(self):
+        source = (
+            'items = [{"name": "A"}]\n'
+            'table = build_markdown_table(items, columns=[\n'
+            '    {"key": "name", "label": "Name")}])\n'
+            'result = table\n'
+        )
+        base = SimpleNamespace(
+            execution_status='failed',
+            generated_code=source,
+            used_datasource_ids_json='[3]',
+            result_payload_json=json.dumps({'repair_target': {
+                'base_execution_id': 17,
+                'mode': 'line_patch',
+                'allowed_ranges': [{'start_line': 3, 'end_line': 3}],
+            }}),
+        )
+        session = MagicMock()
+        session.query.return_value.filter.return_value.first.return_value = base
+
+        with patch('config.database.SessionLocal', return_value=session):
+            repaired, ids, parent, kind = _resolve_execute_python_source(
+                conversation_id=1,
+                turn_id=2,
+                code='',
+                used_datasource_ids=[],
+                base_execution_id=17,
+                patches=[SourceCodePatch(
+                    start_line=3,
+                    end_line=3,
+                    replacement='    {"key": "name", "label": "Name"}])',
+                )],
+            )
+
+        self.assertEqual(ids, [3])
+        self.assertEqual(parent, 17)
+        self.assertEqual(kind, 'llm_patch_repair')
+        ast.parse(repaired)
+        self.assertEqual(repaired.splitlines()[0], source.splitlines()[0])
+        self.assertEqual(repaired.splitlines()[3], source.splitlines()[3])
+
     def test_patch_scope_is_a_set_and_still_inherited_from_base(self):
         base = SimpleNamespace(
             execution_status='failed', generated_code='value = 1\n', used_datasource_ids_json='[3, 4]',
@@ -200,7 +293,7 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
         self.assertEqual(diagnostics['usage_lines'], [9])
         self.assertEqual(
             [(r['start_line'], r['end_line']) for r in context['suggested_patch_ranges']],
-            [(2, 4), (5, 5), (9, 9)],
+            [(9, 9), (2, 4), (5, 5)],
         )
         payload = json.loads(_tool_error_message(
             tool_call_id='key', execution_id=17, error_type='schema_or_column_mismatch',
@@ -210,9 +303,37 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
         self.assertEqual(payload['repair_target']['base_execution_id'], 17)
         self.assertEqual(
             [(item['start_line'], item['end_line']) for item in payload['repair_target']['allowed_ranges']],
-            [(2, 4), (5, 5), (9, 9)],
+            [(9, 9), (2, 4), (5, 5)],
         )
         self.assertEqual(payload['current_failed_code'], '')
+
+    def test_key_error_identifies_post_rename_operation_as_single_repair_target(self):
+        source = (
+            'table = build_table_result(\n'
+            '    data=frame[["metric"]].rename(\n'
+            '        columns={"metric": "指标"}\n'
+            '    ).sort_values("metric")\n'
+            ')\n'
+        )
+        context = _build_generated_code_error_context(source, KeyError('metric'), '')
+        context['line_no'] = 4
+
+        diagnostics, instructions, context = _augment_missing_mapping_key_feedback(
+            code=source,
+            error_type='schema_or_column_mismatch',
+            error_message="'metric'\n",
+            diagnostics={},
+            repair_instructions=[],
+            code_error_context=context,
+        )
+
+        self.assertEqual(diagnostics['violated_contract'], 'dataframe_post_transform_key_mismatch')
+        self.assertEqual(diagnostics['renamed_to'], '指标')
+        self.assertEqual(
+            [(item['start_line'], item['end_line']) for item in context['suggested_patch_ranges']],
+            [(1, 5)],
+        )
+        self.assertIn('before sort_values', instructions[0])
 
     def test_patch_changes_only_the_addressed_lines(self):
         source = "a = 1\nb = (\n    2\n)\nc = a + b\nprint(c)\n"
@@ -416,7 +537,12 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
             current_failed_code=code,
         )
         payload = json.loads(message.content)
-        self.assertNotIn('repair_target', payload)
+        self.assertEqual(payload['repair_target']['base_execution_id'], 678)
+        self.assertEqual(
+            [(item['start_line'], item['end_line']) for item in payload['repair_target']['allowed_ranges']],
+            [(2, 2)],
+        )
+        self.assertTrue(payload['minimal_patch_required'])
 
     def test_structural_contract_error_does_not_offer_line_patch(self):
         message = _tool_error_message(

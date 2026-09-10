@@ -1891,7 +1891,10 @@ def _validate_sql_context_fragments(
     )
 
 
-def _load_data_with_fed_query(sql: str,params: Optional[list[Any]] = None):
+def _load_data_with_fed_query(
+    sql: str,
+    params: Optional[list[Any] | dict[str, Any]] = None,
+):
     return supos_kernel_api.query_dataframe(sql=sql, params=params)
 
 def _ensure_local_file_exists(file_path: str) -> None:
@@ -2208,7 +2211,7 @@ def load_minio_file(bucket: str, object_name: str, sheet_name: Optional[str] = N
 
 def load_data_with_sql(
     sql: str,
-    params: Optional[list[Any]] = None,
+    params: Optional[list[Any] | dict[str, Any]] = None,
     numeric_columns: Optional[list[str]] = None,
     text_columns: Optional[list[str]] = None,
 ):
@@ -7634,44 +7637,11 @@ def validate_query_constraints(
             actual_time_range=query_constraints.get('time_range'),
         )
 
-    aggregation = query_constraints.get('aggregation')
-    aggregation_grain = str(
-        aggregation.get('grain') if isinstance(aggregation, dict) else ''
-    ).strip().lower()
     fragments = _sql_context_fragments(sql_context)
     is_time_series_query = bool(re.search(r'\bts_query\s*\(', str(sql or ''), re.I)) or any(
         str(item.get('kind') or '').strip().lower() == 'time_series_sql'
         for item in fragments
     )
-    runtime_overrides = CURRENT_ANALYSIS_PARAMETERS_OVERRIDE.get()
-    has_runtime_time_override = bool(
-        isinstance(runtime_overrides, dict)
-        and isinstance(runtime_overrides.get('time_range'), dict)
-        and runtime_overrides.get('time_range')
-    )
-    if (
-        CURRENT_EXECUTION_INTENT.get() == 'analysis'
-        and not (isinstance(expected_time_range, dict) and expected_time_range)
-        and not has_runtime_time_override
-        and aggregation_grain in {'overall', 'detail', 'snapshot'}
-        and isinstance(query_constraints.get('time_range'), dict)
-        and query_constraints.get('time_range')
-        and not is_time_series_query
-    ):
-        return request_retry(
-            retry_type='query_constraint_violation',
-            message='用户未指定时间范围，但当前总体或明细基线被一个推断时间窗截断。',
-            diagnostics={
-                'violated_constraint': 'inferred_overall_time_window',
-                'time_range': query_constraints.get('time_range'),
-                'aggregation_grain': aggregation_grain,
-            },
-            repair_instructions=[
-                '开放式概览的总体规模、状态构成和基础明细查询不要设置任意时间范围，query_constraints.time_range 应为 None。',
-                '如趋势观察确实需要时间窗，请保留不受该时间窗截断的总体基线，并为趋势使用独立、明确标注的观察窗口；不要用趋势窗口替代总体范围。',
-                'Probe 返回的数据覆盖范围只用于诊断字段格式和查询口径，不能直接成为正式总体分析的时间范围。',
-            ],
-        )
 
     malformed_ts_query = _find_malformed_ts_query_literal(sql)
     if malformed_ts_query:
@@ -7892,7 +7862,7 @@ def query_data_with_sql(
     query_key: str,
     query_constraints: dict[str, Any],
     sql: str,
-    params: Optional[list[Any]] = None,
+    params: Optional[list[Any] | dict[str, Any]] = None,
     filter_expressions: Optional[list[str]] = None,
     aggregation_hints: Optional[list[str]] = None,
     sql_context: Optional[dict[str, Any]] = None,
@@ -7907,11 +7877,12 @@ def query_data_with_sql(
     control flows. Normal analysis code should use this helper so a repair
     cannot accidentally execute before validation or discard the retry result.
     """
+    normalized_sql, normalized_params = _normalize_sql_query_parameters(sql, params)
     validation = validate_query_constraints(
         query_key=query_key,
         query_constraints=query_constraints,
-        sql=sql,
-        query_params=params,
+        sql=normalized_sql,
+        query_params=normalized_params,
         filter_expressions=filter_expressions,
         aggregation_hints=aggregation_hints,
         sql_context=sql_context,
@@ -7921,11 +7892,29 @@ def query_data_with_sql(
     if validation is not None:
         raise QueryConstraintRetrySignal(validation)
     return load_data_with_sql(
-        sql=sql,
-        params=params,
+        sql=normalized_sql,
+        params=normalized_params,
         numeric_columns=numeric_columns,
         text_columns=text_columns,
     )
+
+
+def _normalize_sql_query_parameters(
+    sql: str,
+    params: Optional[list[Any] | dict[str, Any]],
+) -> tuple[str, Optional[list[Any] | dict[str, Any]]]:
+    """Normalize named DB-API placeholders before validation and execution."""
+    if not isinstance(params, dict) or not params:
+        return sql, params
+    parameter_names = {str(name) for name in params}
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        return f"%({name})s" if name in parameter_names else match.group(0)
+
+    # Preserve PostgreSQL casts (``value::type``) and unknown colon syntax.
+    normalized_sql = re.sub(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)", replace, str(sql or ""))
+    return normalized_sql, params
 
 
 def _local_file_validation_hints(
@@ -10634,7 +10623,7 @@ def _find_repeated_numeric_display_units(report_text: str) -> list[dict[str, Any
     unit_pattern = r"(?:万元|亿元|元|个|台|条|天|月|年|小时|分钟|秒|次|份|件|人|%|‰)"
     pattern = re.compile(
         rf"(?P<number>[-+]?\d[\d,]*(?:\.\d+)?)\s*"
-        rf"(?P<unit>{unit_pattern})(?P=unit)"
+        rf"(?P<unit>{unit_pattern})(?P=unit)(?=$|[\s，。；：、,.!?！？;:）)】\]}}*_])"
     )
     findings: list[dict[str, Any]] = []
     for match in pattern.finditer(str(report_text or "")):
@@ -10718,7 +10707,7 @@ def _sanitize_tool_output(output: str) -> str:
 
 
 def _bind_program_execution_mode(code: str, execution_mode: str) -> str:
-    """Materialize the tool's known mode in the persisted, replayable source."""
+    """Materialize the tool-owned mode without shifting model source lines."""
     if execution_mode not in {'analysis', 'probe'}:
         raise ValueError('Unknown execution mode')
     if not code.strip():
@@ -10749,33 +10738,9 @@ def _bind_program_execution_mode(code: str, execution_mode: str) -> str:
     ):
         raise ValueError('execution_intent is supplied by the tool; remove its dynamic assignment')
 
-    lines = code.splitlines(keepends=True)
-    first_body_statement = None
-    for index, node in enumerate(tree.body):
-        is_docstring = (
-            index == 0 and isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
-        )
-        if not (is_docstring or isinstance(node, ast.ImportFrom) and node.module == '__future__'):
-            first_body_statement = node
-            break
     newline = '\r\n' if '\r\n' in code else '\n'
-    if first_body_statement is None:
-        prefix, suffix = code, ''
-    else:
-        line_index = first_body_statement.lineno - 1
-        byte_offset = first_body_statement.col_offset
-        decorators = getattr(first_body_statement, 'decorator_list', ())
-        if decorators:
-            # A decorated definition starts at its first decorator, not at def/class.
-            line_index = min(decorator.lineno for decorator in decorators) - 1
-            byte_offset = 0
-        current_line = lines[line_index].encode('utf-8')
-        prefix = ''.join(lines[:line_index]) + current_line[:byte_offset].decode('utf-8')
-        suffix = current_line[byte_offset:].decode('utf-8') + ''.join(lines[line_index + 1:])
-    if prefix and not prefix.endswith(('\n', '\r')):
-        prefix += newline
-    return prefix + f'execution_intent = "{execution_mode}"{newline}' + suffix
+    separator = '' if code.endswith(('\n', '\r')) else newline
+    return code + separator + f'execution_intent = "{execution_mode}"{newline}'
 
 
 def _program_requests_probe_feedback(code: str) -> bool:
@@ -10819,6 +10784,57 @@ def _program_uses_probe_api(code: str) -> bool:
     return False
 
 
+def _program_is_probe_shaped(code: str) -> bool:
+    """Recognize an observational program submitted through the formal tool.
+
+    ``execution_intent`` is supplied by the selected tool, so it cannot be the
+    only discriminator. A model can accidentally label a bounded inspection as
+    ``analysis``. This classifier redirects only source that queries data,
+    emits diagnostic observations, and has no final-result construction.
+    Ordinary incomplete formal code remains a normal repair case.
+    """
+    if _program_requests_probe_feedback(code) or _program_uses_probe_api(code):
+        return True
+    try:
+        tree = ast.parse(code or '')
+    except SyntaxError:
+        return False
+
+    call_names: set[str] = set()
+    has_print = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function_name = node.func.id if isinstance(node.func, ast.Name) else (
+            node.func.attr if isinstance(node.func, ast.Attribute) else ''
+        )
+        if function_name:
+            call_names.add(function_name)
+        has_print = has_print or function_name == 'print'
+
+    if 'save_analysis_result' in call_names:
+        return False
+    query_helpers = {
+        'query_data_with_sql', 'query_local_file',
+        'query_local_file_low_memory', 'query_time_series',
+        'load_local_file', 'read_csv', 'read_excel',
+    }
+    diagnostic_operations = {
+        'head', 'tail', 'describe', 'info', 'value_counts', 'nunique',
+        'unique', 'tolist', 'to_dict', 'min', 'max', 'sample',
+    }
+    artifact_operations = {
+        'create_chart', 'build_chart', 'create_table', 'build_table',
+        'build_analysis_report', 'render_markdown',
+    }
+    return bool(
+        call_names & query_helpers
+        and has_print
+        and call_names & diagnostic_operations
+        and not call_names & artifact_operations
+    )
+
+
 def _build_analysis_logic_signature(code: str) -> str:
     normalized_code = (code or '').replace('\r\n', '\n').strip()
     if not normalized_code:
@@ -10826,28 +10842,40 @@ def _build_analysis_logic_signature(code: str) -> str:
     return hashlib.sha256(normalized_code.encode('utf-8')).hexdigest()
 
 
-def _apply_source_code_patches(code: str, patches: list[SourceCodePatch]) -> str:
-    """Apply complete-statement edits to a syntactically valid source revision."""
+def _apply_source_code_patches(
+    code: str,
+    patches: list[SourceCodePatch],
+    *,
+    authorized_ranges: set[tuple[int, int]] | None = None,
+) -> str:
+    """Apply bounded edits to a stored source revision and validate the result."""
     source_lines = str(code or '').splitlines()
     if not source_lines:
         raise ValueError('base_execution_id 对应的执行记录没有可修复代码。')
     if not patches:
         raise ValueError('使用 base_execution_id 修复时必须提供至少一个 patches 行区间替换。')
 
+    source_syntax_error: SyntaxError | None = None
     try:
         source_tree = ast.parse(code or '')
     except SyntaxError as exc:
-        raise ValueError(
-            '失败代码本身无法建立可靠的 Python 语句边界，请提交完整 code 重新生成，不能使用 patches。'
-        ) from exc
-    valid_statement_ranges = {
-        (
-            int(getattr(node, 'lineno', 0) or 0),
-            int(getattr(node, 'end_lineno', 0) or 0),
-        )
-        for node in ast.walk(source_tree)
-        if isinstance(node, ast.stmt)
-    }
+        source_tree = None
+        source_syntax_error = exc
+    if source_tree is None:
+        valid_statement_ranges = set(authorized_ranges or set())
+        if not valid_statement_ranges:
+            raise ValueError(
+                '失败代码本身无法建立可靠的 Python 语句边界，请提交完整 code 重新生成，不能使用 patches。'
+            ) from source_syntax_error
+    else:
+        valid_statement_ranges = {
+            (
+                int(getattr(node, 'lineno', 0) or 0),
+                int(getattr(node, 'end_lineno', 0) or 0),
+            )
+            for node in ast.walk(source_tree)
+            if isinstance(node, ast.stmt)
+        }
 
     normalized = sorted(patches, key=lambda item: (item.start_line, item.end_line))
     previous_end = 0
@@ -10865,6 +10893,11 @@ def _apply_source_code_patches(code: str, patches: list[SourceCodePatch]) -> str
                 'patches 必须完整替换一个 Python 语句或代码块，不能从字典、字符串、调用参数或缩进块中间截断。'
             )
         previous_end = patch.end_line
+
+    if source_syntax_error is not None:
+        error_line = int(source_syntax_error.lineno or 0)
+        if not any(patch.start_line <= error_line <= patch.end_line for patch in normalized):
+            raise ValueError('语法修复 patches 必须覆盖 Python 编译器定位的错误行。')
 
     for patch in reversed(normalized):
         source_lines[patch.start_line - 1:patch.end_line] = patch.replacement.splitlines()
@@ -11028,7 +11061,16 @@ def _resolve_execute_python_source(
         source = str(base_execution.generated_code or '')
         syntax_error = None
         try:
-            resolved_code = _apply_source_code_patches(source, normalized_patches)
+            authorized_ranges = {
+                (int(item.get('start_line') or 0), int(item.get('end_line') or 0))
+                for item in (repair_target or {}).get('allowed_ranges') or []
+                if isinstance(item, dict)
+            }
+            resolved_code = _apply_source_code_patches(
+                source,
+                normalized_patches,
+                authorized_ranges=authorized_ranges,
+            )
         except ValueError as exc:
             errors.append(str(exc))
             syntax_error = exc.__cause__ if isinstance(exc.__cause__, SyntaxError) else None
@@ -13980,6 +14022,90 @@ def _augment_missing_mapping_key_feedback(
     except SyntaxError:
         return diagnostics, repair_instructions, code_error_context
 
+    try:
+        failed_line = int((code_error_context or {}).get('line_no') or 0)
+    except (TypeError, ValueError):
+        failed_line = 0
+
+    # Pandas-style fluent transformations can invalidate a column name inside
+    # one expression, for example rename(columns={"amount": "金额"}) followed
+    # by sort_values("amount"). This is a local operation-order defect, not an
+    # upstream query or mapping-construction defect. Identify it before the
+    # broader symbol search so repair receives one unambiguous statement.
+    failed_statements = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.stmt)
+        and int(getattr(node, 'lineno', 0) or 0) <= failed_line
+        <= int(getattr(node, 'end_lineno', 0) or 0)
+    ]
+    failed_statement = min(
+        failed_statements,
+        key=lambda node: int(getattr(node, 'end_lineno', 0) or 0) - int(getattr(node, 'lineno', 0) or 0),
+        default=None,
+    )
+    if failed_statement is not None:
+        for operation in ast.walk(failed_statement):
+            if not (
+                isinstance(operation, ast.Call)
+                and isinstance(operation.func, ast.Attribute)
+                and operation.func.attr in {'sort_values', 'set_index', 'drop_duplicates'}
+            ):
+                continue
+            referenced = set()
+            for argument in operation.args[:1]:
+                if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                    referenced.add(argument.value)
+                elif isinstance(argument, (ast.List, ast.Tuple)):
+                    referenced.update(
+                        str(item.value) for item in argument.elts
+                        if isinstance(item, ast.Constant) and isinstance(item.value, str)
+                    )
+            if missing_key not in referenced:
+                continue
+            receiver = operation.func.value
+            for transform in ast.walk(receiver):
+                if not (
+                    isinstance(transform, ast.Call)
+                    and isinstance(transform.func, ast.Attribute)
+                    and transform.func.attr == 'rename'
+                ):
+                    continue
+                columns = next((keyword.value for keyword in transform.keywords if keyword.arg == 'columns'), None)
+                if not isinstance(columns, ast.Dict):
+                    continue
+                renames = {
+                    str(key.value): str(value.value)
+                    for key, value in zip(columns.keys, columns.values)
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                    and isinstance(value, ast.Constant) and isinstance(value.value, str)
+                }
+                if missing_key not in renames:
+                    continue
+                statement_range = {
+                    'start_line': int(failed_statement.lineno),
+                    'end_line': int(failed_statement.end_lineno),
+                    'kind': type(failed_statement).__name__,
+                    'source': ast.get_source_segment(code, failed_statement) or ast.unparse(failed_statement),
+                    'role': 'failing_dataframe_transform',
+                }
+                enriched_diagnostics = dict(diagnostics or {})
+                enriched_diagnostics.update({
+                    'violated_contract': 'dataframe_post_transform_key_mismatch',
+                    'missing_key': missing_key,
+                    'renamed_to': renames[missing_key],
+                    'operation': operation.func.attr,
+                })
+                enriched_context = dict(code_error_context or {})
+                enriched_context['suggested_patch_ranges'] = [statement_range]
+                enriched_context['related_contexts'] = []
+                enriched_context['location_domain'] = 'python_source'
+                instruction = (
+                    f"The failing DataFrame expression renames {missing_key!r} to {renames[missing_key]!r} "
+                    f"before {operation.func.attr} still references the old name. Repair the operation order "
+                    "or consistently use the post-transform name within this one statement."
+                )
+                return enriched_diagnostics, [instruction, *repair_instructions], enriched_context
+
     parent_by_node = {
         child: parent
         for parent in ast.walk(tree)
@@ -14021,10 +14147,6 @@ def _augment_missing_mapping_key_feedback(
     if not occurrences:
         return diagnostics, repair_instructions, code_error_context
 
-    try:
-        failed_line = int((code_error_context or {}).get('line_no') or 0)
-    except (TypeError, ValueError):
-        failed_line = 0
     failed_occurrence = next(
         (
             item for item in occurrences
@@ -14076,11 +14198,16 @@ def _augment_missing_mapping_key_feedback(
     enriched_context = dict(code_error_context or {})
     # The generic lookup feedback may contain every literal with this spelling.
     # Once the failing object is known, those unrelated sources are not repair targets.
-    patch_ranges = list(definitions)
+    # The statement that actually raised is the primary repair location.
+    # Definitions are supporting alternatives, not peer-ranked guesses.
+    patch_ranges = []
     for item in related:
         statement_range = item['statement_range']
         if statement_range not in patch_ranges:
             patch_ranges.append(statement_range)
+    for definition in definitions:
+        if definition not in patch_ranges:
+            patch_ranges.append(definition)
     enriched_context['suggested_patch_ranges'] = patch_ranges
     enriched_context['related_contexts'] = []
     enriched_context['symbol_references'] = [{
@@ -15106,19 +15233,33 @@ def _tool_error_message(
         'schema_or_column_mismatch',
         'undefined_name',
     }
+    syntax_patch_available = bool(
+        error_type == 'contract_error'
+        and (diagnostics or {}).get('violated_contract') == 'invalid_python_syntax'
+    )
     patch_required_error_types = {
         'data_type_or_time_mismatch',
         'library_api_signature_mismatch',
         'schema_or_column_mismatch',
         'undefined_name',
     }
+    authorized_patch_ranges = (
+        [
+            item for item in patch_ranges
+            if str(item.get('role') or '') == 'syntax_error_line'
+        ]
+        if syntax_patch_available
+        else patch_ranges
+    )
     patch_available = bool(
         execution_id > 0
         and current_failed_code
-        and patch_ranges
-        and error_type in patch_available_error_types
+        and authorized_patch_ranges
+        and (error_type in patch_available_error_types or syntax_patch_available)
     )
-    patch_required = patch_available and error_type in patch_required_error_types
+    patch_required = patch_available and (
+        error_type in patch_required_error_types or syntax_patch_available
+    )
 
     symbol_references = clipped_code_error_context.get('symbol_references')
     if isinstance(symbol_references, list) and len(symbol_references) > 1:
@@ -15205,7 +15346,7 @@ def _tool_error_message(
             'source_sha256': _build_analysis_logic_signature(current_failed_code),
             'line_count': len(str(current_failed_code).splitlines()),
             'mode': 'line_patch',
-            'allowed_ranges': patch_ranges,
+            'allowed_ranges': authorized_patch_ranges,
             'usage': (
                 '局部修复令 code 为空并提交 base_execution_id 与 patches。每个 patch 必须完整替换一个 '
                 'Python 语句或代码块；行号基于不可变原版本，合成后统一校验完整程序。'
@@ -15278,6 +15419,7 @@ def _build_probe_fact_ledger(
     supplementary diagnostics and never becomes an inferred business rule.
     """
     observations: list[dict[str, Any]] = []
+    projection_semantics_by_index: list[list[dict[str, Any]]] = []
     for fallback_key, raw_snapshot in (query_snapshots or {}).items():
         if not isinstance(raw_snapshot, dict):
             continue
@@ -15305,6 +15447,11 @@ def _build_probe_fact_ledger(
             key: value for key, value in observation.items()
             if value not in (None, '', [], {})
         })
+        projection_semantics_by_index.append([
+            dict(item)
+            for item in implementation.get('projection_semantics') or []
+            if isinstance(item, dict)
+        ])
 
     diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
     # Explicit observations supplied by a generated Probe are useful only as
@@ -15313,19 +15460,34 @@ def _build_probe_fact_ledger(
     for raw in diagnostics.get('query_observations') or []:
         if not isinstance(raw, dict):
             continue
-        query_key = str(raw.get('query_key') or '')
-        if query_key and any(item.get('query_key') == query_key for item in observations):
-            continue
         observation = {
             key: raw.get(key)
             for key in (
-                'query_key', 'datasource_id', 'datasource_name', 'status', 'row_count',
+                'query_key', 'datasource_id', 'datasource_name', 'datasource_identifiers',
+                'status', 'row_count',
                 'columns', 'value_samples', 'distinct_values', 'value_profile', 'error_type',
             )
             if raw.get(key) not in (None, '', [], {})
         }
-        if observation:
+        if not observation:
+            continue
+        matched_index = next((
+            index for index, existing in enumerate(observations)
+            if (
+                set(existing.get('datasource_identifiers') or [])
+                == set(observation.get('datasource_identifiers') or [])
+                and list(existing.get('columns') or []) == list(observation.get('columns') or [])
+                and existing.get('row_count') == observation.get('row_count')
+            )
+        ), None)
+        if matched_index is None:
             observations.append(observation)
+            projection_semantics_by_index.append([])
+        else:
+            observations[matched_index].update({
+                key: value for key, value in observation.items()
+                if key != 'query_key'
+            })
     for outcome in diagnostics.get('_query_execution_outcomes') or []:
         if not isinstance(outcome, dict):
             continue
@@ -15337,6 +15499,64 @@ def _build_probe_fact_ledger(
             if key in {'query_key', 'status', 'row_count', 'effective_no_data', 'columns', 'error_type'}
             and value not in (None, '', [], {})
         })
+        projection_semantics_by_index.append([])
+
+    for index, observation in enumerate(observations):
+        projections = (
+            projection_semantics_by_index[index]
+            if index < len(projection_semantics_by_index)
+            else []
+        )
+        rows = observation.get('value_samples') or []
+        if not projections or not isinstance(rows, list):
+            continue
+        dimensions = [
+            str(item.get('alias') or '')
+            for item in projections
+            if item.get('projection_role') == 'dimension' and str(item.get('alias') or '')
+        ]
+        measures = [
+            item for item in projections
+            if item.get('projection_role') == 'measure' and str(item.get('alias') or '')
+        ]
+        aggregate_facts: list[dict[str, Any]] = []
+        capacity_risks: list[dict[str, Any]] = []
+        for row in rows[:24]:
+            if not isinstance(row, dict):
+                continue
+            dimension_values = {
+                field: row.get(field)
+                for field in dimensions
+                if row.get(field) not in (None, '')
+            }
+            for measure in measures:
+                field = str(measure.get('alias') or '')
+                value = row.get(field)
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    continue
+                expression = str(measure.get('expression') or '')
+                fact = {
+                    'field': field,
+                    'expression': expression,
+                    'value': value,
+                }
+                if dimension_values:
+                    fact['dimensions'] = dimension_values
+                aggregate_facts.append(fact)
+                if expression.strip().upper().startswith('COUNT(') and value > MAX_SQL_RESULT_ROWS:
+                    capacity_risk = {
+                        'observed_population_count': value,
+                        'count_field': field,
+                        'max_rows_per_physical_query': MAX_SQL_RESULT_ROWS,
+                        'required_strategy': 'query_side_final_aggregation_or_stable_pagination',
+                    }
+                    if dimension_values:
+                        capacity_risk['dimensions'] = dimension_values
+                    capacity_risks.append(capacity_risk)
+        if aggregate_facts:
+            observation['aggregate_facts'] = aggregate_facts
+        if capacity_risks:
+            observation['capacity_risks'] = capacity_risks
 
     declared_facts = diagnostics.get('confirmed_facts')
     unresolved_facts = diagnostics.get('unresolved_facts')
@@ -15523,6 +15743,10 @@ def _tool_success_message(
                 'artifact_consistency',
                 'claim_support',
             ],
+            'material_claim_fields': [
+                'claim_text', 'inference_level', 'support_method',
+                'evidence_basis', 'qualification_text', 'supported_as_written',
+            ],
             'decision': 'accept only when every required check passes; otherwise request one revision containing every material issue',
         },
         'static_analysis_advisories': _copy_jsonable(
@@ -15559,11 +15783,67 @@ class AnalysisResultCheck(BaseModel):
     )
 
 
+class AnalysisClaimAssessment(BaseModel):
+    claim_text: str = Field(
+        min_length=1,
+        max_length=500,
+        description='Material conclusion from the candidate report, retained for review audit.',
+    )
+    inference_level: Literal[
+        'descriptive', 'comparative', 'association', 'causal', 'recommendation'
+    ]
+    support_method: Literal[
+        'direct_result', 'computed_comparison', 'statistical_test', 'confirmed_business_rule'
+    ]
+    evidence_basis: str = Field(
+        min_length=1,
+        max_length=800,
+        description=(
+            'Concrete values, population and calculation inspected in the executed candidate; '
+            'a generic statement that the claim was checked is not evidence.'
+        ),
+    )
+    qualification_text: str = Field(
+        default='',
+        max_length=500,
+        description=(
+            'Candidate-report wording that limits the inference. Required when association or '
+            'causal wording rests only on a direct result or descriptive comparison.'
+        ),
+    )
+    supported_as_written: bool
+
+    @model_validator(mode='after')
+    def require_supported_and_qualified_inference(self):
+        if not self.supported_as_written:
+            raise ValueError(
+                'unsupported material claims must be corrected with request_analysis_revision'
+            )
+        if (
+            self.inference_level in {'association', 'causal'}
+            and self.support_method in {'direct_result', 'computed_comparison'}
+            and not self.qualification_text.strip()
+        ):
+            raise ValueError(
+                'association or causal wording based only on descriptive results requires an '
+                'explicit qualification in the candidate report'
+            )
+        return self
+
+
 class AnalysisResultReviewInput(BaseModel):
     checks: list[AnalysisResultCheck] = Field(
         min_length=5,
         max_length=5,
         description='One concrete passing check for every required candidate-review dimension.',
+    )
+    material_claims: list[AnalysisClaimAssessment] = Field(
+        min_length=1,
+        max_length=12,
+        description=(
+            'Every material conclusion driving the report summary or recommendations, quoted from '
+            'the candidate with its executed basis and inference level.'
+        ),
     )
     review_summary: str = Field(
         default='',
@@ -15610,10 +15890,25 @@ class AnalysisResultReviewInput(BaseModel):
 def accept_analysis_result(
     runtime: ToolRuntime[CustomContext],
     checks: list[AnalysisResultCheck],
+    material_claims: list[AnalysisClaimAssessment],
     review_summary: str = '',
     progress_summary: str = '',
-) -> Command:
+) -> Command | ToolMessage:
     """Finalize the latest candidate without regenerating or mutating it."""
+    candidate = _latest_successful_review_execution(
+        conversation_id=int(getattr(runtime.context, 'conversation_id', 0) or 0),
+        turn_id=int(getattr(runtime.context, 'turn_id', 0) or 0),
+    )
+    if candidate is None:
+        return ToolMessage(
+            content=json.dumps({
+                'tool': 'accept_analysis_result',
+                'status': 'failed',
+                'error_type': 'candidate_review_contract_error',
+                'error_message': '当前轮次没有可接受的成功候选分析结果。',
+            }, ensure_ascii=False),
+            tool_call_id=runtime.tool_call_id,
+        )
     emit = _get_stream_emitter()
     emit(
         'status',
@@ -15630,6 +15925,7 @@ def accept_analysis_result(
                 item.model_dump() if isinstance(item, BaseModel) else dict(item)
                 for item in checks
             ],
+            'material_claims': [item.model_dump() for item in material_claims],
             'review_summary': str(review_summary or '').strip(),
         }, ensure_ascii=False),
         tool_call_id=runtime.tool_call_id,
@@ -15637,8 +15933,13 @@ def accept_analysis_result(
 
 
 class AnalysisRevisionIssue(BaseModel):
+    issue_id: str = Field(
+        default='', max_length=120,
+        description='Stable issue id. It is generated locally when omitted.',
+    )
     issue_type: Literal[
-        'coverage', 'calculation', 'scope', 'artifact', 'narrative', 'recommendation'
+        'coverage', 'calculation', 'scope', 'artifact', 'narrative', 'recommendation',
+        'presentation',
     ]
     description: str = Field(min_length=1, max_length=800)
     required_correction: str = Field(min_length=1, max_length=800)
@@ -15697,16 +15998,30 @@ def _review_source_patch_range(code: str, snippet: str) -> dict[str, Any] | None
     """Resolve one exact semantic anchor to its smallest enclosing Python statement."""
     source = str(code or '')
     anchor = str(snippet or '').strip()
-    if not source or not anchor or source.count(anchor) != 1:
+    if not source or not anchor:
+        return None
+    matched_anchor = anchor
+    if source.count(anchor) == 1:
+        offset = source.index(anchor)
+    elif re.search(r'(?m)^\s*\.\.\.\s*$', anchor):
+        parts = re.split(r'(?m)^\s*\.\.\.\s*$', anchor, maxsplit=1)
+        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            return None
+        pattern = re.compile(re.escape(parts[0].rstrip()) + r'.*?' + re.escape(parts[1].lstrip()), re.S)
+        matches = list(pattern.finditer(source))
+        if len(matches) != 1:
+            return None
+        offset = matches[0].start()
+        matched_anchor = matches[0].group(0)
+    else:
         return None
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return None
 
-    offset = source.index(anchor)
     start_line = source.count('\n', 0, offset) + 1
-    end_line = start_line + anchor.count('\n')
+    end_line = start_line + matched_anchor.count('\n')
     candidates = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.stmt):
@@ -15761,7 +16076,7 @@ def _persist_review_revision_target(execution_id: int, target: dict[str, Any]) -
     args_schema=AnalysisRevisionInput,
     description=(
         'Reject the latest successfully executed candidate only for material coverage, calculation, '
-        'scope, artifact, narrative, or recommendation errors. Return all discovered issues together; '
+        'scope, artifact, narrative, recommendation, or presentation errors. Return all discovered issues together; '
         'the next Runtime work state will receive the current program and implementation contracts.'
     ),
 )
@@ -15777,6 +16092,12 @@ def request_analysis_revision(
         for item in issues
         if isinstance(item, (BaseModel, dict))
     ]
+    for issue_index, issue in enumerate(normalized):
+        if not str(issue.get('issue_id') or '').strip():
+            signature = hashlib.sha256(
+                json.dumps(issue, ensure_ascii=False, sort_keys=True).encode('utf-8')
+            ).hexdigest()[:10]
+            issue['issue_id'] = f'review-{issue_index + 1}-{signature}'
     emit(
         'status',
         stage='tool_review_revision',
@@ -16250,15 +16571,14 @@ def execute_python(
                     '保留原查询、计算和产物逻辑，不为执行标识重写或缩减分析。',
                 ],
             )
-    if execution_mode == 'analysis' and (
-        _program_requests_probe_feedback(code) or _program_uses_probe_api(code)
-    ):
+    if execution_mode == 'analysis' and _program_is_probe_shaped(code):
         return _tool_error_message(
             tool_call_id=runtime.tool_call_id,
             error_type='contract_error',
             error_message=(
                 'submit_analysis_program 只能提交正式分析程序，不能提交 '
-                'Probe API 调用或以 request_retry(retry_type="probe_feedback") 返回探测结果。'
+                'Probe API 调用、以 request_retry(retry_type="probe_feedback") 返回探测结果，'
+                '或只进行数据形态观察的 Probe 型程序。'
             ),
             diagnostics={
                 'violated_contract': 'formal_tool_received_probe_program',
@@ -17040,29 +17360,27 @@ def probe_analysis_data(
     probe: str = '',
 ) -> Optional[ToolMessage | Command]:
     """Run a bounded Probe through the shared Python execution implementation."""
-    # The model provider can occasionally emit a previously learned tool name
-    # even after the middleware has removed that tool from the current formal
-    # implementation surface.  Do not let that protocol drift execute the
-    # same Probe again or reopen the Probe state.  The observation is already
-    # durable in the working fact ledger; the only valid next action is the
-    # formal analysis program.
-    if _runtime_probe_is_closed(runtime):
+    normalized_probe_code = str(code or program or probe_code or probe or '')
+    # A gateway can preserve an earlier tool schema after the working view has
+    # moved back to implementation. A genuinely new bounded Probe still adds
+    # information; only an identical request would repeat an existing fact.
+    if _runtime_probe_is_closed(runtime) and _runtime_probe_repeats_completed_request(
+        runtime,
+        normalized_probe_code,
+    ):
         return _tool_error_message(
             tool_call_id=runtime.tool_call_id,
-            error_type='probe_not_allowed_after_observation',
+            error_type='duplicate_probe_request',
             error_message=(
-                '当前工作状态已经完成所需 Probe 观察；请停止重复探测，直接提交 '
-                'execution_intent="analysis" 的完整正式分析程序。'
+                '当前 Probe 与已经成功完成的探测代码相同；已有观察仍在事实账本中，'
+                '请直接复用，不要重复执行。'
             ),
             repair_instructions=[
-                '不要重复调用 Probe，也不要把正式分析程序提交为 Probe。',
-                '直接使用当前工作上下文中的 probe_fact_ledger 和已读取 Schema，'
-                '生成完整 analysis 代码，并以 save_analysis_result(...) 收口。',
-                '正式分析仍需重新查询并计算最终指标，不能把 Probe 输出直接当作正式指标。',
+                '复用当前工作上下文中的 probe_fact_ledger；若仍存在不同的技术未知，'
+                '提交只覆盖该未知的新 Probe，否则继续生成正式分析程序。',
             ],
             diagnostics={
-                'violated_contract': 'probe_closed_for_formal_implementation',
-                'recommended_execution_intent': 'analysis',
+                'violated_contract': 'duplicate_probe_request',
             },
         )
     # Some OpenAI-compatible gateways preserve the model's semantic key rather
@@ -17075,7 +17393,7 @@ def probe_analysis_data(
         len(str(probe_code or '')),
         len(str(probe or '')),
     )
-    code = str(code or program or probe_code or probe or '')
+    code = normalized_probe_code
     return execute_python.func(
         runtime=runtime,
         code=code,
@@ -17114,6 +17432,52 @@ def _runtime_probe_is_closed(runtime: ToolRuntime[CustomContext]) -> bool:
         # object does not expose the LangGraph state shape.  The middleware
         # remains the primary visibility control in that case.
         return False
+
+
+def _runtime_probe_repeats_completed_request(
+    runtime: ToolRuntime[CustomContext],
+    code: str,
+) -> bool:
+    """Return whether identical Probe source already produced an observation."""
+    normalized_code = str(code or '').replace('\r\n', '\n').strip()
+    if not normalized_code:
+        return False
+    messages = list((getattr(runtime, 'state', {}) or {}).get('messages') or [])
+    probe_sources: dict[str, str] = {}
+    completed_calls: set[str] = set()
+    for message in messages:
+        for call in getattr(message, 'tool_calls', None) or []:
+            if not isinstance(call, dict) or call.get('name') != 'probe_analysis_data':
+                continue
+            args = call.get('args') if isinstance(call.get('args'), dict) else {}
+            source = str(
+                args.get('code') or args.get('program')
+                or args.get('probe_code') or args.get('probe') or ''
+            ).replace('\r\n', '\n').strip()
+            probe_sources[str(call.get('id') or '')] = source
+        if not isinstance(message, ToolMessage):
+            continue
+        call_id = str(message.tool_call_id or '')
+        if call_id not in probe_sources:
+            continue
+        try:
+            payload = json.loads(str(message.content or '{}'))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        diagnostics = payload.get('diagnostics')
+        has_ledger = isinstance(diagnostics, dict) and isinstance(
+            diagnostics.get('probe_fact_ledger'), dict
+        )
+        if payload.get('status') in {'success', 'observation'} and (
+            has_ledger or isinstance(payload.get('query_snapshots'), dict)
+        ):
+            completed_calls.add(call_id)
+    return any(
+        probe_sources.get(call_id) == normalized_code
+        for call_id in completed_calls
+    )
 
 
 @tool(

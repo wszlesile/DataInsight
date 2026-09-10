@@ -35,6 +35,10 @@ QUERY_EXECUTION_CAPABILITIES = {
     "max_rows_per_sql_result": 10000,
     "capacity_scope": "each physical load_data_with_sql execution",
     "relational_sql_dialect": "mysql_compatible",
+    "relational_sql_profile": "fedquery_portable_subset",
+    "operation_capabilities": {
+        "string_aggregation": "unsupported",
+    },
     "full_population_strategies": [
         "push filters, joins and final aggregation into the query",
         "use stable pagination and incrementally reduce each page",
@@ -268,6 +272,10 @@ def _build_datasource_prompt_item(item: dict[str, Any]) -> dict[str, Any]:
         query_contract["ts_query_source"] = payload.get("ts_query_source")
     elif payload.get("datasource_type") == "table":
         query_contract["sql_dialect"] = QUERY_EXECUTION_CAPABILITIES["relational_sql_dialect"]
+        query_contract["sql_profile"] = QUERY_EXECUTION_CAPABILITIES["relational_sql_profile"]
+        query_contract["operation_capabilities"] = copy.deepcopy(
+            QUERY_EXECUTION_CAPABILITIES["operation_capabilities"]
+        )
     known_key_cardinalities: list[dict[str, Any]] = []
     seen_key_cardinalities: set[tuple[tuple[str, ...], int]] = set()
     for relationship in schema.get("relationships") or []:

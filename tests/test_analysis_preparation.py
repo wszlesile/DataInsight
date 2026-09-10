@@ -1432,6 +1432,33 @@ def test_business_lineage_field_normalization_preserves_grounded_fields():
     )
 
 
+def test_lineage_datasource_index_is_completed_from_grounded_fact_bindings():
+    context = _business_context()
+    lineage = context.insight_lineage[0]
+    omitted_source = lineage.fact_bindings[-1].datasource_id
+    candidate = context.model_copy(update={
+        "insight_lineage": [lineage.model_copy(update={
+            "datasource_ids": [
+                datasource_id for datasource_id in lineage.datasource_ids
+                if datasource_id != omitted_source
+            ],
+        })],
+    })
+
+    normalized = prep.AnalysisPreparationWorkflow._normalize_lineage_datasource_sets(
+        candidate,
+        _selection(),
+    )
+
+    assert omitted_source in normalized.insight_lineage[0].datasource_ids
+    validate_business_context(
+        normalized,
+        compact_datasource_snapshot(_snapshot())["selected_datasource_snapshot"],
+        selection=_selection(),
+        intent=_intent(),
+    )
+
+
 def test_business_lineage_field_normalization_marks_ungrounded_fact_partial():
     context = _business_context()
     lineage = context.insight_lineage[0]

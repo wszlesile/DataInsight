@@ -695,6 +695,10 @@ def _build_agent_context(
 ) -> CustomContext:
     """构造 Agent 与工具层使用的运行上下文。"""
     user_query = getattr(runtime.turn, 'user_query', '') or agent_request.user_message or ''
+    short_term_memory = getattr(runtime, 'short_term_memory', None)
+    if not isinstance(short_term_memory, dict):
+        short_term_memory = {}
+        runtime.short_term_memory = short_term_memory
     return CustomContext(
         username=agent_request.username,
         namespace_id=runtime.conversation.insight_namespace_id,
@@ -2849,6 +2853,10 @@ def _build_clarification_resume_context(
     runtime: ConversationRunContext,
     transcript: list[BaseMessage] | None = None,
 ) -> dict[str, Any]:
+    if transcript:
+        _update_short_term_memory_from_messages(runtime, transcript)
+    memory = getattr(runtime, 'short_term_memory', None)
+    memory = memory if isinstance(memory, dict) else {}
     probe_observations = [
         item
         for item in _build_structured_execution_feedback(
@@ -3034,6 +3042,8 @@ def _update_runtime_schema_detail_workspace(
 
 
 def _update_short_term_memory_from_messages(runtime: ConversationRunContext, messages: list[Any]) -> None:
+    if not isinstance(getattr(runtime, 'short_term_memory', None), dict):
+        runtime.short_term_memory = {}
     for message in messages or []:
         content = getattr(message, 'content', None)
         if not isinstance(content, str) or not content.strip().startswith('{'):
@@ -3321,7 +3331,10 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
                 raise ValueError(
                     "当前分析需要用户补充业务定义，请通过异步分析接口完成同轮次澄清。"
                 )
-            _update_short_term_memory_from_messages(runtime, response_messages)
+            # Persist from the lossless round, not merely the returned suffix.
+            # Tool results need their paired calls to drive the same explicit
+            # workspace reducers used by the SSE path.
+            _update_short_term_memory_from_messages(runtime, round_transcript)
             assistant_message, analysis_report, charts, tables, raw_tool_call_detected = _extract_invoke_result(
                 response_messages
             )
@@ -3839,6 +3852,7 @@ def _stream_with_runtime(
             # See the non-streaming path above. Streaming retries must retain
             # the same work memory and tool-call identities as well.
             agent_round_messages = round_transcript
+            _update_short_term_memory_from_messages(runtime, round_transcript)
 
             clarification = _extract_runtime_clarification(streamed_messages)
             if clarification is not None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 from dataclasses import replace
 from pathlib import Path
@@ -4090,6 +4091,90 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     assert refs[0]["evidence_key"] == refs[1]["evidence_key"]
 
 
+def test_report_loop_reuses_verified_table_column_from_derived_frame():
+    sql = "SELECT category, alarm_flag, affected_count FROM quality_events"
+    code = r'''
+data = load_data_with_sql(sql="SELECT category, alarm_flag, affected_count FROM quality_events")
+signals = {
+    "process": {
+        "signal_count": int((data["alarm_flag"] == 1).sum()),
+        "strength": int(data.loc[data["alarm_flag"] == 1, "affected_count"].sum()),
+    },
+    "equipment": {
+        "signal_count": int((data["category"] == "equipment").sum()),
+        "strength": int(data.loc[data["category"] == "equipment", "affected_count"].sum()),
+    },
+}
+candidate_rows = []
+for name, values in signals.items():
+    candidate_rows.append({
+        "candidate": name,
+        "signal_count": values["signal_count"],
+        "strength": values["strength"],
+    })
+candidate_df = pd.DataFrame(candidate_rows).sort_values(
+    ["signal_count", "strength"], ascending=False
+).reset_index(drop=True)
+candidate_df["rank"] = range(1, len(candidate_df) + 1)
+candidate_table = candidate_df[["rank", "candidate", "signal_count", "strength"]].copy()
+table_result = build_table_result(
+    title="Root-cause candidates",
+    data=candidate_table,
+    columns=[
+        {"key": "rank", "label": "Rank"},
+        {"key": "candidate", "label": "Candidate"},
+        {"key": "signal_count", "label": "Signal count"},
+        {"key": "strength", "label": "Affected count"},
+    ],
+)
+report_lines = ["## Root-cause candidates"]
+for _, row in candidate_df.iterrows():
+    report_lines.append(
+        f"- {row['rank']}. {row['candidate']}: "
+        f"{row['signal_count']} signals, strength {row['strength']}."
+    )
+analysis_report = "\n".join(report_lines)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[table_result])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report=(
+            "## Root-cause candidates\n"
+            "- 1. process: 2 signals, strength 12.\n"
+            "- 2. equipment: 1 signals, strength 5."
+        ),
+        tables=[{
+            "title": "Root-cause candidates",
+            "columns": [
+                {"key": "rank", "label": "Rank"},
+                {"key": "candidate", "label": "Candidate"},
+                {"key": "signal_count", "label": "Signal count"},
+                {"key": "strength", "label": "Affected count"},
+            ],
+            "rows": [
+                {"rank": 1, "candidate": "process", "signal_count": 2, "strength": 12},
+                {"rank": 2, "candidate": "equipment", "signal_count": 1, "strength": 5},
+            ],
+        }],
+        query_snapshots={
+            "q_quality": _query_snapshot(
+                sql,
+                columns=["category", "alarm_flag", "affected_count"],
+            )
+        },
+    )
+
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert {item["column_key"] for item in bundle["table_trace_refs"]} == {
+        "signal_count", "strength",
+    }
+    report_refs = sorted(bundle["report_trace_refs"], key=lambda item: item["start"])
+    assert [item["text"] for item in report_refs] == ["2", "12", "1", "5"]
+    assert len({item["evidence_key"] for item in report_refs}) == 2
+
+
 def test_static_zero_result_branch_gets_query_backed_report_evidence():
     sql = "SELECT batch_id FROM batch_context"
     code = r'''
@@ -7665,6 +7750,80 @@ result = save_analysis_result(analysis_report="Near-limit distribution.", charts
 
     assert output["candidate_query_node_ids"] == ["q_quality"]
     assert len(output["boundary_operation_node_ids"]) == 1
+
+
+def test_structured_chart_resolves_unique_frame_from_inline_empty_fallback():
+    sql = "SELECT quality_item, batch_id, status FROM quality_results"
+    code = r'''
+data = load_data_with_sql(sql="SELECT quality_item, batch_id, status FROM quality_results")
+def distribution(frame, dimensions, status):
+    subset = frame[frame["status"] == status]
+    if subset.empty:
+        return pd.DataFrame()
+    grouped = subset.groupby(dimensions).agg(
+        test_cnt=("batch_id", "nunique")
+    ).reset_index()
+    return grouped.sort_values("test_cnt", ascending=False)
+
+item_dist = distribution(data, ["quality_item"], "oos")
+chart = build_chart_result(
+    data=item_dist.head(10) if not item_dist.empty else pd.DataFrame(),
+    chart_kind="bar",
+    category_field="quality_item",
+    value_field="test_cnt",
+)
+result = save_analysis_result(analysis_report="Quality item distribution.", charts=[chart], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Quality item distribution.",
+        charts=[{
+            "title": "Quality item distribution",
+            "chart_data_contract": {
+                "encoding": {
+                    "category_field": "quality_item",
+                    "value_field": "test_cnt",
+                },
+            },
+        }],
+        query_snapshots={
+            "q_quality": _query_snapshot(
+                sql, columns=["quality_item", "batch_id", "status"]
+            ),
+        },
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    output = next(
+        item for item in lineage["output_nodes"]
+        if item.get("artifact_type") == "chart"
+        and item.get("field") == "test_cnt"
+    )
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+
+    assert output["source_frame"] == "item_dist"
+    assert output["candidate_query_node_ids"] == ["q_quality"]
+    assert len(output["boundary_operation_node_ids"]) == 1
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert len(bundle["chart_trace_refs"]) == 1
+
+
+def test_structured_chart_keeps_distinct_conditional_frames_ambiguous():
+    tree = ast.parse(r'''
+left = load_data_with_sql(sql="SELECT category, amount FROM left_source")
+right = load_data_with_sql(sql="SELECT category, amount FROM right_source")
+chart = build_chart_result(
+    data=left if use_left else right,
+    chart_kind="bar",
+    category_field="category",
+    value_field="amount",
+)
+''')
+
+    sources = LineageIndexer._chart_data_sources(tree)
+
+    assert len(sources) == 1
+    assert sources[0]["source_frame"] == ""
 
 
 def test_compiled_multi_series_chart_selection_resolves_current_value():

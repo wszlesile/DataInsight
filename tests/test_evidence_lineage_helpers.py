@@ -143,7 +143,7 @@ def test_probe_feedback_marks_time_coverage_as_diagnostic_only():
     assert retry.diagnostics["_probe_contract"]["explicit_user_time_range"] is None
 
 
-def test_open_overall_relational_analysis_rejects_inferred_time_window():
+def test_open_overall_relational_analysis_allows_disclosed_analysis_window():
     intent_token = CURRENT_EXECUTION_INTENT.set("analysis")
     expected_token = CURRENT_EXPECTED_TIME_RANGE.set({})
     override_token = CURRENT_ANALYSIS_PARAMETERS_OVERRIDE.set({})
@@ -165,11 +165,10 @@ def test_open_overall_relational_analysis_rejects_inferred_time_window():
         CURRENT_EXPECTED_TIME_RANGE.reset(expected_token)
         CURRENT_EXECUTION_INTENT.reset(intent_token)
 
-    assert retry is not None
-    assert retry.diagnostics["violated_constraint"] == "inferred_overall_time_window"
+    assert retry is None
 
 
-def test_open_detail_baseline_rejects_inferred_time_window():
+def test_open_detail_baseline_allows_disclosed_analysis_window():
     intent_token = CURRENT_EXECUTION_INTENT.set("analysis")
     expected_token = CURRENT_EXPECTED_TIME_RANGE.set({})
     override_token = CURRENT_ANALYSIS_PARAMETERS_OVERRIDE.set({})
@@ -191,8 +190,7 @@ def test_open_detail_baseline_rejects_inferred_time_window():
         CURRENT_EXPECTED_TIME_RANGE.reset(expected_token)
         CURRENT_EXECUTION_INTENT.reset(intent_token)
 
-    assert retry is not None
-    assert retry.diagnostics["violated_constraint"] == "inferred_overall_time_window"
+    assert retry is None
 
 
 def test_open_grouped_trend_can_use_an_observation_window():

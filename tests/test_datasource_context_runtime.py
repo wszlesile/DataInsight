@@ -68,6 +68,8 @@ def test_datasource_context_keeps_full_snapshot_for_preparation_to_narrow(monkey
         "max_rows_per_sql_result": 10000,
         "capacity_scope": "each physical load_data_with_sql execution",
         "relational_sql_dialect": "mysql_compatible",
+        "relational_sql_profile": "fedquery_portable_subset",
+        "operation_capabilities": {"string_aggregation": "unsupported"},
         "full_population_strategies": [
             "push filters, joins and final aggregation into the query",
             "use stable pagination and incrementally reduce each page",
@@ -191,6 +193,8 @@ def test_datasource_context_compacts_only_redundant_schema_indexes(monkeypatch):
         "allowed_fields_ref": "metadata_schema.properties",
         "all_schema_properties_allowed": True,
         "sql_dialect": "mysql_compatible",
+        "sql_profile": "fedquery_portable_subset",
+        "operation_capabilities": {"string_aggregation": "unsupported"},
     }
     assert datasource["metadata_schema"]["properties"] == properties
     assert datasource["metadata_schema"]["all_properties_required"] is True

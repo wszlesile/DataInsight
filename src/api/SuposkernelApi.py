@@ -202,7 +202,7 @@ class SuposKernelApi:
             self._database_pool = self._create_database_pool(database_conn_info)
             return self._database_pool
 
-    def query_dataframe(self, sql: str, params: list[Any] | None = None):
+    def query_dataframe(self, sql: str, params: list[Any] | dict[str, Any] | None = None):
         """
         使用系统级连接池执行一条 FedQuery SQL，并返回 pandas DataFrame。
 
@@ -213,7 +213,11 @@ class SuposKernelApi:
         columns, rows = self.query_rows(sql=sql, params=params)
         return pd.DataFrame(rows, columns=columns)
 
-    def query_rows(self, sql: str, params: list[Any] | None = None) -> tuple[list[str], list[tuple[Any, ...]]]:
+    def query_rows(
+        self,
+        sql: str,
+        params: list[Any] | dict[str, Any] | None = None,
+    ) -> tuple[list[str], list[tuple[Any, ...]]]:
         """
         使用系统级连接池执行 SQL，并返回列名与结果行。
 

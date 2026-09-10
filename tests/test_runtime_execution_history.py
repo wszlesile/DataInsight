@@ -287,6 +287,51 @@ def test_probe_observation_preserves_custom_facts_and_all_executed_paths():
     assert 'printed_observations' not in diagnostics
 
 
+def test_probe_fact_ledger_merges_helper_observation_and_exposes_capacity_fact():
+    snapshot = query_fact(1)
+    snapshot['implementation'] = {
+        'datasource_identifiers': ['quality.results', 'process.samples'],
+        'projection_semantics': [{
+            'alias': 'overlap_batch_count',
+            'semantic_kind': 'aggregation',
+            'projection_role': 'measure',
+            'expression': 'COUNT(DISTINCT batch_id)',
+        }],
+    }
+    snapshot['execution']['columns'] = ['overlap_batch_count']
+    snapshot['execution']['row_count'] = 1
+    diagnostics = {
+        'query_observations': [{
+            'query_key': 'probe_overlap',
+            'datasource_identifiers': ['quality.results', 'process.samples'],
+            'status': 'success',
+            'row_count': 1,
+            'columns': ['overlap_batch_count'],
+            'value_samples': [{'overlap_batch_count': 18825}],
+        }],
+    }
+
+    ledger = tools._build_probe_fact_ledger(
+        query_snapshots={'query_auto_overlap': snapshot},
+        diagnostics=diagnostics,
+    )
+
+    assert len(ledger['observations']) == 1
+    observation = ledger['observations'][0]
+    assert observation['value_samples'] == [{'overlap_batch_count': 18825}]
+    assert observation['aggregate_facts'] == [{
+        'field': 'overlap_batch_count',
+        'expression': 'COUNT(DISTINCT batch_id)',
+        'value': 18825,
+    }]
+    assert observation['capacity_risks'] == [{
+        'observed_population_count': 18825,
+        'count_field': 'overlap_batch_count',
+        'max_rows_per_physical_query': 10000,
+        'required_strategy': 'query_side_final_aggregation_or_stable_pagination',
+    }]
+
+
 def test_probe_observation_can_carry_a_phase_specific_formal_work_packet():
     message = tools._tool_error_message(
         tool_call_id='probe-formal-packet', execution_id=12,
