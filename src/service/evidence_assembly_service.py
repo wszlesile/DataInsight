@@ -1,5 +1,6 @@
 import hashlib
 import re
+import time
 from datetime import datetime
 from typing import Any
 
@@ -68,6 +69,7 @@ class EvidenceAssemblyService:
                 [],
             ) if turn is not None else []
             try:
+                snapshot_started_at = time.perf_counter()
                 snapshot = build_execution_snapshot(
                     execution=execution,
                     artifacts=artifacts,
@@ -76,7 +78,9 @@ class EvidenceAssemblyService:
                     ),
                     user_query=getattr(turn, 'user_query', '') if turn is not None else '',
                 )
+                compiler_started_at = time.perf_counter()
                 compiled_bundle = PostAnalysisEvidenceCompiler().compile(snapshot)
+                compiler_elapsed = time.perf_counter() - compiler_started_at
                 compilation_status = str(compiled_bundle.get("status") or "partial")
                 compilation_diagnostics = (
                     compiled_bundle.get("diagnostics")
@@ -84,13 +88,16 @@ class EvidenceAssemblyService:
                     else {}
                 )
                 logger.info(
-                    "post-analysis evidence compiled: execution_id=%s status=%s definitions=%s chart_refs=%s table_refs=%s report_refs=%s",
+                    "post-analysis evidence compiled: execution_id=%s status=%s definitions=%s chart_refs=%s table_refs=%s report_refs=%s snapshot_elapsed=%.2fs compiler_elapsed=%.2fs total_elapsed=%.2fs",
                     int(getattr(execution, 'id', 0) or 0),
                     compiled_bundle.get('status'),
                     len(compiled_bundle.get('evidence_definitions') or []),
                     len(compiled_bundle.get('chart_trace_refs') or []),
                     len(compiled_bundle.get('table_trace_refs') or []),
                     len(compiled_bundle.get('report_trace_refs') or []),
+                    compiler_started_at - snapshot_started_at,
+                    compiler_elapsed,
+                    time.perf_counter() - snapshot_started_at,
                 )
             except Exception as exc:
                 # Evidence is post-processing. It must never invalidate an already

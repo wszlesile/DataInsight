@@ -11011,12 +11011,16 @@ def _resolve_execute_python_source(
             base_payload = {}
         repair_target = base_payload.get('repair_target') if isinstance(base_payload, dict) else None
         if base_status == 'success':
-            latest_execution = session.query(InsightNsExecution).filter(
+            latest_successful_execution = session.query(InsightNsExecution).filter(
                 InsightNsExecution.conversation_id == int(conversation_id or 0),
                 InsightNsExecution.turn_id == int(turn_id or 0),
                 InsightNsExecution.is_deleted == 0,
+                InsightNsExecution.execution_status == 'success',
             ).order_by(InsightNsExecution.id.desc()).first()
-            if latest_execution is None or int(latest_execution.id or 0) != base_execution_id:
+            if (
+                latest_successful_execution is None
+                or int(latest_successful_execution.id or 0) != base_execution_id
+            ):
                 raise ValueError('语义修订只能使用当前轮次最新的成功候选作为 base_execution_id。')
             review_target = (
                 base_payload.get('review_revision_target')
@@ -15762,7 +15766,14 @@ def _tool_success_message(
 
 def _terminal_tool_success(message: ToolMessage) -> Command:
     """Finish the agent graph after a fully validated analysis result."""
-    return Command(update={"messages": [message], "analysis_complete": True})
+    # ``analysis_complete`` is retained for state/audit consumers, but an
+    # update alone still leaves create_agent free to schedule another model
+    # turn before the before-model guard observes it.  A reviewed candidate
+    # is terminal by contract, so terminate the graph at the tool boundary.
+    return Command(
+        update={"messages": [message], "analysis_complete": True},
+        goto=END,
+    )
 
 
 class AnalysisResultCheck(BaseModel):
@@ -16000,6 +16011,31 @@ def _review_source_patch_range(code: str, snippet: str) -> dict[str, Any] | None
     anchor = str(snippet or '').strip()
     if not source or not anchor:
         return None
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+
+    def enclosing_statement(start_line: int, end_line: int) -> dict[str, Any] | None:
+        candidates = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.stmt):
+                continue
+            node_start = int(getattr(node, 'lineno', 0) or 0)
+            node_end = int(getattr(node, 'end_lineno', 0) or 0)
+            if node_start <= start_line and node_end >= end_line:
+                candidates.append((node_end - node_start, node_start, node_end))
+        if not candidates:
+            return None
+        _, node_start, node_end = min(candidates)
+        lines = source.splitlines()
+        return {
+            'start_line': node_start,
+            'end_line': node_end,
+            'source': '\n'.join(lines[node_start - 1:node_end]),
+            'anchor': anchor,
+        }
+
     matched_anchor = anchor
     if source.count(anchor) == 1:
         offset = source.index(anchor)
@@ -16014,31 +16050,83 @@ def _review_source_patch_range(code: str, snippet: str) -> dict[str, Any] | None
         offset = matches[0].start()
         matched_anchor = matches[0].group(0)
     else:
+        # Review sees rendered artifacts, while the generated program often
+        # keeps the same sentence as an f-string template.  Treat formatted
+        # expressions as wildcards, but require every literal segment to
+        # match and a unique owning statement.  This maps an artifact fact
+        # back to source without attempting to evaluate user code.
+        rendered_matches = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.JoinedStr):
+                continue
+            parts = []
+            literal_chars = 0
+            for value in node.values:
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    literal = value.value
+                    literal_chars += len(literal)
+                    parts.append(re.escape(literal))
+                else:
+                    parts.append(r'.*?')
+            if literal_chars < 12:
+                continue
+            try:
+                matches_rendered = re.fullmatch(''.join(parts), anchor, re.S)
+            except re.error:
+                continue
+            if matches_rendered is None:
+                continue
+            resolved = enclosing_statement(
+                int(getattr(node, 'lineno', 0) or 0),
+                int(getattr(node, 'end_lineno', 0) or 0),
+            )
+            if resolved is not None:
+                rendered_matches.append(resolved)
+        unique_matches = {
+            (item['start_line'], item['end_line']): item
+            for item in rendered_matches
+        }
+        return next(iter(unique_matches.values())) if len(unique_matches) == 1 else None
+
+    start_line = source.count('\n', 0, offset) + 1
+    end_line = start_line + matched_anchor.count('\n')
+    return enclosing_statement(start_line, end_line)
+
+
+def _named_assignment_patch_range(code: str, target_name: str) -> dict[str, Any] | None:
+    """Locate the last complete assignment owned by one well-known output."""
+    source = str(code or '')
+    target_name = str(target_name or '').strip()
+    if not source or not target_name:
         return None
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return None
-
-    start_line = source.count('\n', 0, offset) + 1
-    end_line = start_line + matched_anchor.count('\n')
-    candidates = []
+    matches: list[ast.stmt] = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.stmt):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        elif isinstance(node, ast.AugAssign):
+            targets = [node.target]
+        else:
             continue
-        node_start = int(getattr(node, 'lineno', 0) or 0)
-        node_end = int(getattr(node, 'end_lineno', 0) or 0)
-        if node_start <= start_line and node_end >= end_line:
-            candidates.append((node_end - node_start, node_start, node_end))
-    if not candidates:
+        if any(isinstance(target, ast.Name) and target.id == target_name for target in targets):
+            matches.append(node)
+    if not matches:
         return None
-    _, node_start, node_end = min(candidates)
+    node = max(matches, key=lambda item: int(getattr(item, 'lineno', 0) or 0))
+    start_line = int(getattr(node, 'lineno', 0) or 0)
+    end_line = int(getattr(node, 'end_lineno', start_line) or start_line)
+    if start_line <= 0 or end_line < start_line:
+        return None
     lines = source.splitlines()
     return {
-        'start_line': node_start,
-        'end_line': node_end,
-        'source': '\n'.join(lines[node_start - 1:node_end]),
-        'anchor': anchor,
+        'start_line': start_line,
+        'end_line': end_line,
+        'source': '\n'.join(lines[start_line - 1:end_line]),
+        'anchor': target_name,
+        'resolved_by': 'named_output_assignment',
     }
 
 
@@ -16120,6 +16208,12 @@ def request_analysis_revision(
         if issue.get('change_scope') == 'query_or_population':
             full_program_revision_required = True
         snippets = issue.get('source_snippets') or []
+        if issue.get('change_scope') == 'presentation' and not snippets:
+            report_range = _named_assignment_patch_range(source, 'analysis_report')
+            if report_range is not None:
+                report_range['issue_index'] = issue_index
+                resolved_ranges.append(report_range)
+                continue
         if issue.get('change_scope') != 'query_or_population' and not snippets:
             full_program_revision_required = True
         for snippet in snippets:
@@ -16144,6 +16238,31 @@ def request_analysis_revision(
     if unresolved_anchors:
         full_program_revision_required = True
     patch_mode_allowed = bool(unique_ranges and not full_program_revision_required)
+    logger.info(
+        'Runtime review revision resolved: candidate_execution_id=%s issues=%s patch_mode_allowed=%s '
+        'full_program_revision_required=%s resolved_ranges=%s unresolved_anchors=%s',
+        int(getattr(candidate, 'id', 0) or 0),
+        [
+            {
+                'issue_type': item.get('issue_type'),
+                'change_scope': item.get('change_scope'),
+                'source_snippet_count': len(item.get('source_snippets') or []),
+            }
+            for item in normalized
+        ],
+        patch_mode_allowed,
+        full_program_revision_required,
+        [
+            {
+                'issue_index': item.get('issue_index'),
+                'start_line': item.get('start_line'),
+                'end_line': item.get('end_line'),
+                'resolved_by': item.get('resolved_by', 'source_snippet'),
+            }
+            for item in unique_ranges
+        ],
+        unresolved_anchors,
+    )
     revision_work_packet = {
         'base_execution_id': int(getattr(candidate, 'id', 0) or 0),
         'base_source_sha256': _build_analysis_logic_signature(source),
@@ -16531,6 +16650,32 @@ def execute_python(
     _raise_if_runtime_task_cancelled(runtime.context)
     conversation_id = int(getattr(runtime.context, 'conversation_id', 0) or 0)
     turn_id = int(getattr(runtime.context, 'turn_id', 0) or 0)
+    review_patch_requirement = (
+        _pending_runtime_review_patch(runtime)
+        if execution_mode == 'analysis' else {}
+    )
+    if not _review_patch_submission_is_authorized(
+        review_patch_requirement,
+        code=code,
+        base_execution_id=base_execution_id,
+        patches=patches,
+    ):
+        return _tool_error_message(
+            tool_call_id=runtime.tool_call_id,
+            error_type='contract_error',
+            error_message=(
+                '当前候选已通过 Review 的局部修订授权；本次只能基于指定成功候选提交 '
+                'allowed_ranges 内的 patches，不能重写完整分析程序。'
+            ),
+            diagnostics={
+                'violated_contract': 'review_patch_required',
+                'revision_work_packet': review_patch_requirement,
+            },
+            repair_instructions=[
+                '令 code 为空，使用 revision_work_packet.base_execution_id 与 allowed_ranges 对应的非重叠 patches。',
+                '保留已验证的查询、计算、图表、表格和数据源范围；本次只修改 Review 指出的呈现语句。',
+            ],
+        )
     try:
         code, normalized_used_datasource_ids, parent_execution_id, execution_source = _resolve_execute_python_source(
             conversation_id=conversation_id,
@@ -17282,10 +17427,10 @@ def execute_python(
         )
         emit(
             'status',
-            stage='tool_candidate',
+            stage='tool_result',
             level='success',
             tool='execute_python',
-            message='候选分析结果已生成，正在复核计算与结论一致性。',
+            message='分析结果已生成并通过执行与产物契约检查。',
         )
         success_message = _tool_success_message(
             tool_call_id=runtime.tool_call_id,
@@ -17297,10 +17442,11 @@ def execute_python(
             query_snapshots=worker_payload.get('query_snapshots') or {},
             static_analysis_advisories=static_analysis_advisories,
         )
-        # A contract-valid StructuredResult is a candidate until the same
-        # Runtime owner checks its evaluated values and narrative claims.
-        # Evidence and outer finalization still run only after explicit accept.
-        return success_message
+        # Successful execution plus the deterministic structured-result
+        # contract is the normal terminal path. Semantic review is available
+        # for explicit future audit flows, but must not make every successful
+        # analysis speculative and trigger a second full-program rewrite.
+        return _terminal_tool_success(success_message)
 
     _update_execution_record(
         execution_id,
@@ -17361,26 +17507,25 @@ def probe_analysis_data(
 ) -> Optional[ToolMessage | Command]:
     """Run a bounded Probe through the shared Python execution implementation."""
     normalized_probe_code = str(code or program or probe_code or probe or '')
-    # A gateway can preserve an earlier tool schema after the working view has
-    # moved back to implementation. A genuinely new bounded Probe still adds
-    # information; only an identical request would repeat an existing fact.
-    if _runtime_probe_is_closed(runtime) and _runtime_probe_repeats_completed_request(
-        runtime,
-        normalized_probe_code,
-    ):
+    # Tool projection is advisory at the provider boundary: a gateway can
+    # still emit a tool call from an earlier turn.  Probe execution therefore
+    # needs the same state authorization as the advertised tool set.  A new
+    # technical unknown remains supported, but formal work must first call
+    # request_runtime_probe so the packet records the Probe focus and resume
+    # state before any query is executed.
+    if not _runtime_probe_is_authorized(runtime):
         return _tool_error_message(
             tool_call_id=runtime.tool_call_id,
-            error_type='duplicate_probe_request',
+            error_type='probe_not_authorized_for_current_phase',
             error_message=(
-                '当前 Probe 与已经成功完成的探测代码相同；已有观察仍在事实账本中，'
-                '请直接复用，不要重复执行。'
+                '当前工作状态未授权直接执行 Probe；已有观察仍在事实账本中。'
             ),
             repair_instructions=[
-                '复用当前工作上下文中的 probe_fact_ledger；若仍存在不同的技术未知，'
-                '提交只覆盖该未知的新 Probe，否则继续生成正式分析程序。',
+                '复用当前工作上下文中的 probe_fact_ledger 并继续正式分析；若发现新的技术未知，'
+                '先调用 request_runtime_probe 声明目标，再在 Probe 状态提交有界探测。',
             ],
             diagnostics={
-                'violated_contract': 'duplicate_probe_request',
+                'violated_contract': 'probe_not_authorized_for_current_phase',
             },
         )
     # Some OpenAI-compatible gateways preserve the model's semantic key rather
@@ -17404,8 +17549,8 @@ def probe_analysis_data(
     )
 
 
-def _runtime_probe_is_closed(runtime: ToolRuntime[CustomContext]) -> bool:
-    """Return whether a completed Probe closes the current Probe tool path.
+def _runtime_probe_is_authorized(runtime: ToolRuntime[CustomContext]) -> bool:
+    """Return whether the current control state authorizes Probe execution.
 
     This is intentionally evaluated at the execution boundary as a second
     line of defense.  Middleware controls the advertised tool set, but a
@@ -17414,15 +17559,33 @@ def _runtime_probe_is_closed(runtime: ToolRuntime[CustomContext]) -> bool:
     module's tool definitions during import.
     """
     try:
+        from agent.runtime_driver_state import (
+            RuntimePhase,
+            runtime_work_packet_from_dict,
+        )
         from agent.runtime_working_context import (
             _has_completed_probe_observation,
             _has_open_probe_replan,
             resolve_work,
         )
 
+        context = getattr(runtime, 'context', None)
+        packet = runtime_work_packet_from_dict(
+            getattr(context, 'runtime_work_packet', None)
+        )
+        if packet is not None and not packet.workspace_id.startswith('legacy:'):
+            return packet.phase in {RuntimePhase.PROBE, RuntimePhase.PROBE_REPAIR}
+
+        # Compatibility for graphs created before RuntimeWorkPacket became the
+        # active control plane. New work must never derive phase from prose.
         messages = list((getattr(runtime, 'state', {}) or {}).get('messages') or [])
         work, _focus, _references = resolve_work(messages)
-        return (
+        if work in {'probe', 'probe_repair'}:
+            return True
+        # Compatibility graphs do not carry an authoritative packet. Keep
+        # their established behavior, while rejecting only a closed duplicate
+        # Probe at the legacy boundary.
+        return not (
             work in {'implement', 'repair'}
             and _has_completed_probe_observation(messages)
             and not _has_open_probe_replan(messages)
@@ -17431,7 +17594,12 @@ def _runtime_probe_is_closed(runtime: ToolRuntime[CustomContext]) -> bool:
         # Tool execution must remain available if a non-standard test/runtime
         # object does not expose the LangGraph state shape.  The middleware
         # remains the primary visibility control in that case.
-        return False
+        return True
+
+
+def _runtime_probe_is_closed(runtime: ToolRuntime[CustomContext]) -> bool:
+    """Compatibility inverse for tests and legacy integrations."""
+    return not _runtime_probe_is_authorized(runtime)
 
 
 def _runtime_probe_repeats_completed_request(
@@ -17478,6 +17646,45 @@ def _runtime_probe_repeats_completed_request(
         probe_sources.get(call_id) == normalized_code
         for call_id in completed_calls
     )
+
+
+def _pending_runtime_review_patch(runtime: ToolRuntime[CustomContext]) -> dict[str, Any]:
+    """Return the locally enforced Review patch authorization, if any."""
+    try:
+        from agent.runtime_driver_state import runtime_work_packet_from_dict
+
+        packet = runtime_work_packet_from_dict(
+            getattr(getattr(runtime, 'context', None), 'runtime_work_packet', None)
+        )
+        pending = getattr(packet, 'pending_review_patch', {}) if packet is not None else {}
+        return dict(pending) if isinstance(pending, dict) and pending else {}
+    except Exception:
+        return {}
+
+
+def _review_patch_submission_is_authorized(
+    requirement: dict[str, Any],
+    *,
+    code: str,
+    base_execution_id: int,
+    patches: list[SourceCodePatch] | None,
+) -> bool:
+    """Check an already-approved bounded Review revision before execution."""
+    if not requirement:
+        return True
+    if str(code or '').strip() or int(base_execution_id or 0) != int(requirement.get('base_execution_id') or 0):
+        return False
+    allowed = {
+        (int(item.get('start_line') or 0), int(item.get('end_line') or 0))
+        for item in requirement.get('allowed_ranges') or []
+        if isinstance(item, dict)
+    }
+    normalized = [
+        item if isinstance(item, SourceCodePatch) else SourceCodePatch.model_validate(item)
+        for item in (patches or [])
+    ]
+    requested = {(int(item.start_line), int(item.end_line)) for item in normalized}
+    return bool(requested) and requested.issubset(allowed)
 
 
 @tool(

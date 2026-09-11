@@ -110,6 +110,10 @@ class CustomContext(BaseModel):
     # outer ReAct recovery prompt replaying the same payloads as free text.
     runtime_probe_fact_ledgers: list[dict[str, Any]] = Field(default_factory=list)
     runtime_schema_detail_workspace: list[dict[str, Any]] = Field(default_factory=list)
+    # Small control-plane packet. It contains lifecycle state and references,
+    # while producer-owned Schema, Probe facts, code and artifacts stay in
+    # their existing authoritative stores.
+    runtime_work_packet: dict[str, Any] = Field(default_factory=dict)
 
 
 def classify_analysis_context_mode(user_message: str) -> str:
@@ -651,7 +655,12 @@ def build_runtime_datasource_working_message(
     ) else _runtime_lineage_field_defaults(
         prompt_snapshot.get("analysis_semantic_context"),
     )
-    if not requested_ids and work not in {"understand", "review"}:
+    # PLAN owns material discovery, not material delivery. Its compact source
+    # index and business lineage are enough to choose exact dependencies; an
+    # automatic lineage expansion here eagerly replayed every selected field
+    # before the plan had made that choice. Explicit detail reads remain
+    # available in PLAN and are retained in ``schema_detail_workspace``.
+    if not requested_ids and work not in {"understand", "plan", "review"}:
         requested_ids = [
             datasource_id for datasource_id in selected_ids
             if datasource_id in lineage_defaults

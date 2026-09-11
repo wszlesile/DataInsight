@@ -196,6 +196,30 @@ def test_state_scoped_runtime_carrier_keeps_full_scope_but_expands_only_current_
     assert "relationships" not in details["metadata_schema"]
 
 
+def test_material_plan_starts_from_compact_index_without_eager_lineage_details():
+    preparation = _preparation()
+    full = preparation.prompt_snapshot()
+    full["analysis_semantic_context"]["insight_lineage"] = [{
+        "question_id": "q1",
+        "datasource_ids": [11],
+        "fact_bindings": [{"fact_id": "f1", "datasource_id": 11, "fields": ["amount"]}],
+        "relationship_ids": [],
+    }]
+    prompt = _build_runtime_prompt_snapshot(full)
+
+    message = build_runtime_datasource_working_message(
+        prompt,
+        preparation.selected_snapshot,
+        work="plan",
+    )
+    payload = _working_payload(message)
+
+    assert payload["selected_datasource_ids"] == [11]
+    assert payload["datasource_index"]
+    assert payload["datasource_details"] == []
+    assert payload["runtime_schema_workspace"]["detail_datasource_ids"] == []
+
+
 def test_result_review_keeps_source_index_without_replaying_schema_details():
     preparation = _preparation()
     full = preparation.prompt_snapshot()

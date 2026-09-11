@@ -4,15 +4,18 @@ import copy
 import hashlib
 import json
 import re
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Literal
 
 from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware.types import ToolCallRequest
 from langchain.tools import tool
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.prebuilt import ToolRuntime
+from langgraph.types import Command
 from pydantic import BaseModel, Field, field_validator
 
 from agent.context_engineering_runtime import (
@@ -26,6 +29,15 @@ from agent.runtime_contract_registry import (
     required_runtime_contract_ids,
 )
 from agent.runtime_schema_memory import merge_schema_sources
+from agent.runtime_driver_state import (
+    RUNTIME_WORK_PACKET_PAYLOAD_KEY,
+    RuntimeWorkPacket,
+    new_runtime_work_packet,
+    reduce_runtime_tool_result,
+    runtime_phase_from_work,
+    runtime_phase_work,
+    runtime_work_packet_from_dict,
+)
 from agent.runtime_progress import emit_model_progress
 from utils import logger
 from utils.token_budget import estimate_messages_tokens, estimate_text_tokens
@@ -397,6 +409,9 @@ def build_short_term_memory_catalog(memory) -> list[dict]:
         ),
         'probe_fact_ledger': (
             WorkingMemoryKind.PROBE_OBSERVATION, 'probe:fact-ledger', ('probe',),
+        ),
+        'runtime_work_packet': (
+            WorkingMemoryKind.RUNTIME_CONTROL, 'control:runtime-work-packet', ('runtime',),
         ),
     }
     for key, value in memory.items():
@@ -817,9 +832,14 @@ def _resolve_work_view(messages):
                 payload.get('error_type') in {
                     'probe_closed_for_formal_implementation',
                     'duplicate_probe_request',
+                    'probe_not_authorized_for_current_phase',
                 }
                 or (payload.get('diagnostics') or {}).get('violated_contract')
-                in {'probe_closed_for_formal_implementation', 'duplicate_probe_request'}
+                in {
+                    'probe_closed_for_formal_implementation',
+                    'duplicate_probe_request',
+                    'probe_not_authorized_for_current_phase',
+                }
             ):
                 # A stale provider call was blocked at the tool boundary. It
                 # must not reopen Probe or replace the current implementation
@@ -871,6 +891,7 @@ def _resolve_prompt_material_scope(
     *,
     work: str,
     material_plan: dict,
+    packet: RuntimeWorkPacket | None = None,
 ) -> tuple[list[int], dict[str, list[str]]]:
     """Build the compact schema projection for the next model request.
 
@@ -878,7 +899,14 @@ def _resolve_prompt_material_scope(
     return restores its parent's scope; it must not leave implementation with
     the Probe's smaller field set. Unopened planned fields remain an index.
     """
-    datasource_ids, fields = resolve_work_material_scope(messages)
+    if packet is not None and not packet.workspace_id.startswith('legacy:'):
+        datasource_ids = list(packet.active_datasource_ids)
+        fields = {
+            str(key): list(values)
+            for key, values in packet.active_fields_by_datasource.items()
+        }
+    else:
+        datasource_ids, fields = resolve_work_material_scope(messages)
     if not material_plan or work not in {'probe', 'probe_repair', 'implement', 'repair'}:
         return datasource_ids, fields
 
@@ -1762,6 +1790,10 @@ def collect_runtime_facts(messages):
         if payload is None:
             projected.append(original)
             continue
+        # The work packet travels in the lossless transcript so the outer
+        # invocation loop can persist it. It is control-plane state, not an
+        # observation for the model.
+        payload.pop(RUNTIME_WORK_PACKET_PAYLOAD_KEY, None)
         owner = call_names.get(str(getattr(original, 'tool_call_id', '') or ''))
         snapshots = payload.get('query_snapshots')
         refs = {}
@@ -1890,13 +1922,102 @@ def _base_system_parts(request, messages) -> list[str]:
     return parts
 
 
+def _ensure_runtime_work_packet(context, messages) -> RuntimeWorkPacket:
+    """Return the active packet, bootstrapping only legacy in-flight graphs."""
+    packet = runtime_work_packet_from_dict(
+        getattr(context, 'runtime_work_packet', None)
+    )
+    if packet is not None and not packet.workspace_id.startswith('legacy:'):
+        return packet
+    work, focus, _, material_plan = resolve_effective_work(messages)
+    if packet is None:
+        packet = new_runtime_work_packet(
+            workspace_id='legacy:' + uuid.uuid4().hex,
+            focus=focus or getattr(context, 'user_query', ''),
+        )
+    packet = replace(
+        packet,
+        phase=runtime_phase_from_work(work),
+        focus=focus or packet.focus,
+        material_manifest=dict(material_plan or {}),
+        reason='legacy_transcript_bootstrap',
+    )
+    context.runtime_work_packet = packet.to_dict()
+    return packet
+
+
+def _command_tool_message(result: Command) -> ToolMessage | None:
+    update = result.update if isinstance(result.update, dict) else {}
+    for message in reversed(list(update.get('messages') or [])):
+        if isinstance(message, ToolMessage):
+            return message
+    return None
+
+
+def _tool_result_payload(result) -> dict:
+    message = result if isinstance(result, ToolMessage) else (
+        _command_tool_message(result) if isinstance(result, Command) else None
+    )
+    return _payload(message) or {}
+
+
+def _attach_runtime_work_packet(result, packet: RuntimeWorkPacket):
+    """Attach internal state for outer-round persistence, not model context."""
+    packet_payload = packet.to_dict()
+
+    def attach(message: ToolMessage) -> ToolMessage:
+        payload = _payload(message)
+        if payload is None:
+            return message
+        payload[RUNTIME_WORK_PACKET_PAYLOAD_KEY] = packet_payload
+        return message.model_copy(update={
+            'content': json.dumps(payload, ensure_ascii=False),
+        })
+
+    if isinstance(result, ToolMessage):
+        return attach(result)
+    if not isinstance(result, Command) or not isinstance(result.update, dict):
+        return result
+    update = dict(result.update)
+    messages = list(update.get('messages') or [])
+    for index in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[index], ToolMessage):
+            messages[index] = attach(messages[index])
+            break
+    update['messages'] = messages
+    return replace(result, update=update)
+
+
+def _reduce_runtime_tool_call(request: ToolCallRequest, result):
+    context = request.runtime.context
+    state = request.state if isinstance(request.state, dict) else {}
+    packet = _ensure_runtime_work_packet(context, state.get('messages') or [])
+    payload = _tool_result_payload(result)
+    update = result.update if isinstance(result, Command) and isinstance(result.update, dict) else {}
+    next_packet = reduce_runtime_tool_result(
+        packet,
+        tool_name=str(request.tool_call.get('name') or ''),
+        tool_call_id=str(request.tool_call.get('id') or ''),
+        arguments=request.tool_call.get('args') or {},
+        result=payload,
+        analysis_complete=bool(update.get('analysis_complete')),
+    )
+    context.runtime_work_packet = next_packet.to_dict()
+    return _attach_runtime_work_packet(result, next_packet)
+
+
 def build_working_request(request):
     context = request.runtime.context
-    work, focus, references, material_plan = resolve_effective_work(request.messages)
+    packet = _ensure_runtime_work_packet(context, request.messages)
+    _, legacy_focus, references, legacy_material_plan = resolve_effective_work(request.messages)
+    work = runtime_phase_work(packet.phase)
+    focus = packet.focus or legacy_focus
+    material_plan = packet.material_manifest or legacy_material_plan
     material_datasource_ids, material_fields = _resolve_prompt_material_scope(
         request.messages,
         work=work,
         material_plan=material_plan,
+        packet=packet,
     )
     contract_ids = work_contracts(context, work, references)
     message_memory = build_working_memory_index(request.messages)
@@ -1916,6 +2037,23 @@ def build_working_request(request):
             material_datasource_ids,
             material_fields,
         )
+    )
+    execution_schema_sources = (
+        (getattr(context, 'execution_datasource_snapshot', {}) or {}).get(
+            'selected_datasource_snapshot', []
+        )
+    )
+    schema_scope_available = (
+        work in {'probe', 'probe_repair', 'implement', 'repair'}
+        and runtime_schema_workspace_covers_material_scope(
+            merge_schema_sources(execution_schema_sources, schema_detail_workspace),
+            material_datasource_ids,
+            material_fields,
+        )
+    )
+    schema_loaded_from_reader = bool(canonical_schema_covered)
+    schema_loaded_from_snapshot = bool(
+        schema_scope_available and not schema_loaded_from_reader
     )
     messages, archived = project_history(
         fact_messages,
@@ -1947,18 +2085,31 @@ def build_working_request(request):
     exact_schema_required = bool(
         material_plan
         and work in {'probe', 'probe_repair', 'implement', 'repair'}
-        and not canonical_schema_covered
+        and not schema_scope_available
     )
-    work_schema_instruction = (
-        '\n当前材料计划的 Schema 明细尚未完整加载；已读取的字段定义仍然有效。'
-        '在生成 Probe 或正式代码前，调用 read_runtime_datasource_context 补充当前焦点缺少的数据源和字段明细；'
-        '读取结果才是字段类型、格式、枚举、关系和业务描述的依据。'
-        if exact_schema_required else
-        '\n本轮已经通过 read_runtime_datasource_context 获取了当前工作所需的精确 Schema；'
-        '后续只使用该读取结果，不要重复展开全部来源，也不要猜测未读取字段。'
-        if material_plan and work in {'probe', 'probe_repair', 'implement', 'repair'} and not material_fields else
-        '\n当前已加载本工作声明的精确 Schema。若发现新的字段或关系依赖，读取该精确明细后再继续，不要猜测字段语义。'
-    )
+    if exact_schema_required:
+        work_schema_instruction = (
+            '\n当前材料计划的 Schema 明细尚未完整加载；已读取的字段定义仍然有效。'
+            '在生成 Probe 或正式代码前，调用 read_runtime_datasource_context 补充当前焦点缺少的数据源和字段明细；'
+            '读取结果才是字段类型、格式、枚举、关系和业务描述的依据。'
+        )
+    elif schema_loaded_from_reader:
+        work_schema_instruction = (
+            '\n当前工作所需的精确 Schema 已由 read_runtime_datasource_context 读取并纳入工作视图；'
+            '后续只使用该读取结果，不要重复展开全部来源，也不要猜测未读取字段。'
+        )
+    elif schema_loaded_from_snapshot:
+        work_schema_instruction = (
+            '\n当前工作所需的精确 Schema 已由权威数据源快照纳入工作视图；'
+            '后续直接使用该快照中的字段定义，不要重复展开全部来源，也不要猜测未读取字段。'
+        )
+    elif material_plan and work in {'probe', 'probe_repair', 'implement', 'repair'} and not material_fields:
+        work_schema_instruction = (
+            '\n当前已加载本工作声明的精确 Schema。若发现新的字段或关系依赖，'
+            '读取该精确明细后再继续，不要猜测字段语义。'
+        )
+    else:
+        work_schema_instruction = ''
     current = SystemMessage(
         '<runtime-working-context>\n'
         + json.dumps({
@@ -1968,6 +2119,9 @@ def build_working_request(request):
             'runtime_material_plan': material_plan,
             'material_datasource_ids': material_datasource_ids if work in {'probe', 'probe_repair', 'implement', 'repair'} else [],
             'material_fields_by_datasource': material_fields if work in {'probe', 'probe_repair', 'implement', 'repair'} else {},
+            'pending_review_patch': (
+                packet.pending_review_patch if work == 'repair' and packet.pending_review_patch else {}
+            ),
         }, ensure_ascii=False)
         + ('\n理解阶段先选择 plan。计划阶段只组织业务事实、来源、字段和已确认关系，不定义指标、图表或报告。'
            '计划产物是后续 Probe、正式实现和修复共同复用的材料范围，不改变完整分析范围。'
@@ -1978,7 +2132,10 @@ def build_working_request(request):
            work_schema_instruction)
         + ('每次 Probe 完成后必须先基于事实账本重新选择下一项工作；只有新的、未被账本覆盖的技术未知才选择 Probe。'
            if work == 'understand' and probe_facts else '')
-        + '修复保持完整分析目标。若需要进一步探测，可以切换回 probe；探测完成不自动代表全部未知已解决。'
+        + ('当前 Review 已授权局部源码修订；必须以 pending_review_patch.base_execution_id 和 allowed_ranges '
+           '提交 patches，不能重写完整程序。'
+           if work == 'repair' and packet.pending_review_patch else
+           '修复保持完整分析目标。若需要进一步探测，可以切换回 probe；探测完成不自动代表全部未知已解决。')
         + '\n' + load_runtime_work_contract_text(
             contract_ids, work=work, output_format=context.output_contract.get('type', 'standard'),
             example_contract_ids=references)
@@ -2081,8 +2238,8 @@ def build_working_request(request):
         for item in tools
         if getattr(item, 'args_schema', None) is not None
     )
-    logger.info('Runtime work view state=%s contracts=%s memory=%s archived_code=%s raw_tokens=%s view_tokens=%s components=%s',
-                work, list(contract_ids), memory_counts, archived,
+    logger.info('Runtime work view state=%s packet_revision=%s packet_reason=%s contracts=%s memory=%s archived_code=%s raw_tokens=%s view_tokens=%s components=%s',
+                work, packet.revision, packet.reason, list(contract_ids), memory_counts, archived,
                 estimate_work_messages([*([request.system_message] if request.system_message else []), *request.messages]),
                 estimate_work_messages([*([system] if system else []), *messages]),
                 {
@@ -2096,28 +2253,54 @@ def build_working_request(request):
 
 
 class RuntimeWorkingContextMiddleware(AgentMiddleware):
+    @staticmethod
+    def _log_model_turn(work: str, started_at: float, result) -> None:
+        tool_calls = list(getattr(result, 'tool_calls', None) or [])
+        content = getattr(result, 'content', '')
+        logger.info(
+            'Runtime model turn completed: work=%s elapsed_seconds=%.3f output_chars=%s tool_calls=%s',
+            work,
+            time.perf_counter() - started_at,
+            len(str(content or '')),
+            [str(call.get('name') or '') for call in tool_calls if isinstance(call, dict)],
+        )
+
     def wrap_model_call(self, request, handler):
         activity = 'model:' + uuid.uuid4().hex
         projected = build_working_request(request)
-        work = resolve_effective_work(request.messages)[0]
+        work = runtime_phase_work(
+            _ensure_runtime_work_packet(request.runtime.context, request.messages).phase
+        )
         emit_model_progress(activity, work, 'running')
+        started_at = time.perf_counter()
         try:
             result = handler(projected)
         except Exception:
             emit_model_progress(activity, work, 'failed')
             raise
+        self._log_model_turn(work, started_at, result)
         emit_model_progress(activity, work, 'completed')
         return result
 
     async def awrap_model_call(self, request, handler):
         activity = 'model:' + uuid.uuid4().hex
         projected = build_working_request(request)
-        work = resolve_effective_work(request.messages)[0]
+        work = runtime_phase_work(
+            _ensure_runtime_work_packet(request.runtime.context, request.messages).phase
+        )
         emit_model_progress(activity, work, 'running')
+        started_at = time.perf_counter()
         try:
             result = await handler(projected)
         except Exception:
             emit_model_progress(activity, work, 'failed')
             raise
+        self._log_model_turn(work, started_at, result)
         emit_model_progress(activity, work, 'completed')
         return result
+
+    def wrap_tool_call(self, request, handler):
+        return _reduce_runtime_tool_call(request, handler(request))
+
+    async def awrap_tool_call(self, request, handler):
+        return _reduce_runtime_tool_call(request, await handler(request))

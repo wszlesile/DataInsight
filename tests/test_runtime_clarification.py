@@ -9,6 +9,13 @@ from langgraph.graph import END
 
 from agent import invoker
 from agent.context_engineering_runtime import CustomContext
+from agent.runtime_driver_state import (
+    RUNTIME_WORK_PACKET_MEMORY_KEY,
+    RUNTIME_WORK_PACKET_PAYLOAD_KEY,
+    new_runtime_work_packet,
+    reduce_runtime_tool_result,
+    runtime_work_packet_from_dict,
+)
 from agent.tools import (
     _build_analysis_clarification_payload,
     request_analysis_clarification,
@@ -390,7 +397,17 @@ def test_canonical_clarification_facts_preserve_all_items_and_raw_fields():
 
 
 def test_clarification_resume_context_keeps_probe_observations(monkeypatch):
-    runtime = SimpleNamespace(context_mode="fresh_analysis")
+    waiting = reduce_runtime_tool_result(
+        new_runtime_work_packet(workspace_id='66:99:7', focus='Analyze quality'),
+        tool_name='request_analysis_clarification',
+        tool_call_id='clarify',
+        arguments={},
+        result={'status': 'clarification_required'},
+    )
+    runtime = SimpleNamespace(
+        context_mode="fresh_analysis",
+        short_term_memory={RUNTIME_WORK_PACKET_MEMORY_KEY: waiting.to_dict()},
+    )
     executions = [
         SimpleNamespace(
             execution_status="failed",
@@ -415,8 +432,26 @@ def test_clarification_resume_context_keeps_probe_observations(monkeypatch):
 
     assert len(context["probe_observations"]) == 1
     assert context["probe_observations"][0]["retry_type"] == "probe_feedback"
+    assert context[RUNTIME_WORK_PACKET_MEMORY_KEY] == waiting.to_dict()
     instruction = invoker._build_resumed_probe_observation_instruction(context)
     assert "quality_status_candidates" in instruction
+
+
+def test_tool_payload_persists_runtime_work_packet_without_changing_existing_memory():
+    runtime = SimpleNamespace(short_term_memory={'probe_fact_ledger': [{'fact_id': 'f1'}]})
+    packet = new_runtime_work_packet(workspace_id='66:99:7', focus='Analyze quality')
+
+    invoker._update_short_term_memory_from_tool_payload(runtime, {
+        'tool': 'select_runtime_work',
+        'status': 'success',
+        RUNTIME_WORK_PACKET_PAYLOAD_KEY: packet.to_dict(),
+    })
+
+    restored = runtime_work_packet_from_dict(
+        runtime.short_term_memory[RUNTIME_WORK_PACKET_MEMORY_KEY]
+    )
+    assert restored == packet
+    assert runtime.short_term_memory['probe_fact_ledger'] == [{'fact_id': 'f1'}]
 
 
 def test_resume_restores_tool_calls_and_accepts_a_second_clarification(monkeypatch):

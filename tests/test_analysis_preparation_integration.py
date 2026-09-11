@@ -4,6 +4,11 @@ import pytest
 from langchain_core.messages import AIMessage
 
 import agent.invoker as invoker
+from agent.runtime_driver_state import (
+    RUNTIME_WORK_PACKET_MEMORY_KEY,
+    RuntimePhase,
+    runtime_work_packet_from_dict,
+)
 from agent.analysis_preparation import (
     BusinessFactCoverageContract,
     BusinessFactRequirementContract,
@@ -107,6 +112,10 @@ def test_formal_context_uses_prepared_snapshot_without_mutating_conversation_sna
     assert context.active_datasource_snapshot["selected_datasource_ids"] == [11]
     assert context.execution_datasource_snapshot["selected_datasource_ids"] == [11, 12]
     assert runtime.active_datasource_snapshot["selected_datasource_ids"] == [11, 12]
+    packet = runtime_work_packet_from_dict(context.runtime_work_packet)
+    assert packet is not None
+    assert packet.phase is RuntimePhase.UNDERSTAND
+    assert runtime.short_term_memory[RUNTIME_WORK_PACKET_MEMORY_KEY] == context.runtime_work_packet
 
 
 def test_preparation_failure_preserves_original_datasource_context(monkeypatch):

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from agent.invoker import _get_latest_failed_repair_target
 from agent.tools import (
+    AnalysisRevisionIssue,
     ExePythonCodeInput,
     SourceCodePatch,
     SourcePatchResolutionError,
@@ -13,11 +14,13 @@ from agent.tools import (
     _augment_missing_mapping_key_feedback,
     _build_generated_code_error_context,
     _extend_query_dependency_ranges,
+    _named_assignment_patch_range,
     _tool_error_message,
     _resolve_execute_python_source,
     _review_source_patch_range,
     _validate_generated_code_contract,
     execute_python,
+    request_analysis_revision,
 )
 
 
@@ -52,6 +55,75 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
         self.assertEqual((target['start_line'], target['end_line']), (1, 5))
         self.assertIn('"equipment": equipment_count', target['source'])
 
+    def test_review_anchor_resolves_rendered_f_string_to_owning_statement(self):
+        source = (
+            'manufacturer = "ABB"\n'
+            'count = 1\n'
+            'share = 10.0\n'
+            'report_lines.append(f"**{manufacturer}** 对应设备最多，为 **{count}** 台，占比 {share:.1f}%")\n'
+        )
+
+        target = _review_source_patch_range(
+            source,
+            '**ABB** 对应设备最多，为 **1** 台，占比 10.0%',
+        )
+
+        self.assertIsNotNone(target)
+        self.assertEqual((target['start_line'], target['end_line']), (4, 4))
+        self.assertIn('report_lines.append', target['source'])
+
+    def test_presentation_revision_can_target_complete_report_assignment_without_snippet(self):
+        source = (
+            'value = 1\n'
+            'analysis_report = f"""\n'
+            '## Summary\n'
+            'Value: {value}\n'
+            '"""\n'
+            'result = save_analysis_result(analysis_report=analysis_report)\n'
+        )
+
+        target = _named_assignment_patch_range(source, 'analysis_report')
+
+        self.assertEqual((target['start_line'], target['end_line']), (2, 5))
+        self.assertEqual(target['resolved_by'], 'named_output_assignment')
+        self.assertIn('Value: {value}', target['source'])
+
+    def test_presentation_review_without_anchor_uses_report_assignment_patch(self):
+        source = (
+            'value = 1\n'
+            'analysis_report = f"""## Summary\nValue: {value}\n"""\n'
+            'result = save_analysis_result(analysis_report=analysis_report)\n'
+        )
+        candidate = SimpleNamespace(id=17, generated_code=source)
+        runtime = SimpleNamespace(
+            context=SimpleNamespace(conversation_id=1, turn_id=2),
+            tool_call_id='review-patch',
+        )
+        with (
+            patch('agent.tools._get_stream_emitter', return_value=MagicMock()),
+            patch('agent.tools._latest_successful_review_execution', return_value=candidate),
+            patch('agent.tools._persist_review_revision_target') as persist_target,
+        ):
+            message = request_analysis_revision.func(
+                runtime=runtime,
+                issues=[AnalysisRevisionIssue(
+                    issue_type='presentation',
+                    description='Summary wording overstates the comparison.',
+                    required_correction='State the verified comparison only.',
+                    change_scope='presentation',
+                )],
+            )
+
+        payload = json.loads(message.content)
+        packet = payload['revision_work_packet']
+        self.assertTrue(packet['patch_mode_allowed'])
+        self.assertFalse(packet['full_program_revision_required'])
+        self.assertEqual(
+            [(item['start_line'], item['end_line']) for item in packet['allowed_ranges']],
+            [(2, 4)],
+        )
+        persist_target.assert_called_once()
+
     def test_review_patch_uses_latest_authorized_successful_candidate(self):
         source = 'value = 1\nreport = f"value={value}"\n'
         base = SimpleNamespace(
@@ -85,6 +157,47 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
 
         self.assertEqual(repaired, 'value = 1\nreport = f"corrected={value}"\n')
         self.assertEqual(ids, [3, 4])
+        self.assertEqual(parent, 17)
+        self.assertEqual(kind, 'llm_review_patch')
+
+    def test_review_patch_keeps_successful_baseline_after_a_failed_revision_attempt(self):
+        source = 'value = 1\nreport = f"value={value}"\n'
+        base = SimpleNamespace(
+            id=17,
+            execution_status='success',
+            generated_code=source,
+            used_datasource_ids_json='[3]',
+            result_payload_json=json.dumps({'review_revision_target': {
+                'mode': 'review_line_patch',
+                'base_execution_id': 17,
+                'base_source_sha256': __import__('hashlib').sha256(source.strip().encode()).hexdigest(),
+                'allowed_ranges': [{'start_line': 2, 'end_line': 2}],
+            }}),
+        )
+        session = MagicMock()
+        base_query = session.query.return_value.filter.return_value
+        base_query.first.return_value = base
+        successful_query = base_query.order_by.return_value
+        successful_query.first.return_value = base
+
+        with patch('config.database.SessionLocal', return_value=session):
+            repaired, ids, parent, kind = _resolve_execute_python_source(
+                conversation_id=1,
+                turn_id=2,
+                code='',
+                used_datasource_ids=[],
+                base_execution_id=17,
+                patches=[SourceCodePatch(
+                    start_line=2,
+                    end_line=2,
+                    replacement='report = f"corrected={value}"',
+                )],
+            )
+
+        latest_success_filters = session.query.return_value.filter.call_args_list[-1].args
+        self.assertTrue(any('execution_status' in str(item) for item in latest_success_filters))
+        self.assertEqual(repaired, 'value = 1\nreport = f"corrected={value}"\n')
+        self.assertEqual(ids, [3])
         self.assertEqual(parent, 17)
         self.assertEqual(kind, 'llm_review_patch')
 

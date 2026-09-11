@@ -1,5 +1,6 @@
 import copy
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -7,6 +8,13 @@ from langchain.agents.middleware import ModelRequest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from agent.context_engineering_runtime import CustomContext
+from agent.runtime_driver_state import (
+    RUNTIME_WORK_PACKET_PAYLOAD_KEY,
+    RuntimePhase,
+    RuntimeWorkPacket,
+    new_runtime_work_packet,
+    runtime_work_packet_from_dict,
+)
 from agent.runtime_working_context import (
     WorkingMemoryKind,
     build_context_memory_items,
@@ -66,6 +74,37 @@ def test_initial_work_selector_cannot_enter_an_execution_state():
     for work in ('probe', 'implement'):
         with pytest.raises(ValidationError):
             RuntimeWorkInput.model_validate({'work': work, 'focus': 'Bypass material planning'})
+
+
+def test_explicit_work_packet_is_authoritative_over_stale_transcript_control():
+    packet = new_runtime_work_packet(workspace_id='1:2:3', focus='Current repair')
+    packet = packet.__class__(**{
+        **packet.to_dict(),
+        'phase': RuntimePhase.REPAIR,
+        'reason': 'formal_program_requires_repair',
+    })
+    messages = [
+        call('select_runtime_work', 'old-select', work='probe', focus='Stale probe'),
+        answer('old-select', tool='select_runtime_work', status='success', work='probe'),
+    ]
+    request = ModelRequest(
+        model=None,
+        messages=messages,
+        runtime=SimpleNamespace(context=CustomContext(
+            username='test', runtime_work_packet=packet.to_dict(),
+        )),
+        tools=[SimpleNamespace(name=name) for name in (
+            'probe_analysis_data', 'submit_analysis_program', 'request_runtime_probe',
+        )],
+    )
+
+    result = build_working_request(request)
+
+    assert '"work": "repair"' in result.system_message.content
+    assert RUNTIME_WORK_PACKET_PAYLOAD_KEY not in result.system_message.content
+    assert {tool.name for tool in result.tools} == {
+        'submit_analysis_program', 'request_runtime_probe',
+    }
 
 
 def test_probe_request_has_one_explicit_transition_and_normalizes_scope():
@@ -268,6 +307,40 @@ def test_new_probe_dependency_can_be_selected_without_first_failing_formal_code(
         material_plan=resolve_runtime_material_plan(messages)) == expected
 
 
+def test_probe_execution_boundary_prefers_explicit_work_packet_over_stale_history():
+    from agent.runtime_driver_state import RuntimePhase, RuntimeWorkPacket
+    from agent.tools import _runtime_probe_is_closed
+
+    messages = [
+        call('probe_analysis_data', 'old-probe', code='observe dates'),
+        answer('old-probe', status='success', diagnostics={
+            'probe_fact_ledger': {'observations': [{'query_key': 'dates'}]},
+        }),
+    ]
+    context = CustomContext(
+        username='test',
+        runtime_work_packet=RuntimeWorkPacket(
+            workspace_id='active-work',
+            revision=4,
+            phase=RuntimePhase.PROBE,
+            focus='Resolve a newly discovered enum',
+            probe_revision=1,
+        ).to_dict(),
+    )
+    runtime = SimpleNamespace(context=context, state={'messages': messages})
+
+    assert not _runtime_probe_is_closed(runtime)
+
+    context.runtime_work_packet = RuntimeWorkPacket(
+        workspace_id='active-work',
+        revision=5,
+        phase=RuntimePhase.IMPLEMENT,
+        focus='Build the report',
+        probe_revision=2,
+    ).to_dict()
+    assert _runtime_probe_is_closed(runtime)
+
+
 def test_first_implementation_sees_completed_probe_pair_until_formal_execution_takes_over():
     messages = [call('probe_analysis_data', 'probe', code='observe()'),
                 answer('probe', status='success', diagnostics={'probe_fact_ledger': {'observations': []}})]
@@ -375,13 +448,24 @@ def test_stale_probe_call_is_rejected_at_tool_boundary():
             'probe_fact_ledger': {'observations': [{'query_key': 'values'}]},
         }),
     ]
-    runtime = SimpleNamespace(state={'messages': messages}, tool_call_id='stale')
+    from agent.runtime_driver_state import RuntimePhase, new_runtime_work_packet
+
+    packet = replace(
+        new_runtime_work_packet(workspace_id='w', focus='Build the report'),
+        phase=RuntimePhase.IMPLEMENT,
+        probe_revision=1,
+        probe_ledgers=({'observations': [{'query_key': 'values'}]},),
+    )
+    runtime = SimpleNamespace(
+        state={'messages': messages}, tool_call_id='stale',
+        context=SimpleNamespace(runtime_work_packet=packet.to_dict()),
+    )
 
     result = probe_analysis_data.func(runtime=runtime, code='probe values')
     payload = json.loads(result.content)
 
-    assert payload['error_type'] == 'duplicate_probe_request'
-    assert payload['diagnostics']['violated_contract'] == 'duplicate_probe_request'
+    assert payload['error_type'] == 'probe_not_authorized_for_current_phase'
+    assert payload['diagnostics']['violated_contract'] == 'probe_not_authorized_for_current_phase'
     assert resolve_work([
         *messages, call('probe_analysis_data', 'stale', code='probe values'), result,
     ])[:2] == ('implement', 'Build the report')
@@ -399,7 +483,7 @@ def test_stale_probe_call_is_rejected_at_tool_boundary():
 
 
 def test_distinct_probe_can_extend_a_completed_probe_observation():
-    """A new technical unknown may be probed without discarding prior facts."""
+    """An explicitly requested new unknown may extend prior Probe facts."""
     from agent.tools import probe_analysis_data
 
     messages = [
@@ -407,27 +491,20 @@ def test_distinct_probe_can_extend_a_completed_probe_observation():
         answer('probe', status='observation', diagnostics={
             'probe_fact_ledger': {'observations': [{'query_key': 'dates'}]},
         }),
+        call('request_runtime_probe', 'request-probe', focus='Observe category encoding'),
+        answer('request-probe', tool='request_runtime_probe', status='success',
+               work='probe', focus='Observe category encoding'),
     ]
-    runtime = SimpleNamespace(state={'messages': messages}, tool_call_id='new-probe')
-
-    with patch('agent.tools.execute_python.func', return_value='executed') as execute:
-        result = probe_analysis_data.func(runtime=runtime, code='observe_categories()')
-
-    assert result == 'executed'
-    execute.assert_called_once()
-
-
-def test_distinct_probe_can_extend_a_completed_probe_observation():
-    """A new technical unknown may be probed without discarding prior facts."""
-    from agent.tools import probe_analysis_data
-
-    messages = [
-        call('probe_analysis_data', 'probe', code='observe_dates()'),
-        answer('probe', status='observation', diagnostics={
-            'probe_fact_ledger': {'observations': [{'query_key': 'dates'}]},
-        }),
-    ]
-    runtime = SimpleNamespace(state={'messages': messages}, tool_call_id='new-probe')
+    packet = replace(
+        new_runtime_work_packet(workspace_id='w', focus='Observe category encoding'),
+        phase=RuntimePhase.PROBE,
+        probe_revision=1,
+        probe_ledgers=({'observations': [{'query_key': 'dates'}]},),
+    )
+    runtime = SimpleNamespace(
+        state={'messages': messages}, tool_call_id='new-probe',
+        context=SimpleNamespace(runtime_work_packet=packet.to_dict()),
+    )
 
     with patch('agent.tools.execute_python.func', return_value='executed') as execute:
         result = probe_analysis_data.func(runtime=runtime, code='observe_categories()')
@@ -593,10 +670,11 @@ def test_implementation_schema_read_preserves_focus_and_delivers_exact_new_depen
                for message in after.messages)
     assert 'submit_analysis_program' in [tool.name for tool in after.tools]
     assert 'read_runtime_datasource_context' in [tool.name for tool in before.tools]
-    # Only currency was read; the planned amount definition is still missing.
+    # The planned amount is already available from the authoritative execution
+    # snapshot; the reader remains available for newly discovered fields.
     assert 'read_runtime_datasource_context' in [tool.name for tool in after.tools]
-    assert 'Schema 明细尚未完整加载' in after.system_message.content
-    assert '当前已加载本工作声明的精确 Schema' not in after.system_message.content
+    assert 'Schema 明细尚未完整加载' not in after.system_message.content
+    assert '已由权威数据源快照纳入工作视图' in after.system_message.content
     messages.extend([
         call('read_runtime_datasource_context', 'read-amount', datasource_ids=[12]),
         answer('read-amount', tool='read_runtime_datasource_context', status='success',
@@ -1632,6 +1710,15 @@ def test_working_request_replaces_initial_schema_envelope_with_selected_material
         runtime=SimpleNamespace(context=CustomContext(
             username='test', active_datasource_snapshot=active,
             execution_datasource_snapshot=copy.deepcopy(active),
+            runtime_work_packet=RuntimeWorkPacket(
+                workspace_id='material-view',
+                revision=3,
+                phase=RuntimePhase.IMPLEMENT,
+                focus='Compute amount',
+                active_datasource_ids=(12,),
+                active_fields_by_datasource={'12': ('amount',)},
+                reason='material_plan_ready',
+            ).to_dict(),
         )),
         tools=[SimpleNamespace(name=name) for name in ('select_runtime_work', 'submit_analysis_program')],
     )
@@ -1703,15 +1790,24 @@ def test_actual_agent_loop_changes_tools_and_material_before_code_generation():
                                            submit_analysis_program, read_runtime_datasource_context,
                                            probe_analysis_data],
                          context_schema=CustomContext, middleware=[RuntimeWorkingContextMiddleware()])
-    result = graph.invoke({'messages': [HumanMessage('Analyze equipment')]},
-                          context=CustomContext(username='test', execution_datasource_snapshot={
-                              'selected_datasource_snapshot': [{
-                                  'datasource_id': 1,
-                                  'metadata_schema': {'properties': {
-                                      'state': {'type': 'string', 'description': 'Equipment state enum: running, stopped.'},
-                                  }},
-                              }],
-                          }))
+    context = CustomContext(
+        username='test',
+        runtime_work_packet=new_runtime_work_packet(
+            workspace_id='actual-agent-loop', focus='Analyze equipment',
+        ).to_dict(),
+        execution_datasource_snapshot={
+            'selected_datasource_snapshot': [{
+                'datasource_id': 1,
+                'metadata_schema': {'properties': {
+                    'state': {'type': 'string', 'description': 'Equipment state enum: running, stopped.'},
+                }},
+            }],
+        },
+    )
+    result = graph.invoke(
+        {'messages': [HumanMessage('Analyze equipment')]},
+        context=context,
+    )
     assert model.bound[0] == ['select_runtime_work']
     assert model.bound[1] == ['plan_runtime_materials', 'read_runtime_datasource_context']
     assert 'submit_analysis_program' in model.bound[2]
@@ -1734,6 +1830,19 @@ def test_actual_agent_loop_changes_tools_and_material_before_code_generation():
     assert 'build_chart_result' in '\n'.join(str(m.content) for m in model.seen[2])
     assert len(result['messages']) == 14
     assert all('runtime-working-context' not in str(m.content) for m in result['messages'])
+    assert all(
+        RUNTIME_WORK_PACKET_PAYLOAD_KEY not in str(message.content)
+        for request_messages in model.seen
+        for message in request_messages
+    )
+    assert any(
+        RUNTIME_WORK_PACKET_PAYLOAD_KEY in str(message.content)
+        for message in result['messages'] if isinstance(message, ToolMessage)
+    )
+    packet = runtime_work_packet_from_dict(context.runtime_work_packet)
+    assert packet is not None
+    assert packet.phase is RuntimePhase.COMPLETED
+    assert packet.active_program_call_id == 'execute'
 
 
 def test_query_facts_deduplicate_identical_snapshots_not_changed_scope():

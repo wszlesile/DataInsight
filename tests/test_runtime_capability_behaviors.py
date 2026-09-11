@@ -312,6 +312,31 @@ def test_source_is_materialized_before_record_validation_and_patch_feedback(monk
     assert tools._bind_program_execution_mode(repaired, 'analysis') == repaired
 
 
+def test_review_patch_authorization_rejects_full_program_before_execution(monkeypatch):
+    monkeypatch.setattr(tools, '_raise_if_runtime_task_cancelled', lambda *a, **kw: None)
+    monkeypatch.setattr(tools, '_get_stream_emitter', lambda: lambda *a, **kw: None)
+    create = Mock()
+    monkeypatch.setattr(tools, '_create_execution_record', create)
+    runtime = SimpleNamespace(
+        context=SimpleNamespace(
+            conversation_id=1,
+            turn_id=2,
+            runtime_work_packet={
+                'workspace_id': 'w', 'revision': 1, 'phase': 'repair',
+                'pending_review_patch': {
+                    'base_execution_id': 17,
+                    'allowed_ranges': [{'start_line': 2, 'end_line': 2}],
+                },
+            },
+        ),
+        tool_call_id='review-patch',
+    )
+    message = tools.submit_analysis_program.func(runtime=runtime, code='value = 1')
+    payload = json.loads(message.content)
+    assert payload['diagnostics']['violated_contract'] == 'review_patch_required'
+    create.assert_not_called()
+
+
 def recorded_loader(frame):
     def load(sql, params=None, **kwargs):
         tools._mark_latest_query_snapshot_execution(

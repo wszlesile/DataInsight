@@ -38,6 +38,13 @@ from agent.analysis_preparation import (
 )
 from agent.context_engineering_runtime import classify_analysis_context_mode, is_analysis_like_request
 from agent.runtime_working_context import build_short_term_memory_catalog
+from agent.runtime_driver_state import (
+    RUNTIME_WORK_PACKET_MEMORY_KEY,
+    RUNTIME_WORK_PACKET_PAYLOAD_KEY,
+    new_runtime_work_packet,
+    resume_runtime_work_packet,
+    runtime_work_packet_from_dict,
+)
 from agent.runtime_schema_memory import merge_schema_sources
 from agent.intent_classifier import (
     PENDING_SCOPE_MEMORY_TYPE,
@@ -699,6 +706,20 @@ def _build_agent_context(
     if not isinstance(short_term_memory, dict):
         short_term_memory = {}
         runtime.short_term_memory = short_term_memory
+    workspace_id = ':'.join(str(value or 0) for value in (
+        getattr(runtime.conversation, 'id', 0),
+        getattr(runtime.turn, 'id', 0),
+        getattr(runtime, 'analysis_task_id', 0),
+    ))
+    runtime_work_packet = runtime_work_packet_from_dict(
+        short_term_memory.get(RUNTIME_WORK_PACKET_MEMORY_KEY)
+    )
+    if runtime_work_packet is None or runtime_work_packet.workspace_id != workspace_id:
+        runtime_work_packet = new_runtime_work_packet(
+            workspace_id=workspace_id,
+            focus=user_query,
+        )
+        short_term_memory[RUNTIME_WORK_PACKET_MEMORY_KEY] = runtime_work_packet.to_dict()
     return CustomContext(
         username=agent_request.username,
         namespace_id=runtime.conversation.insight_namespace_id,
@@ -747,6 +768,7 @@ def _build_agent_context(
             getattr(runtime, 'short_term_memory', {}).get(RUNTIME_SCHEMA_DETAIL_MEMORY_KEY, [])
             if isinstance(getattr(runtime, 'short_term_memory', {}), dict) else []
         ),
+        runtime_work_packet=runtime_work_packet.to_dict(),
     )
 
 
@@ -1032,6 +1054,19 @@ def _prepare_analysis_context(
     clarification_context = dict(
         getattr(agent_request, "clarification_context", None) or {}
     )
+    restored_packet = runtime_work_packet_from_dict(
+        clarification_context.get(RUNTIME_WORK_PACKET_MEMORY_KEY)
+    )
+    if restored_packet is not None:
+        runtime.short_term_memory[RUNTIME_WORK_PACKET_MEMORY_KEY] = (
+            resume_runtime_work_packet(
+                restored_packet,
+                focus=(
+                    getattr(runtime.turn, "user_query", "")
+                    or agent_request.user_message
+                ),
+            ).to_dict()
+        )
     resumed = PreparationResult.from_resume_payload(
         clarification_context.get("preparation")
     )
@@ -2868,6 +2903,10 @@ def _build_clarification_resume_context(
         "preparation": preparation.resume_payload() if preparation is not None else None,
         "context_mode": getattr(runtime, "context_mode", "") or "fresh_analysis",
         "probe_observations": probe_observations,
+        **(
+            {RUNTIME_WORK_PACKET_MEMORY_KEY: copy.deepcopy(memory[RUNTIME_WORK_PACKET_MEMORY_KEY])}
+            if isinstance(memory.get(RUNTIME_WORK_PACKET_MEMORY_KEY), dict) else {}
+        ),
         **({'react_messages': messages_to_dict(transcript)} if transcript else {}),
     }
 
@@ -2964,6 +3003,13 @@ def _ensure_explicit_time_range_guard_memory(
 def _update_short_term_memory_from_tool_payload(runtime: ConversationRunContext, payload: dict[str, Any]) -> None:
     if not isinstance(payload, dict):
         return
+    packet = runtime_work_packet_from_dict(payload.get(RUNTIME_WORK_PACKET_PAYLOAD_KEY))
+    if packet is not None:
+        memory = getattr(runtime, 'short_term_memory', None)
+        if not isinstance(memory, dict):
+            memory = {}
+            setattr(runtime, 'short_term_memory', memory)
+        memory[RUNTIME_WORK_PACKET_MEMORY_KEY] = packet.to_dict()
     tool_name = str(payload.get('tool') or '').strip()
     if tool_name == 'read_runtime_datasource_context':
         _update_runtime_schema_detail_workspace(runtime, payload)

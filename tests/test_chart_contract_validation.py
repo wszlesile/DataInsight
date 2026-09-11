@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
+from langgraph.graph import END
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -1978,6 +1979,7 @@ result = save_analysis_result(analysis_report="Pattern distribution.", charts=[c
 
         self.assertTrue(command.update["analysis_complete"])
         self.assertEqual(command.update, {"messages": [message], "analysis_complete": True})
+        self.assertEqual(command.goto, END)
 
     def test_review_claim_requires_qualification_for_descriptive_association(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires an explicit qualification"):

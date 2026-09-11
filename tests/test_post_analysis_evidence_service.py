@@ -4175,6 +4175,64 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     assert len({item["evidence_key"] for item in report_refs}) == 2
 
 
+def test_labelled_literal_record_rows_keep_independent_report_boundaries():
+    sql = "SELECT category, batch_id FROM quality_events"
+    code = r'''
+data = load_data_with_sql(sql="SELECT category, batch_id FROM quality_events")
+total_batches = data["batch_id"].nunique()
+candidate_rows = [
+    {
+        "candidate": "process",
+        "score": int((data["category"] == "process").sum()),
+        "share_pct": (data["category"] == "process").sum() / total_batches * 100,
+    },
+    {
+        "candidate": "equipment",
+        "score": int((data["category"] == "equipment").sum()),
+        "share_pct": (data["category"] == "equipment").sum() / total_batches * 100,
+    },
+]
+candidate_df = pd.DataFrame(candidate_rows).sort_values(
+    ["score", "share_pct"], ascending=False
+).reset_index(drop=True)
+report_lines = []
+for _, row in candidate_df.iterrows():
+    report_lines.append(
+        f"- {row['candidate']}: {int(row['score'])} batches ({row['share_pct']:.1f}%)."
+    )
+analysis_report = "\n".join(report_lines)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report=(
+            "- process: 2 batches (66.7%).\n"
+            "- equipment: 1 batches (33.3%)."
+        ),
+        query_snapshots={
+            "q_quality": _query_snapshot(sql, columns=["category", "batch_id"]),
+        },
+    )
+
+    def planner(_: dict) -> EvidencePlan:
+        raise AssertionError("locally proven labelled report rows must not call planner")
+
+    bundle = PostAnalysisEvidenceCompiler(planner=planner).compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    refs = sorted(bundle["report_trace_refs"], key=lambda item: item["start"])
+    assert [item["text"] for item in refs] == ["2", "66.7", "1", "33.3"]
+    assert len({item["evidence_key"] for item in refs}) == 4
+    definitions = {
+        item["evidence_key"]: item
+        for item in bundle["evidence_definitions"]
+    }
+    assert all(
+        definitions[item["evidence_key"]]["query_refs"] == ["q_quality"]
+        for item in refs
+    )
+
+
 def test_static_zero_result_branch_gets_query_backed_report_evidence():
     sql = "SELECT batch_id FROM batch_context"
     code = r'''
@@ -5322,6 +5380,81 @@ result = save_analysis_result(analysis_report="", charts=[], tables=[])
     assert all(operation["loads"] == ["rate"] for operation in operations)
 
 
+def test_source_locator_resolves_formatted_and_repeated_fstring_expressions():
+    code = '''data = load_data_with_sql(sql="SELECT material_lot_id FROM material_flow")
+total_movements = len(data)
+distinct_lots = data["material_lot_id"].nunique()
+lot_reuse = 1 - (distinct_lots / total_movements) if total_movements else 0
+concentrated_batches = set(data[data["material_lot_id"].duplicated()]["material_lot_id"])
+analysis_report = f"Lot reuse {lot_reuse * 100:.1f}%; concentrated {len(concentrated_batches)} lots ({len(concentrated_batches)}/{total_movements})."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Lot reuse 25.0%; concentrated 2 lots (2/8).",
+        query_snapshots={
+            "q_material": _query_snapshot(
+                "SELECT material_lot_id FROM material_flow",
+                columns=["material_lot_id"],
+            ),
+        },
+    )
+    lineage = LineageIndexer().build(snapshot)
+
+    operation_ids, errors = PostAnalysisEvidenceCompiler._resolve_calculation_source_refs(
+        code,
+        lineage,
+        [
+            CalculationSourceRef(source_line=6, expression="lot_reuse * 100:.1f"),
+            CalculationSourceRef(source_line=6, expression="len(concentrated_batches)"),
+        ],
+    )
+
+    assert errors == []
+    assert len(operation_ids) == 2
+    operations = {
+        item["operation_node_id"]: item
+        for item in lineage["operation_nodes"]
+        if item["operation_node_id"] in operation_ids
+    }
+    assert {item["source"] for item in operations.values()} == {
+        "lot_reuse * 100",
+        "len(concentrated_batches)",
+    }
+
+
+def test_runtime_report_text_keeps_a_local_fstring_metric_boundary():
+    code = '''data = load_data_with_sql(sql="SELECT material_lot_id FROM material_flow")
+total = len(data)
+lot_reuse = 1 / total if total else 0
+records = [{"candidate": "Material", "detail": f"Lot reuse {lot_reuse * 100:.1f}%"}]
+report_lines = []
+for row in records:
+    report_lines.append(f"- {row['candidate']}: {row['detail']}")
+analysis_report = "\\n".join(report_lines)
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="- Material: Lot reuse 25.0%",
+        query_snapshots={
+            "q_material": _query_snapshot(
+                "SELECT material_lot_id FROM material_flow",
+                columns=["material_lot_id"],
+            ),
+        },
+    )
+    lineage = LineageIndexer().build(snapshot)
+    output = next(
+        item for item in lineage["output_nodes"]
+        if item.get("artifact_type") == "report"
+    )
+
+    assert output["posthoc_report_candidate"] is True
+    assert len(output["boundary_operation_node_ids"]) == 1
+    assert output["candidate_query_node_ids"] == ["q_material"]
+
+
 def test_source_locator_prefers_exact_expression_over_nearby_same_target():
     code = '''data = load_data_with_sql(sql="SELECT amount FROM sales")
 value = data["amount"].sum()
@@ -5460,6 +5593,39 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
 
     assert bundle["status"] == "complete", bundle["diagnostics"]
     assert [item["text"] for item in bundle["report_trace_refs"]] == ["1280.50"]
+
+
+def test_grouped_report_formula_remains_local_evidence_metric():
+    sql = "SELECT device_type FROM devices"
+    code = '''
+data = load_data_with_sql(sql="SELECT device_type FROM devices")
+total = len(data)
+type_dist = data["device_type"].value_counts().reset_index()
+type_dist.columns = ["device_type", "count"]
+type_dist["share"] = type_dist["count"] / total * 100
+processing_share = type_dist.loc[
+    type_dist["device_type"] == "processing", "share"
+].values[0]
+analysis_report = f"Processing equipment share: {processing_share:.1f}%."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Processing equipment share: 30.0%.",
+        query_snapshots={
+            "q_devices": _query_snapshot(sql, columns=["device_type"])
+        },
+    )
+
+    def planner(_payload: dict) -> EvidencePlan:
+        raise AssertionError("locally proven grouped report formula reached planner")
+
+    compiler = PostAnalysisEvidenceCompiler(planner=planner)
+    compiler._uses_default_planner = True
+    bundle = compiler.compile(snapshot)
+
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    assert [item["text"] for item in bundle["report_trace_refs"]] == ["30.0"]
 
 
 def test_report_mapping_member_keeps_its_own_calculation_container():
