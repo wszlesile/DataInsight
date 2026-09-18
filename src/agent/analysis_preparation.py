@@ -4490,6 +4490,24 @@ class AnalysisPreparationWorkflow:
     ) -> AnalysisPreparationState:
         self._start_stage("business_context")
         selection = state["selection"]
+        # A workflow request with one explicitly supplied source has neither
+        # source discovery nor cross-source lineage left to resolve. Keep the
+        # canonical Schema available to Runtime instead of manufacturing a
+        # business-context result purely to satisfy the normal path.
+        if (
+            bool(self.execution_context.get("exact_datasource_scope"))
+            and len(selection.selected_datasource_ids) == 1
+        ):
+            contract = self._fallback_business_context(selection)
+            return {
+                "business_context": contract,
+                "probe_observations": (),
+                "selected_snapshot": enrich_selected_datasource_schemas(
+                    state["selected_snapshot"],
+                    selection=selection,
+                    business_context=contract,
+                ),
+            }
         payload = {
             "user_query": self.user_query,
             # Business Context resolves fact placement and ER lineage. Open-ended
@@ -4727,7 +4745,11 @@ class AnalysisPreparationWorkflow:
         return graph.compile()
 
     def run(self) -> PreparationResult | ScopeClarificationResult:
-        provider = DatasourceSelectionProviderRouter.resolve(self.datasource_snapshot)
+        provider = (
+            "local"
+            if bool(self.execution_context.get("exact_datasource_scope"))
+            else DatasourceSelectionProviderRouter.resolve(self.datasource_snapshot)
+        )
         try:
             state = self.compile(provider=provider).invoke({
                 "catalog": build_datasource_catalog(self.datasource_snapshot),

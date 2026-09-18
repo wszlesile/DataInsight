@@ -202,6 +202,7 @@ class WorkflowInsightJobService:
             output_contract=policy.output.to_dict(),
             clarification_mode=policy.clarification_mode,
             evidence_enabled=policy.evidence_enabled,
+            exact_datasource_scope=True,
         )
         try:
             get_analysis_task_runner().submit(

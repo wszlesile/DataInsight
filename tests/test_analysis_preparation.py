@@ -517,6 +517,46 @@ def test_full_scope_without_bound_datasource_stops_before_semantic_retrieval():
     )
 
 
+def test_exact_external_scope_uses_local_preparation_provider(monkeypatch):
+    workflow = prep.AnalysisPreparationWorkflow(
+        user_query="分析当前数据源",
+        context_mode="fresh_analysis",
+        expected_time_range={},
+        datasource_snapshot=_snapshot(),
+        conversation_context={},
+        runtime_config=None,
+        execution_context={"exact_datasource_scope": True},
+        cancelled=None,
+        stage_callback=None,
+    )
+    seen: dict[str, str] = {}
+
+    class _Graph:
+        def invoke(self, state):
+            return {
+                **state,
+                "intent": _intent(),
+                "selection": _selection(),
+                "business_context": _business_context(),
+                "selected_snapshot": _snapshot(),
+            }
+
+    def _compile(*, provider):
+        seen["provider"] = provider
+        return _Graph()
+
+    monkeypatch.setattr(workflow, "compile", _compile)
+    monkeypatch.setattr(
+        prep.DatasourceSelectionProviderRouter,
+        "resolve",
+        lambda _snapshot: pytest.fail("exact external scope must not resolve a retrieval provider"),
+    )
+
+    workflow.run()
+
+    assert seen["provider"] == "local"
+
+
 def test_fact_recall_keeps_dimension_source_omitted_by_llm_shortlist():
     intent = IntentContract(
         business_goal="分析收入结构",

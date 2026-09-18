@@ -162,6 +162,9 @@ class AgentRequest:
     output_contract: dict[str, Any] | None = None
     clarification_mode: str = "same_turn"
     evidence_enabled: bool = True
+    # Workflow callers provide the complete allowed UNS scope. Preparation may
+    # validate and describe it, but must not retrieve additional sources.
+    exact_datasource_scope: bool = False
 
     @property
     def database_context(self) -> dict[str, Any]:
@@ -1116,6 +1119,9 @@ def _prepare_analysis_context(
                 "namespace_id": int(runtime.conversation.insight_namespace_id or 0),
                 "conversation_id": int(runtime.conversation.id or 0),
                 "turn_id": int(runtime.turn.id or 0),
+                "exact_datasource_scope": bool(
+                    getattr(agent_request, "exact_datasource_scope", False)
+                ),
             },
             cancelled=lambda: _raise_if_analysis_task_cancelled(runtime),
             stage_callback=lambda stage: _notify_preparation_stage(
