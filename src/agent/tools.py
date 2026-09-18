@@ -15600,13 +15600,26 @@ def _build_implicit_probe_feedback(
         execution = execution if isinstance(execution, dict) else {}
         implementation = snapshot.get('implementation')
         implementation = implementation if isinstance(implementation, dict) else {}
+        error_message = str(execution.get('error_message') or '')
+        raw_status = str(execution.get('status') or '')
+        raw_error_type = str(execution.get('error_type') or '')
+        # ``probe_data_with_sql`` deliberately returns ``query_error`` instead
+        # of raising, so a worker can inspect several independent paths.  At
+        # the Runtime boundary it must nevertheless use the same canonical
+        # failure vocabulary as ordinary query snapshots.  Otherwise a
+        # missing FedQuery registration is merely an "observation" and the
+        # state machine incorrectly proceeds to formal implementation.
+        status = 'failed' if raw_status == 'query_error' else raw_status
+        error_type = raw_error_type
+        if status == 'failed' and error_type in {'', 'runtime_error'}:
+            error_type = _classify_execution_error(None, error_message)
         outcome = {
             'query_key': str(snapshot.get('query_key') or query_key),
-            'status': str(execution.get('status') or ''),
+            'status': status,
             'row_count': execution.get('row_count'),
             'columns': list(execution.get('columns') or []),
-            'error_type': str(execution.get('error_type') or ''),
-            'error_message': str(execution.get('error_message') or ''),
+            'error_type': error_type,
+            'error_message': error_message,
             'datasource_identifiers': list(
                 implementation.get('datasource_identifiers') or []
             ),

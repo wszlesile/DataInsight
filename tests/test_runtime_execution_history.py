@@ -406,6 +406,33 @@ def test_implicit_probe_feedback_marks_only_all_unavailable_paths_as_terminal():
     assert retry.diagnostics['_terminal_probe_failure']['required_datasource_ids'] == [1]
 
 
+def test_implicit_probe_feedback_normalizes_worker_query_error_for_missing_timeseries_registration():
+    snapshot = query_fact(0)
+    snapshot['implementation'] = {'datasource_identifiers': ['_test01_abc']}
+    snapshot['execution'].update({
+        'status': 'query_error',
+        'error_type': 'runtime_error',
+        'error_message': (
+            'Binder Error: Failed to find attached database "uns_timescale" '
+            'referenced in postgres_query'
+        ),
+    })
+
+    retry = tools._build_implicit_probe_feedback(
+        {'q': snapshot},
+        '',
+        selected_datasource_snapshot=[{
+            'datasource_id': 1,
+            'datasource_identifier': '_test01_abc',
+        }],
+    )
+
+    outcome = retry.diagnostics['_query_execution_outcomes'][0]
+    assert outcome['status'] == 'failed'
+    assert outcome['error_type'] == 'data_source_unavailable'
+    assert retry.diagnostics['_terminal_probe_failure']['kind'] == 'all_required_query_paths_unavailable'
+
+
 def test_implicit_probe_feedback_keeps_multi_source_analysis_open_when_only_one_path_failed():
     snapshot = query_fact(0)
     snapshot['implementation'] = {'datasource_identifiers': ['demo.contracts']}
