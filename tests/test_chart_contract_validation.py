@@ -2361,6 +2361,14 @@ result = request_retry(
             "data_source_unavailable",
         )
 
+    def test_query_authorization_failure_is_not_misclassified_as_unavailable_source(self) -> None:
+        error_message = 'invalid authorization token'
+
+        self.assertEqual(
+            _classify_execution_error(RuntimeError(error_message), error_message),
+            "authorization_error",
+        )
+
     def test_oversized_query_result_has_a_specific_repair_type(self) -> None:
         error_message = (
             "Query result exceeds 10000 rows, please update query conditions "

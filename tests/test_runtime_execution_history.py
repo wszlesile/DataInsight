@@ -383,6 +383,50 @@ def test_implicit_probe_feedback_preserves_worker_outcomes_without_replaying_std
     assert 'printed_observations' not in retry.diagnostics
 
 
+def test_implicit_probe_feedback_marks_only_all_unavailable_paths_as_terminal():
+    snapshot = query_fact(0)
+    snapshot['implementation'] = {'datasource_identifiers': ['demo.contracts']}
+    snapshot['execution'].update({
+        'status': 'failed',
+        'error_type': 'data_source_unavailable',
+        'error_message': 'failed to find attached database',
+    })
+
+    retry = tools._build_implicit_probe_feedback(
+        {'q': snapshot},
+        '',
+        selected_datasource_snapshot=[{
+            'datasource_id': 1,
+            'datasource_identifier': 'demo.contracts',
+        }],
+    )
+
+    assert retry.diagnostics['_query_execution_outcomes'][0]['error_type'] == 'data_source_unavailable'
+    assert retry.diagnostics['_terminal_probe_failure']['kind'] == 'all_required_query_paths_unavailable'
+    assert retry.diagnostics['_terminal_probe_failure']['required_datasource_ids'] == [1]
+
+
+def test_implicit_probe_feedback_keeps_multi_source_analysis_open_when_only_one_path_failed():
+    snapshot = query_fact(0)
+    snapshot['implementation'] = {'datasource_identifiers': ['demo.contracts']}
+    snapshot['execution'].update({
+        'status': 'failed',
+        'error_type': 'data_source_unavailable',
+        'error_message': 'failed to find attached database',
+    })
+
+    retry = tools._build_implicit_probe_feedback(
+        {'q': snapshot},
+        '',
+        selected_datasource_snapshot=[
+            {'datasource_id': 1, 'datasource_identifier': 'demo.contracts'},
+            {'datasource_id': 2, 'datasource_identifier': 'demo.customers'},
+        ],
+    )
+
+    assert '_terminal_probe_failure' not in retry.diagnostics
+
+
 @pytest.mark.parametrize('mode,output', [('same_turn', {'type': 'standard'}), ('disabled', {'type': 'text'}), ('disabled', {'type': 'json', 'schema': {'type': 'object'}})])
 def test_backup_recovery_obeys_invocation_policy_without_inventing_filter(mode, output):
     execution = SimpleNamespace(id=5, execution_status='failed', error_message='Probe complete',

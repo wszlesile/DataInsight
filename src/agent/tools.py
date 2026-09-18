@@ -3737,6 +3737,7 @@ class RetryResult(BaseModel):
     retry_type: Literal[
         "probe_feedback",
         "data_source_unavailable",
+        "authorization_error",
         "missing_structured_artifact",
         "missing_report",
         "incomplete_result",
@@ -3893,6 +3894,7 @@ def request_retry(
     allowed_types = {
         "probe_feedback",
         "data_source_unavailable",
+        "authorization_error",
         "missing_structured_artifact",
         "missing_report",
         "incomplete_result",
@@ -12424,6 +12426,12 @@ def _classify_execution_error(error: Exception | None, error_message: str) -> st
     ):
         return 'schema_or_column_mismatch'
     if any(marker in lowered for marker in (
+        'invalid authorization token',
+        'authorization failed',
+        'authentication failed',
+    )):
+        return 'authorization_error'
+    if any(marker in lowered for marker in (
         'failed to fetch result for query',
         'binder error',
         'catalog error',
@@ -15041,6 +15049,11 @@ def _build_repair_instructions(error_type: str) -> list[str]:
             '不要调用 raise_no_data_error(...)，也不要继续生成空图表或空报告伪装成功。',
             '只能原样使用当前数据源上下文提供的文件路径、表名或接口地址；如果仍不可访问，应保持 data_source_unavailable 语义并让上层失败收口。',
         ],
+        'authorization_error': [
+            '当前反馈表示调用身份或访问令牌不可用，不是数据筛选、字段、查询语法或业务口径问题。',
+            '不要通过修改 Python 代码、缩小数据源范围或输出空报告来掩盖该错误。',
+            '保留认证失败语义并让上层按平台认证故障处理。',
+        ],
         'missing_structured_artifact': [
             '当前代码已经生成分析报告，但没有生成 charts 或 tables 结构化产物。',
             '下一版代码应保留已有统计口径、筛选条件和核心结论，至少补充一个 charts 或 tables。',
@@ -15576,6 +15589,7 @@ def _build_implicit_probe_feedback(
     query_snapshots: dict[str, Any] | None,
     stdout_text: str,
     probe_query_observations: list[dict[str, Any]] | None = None,
+    selected_datasource_snapshot: list[dict[str, Any]] | None = None,
 ) -> RetryResult:
     """Convert a successful dedicated Probe call into its standard observation."""
     outcomes: list[dict[str, Any]] = []
@@ -15591,6 +15605,8 @@ def _build_implicit_probe_feedback(
             'status': str(execution.get('status') or ''),
             'row_count': execution.get('row_count'),
             'columns': list(execution.get('columns') or []),
+            'error_type': str(execution.get('error_type') or ''),
+            'error_message': str(execution.get('error_message') or ''),
             'datasource_identifiers': list(
                 implementation.get('datasource_identifiers') or []
             ),
@@ -15618,7 +15634,77 @@ def _build_implicit_probe_feedback(
     # request_retry reads query snapshots from the current process context.
     # Dedicated Probe executes in a worker, so preserve the worker outcomes here.
     retry.diagnostics['_query_execution_outcomes'] = outcomes
+    terminal_failure = _all_selected_probe_paths_unavailable(
+        outcomes=outcomes,
+        selected_datasource_snapshot=selected_datasource_snapshot,
+    )
+    if terminal_failure is not None:
+        retry.diagnostics['_terminal_probe_failure'] = terminal_failure
     return retry
+
+
+def _all_selected_probe_paths_unavailable(
+    *,
+    outcomes: list[dict[str, Any]],
+    selected_datasource_snapshot: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """Return terminal unavailability only after every selected source failed.
+
+    A Probe may inspect one technical unknown before it reaches other selected
+    sources.  "All executed outcomes failed" is consequently not evidence that
+    the analysis has no remaining executable path.  The backend can terminate
+    only when every selected datasource maps to a real unavailable query.
+    """
+    selected_by_id: dict[int, dict[str, Any]] = {}
+    for datasource in selected_datasource_snapshot or []:
+        try:
+            datasource_id = int(datasource.get('datasource_id') or datasource.get('id') or 0)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if datasource_id > 0:
+            selected_by_id[datasource_id] = datasource
+    if not selected_by_id:
+        return None
+
+    unavailable_tokens: set[str] = set()
+    unavailable_queries: list[dict[str, Any]] = []
+    for outcome in outcomes:
+        if (
+            str(outcome.get('status') or '') != 'failed'
+            or str(outcome.get('error_type') or '') != 'data_source_unavailable'
+        ):
+            continue
+        identifiers = [
+            str(identifier).strip().strip('`"[]').lower()
+            for identifier in outcome.get('datasource_identifiers') or []
+            if str(identifier).strip()
+        ]
+        if not identifiers:
+            continue
+        for identifier in identifiers:
+            unavailable_tokens.add(identifier)
+            unavailable_tokens.add(identifier.rsplit('.', 1)[-1])
+        unavailable_queries.append({
+            'query_key': outcome.get('query_key'),
+            'datasource_identifiers': identifiers,
+            'error_type': outcome.get('error_type'),
+        })
+
+    unavailable_source_ids = sorted(
+        datasource_id
+        for datasource_id, datasource in selected_by_id.items()
+        if _datasource_relation_tokens(datasource) & unavailable_tokens
+    )
+    required_source_ids = sorted(selected_by_id)
+    if not unavailable_queries or set(unavailable_source_ids) != set(required_source_ids):
+        return None
+    return {
+        'kind': 'all_required_query_paths_unavailable',
+        'query_count': len(unavailable_queries),
+        'required_datasource_ids': required_source_ids,
+        'unavailable_datasource_ids': unavailable_source_ids,
+        'queries': unavailable_queries,
+    }
 
 
 def _build_artifact_review_packet(
@@ -17178,6 +17264,7 @@ def execute_python(
             worker_payload.get('query_snapshots') or {},
             stdout_text,
             worker_payload.get('probe_query_observations') or [],
+            selected_datasource_snapshot=selected_datasource_snapshot,
         )
     if isinstance(exec_result, StructuredResult) and exec_result.output_format == "standard":
         from service.report_presentation_service import normalize_report_presentation
@@ -17539,7 +17626,7 @@ def probe_analysis_data(
         len(str(probe or '')),
     )
     code = normalized_probe_code
-    return execute_python.func(
+    result = execute_python.func(
         runtime=runtime,
         code=code,
         title=title,
@@ -17547,6 +17634,38 @@ def probe_analysis_data(
         used_datasource_ids=_decode_tool_id_list(used_datasource_ids),
         execution_mode='probe',
     )
+    if _is_terminal_probe_unavailability(result):
+        return Command(
+            update={
+                "messages": [result],
+                "runtime_terminal_failure": {
+                    "error_type": "data_source_unavailable",
+                    "source": "probe",
+                },
+            },
+            goto=END,
+        )
+    return result
+
+
+def _is_terminal_probe_unavailability(result: ToolMessage | Command | Any) -> bool:
+    """Return whether a Probe exhausted only unavailable physical paths."""
+    message = result if isinstance(result, ToolMessage) else None
+    if isinstance(result, Command):
+        update = result.update if isinstance(result.update, dict) else {}
+        for item in reversed(list(update.get('messages') or [])):
+            if isinstance(item, ToolMessage):
+                message = item
+                break
+    if not isinstance(message, ToolMessage):
+        return False
+    try:
+        payload = json.loads(str(message.content or '{}'))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    diagnostics = payload.get('diagnostics') if isinstance(payload, dict) else None
+    terminal = diagnostics.get('_terminal_probe_failure') if isinstance(diagnostics, dict) else None
+    return isinstance(terminal, dict) and terminal.get('kind') == 'all_required_query_paths_unavailable'
 
 
 def _runtime_probe_is_authorized(runtime: ToolRuntime[CustomContext]) -> bool:

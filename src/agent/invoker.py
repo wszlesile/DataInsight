@@ -98,6 +98,29 @@ RETRY_LATEST_ERROR_LIMIT = 3
 RETRY_PATTERN_HINT_LIMIT = 5
 RETRY_ERROR_MAX_CHARS = 700
 RETRY_HINT_MAX_CHARS = 500
+
+
+class RuntimeDatasourceUnavailableError(RuntimeError):
+    """A required datasource could not be reached by any executed Probe path."""
+
+
+def _raise_if_terminal_probe_unavailability(messages: list[BaseMessage]) -> None:
+    """Stop the outer ReAct loop when Probe proved every required path unavailable."""
+    for message in reversed(messages or []):
+        if not isinstance(message, BaseMessage):
+            continue
+        try:
+            payload = json.loads(str(getattr(message, 'content', '') or '{}'))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        diagnostics = payload.get('diagnostics')
+        terminal = diagnostics.get('_terminal_probe_failure') if isinstance(diagnostics, dict) else None
+        if isinstance(terminal, dict) and terminal.get('kind') == 'all_required_query_paths_unavailable':
+            raise RuntimeDatasourceUnavailableError(
+                '分析所需数据源当前不可访问，未生成分析结果。请确认数据源挂载、权限或联邦查询服务后重试。'
+            )
 RETRY_RECOVERY_INSTRUCTION_MAX_CHARS = 14000
 RUNTIME_SCHEMA_DETAIL_MEMORY_KEY = 'runtime_schema_detail_workspace'
 PROBE_NO_DATA_ERROR_TYPES = {'probe_feedback', 'no_data_found'}
@@ -3387,6 +3410,7 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
             # Tool results need their paired calls to drive the same explicit
             # workspace reducers used by the SSE path.
             _update_short_term_memory_from_messages(runtime, round_transcript)
+            _raise_if_terminal_probe_unavailability(round_transcript)
             assistant_message, analysis_report, charts, tables, raw_tool_call_detected = _extract_invoke_result(
                 response_messages
             )
@@ -3905,6 +3929,7 @@ def _stream_with_runtime(
             # the same work memory and tool-call identities as well.
             agent_round_messages = round_transcript
             _update_short_term_memory_from_messages(runtime, round_transcript)
+            _raise_if_terminal_probe_unavailability(round_transcript)
 
             clarification = _extract_runtime_clarification(streamed_messages)
             if clarification is not None:

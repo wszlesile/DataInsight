@@ -24,6 +24,7 @@ class RuntimePhase(StrEnum):
     REPAIR = "repair"
     WAITING_CLARIFICATION = "waiting_clarification"
     COMPLETED = "completed"
+    BLOCKED = "blocked"
 
 
 ACTIVE_PHASES = frozenset({
@@ -323,6 +324,30 @@ def reduce_runtime_tool_result(
                     "call_id": str(tool_call_id or ""),
                 },
                 reason="stale_probe_call_rejected",
+                **common,
+            )
+        terminal_failure = (
+            diagnostics.get("_terminal_probe_failure")
+            if isinstance(diagnostics, dict) else None
+        )
+        if isinstance(terminal_failure, dict):
+            # Every executed Probe path reached the data boundary and proved
+            # unavailable. There is no analytical fact for the model to repair.
+            return _next(
+                packet,
+                phase=RuntimePhase.BLOCKED,
+                resume_phase=None,
+                resume_focus="",
+                resume_datasource_ids=(),
+                resume_fields_by_datasource={},
+                probe_revision=packet.probe_revision + 1,
+                diagnostic_revision=packet.diagnostic_revision + 1,
+                latest_diagnostic={
+                    "error_type": "data_source_unavailable",
+                    "probe_failure": dict(terminal_failure),
+                    "call_id": str(tool_call_id or ""),
+                },
+                reason="probe_paths_unavailable",
                 **common,
             )
         ledger = diagnostics.get("probe_fact_ledger") if isinstance(diagnostics, dict) else None

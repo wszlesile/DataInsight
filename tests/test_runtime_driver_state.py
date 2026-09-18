@@ -213,6 +213,41 @@ def test_material_and_probe_scope_return_with_the_parent_focus():
     assert packet.probe_ledgers == ({},)
 
 
+def test_all_unavailable_probe_paths_block_runtime_instead_of_entering_implementation():
+    packet = reduce_runtime_tool_result(
+        new_runtime_work_packet(workspace_id="w", focus="Analyze"),
+        tool_name="plan_runtime_materials",
+        tool_call_id="plan",
+        arguments={},
+        result={
+            "status": "success",
+            "focus": "Analyze",
+            "probe_required": True,
+            "material_units": [{"datasource_id": 12, "field_names": ["amount"]}],
+        },
+    )
+
+    blocked = reduce_runtime_tool_result(
+        packet,
+        tool_name="probe_analysis_data",
+        tool_call_id="probe",
+        arguments={},
+        result={
+            "status": "observation",
+            "diagnostics": {
+                "_terminal_probe_failure": {
+                    "kind": "all_required_query_paths_unavailable",
+                    "query_count": 1,
+                },
+            },
+        },
+    )
+
+    assert blocked.phase is RuntimePhase.BLOCKED
+    assert blocked.reason == "probe_paths_unavailable"
+    assert blocked.latest_diagnostic["error_type"] == "data_source_unavailable"
+
+
 def test_formal_probe_program_only_enters_initial_probe_once():
     packet = reduce_runtime_tool_result(
         new_runtime_work_packet(workspace_id="w", focus="Analyze"),
