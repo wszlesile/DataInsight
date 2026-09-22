@@ -3008,6 +3008,29 @@ def _register_query_snapshot(
     return None
 
 
+def _sql_table_relation_tokens(table: Any) -> set[str]:
+    """Return stable physical or UNS-path tokens for one sqlglot table."""
+    try:
+        from sqlglot import exp
+    except Exception:
+        return set()
+    table_expression = getattr(table, 'this', None)
+    if isinstance(table_expression, exp.Anonymous) and str(
+        table_expression.name or ''
+    ).strip().lower() == 'uns_get':
+        arguments = list(table_expression.expressions or [])
+        if arguments and isinstance(arguments[0], exp.Literal) and arguments[0].is_string:
+            path = str(arguments[0].this or '').strip()
+            return {path} if path and path != '__query_parameter__' else set()
+        return set()
+    parts = [
+        str(part).strip()
+        for part in (table.catalog, table.db, table.name)
+        if str(part).strip()
+    ]
+    return {'.'.join(parts).strip(chr(96) + '"[]')} if parts else set()
+
+
 def _extract_physical_sql_datasource_identifiers(sql: str) -> set[str]:
     """Return physical table identifiers, including tables inside ts_query."""
 
@@ -3026,15 +3049,7 @@ def _extract_physical_sql_datasource_identifiers(sql: str) -> set[str]:
             for statement in parse(statement_sql):
                 parsed = True
                 for table in statement.find_all(exp.Table):
-                    if isinstance(table.this, exp.Func):
-                        continue
-                    parts = [
-                        str(part).strip()
-                        for part in (table.catalog, table.db, table.name)
-                        if str(part).strip()
-                    ]
-                    if parts:
-                        identifiers.add('.'.join(parts).strip(chr(96) + '"[]'))
+                    identifiers.update(_sql_table_relation_tokens(table))
                 for function in statement.find_all(exp.Anonymous):
                     if str(function.name or '').strip().lower() != 'ts_query':
                         continue
@@ -5275,20 +5290,32 @@ def _validate_analysis_relationship_contract(
         tree = ast.parse(code or "")
     except SyntaxError:
         return None
+    snapshot_sources = [
+        item for item in snapshot.get("selected_datasource_snapshot") or []
+        if isinstance(item, dict) and int(item.get("datasource_id") or 0) > 0
+    ]
+    identifier_tokens_by_id = {
+        int(item.get("datasource_id") or 0): _datasource_relation_tokens(item)
+        for item in snapshot_sources
+    }
     identifiers = {
         int(item.get("datasource_id") or 0): str(
-            item.get("datasource_identifier") or ""
+            (item.get("query_access") or {}).get("uns_path")
+            if isinstance(item.get("query_access"), dict)
+            and (item.get("query_access") or {}).get("uns_path")
+            else item.get("datasource_identifier") or ""
         ).strip()
-        for item in snapshot.get("selected_datasource_snapshot") or []
-        if isinstance(item, dict) and int(item.get("datasource_id") or 0) > 0
+        for item in snapshot_sources
     }
 
     normalized_code = re.sub(r'["`\[\]\s]+', "", code or "").lower()
     referenced_source_ids = {
         datasource_id
-        for datasource_id, identifier in identifiers.items()
-        if identifier and re.sub(r'["`\[\]\s]+', "", identifier).lower()
-        in normalized_code
+        for datasource_id, tokens in identifier_tokens_by_id.items()
+        if any(
+            re.sub(r'["`\[\]\s]+', "", token).lower() in normalized_code
+            for token in tokens if token
+        )
     }
     called_functions = _called_function_names(tree)
     declared_text_columns = {
@@ -5915,12 +5942,11 @@ def _validate_analysis_relationship_contract(
         table_names: set[str] = set()
         for statement in statements:
             for table in statement.find_all(exp.Table):
-                qualified_name = ".".join(
-                    part
-                    for part in (table.catalog, table.db, table.name)
-                    if part
+                table_names.update(
+                    _normalize_identifier(token)
+                    for token in _sql_table_relation_tokens(table)
+                    if _normalize_identifier(token)
                 )
-                table_names.add(_normalize_identifier(qualified_name))
         for relationship in unresolved_pairs:
             left_id = int(relationship.get("left_datasource_id") or 0)
             right_id = int(relationship.get("right_datasource_id") or 0)
@@ -5944,14 +5970,17 @@ def _validate_analysis_relationship_contract(
                 for alias, source in scope.sources.items():
                     if not isinstance(source, exp.Table):
                         continue
-                    qualified_name = ".".join(
-                        part
-                        for part in (source.catalog, source.db, source.name)
-                        if part
-                    )
-                    normalized_name = _normalize_identifier(qualified_name)
-                    for datasource_id, identifier in identifiers.items():
-                        if normalized_name == _normalize_identifier(identifier):
+                    normalized_names = {
+                        _normalize_identifier(token)
+                        for token in _sql_table_relation_tokens(source)
+                        if _normalize_identifier(token)
+                    }
+                    for datasource_id, tokens in identifier_tokens_by_id.items():
+                        normalized_tokens = {
+                            _normalize_identifier(token)
+                            for token in tokens if _normalize_identifier(token)
+                        }
+                        if normalized_names.intersection(normalized_tokens):
                             alias_source_ids[str(alias)] = datasource_id
                             break
 
@@ -9552,11 +9581,10 @@ def _query_snapshot_table_names(query_snapshots: dict[str, Any]) -> set[str]:
 
             for statement in parse(sql):
                 for table in statement.find_all(exp.Table):
-                    parts = [str(part).strip().lower() for part in (table.catalog, table.db, table.name) if str(part).strip()]
-                    if not parts:
-                        continue
-                    table_names.add('.'.join(parts))
-                    table_names.add(parts[-1])
+                    for raw_token in _sql_table_relation_tokens(table):
+                        token = raw_token.lower()
+                        table_names.add(token)
+                        table_names.add(token.rsplit('.', 1)[-1])
         except Exception:
             # Query snapshots remain useful even for a dialect sqlglot cannot parse.
             normalized_sql = sql.lower()
@@ -9652,11 +9680,17 @@ def _canonicalize_used_datasource_ids(
 
 def _datasource_relation_tokens(item: dict[str, Any]) -> set[str]:
     config = item.get('config') if isinstance(item.get('config'), dict) else {}
+    query_access = item.get('query_access') if isinstance(item.get('query_access'), dict) else {}
+    query_contract = item.get('query_contract') if isinstance(item.get('query_contract'), dict) else {}
     metadata_schema = item.get('metadata_schema') if isinstance(item.get('metadata_schema'), dict) else {}
     raw_values = [
         item.get('datasource_identifier'),
+        item.get('uns_path'),
         item.get('table_name'),
         config.get('table_name'),
+        config.get('uns_path'),
+        query_access.get('uns_path'),
+        query_contract.get('uns_path'),
         metadata_schema.get('name'),
     ]
     tokens: set[str] = set()
@@ -9826,13 +9860,9 @@ def _find_opaque_dimension_artifacts(
                 sql,
             )):
                 for table in statement.find_all(exp.Table):
-                    parts = [
-                        str(part).strip().lower()
-                        for part in (table.catalog, table.db, table.name)
-                        if str(part).strip()
-                    ]
-                    if parts:
-                        table_names.update({".".join(parts), parts[-1]})
+                    for raw_token in _sql_table_relation_tokens(table):
+                        token = raw_token.lower()
+                        table_names.update({token, token.rsplit(".", 1)[-1]})
                 for select in statement.find_all(exp.Select):
                     for projection in select.expressions:
                         output_name = str(projection.alias_or_name or "").strip().lower()
@@ -11318,6 +11348,88 @@ def _validate_tool_used_datasource_ids(
     return None
 
 
+def _validate_uns_get_access_contract(
+    *,
+    code: str,
+    selected_datasource_snapshot: list[dict[str, Any]] | None,
+) -> RetryResult | None:
+    """Reject a provable bypass of an UNS path's access semantics."""
+    normalized_code = str(code or '').casefold()
+    sql_relation_tokens: set[str] = set()
+    try:
+        tree = ast.parse(code or '')
+    except SyntaxError:
+        tree = None
+    if tree is not None:
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and re.search(r'(?is)\bselect\b.+\bfrom\b', node.value)
+            ):
+                continue
+            sql_relation_tokens.update(
+                str(token).strip().strip('`"[]').casefold()
+                for token in _extract_physical_sql_datasource_identifiers(node.value)
+                if str(token).strip()
+            )
+    findings: list[dict[str, Any]] = []
+    for item in selected_datasource_snapshot or []:
+        if not isinstance(item, dict):
+            continue
+        access = item.get('query_access') if isinstance(item.get('query_access'), dict) else {}
+        if access.get('access_mode') != 'uns_get':
+            continue
+        uns_path = str(access.get('uns_path') or '').strip()
+        identifier = str(item.get('datasource_identifier') or '').strip()
+        if not uns_path:
+            continue
+        path_token = uns_path.strip('`"[]').casefold()
+        bypass_tokens = {
+            str(value or '').strip().strip('`"[]').casefold()
+            for value in (
+                identifier,
+                identifier.rsplit('.', 1)[-1] if identifier else '',
+                item.get('datasource_name'),
+                (item.get('metadata_schema') or {}).get('name')
+                if isinstance(item.get('metadata_schema'), dict) else '',
+            )
+            if str(value or '').strip()
+        }
+        path_is_used = (
+            path_token in sql_relation_tokens
+            or uns_path.casefold() in normalized_code
+        )
+        used_bypass_tokens = sorted(sql_relation_tokens.intersection(bypass_tokens))
+        identifier_is_used = bool(
+            identifier and identifier.casefold() in normalized_code
+        )
+        if (used_bypass_tokens or identifier_is_used) and not path_is_used:
+            findings.append({
+                'datasource_id': item.get('datasource_id') or item.get('id'),
+                'datasource_name': item.get('datasource_name'),
+                'uns_path': uns_path,
+                'forbidden_identifier': identifier,
+                'used_bypass_tokens': used_bypass_tokens,
+                'required_relation_expression': access.get('relation_expression'),
+            })
+    if not findings:
+        return None
+    return request_retry(
+        retry_type='query_constraint_violation',
+        message='关系型 UNS 查询绕过了当前节点的 uns_get(path) 访问契约。',
+        diagnostics={
+            'violated_contract': 'uns_get_access_required',
+            'findings': findings,
+        },
+        repair_instructions=[
+            '保留现有分析范围、字段、筛选、JOIN 和聚合，只替换 FROM/JOIN 的数据源访问表达式。',
+            '对 access_mode=uns_get 的来源原样使用 query_contract.relation_expression，并为每个关系表达式设置独立 SQL alias。',
+            '不要改用 datasource_identifier、底层 alias 或 fqe_uns.public.<alias> 绕过用户选择的 UNS 节点。',
+        ],
+    )
+
+
 def _build_execution_namespace() -> dict[str, Any]:
     """向生成代码暴露允许使用的辅助函数命名空间。"""
     import pandas as pd
@@ -11385,7 +11497,13 @@ def _build_datasource_numeric_field_profiles(
         if not isinstance(datasource, dict):
             continue
         identifier = str(datasource.get("datasource_identifier") or "").strip()
-        if not identifier:
+        query_access = (
+            datasource.get('query_access')
+            if isinstance(datasource.get('query_access'), dict)
+            else {}
+        )
+        uns_path = str(query_access.get('uns_path') or '').strip()
+        if not identifier and not uns_path:
             continue
         schema = datasource.get("metadata_schema") if isinstance(datasource.get("metadata_schema"), dict) else {}
         properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
@@ -11403,11 +11521,12 @@ def _build_datasource_numeric_field_profiles(
                 fields.append(str(name))
         if not fields:
             continue
-        identifier_parts = identifier.split(".")
-        identifiers = [identifier]
+        identifier_parts = identifier.split(".") if identifier else []
+        identifiers = [identifier, uns_path]
         if len(identifier_parts) >= 2:
             identifiers.append(".".join(identifier_parts[-2:]))
-        identifiers.append(identifier_parts[-1])
+        if identifier_parts:
+            identifiers.append(identifier_parts[-1])
         profiles.append({
             "identifiers": list(dict.fromkeys(item for item in identifiers if item)),
             "fields": sorted(set(fields)),
@@ -12852,12 +12971,10 @@ def _build_schema_field_mismatch_diagnostics(
         except Exception:
             continue
         table_tokens = {
-            normalize_identifier('.'.join(
-                str(part).strip()
-                for part in (table.catalog, table.db, table.name)
-                if str(part).strip()
-            ))
+            normalize_identifier(token)
             for table in statement.find_all(exp.Table)
+            for token in _sql_table_relation_tokens(table)
+            if normalize_identifier(token)
         }
         matched_sources = [
             source for source in source_catalog
@@ -12988,18 +13105,18 @@ def _validate_static_sql_field_ownership_contract(
 
         alias_sources: dict[str, dict[str, Any]] = {}
         for table in statement.find_all(exp.Table):
-            parts = [
-                normalize(part)
-                for part in (table.catalog, table.db, table.name)
-                if normalize(part)
-            ]
-            if not parts:
+            relation_tokens = {
+                normalize(token)
+                for token in _sql_table_relation_tokens(table)
+                if normalize(token)
+            }
+            if not relation_tokens:
                 continue
-            full_token = '.'.join(parts)
-            exact_matches = [source for source in sources if full_token in source['tokens']]
-            matched_sources = exact_matches or [
-                source for source in sources if parts[-1] in source['tokens']
+            exact_matches = [
+                source for source in sources
+                if source['tokens'].intersection(relation_tokens)
             ]
+            matched_sources = exact_matches
             if len(matched_sources) != 1:
                 continue
             alias = normalize(table.alias_or_name)
@@ -16998,6 +17115,11 @@ def execute_python(
             current_execution_id=execution_id,
             current_used_datasource_ids=normalized_used_datasource_ids,
             current_code=code,
+            selected_datasource_snapshot=selected_datasource_snapshot,
+        )
+    if contract_retry is None:
+        contract_retry = _validate_uns_get_access_contract(
+            code=code,
             selected_datasource_snapshot=selected_datasource_snapshot,
         )
     if contract_retry is None:

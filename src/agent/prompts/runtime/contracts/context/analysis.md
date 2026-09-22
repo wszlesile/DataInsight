@@ -20,7 +20,7 @@
 - 每个属性的字段 key 是代码和查询使用的真实字段名；`name/displayName` 是用户可读业务名；`description/remark` 用于判断统计对象、单位、时间归属和业务含义。字段字面相似不能替代语义核对。
 - `property_type/type` 决定基础处理方式：字符串通常用于名称、编码、枚举和分组；数值用于有业务依据的聚合；时间字段用于范围、顺序和可比周期。
 - `all_properties_required=true` 等价于所有 `properties` 均在 `required`；`all_properties_queryable=true` 等价于所有属性均可查询，它们是去重表达，不是字段裁剪。
-- 数据源对象中的 `datasource_identifier` 是物理访问标识；当前详情的 `metadata_schema.properties` 是已加载字段定义，`all_field_names` 是该来源的字段发现索引。不得把相邻数据源字段串用，也不得把 `datasource_name` 当作表名或路径。
+- 数据源对象中的 `query_contract` 决定访问方式：`access_mode=uns_get` 使用 `relation_expression`，`access_mode=physical_table` 使用对应物理关系，时序来源使用独立时序协议。`datasource_identifier` 仅用于技术定位和血缘。当前详情的 `metadata_schema.properties` 是已加载字段定义，`all_field_names` 是该来源的字段发现索引。不得把相邻数据源字段串用，也不得把 `datasource_name` 当作表名或路径。
 - `datasource_id`、`conversation_id`、`turn_id`、`execution_id` 和记录主键仅用于定位。不要从编号推导业务含义；用户可见内容优先使用 `datasource_name` 和 Schema 中的业务名称字段。
 
 ## Preparation 事实边界

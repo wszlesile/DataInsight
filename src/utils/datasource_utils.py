@@ -15,6 +15,7 @@ TABLE_ENGINE_RELATIONAL = 'relational'
 TABLE_ENGINE_TIME_SERIES = 'time_series'
 TABLE_ENGINE_VALUES = {TABLE_ENGINE_RELATIONAL, TABLE_ENGINE_TIME_SERIES}
 TIME_SERIES_BACKEND_VALUES = {'timescale', 'vxbase'}
+UNS_RELATIONAL_DATA_TYPES = {'2', '7'}
 
 
 def safe_json_loads(value: Any, fallback: Any) -> Any:
@@ -132,6 +133,42 @@ def build_table_runtime_metadata(config_json: dict[str, Any] | None) -> dict[str
             'quality_field': str(config.get('quality_field') or 'status').strip(),
         })
     return {key: value for key, value in payload.items() if value != ''}
+
+
+def build_table_query_access(config_json: dict[str, Any] | None) -> dict[str, Any]:
+    """Build the stable table access contract used by generated analysis SQL.
+
+    Native relational UNS nodes are addressed through their user-visible UNS
+    path. This preserves UNS permission semantics and avoids relying on a
+    FedQuery session's default catalog. Time-series and protocol-backed nodes
+    keep their existing dedicated access protocols.
+    """
+    config = config_json if isinstance(config_json, dict) else {}
+    table_engine = resolve_table_engine(config)
+    uns_data_type = str(config.get('uns_data_type') or '').strip()
+    if table_engine == TABLE_ENGINE_TIME_SERIES:
+        return {'access_mode': 'time_series'}
+
+    uns_path = str(config.get('uns_path') or '').strip()
+    if uns_data_type in UNS_RELATIONAL_DATA_TYPES and uns_path:
+        escaped_path = uns_path.replace("'", "''")
+        return {
+            'access_mode': 'uns_get',
+            'uns_path': uns_path,
+            'relation_expression': f"uns_get('{escaped_path}')",
+        }
+
+    database_name = normalize_fedquery_database_name(config.get('database_name'))
+    table_name = str(config.get('table_name') or '').strip()
+    if database_name and table_name:
+        return {
+            'access_mode': 'physical_table',
+            'relation_expression': f'{database_name}.{table_name}',
+        }
+    return {
+        'access_mode': 'physical_table',
+        'relation_expression': table_name,
+    }
 
 
 def extract_datasource_identifier(datasource: Any, config_json: dict[str, Any]) -> str:

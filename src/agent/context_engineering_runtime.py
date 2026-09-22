@@ -14,6 +14,7 @@ from agent.runtime_contract_registry import infer_query_capabilities_from_snapsh
 from utils import logger
 from utils.context_compression import clip_text
 from utils.datasource_utils import (
+    build_table_query_access,
     build_table_runtime_metadata,
     extract_datasource_identifier,
     extract_datasource_schema,
@@ -215,6 +216,7 @@ def _build_datasource_payload_item(datasource: InsightDatasource) -> dict[str, A
         )
     if datasource_type == "table":
         payload.update(build_table_runtime_metadata(config_json))
+        payload["query_access"] = build_table_query_access(config_json)
     sheet_name = str(config_json.get("sheet_name") or "").strip()
     if sheet_name:
         payload["sheet_name"] = sheet_name
@@ -262,10 +264,17 @@ def _build_datasource_prompt_item(item: dict[str, Any]) -> dict[str, Any]:
             *value_fields,
         ]))
         payload["time_field"] = physical_time_field
+    query_access = payload.pop("query_access", None)
     query_contract: dict[str, Any] = {
         "datasource_id": payload.get("datasource_id"),
         "datasource_identifier": payload.get("datasource_identifier"),
     }
+    if isinstance(query_access, dict):
+        query_contract.update({
+            key: copy.deepcopy(value)
+            for key, value in query_access.items()
+            if value not in (None, "", [], {})
+        })
     if property_names and set(queryable_fields) == set(property_names):
         query_contract["allowed_fields_ref"] = "metadata_schema.properties"
         query_contract["all_schema_properties_allowed"] = True
@@ -547,7 +556,7 @@ def get_datasource_message(
         "<runtime-context-instructions>",
         "以下 JSON 是本轮完整分析上下文，包含 Schema 工作视图、业务规则与带确认状态的准备信息，不是报告模板或指标计划：",
         "- `datasources` 是 Preparation 选定的完整数据源范围。默认工作视图保留全部字段名、已绑定事实字段和关系键；若 `runtime_schema_workspace.mode=indexed`，未展开字段的精确定义可用 `read_runtime_datasource_context` 本地读取，不会改变分析范围。",
-        "- `datasource_name` 是用户可读名称；`query_contract.datasource_identifier` 是物理访问标识。`allowed_fields` 是显式字段边界；若为 `allowed_fields_ref=metadata_schema.properties`，则完整 properties 键集合就是字段边界。",
+        "- `datasource_name` 是用户可读名称；关系来源必须按 `query_contract.access_mode` 访问。`access_mode=uns_get` 时，SQL 的 FROM/JOIN 必须直接使用 `relation_expression`；`datasource_identifier` 仅保留为技术定位与血缘标识。`allowed_fields` 是显式字段边界；若为 `allowed_fields_ref=metadata_schema.properties`，则完整 properties 键集合就是字段边界。",
         "- `analysis_semantic_context` 是用户业务目标、开放式问题和已确认血缘的准备信息。Runtime 仍自主决定查询、指标、产物和叙事。",
         "- `analysis_semantic_context.question_fact_coverage` 是 Selection 已完成的每个问题/业务事实/数据源覆盖状态；`runtime_probe_agenda` 是后端据此生成的技术工作状态。二者都不预先规定指标、图表、结论或报告章节。",
         "- Schema 中关系、observed_value_profile、requested_value_resolutions、aggregation_safety 等状态按其原始含义使用；unresolved/unknown 不等同于已确认事实。",

@@ -7,7 +7,8 @@
 ## 访问与字段
 
 - 关系型 `table` 的常规查询使用 `query_data_with_sql(...)`；需要特殊控制流时可使用底层 `load_data_with_sql(...)`。
-- 表名使用当前来源 `query_contract.datasource_identifier`，字段来自同一来源的 `query_contract.allowed_fields`；若提供 `allowed_fields_ref=metadata_schema.properties`，则以该来源完整 properties 的键集合为准。`datasource_name` 不是 SQL 表名，相邻数据源同名字段也不能串用。
+- FROM/JOIN 必须使用当前来源的 `query_contract.relation_expression`。`uns_get` 来源不得改用 `datasource_identifier`、底层 alias 或 `fqe_uns.public.<alias>`；物理表使用其自身表达式，时序来源遵守时序协议。下例是 `uns_get` 场景。
+- 字段来自同一来源的 `query_contract.allowed_fields`；若提供 `allowed_fields_ref=metadata_schema.properties`，则以该来源完整 properties 的键集合为准。`datasource_name` 不是 SQL 表名，相邻数据源同名字段也不能串用。
 - 遵守 `query_contract.sql_dialect`。优先在 SQL 层完成字段裁剪、业务时间过滤、JOIN、聚合、排序和 TopN，再用 pandas 整理小结果。
 - 同时遵守 `query_contract.operation_capabilities`。能力标为 `unsupported` 的运算不能换用另一数据库方言函数；应改写为当前查询层支持的分组结果，或在结果有界时于 pandas 组合。
 - Loader 自动恢复 Schema 中直接投影的数值字段和明确聚合别名。表达式派生数值列用 `numeric_columns=[...]`；合同号、设备号、产品编码等业务标识用 `text_columns=[...]` 保真，不能数值化。
@@ -62,7 +63,7 @@ query_constraints = {
 }
 sql = """
 SELECT category, SUM(metric_value) AS metric_value
-FROM schema_name.selected_table
+FROM uns_get('业务域/已选节点') AS selected_source
 GROUP BY category
 """
 summary = query_data_with_sql(

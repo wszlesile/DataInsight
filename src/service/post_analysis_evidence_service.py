@@ -3765,6 +3765,28 @@ class LineageIndexer:
                 columns.setdefault(str(key_node.value), []).extend(values)
         return columns
 
+    @staticmethod
+    def _literal_record_expressions(expression: ast.AST | None) -> list[ast.Dict]:
+        """Return inline record rows, including records wrapped by DataFrame."""
+        if isinstance(expression, ast.Call):
+            function_name = (
+                expression.func.id
+                if isinstance(expression.func, ast.Name)
+                else expression.func.attr
+                if isinstance(expression.func, ast.Attribute)
+                else ""
+            )
+            if function_name != "DataFrame" or not expression.args:
+                return []
+            expression = expression.args[0]
+        if isinstance(expression, ast.Dict):
+            return [expression]
+        if isinstance(expression, (ast.List, ast.Tuple)) and all(
+            isinstance(item, ast.Dict) for item in expression.elts
+        ):
+            return list(expression.elts)
+        return []
+
     @classmethod
     def _table_data_sources(cls, tree: ast.AST) -> list[dict[str, Any]]:
         loop_ranges = [
@@ -7085,7 +7107,7 @@ class LineageIndexer:
                     if (item.get("origins") or {}).get(metric_field, {}).get("queries")
                     and (item.get("origins") or {}).get(metric_field, {}).get("boundaries")
                 ]
-                if len(scoped_rows) != len(records):
+                if not scoped_rows:
                     continue
                 selector_fields = [
                     key for key in (scoped_rows[0].get("values") or {})
@@ -7137,14 +7159,7 @@ class LineageIndexer:
         ] = []
         for table_expression in cls._table_artifact_expressions(tree):
             rows_expression = cls._table_rows_expression(table_expression)
-            records = (
-                list(rows_expression.elts)
-                if isinstance(rows_expression, (ast.List, ast.Tuple))
-                and all(isinstance(item, ast.Dict) for item in rows_expression.elts)
-                else [rows_expression]
-                if isinstance(rows_expression, ast.Dict)
-                else []
-            )
+            records = cls._literal_record_expressions(rows_expression)
             column_origins: dict[str, dict[str, set[str]]] = {}
             record_rows: list[dict[str, Any]] = []
             for record in records:

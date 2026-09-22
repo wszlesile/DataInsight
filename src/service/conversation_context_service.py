@@ -1,6 +1,7 @@
 ﻿from dataclasses import dataclass
 from dataclasses import field
 from datetime import datetime
+import copy
 import re
 from typing import Any
 
@@ -26,6 +27,7 @@ from utils.context_compression import (
     summarize_turns_incrementally,
 )
 from utils.datasource_utils import (
+    build_table_query_access,
     build_table_runtime_metadata,
     build_conversation_title,
     dump_json,
@@ -1340,6 +1342,43 @@ class ConversationContextService:
             if datasource_id in payload_map
         ]
 
+    def hydrate_datasource_snapshot_query_access(
+        self,
+        datasource_snapshot: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Add access contracts to legacy snapshots without re-importing UNS."""
+        rows = [
+            copy.deepcopy(item)
+            for item in datasource_snapshot or []
+            if isinstance(item, dict)
+        ]
+        missing_ids = {
+            to_int(item.get('datasource_id') or item.get('id'), 0)
+            for item in rows
+            if item.get('datasource_type') == 'table'
+            and not isinstance(item.get('query_access'), dict)
+        }
+        missing_ids.discard(0)
+        if not missing_ids:
+            return rows
+        datasources = self.session.query(InsightDatasource).filter(
+            InsightDatasource.id.in_(missing_ids),
+            InsightDatasource.is_deleted == 0,
+        ).all()
+        access_by_id = {
+            int(datasource.id): build_table_query_access(
+                safe_json_loads(datasource.datasource_config_json, {})
+            )
+            for datasource in datasources
+        }
+        for item in rows:
+            access = access_by_id.get(
+                to_int(item.get('datasource_id') or item.get('id'), 0)
+            )
+            if access:
+                item['query_access'] = access
+        return rows
+
     def merge_turn_datasource_snapshot(
         self,
         *,
@@ -1452,6 +1491,7 @@ class ConversationContextService:
             )
         if datasource_type == "table":
             payload.update(build_table_runtime_metadata(config_json))
+            payload["query_access"] = build_table_query_access(config_json)
         sheet_name = str(config_json.get("sheet_name") or "").strip()
         if sheet_name:
             payload["sheet_name"] = sheet_name

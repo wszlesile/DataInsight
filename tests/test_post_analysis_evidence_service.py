@@ -3938,6 +3938,75 @@ result = save_analysis_result(analysis_report="Current-year contracts.", charts=
     assert len(bundle["table_trace_refs"]) == 1
 
 
+def test_inline_dataframe_record_table_keeps_dynamic_rows_separate_from_static_rows():
+    sql_count = "SELECT COUNT(*) AS record_count FROM uns_get('factory/orders')"
+    sql_quality = (
+        "SELECT COUNT(value) AS non_null_count, AVG(value) AS avg_value "
+        "FROM uns_get('factory/orders')"
+    )
+    code = r'''
+count_frame = query_data_with_sql(query_key="q_count", sql="SELECT COUNT(*) AS record_count FROM uns_get('factory/orders')")
+quality_frame = query_data_with_sql(query_key="q_quality", sql="SELECT COUNT(value) AS non_null_count, AVG(value) AS avg_value FROM uns_get('factory/orders')")
+record_count = int(count_frame["record_count"].iloc[0])
+non_null_count = int(quality_frame["non_null_count"].iloc[0])
+avg_value = float(quality_frame["avg_value"].iloc[0])
+tables = [build_table_result(
+    title="Data summary",
+    data=pd.DataFrame([
+        {"Metric": "Records", "Value": record_count},
+        {"Metric": "Field count", "Value": 1},
+        {"Metric": "Non-null", "Value": non_null_count},
+        {"Metric": "Average", "Value": f"{avg_value:.2f}"},
+    ]),
+)]
+result = save_analysis_result(analysis_report="Summary.", charts=[], tables=tables)
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Summary.",
+        tables=[{
+            "title": "Data summary",
+            "columns": [
+                {"key": "Metric", "label": "Metric"},
+                {"key": "Value", "label": "Value"},
+            ],
+            "rows": [
+                {"Metric": "Records", "Value": 12},
+                {"Metric": "Field count", "Value": 1},
+                {"Metric": "Non-null", "Value": 11},
+                {"Metric": "Average", "Value": "8.50"},
+            ],
+        }],
+        query_snapshots={
+            "q_count": _query_snapshot(sql_count, columns=["record_count"]),
+            "q_quality": _query_snapshot(
+                sql_quality, columns=["non_null_count", "avg_value"]
+            ),
+        },
+    )
+
+    lineage = LineageIndexer().build(snapshot)
+    table_outputs = [
+        item for item in lineage["output_nodes"]
+        if item.get("artifact_type") == "table"
+    ]
+    selectors = {
+        item.get("row_selector", {}).get("Metric")
+        for item in table_outputs
+        if item.get("row_selector")
+    }
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+    ref_selectors = {
+        item.get("row_selector", {}).get("Metric")
+        for item in bundle["table_trace_refs"]
+        if item.get("row_selector")
+    }
+
+    assert selectors == {"Records", "Non-null", "Average"}
+    assert ref_selectors == {"Records", "Non-null", "Average"}
+    assert "Field count" not in ref_selectors
+
+
 def test_planner_failure_keeps_ast_verified_report_evidence():
     sql = "SELECT SUM(amount) AS sales_amount FROM sales"
     code = r'''

@@ -69,7 +69,8 @@ RUNTIME_CONTRACT_PACKS: tuple[RuntimeContractPack, ...] = (
     RuntimeContractPack("query.relational", "query/relational.md", "关系型查询和 SQL 下推", (
         "query_data_with_sql", "load_data_with_sql", "probe_data_with_sql",
     ), example_output_formats=("standard",), initial_summary=(
-        "关系表使用当前来源的 datasource_identifier 和同源字段。优先在 SQL 完成过滤、JOIN、"
+        "关系表按当前来源 query_contract 的 access_mode 和 relation_expression 访问，并只使用同源字段。"
+        "datasource_identifier 仅用于技术定位和血缘。优先在 SQL 完成过滤、JOIN、"
         "聚合、排序和 TopN；单次物理结果上限不等于总体范围，明细过大需分页累计或下推聚合。"
         "confirmed 关系才可 JOIN；一对多前先在事实粒度聚合，避免重复计量。"
     )),

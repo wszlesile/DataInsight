@@ -1493,9 +1493,16 @@ def _build_datasource_reference_lines(runtime: ConversationRunContext) -> list[s
         datasource_id = row.get('datasource_id') or row.get('id') or ''
         datasource_name = str(row.get('datasource_name') or '').strip()
         datasource_identifier = str(row.get('datasource_identifier') or '').strip()
+        query_access = row.get('query_access') if isinstance(row.get('query_access'), dict) else {}
+        relation_expression = str(query_access.get('relation_expression') or '').strip()
         if not datasource_id or not datasource_name:
             continue
-        if datasource_identifier:
+        if relation_expression:
+            lines.append(
+                f'- datasource_id={datasource_id}，datasource_name="{datasource_name}"，'
+                f'relation_expression="{relation_expression}"'
+            )
+        elif datasource_identifier:
             lines.append(f'- datasource_id={datasource_id}，datasource_name="{datasource_name}"，datasource_identifier="{datasource_identifier}"')
         else:
             lines.append(f'- datasource_id={datasource_id}，datasource_name="{datasource_name}"')
@@ -1510,6 +1517,8 @@ def _datasource_match_tokens(item: dict[str, Any]) -> list[str]:
     raw_values = [
         item.get('datasource_name'),
         item.get('datasource_identifier'),
+        (item.get('query_access') or {}).get('uns_path')
+        if isinstance(item.get('query_access'), dict) else None,
         item.get('table_name'),
         item.get('sheet_name'),
     ]
@@ -1601,7 +1610,11 @@ def _build_possible_datasource_selection_hints(
                 f'（datasource_name="{datasource_name}"），但本轮正式 analysis 的 used_datasource_ids 未包含它。'
                 '下一版请重新规划数据源选择；如果该数据源与问题相关，应实际查询它并加入 used_datasource_ids。'
             )
-        if datasource_identifier:
+        query_access = item.get('query_access') if isinstance(item.get('query_access'), dict) else {}
+        relation_expression = str(query_access.get('relation_expression') or '').strip()
+        if relation_expression:
+            hint += f' SQL 访问必须使用 relation_expression="{relation_expression}"。'
+        elif datasource_identifier:
             hint += f' 访问时必须使用 datasource_identifier="{datasource_identifier}"，不要把 datasource_name 当作 SQL 表名。'
         hints.append(hint)
         if len(hints) >= 5:
@@ -1697,7 +1710,7 @@ def _build_history_requirement_recovery_instruction(
         '如果最近补充/纠错指出了遗漏的数据源、字段、关联键或计算口径，必须合并进本轮恢复后的分析目标。',
         '不要回答“没有历史对话上下文”，也不要要求用户重新描述完整需求；当前链路已经提供了历史消息、历史摘要和当前数据源快照。',
         '如果恢复出的目标需要数据分析、统计、联表、图表或报告，必须调用 submit_analysis_program 重新执行，而不是复述历史结论。',
-        '访问表型数据源时，datasource_name 只用于语义匹配；真正写 SQL 必须使用 datasource_identifier。',
+        '访问表型数据源时，datasource_name 只用于语义匹配；真正写 SQL 必须遵守当前数据源 query_access/relation_expression。',
     ])
     datasource_lines = _build_datasource_reference_lines(runtime)
     if datasource_lines:
@@ -1782,7 +1795,14 @@ def _build_followup_used_datasource_lines(
             continue
         datasource_name = str(item.get('datasource_name') or '').strip()
         datasource_identifier = str(item.get('datasource_identifier') or '').strip()
-        if datasource_identifier:
+        query_access = item.get('query_access') if isinstance(item.get('query_access'), dict) else {}
+        relation_expression = str(query_access.get('relation_expression') or '').strip()
+        if relation_expression:
+            lines.append(
+                f'- datasource_id={datasource_id}, datasource_name="{datasource_name}", '
+                f'relation_expression="{relation_expression}"'
+            )
+        elif datasource_identifier:
             lines.append(
                 f'- datasource_id={datasource_id}, datasource_name="{datasource_name}", '
                 f'datasource_identifier="{datasource_identifier}"'
@@ -1818,7 +1838,7 @@ def _build_followup_hint_instruction(
             '本轮 followup 规划要求：',
             '- 如果当前用户只是要求换图表、补图表、补报告、换展示方式、继续展示，且没有明确新增数据源/对象/时间范围/指标，优先围绕上述最近成功 used_datasource_ids 重新生成结果。',
             '- 如果存在 analysis_semantic_context，selected_datasource_ids 是 Preparation 为本轮追问确定的业务语义空间；否则它才是当前会话候选全集。应优先延续最近成功 used_datasource_ids，同时完整覆盖本轮明确新增的业务问题。',
-            '- 对于表型数据源，SQL 必须使用 datasource_identifier；不要根据其它 selected 数据源名称自行猜 catalog、schema 或表名。',
+            '- 对于表型数据源，SQL 必须遵守 query_access/relation_expression；不要根据其它 selected 数据源名称自行猜 catalog、schema 或表名。',
         ])
     return '\n'.join(lines)
 
@@ -3657,6 +3677,23 @@ def _stream_with_runtime(
     # Keep this entry point self-contained: callers that resume or directly invoke
     # the runtime must receive the same policy defaults as controller-driven calls.
     _apply_invocation_policy(runtime, agent_request)
+    active_snapshot = runtime.active_datasource_snapshot
+    if isinstance(active_snapshot, dict):
+        rows = active_snapshot.get('selected_datasource_snapshot') or []
+        if any(
+            isinstance(item, dict)
+            and item.get('datasource_type') == 'table'
+            and not isinstance(item.get('query_access'), dict)
+            for item in rows
+        ):
+            with session_scope(expire_on_commit=False) as session:
+                hydrated_rows = ConversationContextService(
+                    session
+                ).hydrate_datasource_snapshot_query_access(rows)
+            runtime.active_datasource_snapshot = {
+                **active_snapshot,
+                'selected_datasource_snapshot': hydrated_rows,
+            }
     assistant_message = ''
     analysis_report = ''
     charts: list[dict[str, Any]] = []
