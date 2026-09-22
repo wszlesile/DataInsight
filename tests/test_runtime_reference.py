@@ -116,6 +116,51 @@ def test_execution_observation_stays_in_real_react_with_probe_and_repair(monkeyp
     assert len([msg for msg in result["messages"] if isinstance(msg, HumanMessage)]) == 1
 
 
+def test_terminal_datasource_failure_stops_before_another_model_call(monkeypatch):
+    class ScriptedModel(FakeMessagesListChatModel):
+        seen: list = Field(default_factory=list)
+
+        def bind_tools(self, tool_list, **kwargs):
+            return self
+
+        def _generate(self, messages, **kwargs):
+            self.seen.append(list(messages))
+            return super()._generate(messages, **kwargs)
+
+    llm = ScriptedModel(responses=[
+        AIMessage(content="", tool_calls=[{
+            "id": "probe-terminal",
+            "name": "probe_analysis_data",
+            "args": {"code": "result = None", "used_datasource_ids": [1]},
+        }]),
+        AIMessage(content="should not be generated"),
+    ])
+    monkeypatch.setattr(agent, "create_data_insight_model", lambda _: llm)
+
+    terminal_message = ToolMessage(
+        content=json.dumps({
+            "status": "failed",
+            "error_type": "data_source_unavailable",
+            "diagnostics": {
+                "_terminal_probe_failure": {
+                    "kind": "all_required_query_paths_unavailable",
+                },
+            },
+        }),
+        tool_call_id="probe-terminal",
+    )
+    monkeypatch.setattr(tools.execute_python, "func", lambda **_: terminal_message)
+
+    graph = agent.create_data_insight_agent()
+    result = graph.invoke(
+        {"messages": [HumanMessage("Analyze the selected source")]},
+        context=reference_runtime().context,
+    )
+
+    assert len(llm.seen) == 1
+    assert result["runtime_terminal_failure"]["error_type"] == "data_source_unavailable"
+
+
 def test_reference_does_not_pollute_execution_feedback_or_frontend_progress():
     runtime = SimpleNamespace(short_term_memory={})
     invoker._update_short_term_memory_from_tool_payload(runtime, read_runtime_reference.func(

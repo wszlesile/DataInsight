@@ -68,12 +68,13 @@ class CustomAgentState(AgentState):
 
     username: str
     analysis_complete: bool
+    runtime_terminal_failure: dict[str, Any]
 
 
 @before_model(can_jump_to=["end"])
 def stop_after_saved_analysis(state, runtime):
-    """Stop before another model request once the execution tool saved the result."""
-    if state.get("analysis_complete"):
+    """Stop before another model request after success or a terminal runtime failure."""
+    if state.get("analysis_complete") or state.get("runtime_terminal_failure"):
         return {"jump_to": "end"}
     return None
 

@@ -454,6 +454,51 @@ def test_implicit_probe_feedback_keeps_multi_source_analysis_open_when_only_one_
     assert '_terminal_probe_failure' not in retry.diagnostics
 
 
+def test_formal_scanner_capability_failure_is_terminal_for_single_selected_source():
+    error_message = 'invalid sql: data source "fqe_uns" does not support scanner metadata sync'
+
+    assert tools._classify_execution_error(None, error_message) == 'data_source_unavailable'
+    terminal = tools._formal_datasource_unavailable_terminal(
+        error_type='data_source_unavailable',
+        error_message=error_message,
+        selected_datasource_snapshot=[{
+            'datasource_id': 41,
+            'datasource_identifier': 'some_uns_alias',
+        }],
+    )
+
+    assert terminal is not None
+    assert terminal['kind'] == 'all_required_query_paths_unavailable'
+    assert terminal['required_datasource_ids'] == [41]
+    assert terminal['source'] == 'formal_execution'
+
+
+def test_formal_scanner_capability_failure_does_not_terminate_partial_multi_source_analysis():
+    terminal = tools._formal_datasource_unavailable_terminal(
+        error_type='data_source_unavailable',
+        error_message='invalid sql: data source "fqe_uns" does not support scanner metadata sync',
+        selected_datasource_snapshot=[
+            {'datasource_id': 41, 'datasource_identifier': 'fqe_uns'},
+            {'datasource_id': 42, 'datasource_identifier': 'customer_dimension'},
+        ],
+    )
+
+    assert terminal is None
+
+
+def test_formal_binder_error_remains_repairable_when_unavailability_is_not_proven():
+    terminal = tools._formal_datasource_unavailable_terminal(
+        error_type='data_source_unavailable',
+        error_message='Binder Error: referenced column "device_name" not found',
+        selected_datasource_snapshot=[{
+            'datasource_id': 41,
+            'datasource_identifier': 'fqe_uns',
+        }],
+    )
+
+    assert terminal is None
+
+
 @pytest.mark.parametrize('mode,output', [('same_turn', {'type': 'standard'}), ('disabled', {'type': 'text'}), ('disabled', {'type': 'json', 'schema': {'type': 'object'}})])
 def test_backup_recovery_obeys_invocation_policy_without_inventing_filter(mode, output):
     execution = SimpleNamespace(id=5, execution_status='failed', error_message='Probe complete',

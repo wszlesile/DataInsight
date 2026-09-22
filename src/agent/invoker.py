@@ -2211,7 +2211,10 @@ def _promote_assistant_message_to_report(assistant_message: str, analysis_report
     return (analysis_report or '').strip() or (assistant_message or '').strip()
 
 
-def _get_selected_datasource_names(runtime: ConversationRunContext) -> list[str]:
+def _get_selected_datasource_names(
+    runtime: ConversationRunContext,
+    datasource_ids: set[int] | None = None,
+) -> list[str]:
     """提取当前会话已绑定数据源名称，供失败原因说明使用。"""
     snapshot = runtime.active_datasource_snapshot if isinstance(runtime.active_datasource_snapshot, dict) else {}
     rows = snapshot.get('selected_datasource_snapshot') or []
@@ -2220,6 +2223,13 @@ def _get_selected_datasource_names(runtime: ConversationRunContext) -> list[str]
     for row in rows:
         if not isinstance(row, dict):
             continue
+        if datasource_ids is not None:
+            try:
+                datasource_id = int(row.get('datasource_id') or row.get('id') or 0)
+            except (TypeError, ValueError):
+                continue
+            if datasource_id not in datasource_ids:
+                continue
         name = str(row.get('datasource_name') or '').strip()
         if not name or name in seen:
             continue
@@ -2287,6 +2297,83 @@ def _build_failure_reason_reply(
         parts.append(f"当前会话里已绑定的数据源包括：{', '.join(datasource_names)}。")
     parts.append("你可以检查运行环境依赖是否完整，或者再明确一下分析对象、时间范围和期望指标后重试。")
     return '\n\n'.join(parts).strip()
+
+
+def _build_datasource_unavailable_report(
+    runtime: ConversationRunContext,
+    fallback_message: str = '',
+) -> str:
+    """Build a visible terminal result for a proven infrastructure failure."""
+    executions = _load_turn_executions_fresh(runtime)
+    latest_execution = next((
+        execution for execution in reversed(executions)
+        if str(getattr(execution, 'error_message', '') or '').strip()
+    ), None)
+    latest_error = (
+        str(getattr(latest_execution, 'error_message', '') or '').strip()
+        if latest_execution is not None else ''
+    )
+    required_datasource_ids: set[int] = set()
+    if latest_execution is not None:
+        try:
+            payload = json.loads(str(getattr(latest_execution, 'result_payload_json', '') or '{}'))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        diagnostics = payload.get('diagnostics') if isinstance(payload, dict) else None
+        terminal = diagnostics.get('_terminal_probe_failure') if isinstance(diagnostics, dict) else None
+        for datasource_id in (terminal or {}).get('required_datasource_ids') or []:
+            try:
+                normalized_id = int(datasource_id)
+            except (TypeError, ValueError):
+                continue
+            if normalized_id > 0:
+                required_datasource_ids.add(normalized_id)
+    latest_error = latest_error or fallback_message
+    latest_error = re.split(r'\n\s*(?:错误定位|Error location)\s*[:：]', latest_error, maxsplit=1)[0]
+    latest_error = re.sub(r'\s+', ' ', latest_error).strip()
+    if len(latest_error) > 700:
+        latest_error = latest_error[:697].rstrip() + '...'
+    datasource_names = _get_selected_datasource_names(
+        runtime,
+        required_datasource_ids or None,
+    )
+
+    lines = [
+        '## 数据源不可用说明',
+        '',
+        '### 当前结论',
+        '',
+        '本轮未生成统计结果、图表或业务结论，因为分析所需的数据源当前无法通过查询服务访问。'
+        '这属于数据源连接、挂载或查询能力异常，不能解释为业务数据为空。',
+    ]
+    if datasource_names:
+        lines.extend([
+            '',
+            '### 受影响的数据源',
+            '',
+            *[f'- {name}' for name in datasource_names],
+        ])
+    if latest_error:
+        lines.extend([
+            '',
+            '### 已确认的技术原因',
+            '',
+            f'- {latest_error}',
+        ])
+    lines.extend([
+        '',
+        '### 建议处理',
+        '',
+        '1. 检查相关 UNS 节点是否已在联邦查询服务中正确注册或挂载。',
+        '2. 检查查询连接器、scanner metadata 能力以及底层数据库连接状态。',
+        '3. 环境恢复后重新执行本轮分析，才能得到可信的分析结果。',
+    ])
+    return '\n'.join(lines).strip()
+
+
+def _requires_strict_json_result(runtime: ConversationRunContext) -> bool:
+    output_contract = runtime.output_contract if isinstance(runtime.output_contract, dict) else {}
+    return str(output_contract.get('type') or 'standard') == 'json'
 
 
 def _should_use_failure_reason_fallback(
@@ -3512,6 +3599,29 @@ def invoke_agent(agent_request: AgentRequest) -> AgentResponse:
             tables=tables,
             allow_report_only=allow_report_only,
         )
+    except RuntimeDatasourceUnavailableError as exc:
+        if _requires_strict_json_result(runtime):
+            user_error_message = str(exc)
+            _fail_run_with_fresh_session(
+                runtime,
+                user_error_message,
+                preserve_existing_results=runtime.is_rerun,
+            )
+            raise RuntimeError(user_error_message) from exc
+        analysis_report = _build_datasource_unavailable_report(runtime, str(exc))
+        assistant_message = '分析所需数据源当前不可访问，已生成问题说明。'
+        runtime.evidence_enabled = False
+        return _finalize_run_with_fresh_session(
+            runtime=runtime,
+            username=agent_request.username,
+            user_message=agent_request.user_message,
+            analysis_flow_started=True,
+            assistant_message=assistant_message,
+            analysis_report=analysis_report,
+            charts=[],
+            tables=[],
+            allow_report_only=True,
+        )
     except AnalysisTaskCancelled as exc:
         _fail_run_with_fresh_session(
             runtime,
@@ -4077,6 +4187,53 @@ def _stream_with_runtime(
                 chart_artifact_id=response.chart_artifact_id,
                 chart_artifact_ids=response.chart_artifact_ids,
             )
+        yield _build_progress_event(
+            'done',
+            conversation_id=runtime.conversation.id,
+            turn_id=runtime.turn.id,
+        )
+    except RuntimeDatasourceUnavailableError as exc:
+        if _requires_strict_json_result(runtime):
+            user_error_message = str(exc)
+            _fail_run_with_fresh_session(
+                runtime,
+                user_error_message,
+                preserve_existing_results=runtime.is_rerun,
+            )
+            yield _build_progress_event(
+                'error',
+                conversation_id=runtime.conversation.id,
+                turn_id=runtime.turn.id,
+                stage='data_source_unavailable',
+                level='error',
+                message=user_error_message,
+            )
+            return
+        analysis_report = _build_datasource_unavailable_report(runtime, str(exc))
+        assistant_message = '分析所需数据源当前不可访问，已生成问题说明。'
+        runtime.evidence_enabled = False
+        response = _finalize_run_with_fresh_session(
+            runtime=runtime,
+            username=agent_request.username,
+            user_message=agent_request.user_message,
+            analysis_flow_started=True,
+            assistant_message=assistant_message,
+            analysis_report=analysis_report,
+            charts=[],
+            tables=[],
+            allow_report_only=True,
+        )
+        yield _build_progress_event(
+            'result',
+            conversation_id=runtime.conversation.id,
+            turn_id=runtime.turn.id,
+            stage='data_source_unavailable',
+            analysis_report=analysis_report,
+            charts=response.charts,
+            tables=response.tables,
+            chart_artifact_id=response.chart_artifact_id,
+            chart_artifact_ids=response.chart_artifact_ids,
+        )
         yield _build_progress_event(
             'done',
             conversation_id=runtime.conversation.id,

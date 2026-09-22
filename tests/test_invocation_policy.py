@@ -73,3 +73,54 @@ def test_json_output_contract_requires_object_root():
                 "items": {"type": "integer"},
             },
         })
+
+
+def test_json_output_contract_rejects_reversed_numeric_bounds():
+    with pytest.raises(
+        ValueError,
+        match=r"\$\.total_batch_count: minimum \(100000\) 不能大于 maximum \(10\)",
+    ):
+        normalize_output_contract({
+            "type": "json",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "total_batch_count": {
+                        "type": "integer",
+                        "minimum": 100000,
+                        "maximum": 10,
+                    },
+                },
+                "required": ["total_batch_count"],
+                "additionalProperties": False,
+            },
+        })
+
+
+@pytest.mark.parametrize(
+    "property_schema, expected_message",
+    [
+        (
+            {"type": "number", "exclusiveMinimum": 10, "maximum": 10},
+            "数值范围不可满足",
+        ),
+        (
+            {"type": "array", "items": {"type": "integer"}, "minItems": 5, "maxItems": 2},
+            "minItems (5) 不能大于 maxItems (2)",
+        ),
+        (
+            {"type": "string", "minLength": 8, "maxLength": 3},
+            "minLength (8) 不能大于 maxLength (3)",
+        ),
+    ],
+)
+def test_json_output_contract_rejects_unsatisfiable_ranges(property_schema, expected_message):
+    with pytest.raises(ValueError) as exc_info:
+        normalize_output_contract({
+            "type": "json",
+            "schema": {
+                "type": "object",
+                "properties": {"value": property_schema},
+            },
+        })
+    assert expected_message in str(exc_info.value)

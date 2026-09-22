@@ -2884,7 +2884,7 @@ GET /api/insight/namespaces/10/datasources/82/content?page_no=1&page_size=50
   - `{"type":"text"}`：纯文本洞察结果。
   - `{"type":"json","schema":{...}}`：严格 JSON 对象；`schema` 必填。
 
-JSON Schema 根节点必须是 `object`。其属性可使用本地可验证子集：`object/array/string/number/integer/boolean/null`、`properties`、`required`、`additionalProperties`、`items`、`enum`、`const`、数值/长度/数组边界和 `pattern`。不支持远程引用、递归引用和组合关键字。
+JSON Schema 根节点必须是 `object`。其属性可使用本地可验证子集：`object/array/string/number/integer/boolean/null`、`properties`、`required`、`additionalProperties`、`items`、`enum`、`const`、数值/长度/数组边界和 `pattern`。不支持远程引用、递归引用和组合关键字。服务会在创建作业前检查 Schema 自身的一致性；数值、字符串长度或数组长度的下界大于上界，以及排他边界形成空区间时，接口直接返回 HTTP `400`，不会创建异步作业。
 
 新建成功返回 HTTP `202`；幂等命中返回 HTTP `200`：
 

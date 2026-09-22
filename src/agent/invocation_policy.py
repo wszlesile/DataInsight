@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -126,6 +127,68 @@ def validate_output_schema(schema: dict[str, Any]) -> None:
         raise ValueError(f"JSON Schema 不能超过 {MAX_OUTPUT_SCHEMA_CHARS} 字符")
     property_count = 0
 
+    def validate_non_negative_integer_keyword(node: dict[str, Any], key: str, path: str) -> None:
+        if key not in node:
+            return
+        value = node[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"JSON Schema {key} 必须是非负整数: {path}")
+
+    def validate_numeric_keyword(node: dict[str, Any], key: str, path: str) -> None:
+        if key not in node:
+            return
+        value = node[key]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise ValueError(f"JSON Schema {key} 必须是有限数值: {path}")
+
+    def validate_ordered_pair(
+        node: dict[str, Any],
+        lower_key: str,
+        upper_key: str,
+        path: str,
+    ) -> None:
+        if lower_key in node and upper_key in node and node[lower_key] > node[upper_key]:
+            raise ValueError(
+                f"JSON Schema 边界冲突: {path}: "
+                f"{lower_key} ({node[lower_key]}) 不能大于 {upper_key} ({node[upper_key]})"
+            )
+
+    def validate_numeric_bounds(node: dict[str, Any], path: str) -> None:
+        keys = ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum")
+        for key in keys:
+            validate_numeric_keyword(node, key, path)
+        validate_ordered_pair(node, "minimum", "maximum", path)
+        validate_ordered_pair(node, "exclusiveMinimum", "exclusiveMaximum", path)
+
+        lower_bounds: list[tuple[float | int, bool, str]] = []
+        upper_bounds: list[tuple[float | int, bool, str]] = []
+        if "minimum" in node:
+            lower_bounds.append((node["minimum"], False, "minimum"))
+        if "exclusiveMinimum" in node:
+            lower_bounds.append((node["exclusiveMinimum"], True, "exclusiveMinimum"))
+        if "maximum" in node:
+            upper_bounds.append((node["maximum"], False, "maximum"))
+        if "exclusiveMaximum" in node:
+            upper_bounds.append((node["exclusiveMaximum"], True, "exclusiveMaximum"))
+        if not lower_bounds or not upper_bounds:
+            return
+
+        lower_value = max(item[0] for item in lower_bounds)
+        upper_value = min(item[0] for item in upper_bounds)
+        lower_exclusive = any(value == lower_value and exclusive for value, exclusive, _ in lower_bounds)
+        upper_exclusive = any(value == upper_value and exclusive for value, exclusive, _ in upper_bounds)
+        if lower_value > upper_value or (
+            lower_value == upper_value and (lower_exclusive or upper_exclusive)
+        ):
+            raise ValueError(
+                f"JSON Schema 数值范围不可满足: {path}: "
+                f"有效下界 {lower_value} 与有效上界 {upper_value} 冲突"
+            )
+
     def walk(node: Any, path: str, depth: int) -> None:
         nonlocal property_count
         if depth > MAX_OUTPUT_SCHEMA_DEPTH:
@@ -139,6 +202,11 @@ def validate_output_schema(schema: dict[str, Any]) -> None:
         allowed_types = schema_type if isinstance(schema_type, list) else [schema_type]
         if not allowed_types or any(item not in SUPPORTED_SCHEMA_TYPES for item in allowed_types):
             raise ValueError(f"JSON Schema 必须声明受支持的 type: {path}")
+        validate_numeric_bounds(node, path)
+        for key in ("minItems", "maxItems", "minLength", "maxLength"):
+            validate_non_negative_integer_keyword(node, key, path)
+        validate_ordered_pair(node, "minItems", "maxItems", path)
+        validate_ordered_pair(node, "minLength", "maxLength", path)
         if "object" in allowed_types:
             properties = node.get("properties")
             if not isinstance(properties, dict):
@@ -153,6 +221,8 @@ def validate_output_schema(schema: dict[str, Any]) -> None:
                 not isinstance(item, str) or item not in properties for item in required
             ):
                 raise ValueError(f"required 必须引用当前 properties 中的字段: {path}")
+            if len(required) != len(set(required)):
+                raise ValueError(f"required 不能包含重复字段: {path}")
             additional = node.get("additionalProperties", True)
             if not isinstance(additional, bool):
                 raise ValueError(f"additionalProperties 仅支持布尔值: {path}")
@@ -164,8 +234,10 @@ def validate_output_schema(schema: dict[str, Any]) -> None:
                 raise ValueError(f"array Schema 必须声明单一 items Schema: {path}")
             walk(items, f"{path}[]", depth + 1)
         if "pattern" in node:
+            if not isinstance(node["pattern"], str):
+                raise ValueError(f"JSON Schema pattern 必须是字符串: {path}")
             try:
-                re.compile(str(node["pattern"]))
+                re.compile(node["pattern"])
             except re.error as exc:
                 raise ValueError(f"JSON Schema pattern 非法: {path}: {exc}") from exc
 

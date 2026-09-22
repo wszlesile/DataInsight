@@ -77,6 +77,24 @@ QUERY_SNAPSHOT_SQL_MAX_CHARS = int(os.environ.get('QUERY_SNAPSHOT_SQL_MAX_CHARS'
 QUERY_SNAPSHOT_CONTEXT_MAX_CHARS = int(os.environ.get('QUERY_SNAPSHOT_CONTEXT_MAX_CHARS', '12000'))
 MAX_SQL_RESULT_ROWS = 10000
 
+# These are physical query/connector failures.  They are deliberately kept
+# separate from schema and analysis-logic errors: retrying generated Python
+# cannot make an unavailable FedQuery capability appear.
+DATASOURCE_UNAVAILABLE_ERROR_MARKERS = (
+    'failed to fetch result for query',
+    'binder error',
+    'catalog error',
+    'connection refused',
+    'could not connect',
+    'does not support scanner metadata sync',
+)
+TERMINAL_DATASOURCE_UNAVAILABLE_ERROR_MARKERS = (
+    'does not support scanner metadata sync',
+    'failed to find attached database',
+    'connection refused',
+    'could not connect',
+)
+
 
 class ChartArtifactContractError(ValueError):
     def __init__(self, *, chart_index: int, chart_title: str, cause: ValueError):
@@ -12431,13 +12449,7 @@ def _classify_execution_error(error: Exception | None, error_message: str) -> st
         'authentication failed',
     )):
         return 'authorization_error'
-    if any(marker in lowered for marker in (
-        'failed to fetch result for query',
-        'binder error',
-        'catalog error',
-        'connection refused',
-        'could not connect',
-    )):
+    if any(marker in lowered for marker in DATASOURCE_UNAVAILABLE_ERROR_MARKERS):
         return 'data_source_unavailable'
     if (
         'no_data_found' in lowered
@@ -15720,6 +15732,79 @@ def _all_selected_probe_paths_unavailable(
     }
 
 
+_DATASOURCE_ERROR_IDENTIFIER_PATTERN = re.compile(
+    r'(?:data source|datasource|attached database|catalog)\s*["\'`\[]?'
+    r'([^"\'`\]\s,;]+)',
+    re.IGNORECASE,
+)
+
+
+def _formal_datasource_unavailable_terminal(
+    *,
+    error_type: str,
+    error_message: str,
+    selected_datasource_snapshot: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """Build a terminal diagnostic for a hard formal-query availability error.
+
+    Formal execution normally repairs code.  A connector capability failure is
+    different: changing Python cannot repair it.  We only terminate when the
+    error is a known hard availability marker and all selected sources can be
+    mapped to unavailable paths.  For a single selected source, the physical
+    error itself is sufficient even when the connector omits a datasource name.
+    """
+    if str(error_type or '') != 'data_source_unavailable':
+        return None
+    lowered = str(error_message or '').lower()
+    if not any(marker in lowered for marker in TERMINAL_DATASOURCE_UNAVAILABLE_ERROR_MARKERS):
+        return None
+
+    selected_by_id: dict[int, dict[str, Any]] = {}
+    for item in selected_datasource_snapshot or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            datasource_id = int(item.get('datasource_id') or item.get('id') or 0)
+        except (TypeError, ValueError):
+            continue
+        if datasource_id > 0:
+            selected_by_id[datasource_id] = item
+    if not selected_by_id:
+        return None
+
+    identifiers = [match.strip().strip('`"[]').lower() for match in _DATASOURCE_ERROR_IDENTIFIER_PATTERN.findall(error_message or '')]
+    identifiers = [item for item in identifiers if item]
+    unavailable_tokens = set(identifiers)
+    unavailable_tokens.update(item.rsplit('.', 1)[-1] for item in identifiers)
+    mapped_ids = sorted(
+        datasource_id
+        for datasource_id, item in selected_by_id.items()
+        if _datasource_relation_tokens(item) & unavailable_tokens
+    )
+    required_ids = sorted(selected_by_id)
+
+    # A single selected source has no alternative path.  This is the exact
+    # shape of the fqe_uns failure; do not force a model repair loop just
+    # because the connector's error text omitted the source alias.
+    if len(required_ids) == 1:
+        mapped_ids = mapped_ids or required_ids
+    if set(mapped_ids) != set(required_ids):
+        return None
+    return {
+        'kind': 'all_required_query_paths_unavailable',
+        'query_count': 1,
+        'required_datasource_ids': required_ids,
+        'unavailable_datasource_ids': mapped_ids,
+        'queries': [{
+            'query_key': 'formal_execution',
+            'datasource_identifiers': identifiers,
+            'error_type': 'data_source_unavailable',
+            'error_message': str(error_message or '')[:1200],
+        }],
+        'source': 'formal_execution',
+    }
+
+
 def _build_artifact_review_packet(
     charts: list[dict[str, Any]] | None,
     tables: list[dict[str, Any]] | None,
@@ -17170,6 +17255,8 @@ def execute_python(
         error_signature = worker_result.get('error_signature') or _extract_error_signature(error_type, error_message)
         error_message = worker_payload.get('error_message', error_message)
         error_type = worker_payload.get('error_type', error_type)
+        if error_type in {'', 'runtime_error'}:
+            error_type = _classify_execution_error(None, error_message)
         repair_instructions = worker_payload.get('repair_instructions') or _build_repair_instructions(error_type)
         error_signature = worker_payload.get('error_signature') or _extract_error_signature(error_type, error_message)
         code_error_context = worker_payload.get('code_error_context') if isinstance(worker_payload.get('code_error_context'), dict) else {}
@@ -17230,6 +17317,14 @@ def execute_python(
             repair_instructions=repair_instructions,
             diagnostics=worker_diagnostics,
         )
+        terminal_failure = _formal_datasource_unavailable_terminal(
+            error_type=error_type,
+            error_message=error_message,
+            selected_datasource_snapshot=selected_datasource_snapshot,
+        )
+        if terminal_failure is not None:
+            limit_diagnostics = dict(limit_diagnostics or {})
+            limit_diagnostics['_terminal_probe_failure'] = terminal_failure
         tool_error_message = _tool_error_message(
             tool_call_id=runtime.tool_call_id,
             execution_id=execution_id,
@@ -17263,11 +17358,26 @@ def execute_python(
             logger.error(f"代码执行失败（{error_type}）：{error_message}")
         emit(
             'status',
-            stage='tool_error',
+            stage='data_source_unavailable' if terminal_failure is not None else 'tool_error',
             level='error',
             tool='execute_python',
-            message=FRONTEND_TOOL_ERROR_MESSAGE,
+            message=(
+                '分析所需数据源当前不可访问，正在生成问题说明。'
+                if terminal_failure is not None
+                else FRONTEND_TOOL_ERROR_MESSAGE
+            ),
         )
+        if terminal_failure is not None:
+            return Command(
+                update={
+                    'messages': [tool_error_message],
+                    'runtime_terminal_failure': {
+                        'error_type': 'data_source_unavailable',
+                        'source': 'formal_execution',
+                    },
+                },
+                goto=END,
+            )
         return tool_error_message
 
     exec_result = _deserialize_exec_result(worker_result.get('exec_result') or {})

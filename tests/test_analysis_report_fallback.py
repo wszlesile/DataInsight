@@ -1,7 +1,9 @@
+import json
 import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -11,6 +13,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from agent.invoker import (  # noqa: E402
     MAX_ANALYSIS_AGENT_ROUNDS,
+    _build_datasource_unavailable_report,
     _build_failure_reason_reply,
     _ensure_analysis_result_ready,
     _is_chart_contract_error_text,
@@ -124,6 +127,65 @@ class AnalysisReportFallbackTestCase(unittest.TestCase):
         self.assertIn("这次没有顺利完成“分析最近的汽车维修记录”的分析。", reply)
         self.assertIn("No module named 'pytz'", reply)
         self.assertIn("报警记录表", reply)
+
+    def test_datasource_unavailable_report_distinguishes_failure_from_no_data(self) -> None:
+        runtime = ConversationRunContext(
+            conversation=SimpleNamespace(id=117, insight_namespace_id=18),
+            turn=SimpleNamespace(id=191, started_at=None),
+            active_datasource_snapshot={
+                "selected_datasource_snapshot": [
+                    {"datasource_id": 41, "datasource_name": "设备运行记录"},
+                    {"datasource_id": 42, "datasource_name": "产品月度利润"},
+                ]
+            },
+            is_rerun=False,
+            history_turn_limit=None,
+        )
+
+        execution = SimpleNamespace(
+            error_message='data source "fqe_uns" does not support scanner metadata sync',
+            result_payload_json=json.dumps({
+                'diagnostics': {
+                    '_terminal_probe_failure': {
+                        'required_datasource_ids': [41],
+                    },
+                },
+            }),
+        )
+        with patch('agent.invoker._load_turn_executions_fresh', return_value=[execution]):
+            report = _build_datasource_unavailable_report(
+                runtime,
+                'data source "fqe_uns" does not support scanner metadata sync',
+            )
+
+        self.assertIn("数据源不可用说明", report)
+        self.assertIn("设备运行记录", report)
+        self.assertNotIn("产品月度利润", report)
+        self.assertIn("不能解释为业务数据为空", report)
+        self.assertIn("scanner metadata", report)
+
+    def test_datasource_unavailable_report_removes_executor_location_suffix(self) -> None:
+        runtime = ConversationRunContext(
+            conversation=SimpleNamespace(id=117, insight_namespace_id=18),
+            turn=SimpleNamespace(id=191, started_at=None),
+            active_datasource_snapshot={"selected_datasource_snapshot": []},
+            is_rerun=False,
+            history_turn_limit=None,
+        )
+        execution = SimpleNamespace(
+            error_message=(
+                'invalid sql:data source "fqe_uns" does not support scanner metadata sync\n\n'
+                '错误定位：生成代码第 29 行：df = query_data_with_sql('
+            ),
+            result_payload_json='{}',
+        )
+
+        with patch('agent.invoker._load_turn_executions_fresh', return_value=[execution]):
+            report = _build_datasource_unavailable_report(runtime)
+
+        self.assertIn("does not support scanner metadata sync", report)
+        self.assertNotIn("错误定位", report)
+        self.assertNotIn("query_data_with_sql", report)
 
     def test_existing_report_takes_priority(self) -> None:
         self.assertEqual(

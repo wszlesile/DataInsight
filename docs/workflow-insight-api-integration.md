@@ -156,7 +156,7 @@ X-Request-ID: {optional-request-id}
 }
 ```
 
-JSON Schema 根节点必须是 `object`。字段名、类型、`description`、枚举和必填项共同定义调用方需要的结果。洞察服务会对最终对象做确定性 Schema 校验，不满足 Schema 的结果不会以成功状态返回。
+JSON Schema 根节点必须是 `object`。字段名、类型、`description`、枚举和必填项共同定义调用方需要的结果。洞察服务会在提交时校验 Schema 自身是否一致，并在执行完成后对最终对象做确定性 Schema 校验；Schema 无效或结果不满足 Schema 时均不会以成功状态返回。
 
 首版支持以下安全子集：
 
@@ -165,6 +165,8 @@ JSON Schema 根节点必须是 `object`。字段名、类型、`description`、�
 - 数组：`items`、`minItems`、`maxItems`
 - 字符串：`minLength`、`maxLength`、`pattern`
 - 数值：`minimum`、`maximum`、`exclusiveMinimum`、`exclusiveMaximum`
+
+边界约束必须可满足。例如 `minimum` 不能大于 `maximum`，`minItems` 不能大于 `maxItems`，`minLength` 不能大于 `maxLength`；相等的上下界中包含排他边界也会形成无效空区间。这类请求直接返回 HTTP `400`，错误消息包含字段路径和冲突边界。
 - 通用：`enum`、`const`、`title`、`description`
 
 不支持 `$ref`、远程引用、递归引用及 `oneOf`、`anyOf`、`allOf` 等组合关键字。
@@ -355,7 +357,7 @@ Authorization: Bearer {token}
 
 | HTTP 状态码 | 场景 |
 | --- | --- |
-| `400` | 参数缺失、输出协议非法、JSON Schema 不受支持、幂等键内容冲突、UNS 节点无法访问或转换 |
+| `400` | 参数缺失、输出协议非法、JSON Schema 不受支持或边界冲突、幂等键内容冲突、UNS 节点无法访问或转换 |
 | `401` | 未获取到有效调用用户 |
 | `404` | 作业不存在，或当前用户无权访问该作业 |
 | `500` | 作业提交、状态同步或取消过程中发生服务异常 |
