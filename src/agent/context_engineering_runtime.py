@@ -875,16 +875,64 @@ def _runtime_lineage_field_defaults(semantic_context: Any) -> dict[int, tuple[st
     }
 
 
+def _runtime_query_contract(
+    row: dict[str, Any],
+    fallback: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the single executable access contract exposed to Runtime.
+
+    Execution snapshots retain ``query_access`` for backend compatibility,
+    while prompt snapshots expose ``query_contract``.  A state-scoped work
+    view may be built from either snapshot, so normalize both here instead of
+    making the model reconcile two representations.
+    """
+    fallback = fallback if isinstance(fallback, dict) else {}
+    contract: dict[str, Any] = {}
+    for source in (fallback, row):
+        query_contract = source.get("query_contract")
+        if isinstance(query_contract, dict):
+            contract.update(copy.deepcopy(query_contract))
+        query_access = source.get("query_access")
+        if isinstance(query_access, dict):
+            contract.update({
+                key: copy.deepcopy(value)
+                for key, value in query_access.items()
+                if value not in (None, "", [], {})
+            })
+    datasource_id = _runtime_datasource_id(row) or _runtime_datasource_id(fallback)
+    if datasource_id > 0:
+        contract["datasource_id"] = datasource_id
+    if contract.get("access_mode") != "uns_get":
+        identifier = str(
+            row.get("datasource_identifier")
+            or fallback.get("datasource_identifier")
+            or ""
+        ).strip()
+        if identifier:
+            contract.setdefault("datasource_identifier", identifier)
+    else:
+        # A physical alias is backend lineage metadata, not an alternative
+        # executable relation for an UNS-permission-bound source.
+        contract.pop("datasource_identifier", None)
+    return contract
+
+
 def _runtime_source_identity(row: dict[str, Any]) -> dict[str, Any]:
     keys = (
-        "datasource_id", "datasource_name", "datasource_identifier", "datasource_type",
+        "datasource_id", "datasource_name", "datasource_type",
         "table_engine", "ts_query_source", "time_field", "sheet_name", "recommended_loader",
     )
-    return {
+    item = {
         key: copy.deepcopy(row[key])
         for key in keys
         if row.get(key) not in (None, "", [], {})
     }
+    query_contract = _runtime_query_contract(row)
+    if query_contract:
+        item["query_contract"] = query_contract
+    if query_contract.get("access_mode") != "uns_get" and row.get("datasource_identifier"):
+        item["datasource_identifier"] = copy.deepcopy(row["datasource_identifier"])
+    return item
 
 
 def _clip_runtime_work_text(value: str, limit: int) -> str:
@@ -943,8 +991,15 @@ def _runtime_datasource_detail_item(
     }
     item = {
         key: copy.deepcopy(value) for key, value in row.items()
-        if key not in {'metadata_schema', 'field_capabilities'}
+        if key not in {
+            'metadata_schema', 'field_capabilities', 'query_access', 'query_contract',
+        }
     }
+    query_contract = _runtime_query_contract(row, fallback_index)
+    if query_contract:
+        item["query_contract"] = query_contract
+    if query_contract.get("access_mode") == "uns_get":
+        item.pop("datasource_identifier", None)
     item["metadata_schema"] = {
         **copy.deepcopy(schema),
         "name": schema.get("name") or fallback_schema.get("name"),

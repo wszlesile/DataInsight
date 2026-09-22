@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 from agent import context_engineering_runtime
+from agent.context_engineering_runtime import build_runtime_datasource_working_message
 from agent.tools import (
     _datasource_relation_tokens,
     _extract_physical_sql_datasource_identifiers,
@@ -174,6 +175,75 @@ def test_runtime_query_contract_exposes_uns_get_as_authoritative_relation(monkey
     assert "query_access" not in _runtime_payload(message)["datasources"][0]
 
 
+def test_runtime_work_views_expose_only_uns_get_as_executable_relation():
+    execution_snapshot = {
+        "selected_datasource_ids": [31],
+        "selected_datasource_snapshot": [{
+            "datasource_id": 31,
+            "datasource_type": "table",
+            "datasource_name": "批次质量上下文",
+            "datasource_identifier": "public._dim_batch",
+            "table_engine": "relational",
+            "query_access": {
+                "access_mode": "uns_get",
+                "uns_path": "生产数仓/批次质量上下文",
+                "relation_expression": "uns_get('生产数仓/批次质量上下文')",
+            },
+            "metadata_schema": {
+                "properties": {"batch_id": {"type": "string"}},
+            },
+        }],
+    }
+    prompt_snapshot = {
+        "selected_datasource_ids": [31],
+        "selected_datasource_snapshot": [{
+            "datasource_id": 31,
+            "datasource_type": "table",
+            "datasource_name": "批次质量上下文",
+            "datasource_identifier": "public._dim_batch",
+            "table_engine": "relational",
+            "query_contract": {
+                "datasource_id": 31,
+                "datasource_identifier": "public._dim_batch",
+                "access_mode": "uns_get",
+                "uns_path": "生产数仓/批次质量上下文",
+                "relation_expression": "uns_get('生产数仓/批次质量上下文')",
+                "allowed_fields": ["batch_id"],
+            },
+            "metadata_schema": {
+                "properties": {"batch_id": {"type": "string"}},
+            },
+        }],
+    }
+
+    plan_payload = _runtime_payload(build_runtime_datasource_working_message(
+        prompt_snapshot,
+        execution_snapshot,
+        work="plan",
+    ))
+    index = plan_payload["datasource_index"][0]
+    assert index["query_contract"]["relation_expression"] == (
+        "uns_get('生产数仓/批次质量上下文')"
+    )
+    assert "datasource_identifier" not in index
+    assert "datasource_identifier" not in index["query_contract"]
+
+    implement_payload = _runtime_payload(build_runtime_datasource_working_message(
+        prompt_snapshot,
+        execution_snapshot,
+        work="implement",
+        datasource_ids=[31],
+        field_names_by_datasource={"31": ["batch_id"]},
+    ))
+    detail = implement_payload["datasource_details"][0]
+    assert detail["query_contract"]["relation_expression"] == (
+        "uns_get('生产数仓/批次质量上下文')"
+    )
+    assert detail["query_contract"]["allowed_fields"] == ["batch_id"]
+    assert "query_access" not in detail
+    assert "datasource_identifier" not in detail
+
+
 def test_uns_get_join_is_bound_back_to_both_datasources():
     sql = """
     SELECT a.batch_id, b.product_name
@@ -250,5 +320,31 @@ def test_static_contract_rejects_using_datasource_name_as_uns_table():
     ]
     assert _validate_uns_get_access_contract(
         code='analysis_report = "分析批次质量上下文"',
+        selected_datasource_snapshot=snapshot,
+    ) is None
+
+
+def test_static_contract_does_not_confuse_path_with_physical_alias_substring():
+    snapshot = [{
+        "datasource_id": 99,
+        "datasource_name": "hhhhhhh",
+        "datasource_identifier": "public._hhhhhhh_b7cb830fc10248fbb6dc",
+        "metadata_schema": {"name": "hhhhhhh"},
+        "query_access": {
+            "access_mode": "uns_get",
+            "uns_path": "hhhhhhh",
+            "relation_expression": "uns_get('hhhhhhh')",
+        },
+    }]
+
+    retry = _validate_uns_get_access_contract(
+        code='sql = "SELECT COUNT(*) FROM public._hhhhhhh_b7cb830fc10248fbb6dc"',
+        selected_datasource_snapshot=snapshot,
+    )
+
+    assert retry is not None
+    assert retry.diagnostics["violated_contract"] == "uns_get_access_required"
+    assert _validate_uns_get_access_contract(
+        code='sql = "SELECT COUNT(*) FROM uns_get(\'hhhhhhh\')"',
         selected_datasource_snapshot=snapshot,
     ) is None

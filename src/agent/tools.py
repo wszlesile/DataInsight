@@ -11354,7 +11354,6 @@ def _validate_uns_get_access_contract(
     selected_datasource_snapshot: list[dict[str, Any]] | None,
 ) -> RetryResult | None:
     """Reject a provable bypass of an UNS path's access semantics."""
-    normalized_code = str(code or '').casefold()
     sql_relation_tokens: set[str] = set()
     try:
         tree = ast.parse(code or '')
@@ -11368,11 +11367,17 @@ def _validate_uns_get_access_contract(
                 and re.search(r'(?is)\bselect\b.+\bfrom\b', node.value)
             ):
                 continue
-            sql_relation_tokens.update(
-                str(token).strip().strip('`"[]').casefold()
-                for token in _extract_physical_sql_datasource_identifiers(node.value)
-                if str(token).strip()
-            )
+            for token in _extract_physical_sql_datasource_identifiers(node.value):
+                normalized_token = str(token).strip().strip('`"[]').casefold()
+                if not normalized_token:
+                    continue
+                sql_relation_tokens.add(normalized_token)
+                if '/' not in normalized_token:
+                    parts = [part for part in normalized_token.split('.') if part]
+                    if len(parts) >= 2:
+                        sql_relation_tokens.add('.'.join(parts[-2:]))
+                    if parts:
+                        sql_relation_tokens.add(parts[-1])
     findings: list[dict[str, Any]] = []
     for item in selected_datasource_snapshot or []:
         if not isinstance(item, dict):
@@ -11396,13 +11401,15 @@ def _validate_uns_get_access_contract(
             )
             if str(value or '').strip()
         }
-        path_is_used = (
-            path_token in sql_relation_tokens
-            or uns_path.casefold() in normalized_code
-        )
+        # Only parsed SQL relations prove that the UNS path is actually used.
+        # A plain substring check is unsafe because physical aliases commonly
+        # embed the node name (for example path ``orders`` and alias
+        # ``public._orders_<suffix>``).
+        path_is_used = path_token in sql_relation_tokens
         used_bypass_tokens = sorted(sql_relation_tokens.intersection(bypass_tokens))
         identifier_is_used = bool(
-            identifier and identifier.casefold() in normalized_code
+            identifier
+            and identifier.strip('`"[]').casefold() in sql_relation_tokens
         )
         if (used_bypass_tokens or identifier_is_used) and not path_is_used:
             findings.append({
