@@ -9,7 +9,7 @@
 
 ## 保存协议
 
-正式分析代码最终调用：
+首次 definition 的 `present(results, parameters)` 不生成 JSON 正文；宿主先保留计算候选，再由 `express` 阶段在模型看到本次事实后构造 JSON 并保存。以下是历史源码接口：
 
 ```python
 result = save_analysis_result(output_json=result_object)
@@ -17,5 +17,5 @@ result = save_analysis_result(output_json=result_object)
 
 - `output_json` 必须是 Python `dict`，不能是 JSON 字符串、Markdown 代码块或 Pydantic 对象。
 - 不传 `analysis_report`、`charts`、`tables` 或 `output_text`。
-- 后端会在子进程中使用当前调用的 JSON Schema 做确定性校验。
+- `compose_analysis_presentation` 会使用当前调用的 JSON Schema 做确定性结构校验。
 - Probe 仍使用 `request_retry(...)`，不保存半成品 JSON。

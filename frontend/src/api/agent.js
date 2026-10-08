@@ -140,6 +140,10 @@ export function getTurnDetail(conversationId, turnId) {
   return api.get(`/insight/conversations/${conversationId}/turns/${turnId}`)
 }
 
+export function getEvidenceCompilationStatus(conversationId, turnId) {
+  return api.get(`/insight/conversations/${conversationId}/turns/${turnId}/evidence/status`)
+}
+
 export function listTurnVersions(conversationId, turnId) {
   return api.get(`/insight/conversations/${conversationId}/turns/${turnId}/versions`)
 }

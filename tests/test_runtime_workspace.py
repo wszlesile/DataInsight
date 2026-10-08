@@ -62,32 +62,29 @@ def test_schema_reader_accepts_multi_source_full_schema_reads_when_fields_are_om
     assert payload.include_relationships is True
 
 
-def test_relationship_read_delivers_exact_business_rationale_without_changing_snapshot():
+def test_relationship_read_uses_schema_without_parallel_business_context():
     import copy
-    semantic = {
-        'insight_lineage': [{'question_id': 'q1', 'datasource_ids': [11],
-                            'synthesis_path': 'Keep the entire interpretation. ' * 100,
-                            'fact_bindings': [{'fact_id': 'f1', 'datasource_id': 11,
-                                               'semantic_definition': 'Weighted total, not sum of rates.'}]}],
-        'relationships': [{'relationship_id': 'r1', 'left_datasource_id': 11,
-                           'right_datasource_id': 12, 'aggregation_safety': {
-                               'left': {'status': 'conditional', 'reason': 'Preaggregate child rows.'}}}],
-    }
-    context = CustomContext(username='test', active_datasource_snapshot={'analysis_semantic_context': semantic},
+    relationship = {'relationship_id': 'r1', 'target_datasource_id': 12,
+                    'aggregation_safety': {'left': {'status': 'conditional'}}}
+    context = CustomContext(username='test', active_datasource_snapshot={},
                             execution_datasource_snapshot={'selected_datasource_snapshot': [
-                                {'datasource_id': 11, 'metadata_schema': {'properties': {'amount': {'type': 'number'}}}},
+                                {'datasource_id': 11, 'metadata_schema': {
+                                    'properties': {'amount': {'type': 'number'}},
+                                    'relationships': [relationship],
+                                }},
                             ]})
     saved = copy.deepcopy(context.active_datasource_snapshot)
     args = dict(runtime=SimpleNamespace(context=context), datasource_ids=[11],
                 field_names_by_datasource={'11': ['amount']})
     assert 'business_context' not in read_runtime_datasource_context.func(**args)
     detail = read_runtime_datasource_context.func(**args, include_relationships=True)
-    assert detail['business_context'] == semantic
+    assert detail['datasources'][0]['metadata_schema']['relationships'] == [relationship]
+    assert 'business_context' not in detail
     assert context.active_datasource_snapshot == saved
     invalid = read_runtime_datasource_context.func(
         runtime=SimpleNamespace(context=context), datasource_ids=[99], include_relationships=True,
     )
-    assert invalid['business_context'] == {'insight_lineage': [], 'relationships': []}
+    assert 'business_context' not in invalid
 
 
 def _preparation() -> PreparationResult:
@@ -162,7 +159,7 @@ def test_runtime_workspace_keeps_scope_and_reduces_unbound_schema_details():
     assert workspace["runtime_schema_workspace"]["detail_tool"] == "read_runtime_datasource_context"
 
 
-def test_state_scoped_runtime_carrier_keeps_full_scope_but_expands_only_current_fields():
+def test_semantic_understanding_gets_complete_schema_while_implementation_is_field_scoped():
     preparation = _preparation()
     full = preparation.prompt_snapshot()
     full["analysis_semantic_context"]["insight_lineage"] = [{
@@ -178,9 +175,14 @@ def test_state_scoped_runtime_carrier_keeps_full_scope_but_expands_only_current_
     )
     understand_payload = _working_payload(understand)
     assert understand_payload["selected_datasource_ids"] == [11]
-    assert understand_payload["datasource_details"] == []
-    index_field = understand_payload["datasource_index"][0]["schema_summary"]["fields"]["amount"]
-    assert "description" not in index_field
+    understanding_source = understand_payload["datasource_details"][0]
+    expected_schema = preparation.selected_snapshot['selected_datasource_snapshot'][0]['metadata_schema']
+    assert all(understanding_source['metadata_schema'][key] == value
+               for key, value in expected_schema.items() if key != 'description')
+    assert expected_schema['description'].startswith(understanding_source['dataset_context']['description'][:120])
+    assert len(understanding_source['dataset_context']['description']) <= 323
+    assert understanding_source['dataset_context']['evidence_authority'] == 'context_only'
+    assert 'schema_summary' not in understand_payload['datasource_index'][0]
 
     implement = build_runtime_datasource_working_message(
         prompt,
@@ -194,6 +196,46 @@ def test_state_scoped_runtime_carrier_keeps_full_scope_but_expands_only_current_
     assert set(details["metadata_schema"]["properties"]) == {"amount"}
     assert "合同含税金额" in details["metadata_schema"]["properties"]["amount"]["description"]
     assert "relationships" not in details["metadata_schema"]
+
+
+def test_understanding_preserves_schema_meanings_and_all_selected_sources_without_reader():
+    import copy
+    sources = [
+        {'datasource_id': 11, 'metadata_schema': {
+            'properties': {
+                'amount': {'type': 'number', 'description': 'Net value', 'formula': 'gross - rebate'},
+                'status': {'type': 'string', 'enum': ['active', 'retired'],
+                           'semantic_enrichment': {'business_meaning': 'Lifecycle, not health'},
+                           'semantic_interpretation': {'origin': 'preparation_model',
+                                                       'confidence': 'inferred',
+                                                       'model_confidence': 'confirmed',
+                                                       'business_meaning': 'Health'},
+                           'observed_value_profile': {'observed_values': ['active']}},
+            },
+            'relationships': [{'relationship_id': 'r1', 'target_datasource_id': 12}],
+        }},
+        {'datasource_id': 12, 'metadata_schema': {'properties': {
+            'timestamp': {'type': 'string', 'semantic_enrichment': {'time_semantics': 'event_start'}},
+        }}},
+    ]
+    snapshot = {'selected_datasource_ids': [11, 12], 'selected_datasource_snapshot': sources}
+    before = copy.deepcopy(snapshot)
+    workspace = [{'datasource_id': 11, 'metadata_schema': {'properties': {
+        'amount': {**sources[0]['metadata_schema']['properties']['amount'], 'unit': 'USD'},
+    }}}]
+    payload = _working_payload(build_runtime_datasource_working_message(
+        snapshot, snapshot, work='understand', datasource_ids=[11],
+        field_names_by_datasource={'11': ['amount']},
+        schema_detail_workspace=workspace, omit_replayed_details=True,
+    ))
+    assert payload['selected_datasource_ids'] == [11, 12]
+    assert [source['datasource_id'] for source in payload['datasource_details']] == [11, 12]
+    schema = payload['datasource_details'][0]['metadata_schema']
+    assert schema['properties']['status'] == sources[0]['metadata_schema']['properties']['status']
+    assert schema['properties']['amount']['unit'] == 'USD'
+    assert schema['relationships'] == sources[0]['metadata_schema']['relationships']
+    assert payload['datasource_details'][1]['metadata_schema']['properties'] == sources[1]['metadata_schema']['properties']
+    assert snapshot == before
 
 
 def test_material_plan_starts_from_compact_index_without_eager_lineage_details():
@@ -271,7 +313,7 @@ def test_implementation_does_not_replay_all_fields_from_prior_schema_detail_read
     assert "runtime_material_plan" not in payload
 
 
-def test_state_scoped_carrier_uses_lineage_fields_when_legacy_work_selection_has_no_fields():
+def test_state_scoped_carrier_does_not_expand_fields_without_material_plan():
     preparation = _preparation()
     full = preparation.prompt_snapshot()
     full["analysis_semantic_context"]["insight_lineage"] = [{
@@ -284,8 +326,8 @@ def test_state_scoped_carrier_uses_lineage_fields_when_legacy_work_selection_has
         prompt, preparation.selected_snapshot, work="implement",
     )
     payload = _working_payload(message)
-    assert payload["runtime_schema_workspace"]["detail_datasource_ids"] == [11]
-    assert set(payload["datasource_details"][0]["metadata_schema"]["properties"]) == {"amount"}
+    assert payload["runtime_schema_workspace"]["detail_datasource_ids"] == []
+    assert payload["datasource_details"] == []
 
 
 def test_runtime_workspace_reader_returns_exact_requested_fields_without_expanding_scope():
@@ -317,6 +359,7 @@ def test_runtime_workspace_tool_exposes_runtime_as_injected_parameter():
 
 def test_schema_projection_and_reader_preserve_verified_facts_and_bound_field_semantics():
     preparation = _preparation()
+    preparation.selected_snapshot['selected_datasource_snapshot'][0]['metadata_schema']['semantic_enrichment_status'] = 'unavailable'
     full = preparation.prompt_snapshot()
     properties = full["selected_datasource_snapshot"][0]["metadata_schema"]["properties"]
     profile = {"observed_values": ["A", "B"], "availability": "non_empty"}
@@ -337,6 +380,7 @@ def test_schema_projection_and_reader_preserve_verified_facts_and_bound_field_se
     detail = read_runtime_datasource_context.func(runtime, datasource_ids=[11],
         field_names_by_datasource={"11": ["contract_id"]})
     assert detail["datasources"][0]["metadata_schema"]["properties"]["contract_id"]["observed_value_profile"] == profile
+    assert detail['datasources'][0]['metadata_schema']['semantic_enrichment_status'] == 'unavailable'
 
 
 def test_schema_reader_result_is_held_in_typed_workspace_not_recovery_prose():
@@ -469,3 +513,18 @@ def test_local_material_focus_does_not_hide_global_coverage_or_pending_checks():
     assert result['question_fact_coverage'] == semantic['question_fact_coverage']
     assert result['runtime_probe_agenda'] == semantic['runtime_probe_agenda']
     assert semantic == original
+
+
+def test_semantic_work_view_keeps_selection_fact_sources_and_rule_definitions():
+    from agent.context_engineering_runtime import _runtime_semantic_work_view
+
+    semantic = {
+        'question_fact_coverage': [{'question_id': 'q1', 'coverage_status': 'direct',
+            'fact_coverage': [{'fact_id': 'f1', 'coverage_status': 'direct', 'datasource_ids': [7]}]}],
+        'semantic_references': [{'datasource_id': 8, 'metadata_schema': {
+            'properties': {'ratio': {'description': 'numerator / denominator'}},
+        }}],
+    }
+    result = _runtime_semantic_work_view(semantic, requested_ids=[])
+    assert result['question_fact_coverage'][0]['fact_coverage'][0]['datasource_ids'] == [7]
+    assert result['semantic_references'][0]['metadata_schema'] == semantic['semantic_references'][0]['metadata_schema']

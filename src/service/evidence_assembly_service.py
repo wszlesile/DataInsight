@@ -31,6 +31,53 @@ class EvidenceAssemblyService:
     def __init__(self, session: Session):
         self.session = session
 
+    def enqueue_for_execution(
+        self,
+        *,
+        conversation_id: int,
+        turn_id: int,
+        execution: InsightNsExecution | None,
+    ) -> None:
+        """Persist a durable marker so Evidence compilation can run after the response."""
+        if (
+            not Config.POST_ANALYSIS_EVIDENCE_ENABLED
+            or execution is None
+            or int(getattr(execution, 'id', 0) or 0) <= 0
+            or str(getattr(execution, 'execution_status', '') or '') != 'success'
+            or not str(getattr(execution, 'generated_code', '') or '').strip()
+        ):
+            return
+        execution_id = int(execution.id)
+        row = self.session.query(InsightNsExecutionEvidence).filter(
+            InsightNsExecutionEvidence.execution_id == execution_id,
+        ).first()
+        now = datetime.now()
+        if row is None:
+            row = InsightNsExecutionEvidence(
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                execution_id=execution_id,
+                schema_version='v2',
+                compilation_status='queued',
+                diagnostics_json=dump_json({}),
+                query_snapshots_json=dump_json({}),
+                evidence_map_json=dump_json({}),
+                is_deleted=0,
+                created_at=now,
+                updated_at=now,
+            )
+            self.session.add(row)
+            return
+        row.conversation_id = conversation_id
+        row.turn_id = turn_id
+        row.schema_version = 'v2'
+        row.compilation_status = 'queued'
+        row.diagnostics_json = dump_json({})
+        row.query_snapshots_json = dump_json({})
+        row.evidence_map_json = dump_json({})
+        row.is_deleted = 0
+        row.updated_at = now
+
     def assemble_for_execution(
         self,
         *,
@@ -62,7 +109,7 @@ class EvidenceAssemblyService:
         compilation_status = "complete"
         compilation_diagnostics: dict[str, Any] = {}
         compiled_bundle: dict[str, Any] = {}
-        if Config.POST_ANALYSIS_EVIDENCE_ENABLED and generated_code:
+        if Config.POST_ANALYSIS_EVIDENCE_ENABLED and (generated_code or payload.get('runtime_evidence')):
             post_compilation_attempted = True
             selected_snapshot = safe_json_loads(
                 getattr(turn, 'selected_datasource_snapshot_json', '') or '[]',
@@ -79,7 +126,14 @@ class EvidenceAssemblyService:
                     user_query=getattr(turn, 'user_query', '') if turn is not None else '',
                 )
                 compiler_started_at = time.perf_counter()
-                compiled_bundle = PostAnalysisEvidenceCompiler().compile(snapshot)
+                if payload.get('runtime_evidence'):
+                    from analysis_runtime.runtime_evidence import compile_runtime_evidence
+                    compiled_bundle = compile_runtime_evidence(payload['runtime_evidence'],
+                        traces=payload.get('semantic_execution_traces') or [],
+                        queries=payload.get('query_snapshots') or {}, tables=payload.get('tables') or [],
+                        charts=payload.get('charts') or [], report=payload.get('analysis_report') or '')
+                else:
+                    compiled_bundle = PostAnalysisEvidenceCompiler().compile(snapshot)
                 compiler_elapsed = time.perf_counter() - compiler_started_at
                 compilation_status = str(compiled_bundle.get("status") or "partial")
                 compilation_diagnostics = (
@@ -408,11 +462,15 @@ class EvidenceAssemblyService:
             if str(item).strip()
         }
         identifier_to_query_keys: dict[str, list[str]] = {}
+        owner_to_query_keys: dict[int, list[str]] = {}
         for query_key, snapshot in (query_snapshots or {}).items():
             query_key_text = str(query_key)
             if evidence_query_keys and query_key_text not in evidence_query_keys:
                 continue
             implementation = ((snapshot or {}).get("implementation") or {})
+            owner = implementation.get('datasource_id')
+            if owner is not None:
+                owner_to_query_keys.setdefault(int(owner), []).append(query_key_text)
             sql_context = implementation.get("sql_context") or {}
             fragments = sql_context.get("fragments") or []
             for fragment in fragments if isinstance(fragments, list) else []:
@@ -440,13 +498,15 @@ class EvidenceAssemblyService:
                         identifier_to_query_keys.setdefault(identifier, []).append(query_key_text)
 
         refs: list[dict[str, Any]] = []
-        has_precise_source = bool(identifier_to_query_keys)
+        has_precise_source = bool(identifier_to_query_keys or owner_to_query_keys)
         for row in snapshot_rows:
             if not isinstance(row, dict):
                 continue
             datasource_id = int(row.get("datasource_id") or row.get("id") or 0)
             identifier = str(row.get("datasource_identifier") or row.get("table_name") or '').strip()
-            if has_precise_source and identifier not in identifier_to_query_keys:
+            query_keys = list(dict.fromkeys(owner_to_query_keys.get(datasource_id, [])
+                                           + identifier_to_query_keys.get(identifier, [])))
+            if has_precise_source and not query_keys:
                 continue
             if not has_precise_source and len(used_ids) != 1:
                 continue
@@ -457,8 +517,8 @@ class EvidenceAssemblyService:
                 "datasource_name": row.get("datasource_name") or '',
                 "datasource_type": row.get("datasource_type") or '',
                 "datasource_identifier": identifier,
-                "resolution": "query_scope" if identifier in identifier_to_query_keys else "execution_scope",
-                "query_keys": identifier_to_query_keys.get(identifier, sorted(evidence_query_keys)),
+                "resolution": "query_scope" if query_keys else "execution_scope",
+                "query_keys": query_keys or sorted(evidence_query_keys),
             }
             field_summary = self._build_source_field_summary(
                 row.get("metadata_schema") if isinstance(row.get("metadata_schema"), dict) else {},

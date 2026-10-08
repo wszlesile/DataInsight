@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from agent.tools import run_generated_code_locally
 from analysis_runtime import AnalysisExecutionSnapshot, LocalAnalysisRuntime
+from analysis_runtime.contracts import delivery_requirements_from_result
 from analysis_runtime.parameters import (
     build_reusable_parameter_defaults,
     normalize_parameter_schema,
@@ -69,6 +70,8 @@ class AnalysisExecutionRerunService:
                 safe_json_loads(original.analysis_parameters_json, {}),
             ),
             logic_signature=original.analysis_logic_signature or '',
+            semantic_delivery_requirements=delivery_requirements_from_result(
+                safe_json_loads(original.result_payload_json, {}) or {}),
         )
 
         old_turn_state = {

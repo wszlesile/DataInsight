@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 from dataclasses import replace
 from pathlib import Path
@@ -25,6 +26,26 @@ from service.insight_ns_conversation_service import InsightNsConversationService
 from service.evidence_assembly_service import EvidenceAssemblyService  # noqa: E402
 
 
+def test_evidence_source_identity_uses_recorded_owner_for_shared_workbook():
+    import json
+    from types import SimpleNamespace
+    rows = [{'datasource_id': identifier, 'datasource_name': sheet, 'datasource_type': 'local_file',
+             'datasource_identifier': 'shared.xlsx', 'sheet_name': sheet}
+            for identifier, sheet in [(1, 'first'), (2, 'second')]]
+    session = MagicMock()
+    session.query.return_value.filter.return_value.first.return_value = SimpleNamespace(
+        selected_datasource_snapshot_json=json.dumps(rows))
+    refs = EvidenceAssemblyService(session)._build_source_refs(turn_id=1,
+        execution=SimpleNamespace(used_datasource_ids_json='[1,2]'),
+        query_snapshots={'first_q': {'implementation': {'datasource_id': 1}},
+                         'second_q': {'implementation': {'datasource_id': 2}}},
+        evidence_definition={'query_refs': ['second_q']})
+    assert len(refs) == 1
+    assert refs[0]['datasource_id'] == 2
+    assert refs[0]['datasource_name'] == 'second'
+    assert refs[0]['query_keys'] == ['second_q']
+
+
 def test_evidence_assembly_ignores_failed_execution():
     session = MagicMock()
     execution = type("Execution", (), {"id": 91, "execution_status": "failed"})()
@@ -37,6 +58,28 @@ def test_evidence_assembly_ignores_failed_execution():
     )
 
     session.query.assert_not_called()
+
+
+def test_evidence_enqueue_persists_queued_status_without_compiling():
+    session = MagicMock()
+    session.query.return_value.filter.return_value.first.return_value = None
+    execution = type("Execution", (), {
+        "id": 91,
+        "execution_status": "success",
+        "generated_code": "result = {}",
+    })()
+
+    EvidenceAssemblyService(session).enqueue_for_execution(
+        conversation_id=1,
+        turn_id=2,
+        execution=execution,
+    )
+
+    queued = session.add.call_args.args[0]
+    assert queued.execution_id == 91
+    assert queued.conversation_id == 1
+    assert queued.turn_id == 2
+    assert queued.compilation_status == "queued"
 
 
 def _query_snapshot(sql: str, *, columns: list[str] | None = None) -> dict:
@@ -97,6 +140,18 @@ def _snapshot(
         charts=charts or [],
         tables=tables or [],
     )
+
+
+def test_metric_parameter_bindings_accept_absence_without_inventing_bindings():
+    required = {
+        "metric_key": "count", "business_name": "Count",
+        "business_explanation": "Count executed records",
+    }
+    assert PlannedMetric(**required).parameter_bindings == {}
+    assert PlannedMetric(**required, parameter_bindings=None).parameter_bindings == {}
+    assert PlannedMetric(**required, parameter_bindings={"group": "A"}).parameter_bindings == {"group": "A"}
+    with pytest.raises(ValueError):
+        PlannedMetric(**required, parameter_bindings="group=A")
 
 
 def _semantic_plan(payload: dict) -> EvidencePlan:
@@ -830,6 +885,55 @@ result = save_analysis_result(analysis_report="合同结构。", charts=[chart_s
     assert bundle["chart_trace_refs"][0]["evidence_key"] != bundle["chart_trace_refs"][1]["evidence_key"]
 
 
+def test_record_conversion_aliases_preserve_independent_grouping_boundaries():
+    sql = "SELECT status, cycle FROM contracts"
+    code = '''
+sql = "SELECT status, cycle FROM contracts"
+data = load_data_with_sql(sql=sql)
+total = len(data)
+status_dist = data.groupby("status").size().reset_index(name="instance_count")
+status_dist["share"] = status_dist["instance_count"] / total * 100
+status_dist = status_dist.sort_values("instance_count", ascending=False)
+cycle_dist = data.groupby("cycle").size().reset_index(name="instance_count")
+cycle_dist["share"] = cycle_dist["instance_count"] / total * 100
+status_rows = status_dist.to_dict("records")
+cycle_rows = cycle_dist.to_dict(orient="records")
+columns = [{"key": "instance_count"}, {"key": "share"}]
+tables = [
+    build_table_result(title="Status", columns=columns, data=status_rows),
+    build_table_result(title="Cycle", columns=columns, data=cycle_rows),
+]
+result = save_analysis_result(analysis_report="Distribution.", charts=[], tables=tables)
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="Distribution.",
+        tables=[
+            {"title": title, "columns": [{"key": "instance_count"}, {"key": "share"}],
+             "rows": [{"instance_count": count, "share": share}]}
+            for title, count, share in [("Status", 12, 60), ("Cycle", 8, 40)]
+        ],
+        query_snapshots={"q_contracts": _query_snapshot(sql, columns=["status", "cycle"])},
+    )
+    outputs = [item for item in LineageIndexer().build(snapshot)["output_nodes"]
+               if item["artifact_type"] == "table"]
+    assert len(outputs) == 4
+    by_slot = {(item["artifact_index"], item["field"]): item for item in outputs}
+    for field in ("instance_count", "share"):
+        first = by_slot[(0, field)]
+        second = by_slot[(1, field)]
+        assert first.get("structured_origin") is True
+        assert second.get("structured_origin") is True
+        assert len(first["boundary_operation_node_ids"]) == 1
+        assert len(second["boundary_operation_node_ids"]) == 1
+        assert set(first["boundary_operation_node_ids"]).isdisjoint(second["boundary_operation_node_ids"])
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+    refs = {(item["table_index"], item["column_key"]): item["evidence_key"]
+            for item in bundle["table_trace_refs"]}
+    assert len(refs) == 4
+    assert len(set(refs.values())) == 4
+
+
 def test_multi_metric_chart_fields_keep_distinct_evidence_boundaries():
     sql = "SELECT month, SUM(amount) AS amount, SUM(contract_count) AS contract_count FROM sales GROUP BY month"
     code = r'''
@@ -1055,6 +1159,77 @@ result = save_analysis_result(analysis_report="", charts=[], tables=tables)
     assert bundle["status"] == "complete", bundle["diagnostics"]
     assert len(bundle["table_trace_refs"]) == 2
     assert len({item["evidence_key"] for item in bundle["table_trace_refs"]}) == 2
+
+
+def test_inline_report_aggregation_preserves_its_terminal_calculation_boundary():
+    sql = "SELECT category, amount FROM records"
+    code = '''
+data = load_data_with_sql(sql="SELECT category, amount FROM records")
+grouped = data.groupby("category")["amount"].sum().reset_index()
+analysis_report = f"First: {grouped.iloc[0]['amount']}; total: {grouped.head(3)['amount'].sum():.1f}; mean: {grouped['amount'].mean():.1f}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code, report="First: 3; total: 5.0; mean: 1.7.",
+        query_snapshots={"q_records": _query_snapshot(sql, columns=["category", "amount"])},
+    )
+    lineage = LineageIndexer().build(snapshot)
+    outputs = [item for item in lineage["output_nodes"] if item.get("artifact_type") == "report"]
+    assert len(outputs) == 3
+    operations = {item["operation_node_id"]: item for item in lineage["operation_nodes"]}
+    for output in outputs[1:]:
+        boundaries = output["boundary_operation_node_ids"]
+        assert len(boundaries) == 1
+        assert operations[boundaries[0]]["source"] == output["field"]
+        assert operations[boundaries[0]]["semantic_kind"] == "aggregation"
+    assert outputs[0]["boundary_operation_node_ids"] != outputs[1]["boundary_operation_node_ids"]
+    assert outputs[1]["boundary_operation_node_ids"] != outputs[2]["boundary_operation_node_ids"]
+
+
+def test_report_column_projection_does_not_inherit_sibling_calculations():
+    sql = "SELECT category, record_id, power FROM records"
+    code = '''
+data = load_data_with_sql(sql="SELECT category, record_id, power FROM records")
+grouped = data.groupby("category").agg(count=("record_id", "nunique"), power=("power", "sum")).reset_index()
+grouped["share"] = grouped["count"] / grouped["count"].sum() * 100
+analysis_report = f"First: {grouped.iloc[0]['count']}; total share: {grouped.head(3)['share'].sum():.1f}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    lineage = LineageIndexer().build(_snapshot(
+        code=code, report="First: 3; total share: 50.0.",
+        query_snapshots={"q_records": _query_snapshot(sql, columns=["category", "record_id", "power"])},
+    ))
+    outputs = [item for item in lineage["output_nodes"] if item.get("artifact_type") == "report"]
+    operations = {item["operation_node_id"]: item for item in lineage["operation_nodes"]}
+    count_operations = [operations[key] for key in outputs[0]["candidate_operation_node_ids"]]
+    assert not any('grouped["share"] =' in item["source"] for item in count_operations)
+    share_operations = [operations[key] for key in outputs[1]["boundary_operation_node_ids"]]
+    assert [item["source"] for item in share_operations] == ["grouped.head(3)['share'].sum()"]
+
+
+def test_merge_input_column_projection_keeps_excluded_sibling_boundary_out():
+    code = '''
+data = load_data_with_sql(sql="SELECT category, amount, cost FROM records")
+left = data.groupby("category", as_index=False).agg(amount=("amount", "sum"))
+right = data.groupby("category", as_index=False).agg(amount=("amount", "mean"), cost=("cost", "sum"))
+keys = ["category"]
+merged = left.merge(right[keys + ["cost"]], on="category")
+analysis_report = f"Amount: {merged.iloc[0]['amount']}; cost: {merged.iloc[0]['cost']}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    lineage = LineageIndexer().build(_snapshot(
+        code=code, report="Amount: 10; cost: 4.",
+        query_snapshots={"q_records": _query_snapshot(
+            "SELECT category, amount, cost FROM records", columns=["category", "amount", "cost"]
+        )},
+    ))
+    outputs = [item for item in lineage["output_nodes"] if item.get("artifact_type") == "report"]
+    operations = {item["operation_node_id"]: item for item in lineage["operation_nodes"]}
+    assert len(outputs) == 2
+    assert len(outputs[0]["boundary_operation_node_ids"]) == 1
+    boundary = operations[outputs[0]["boundary_operation_node_ids"][0]]
+    assert boundary["source"].startswith("left =")
+    assert outputs[0]["boundary_operation_node_ids"] != outputs[1]["boundary_operation_node_ids"]
 
 
 def test_static_sql_expression_binds_runtime_snapshot_to_dataframe():
@@ -1637,6 +1812,52 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     assert category_ratio_key != manufacturer_ratio_key
 
 
+@pytest.mark.parametrize("string_style", ["fstring", "format"])
+def test_named_aggregate_tuple_rows_keep_group_specific_calculation_boundaries(string_style):
+    sql = "SELECT asset_id, category, manufacturer FROM assets"
+    code = '''
+data = load_data_with_sql(sql="SELECT asset_id, category, manufacturer FROM assets")
+total = data["asset_id"].nunique()
+categories = data.groupby("category").agg(count=("asset_id", "nunique")).reset_index()
+categories["share"] = categories["count"] / total * 100
+categories = categories.sort_values("count", ascending=False).reset_index(drop=True)
+manufacturers = data.groupby("manufacturer").agg(count=("asset_id", "nunique")).reset_index()
+manufacturers["share"] = manufacturers["count"] / total * 100
+manufacturers = manufacturers.sort_values("count", ascending=False).reset_index(drop=True)
+analysis_report = "## Categories\\n| Category | Count | Share |\\n| --- | --- | --- |\\n"
+for row in categories.itertuples():
+    analysis_report += f"| {row.category} | {row.count} | {row.share}% |\\n"
+analysis_report += "## Manufacturers\\n| Manufacturer | Count | Share |\\n| --- | --- | --- |\\n"
+for row in manufacturers.itertuples():
+    analysis_report += f"| {row.manufacturer} | {row.count} | {row.share}% |\\n"
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    if string_style == "format":
+        for dimension in ("category", "manufacturer"):
+            code = code.replace(
+                'f"| {row.' + dimension + '} | {row.count} | {row.share}% |\\n"',
+                '"| {} | {} | {}% |\\n".format(row.' + dimension + ', row.count, row.share)',
+            )
+    snapshot = _snapshot(
+        code=code,
+        report=(
+            "## Categories\n| Category | Count | Share |\n| --- | --- | --- |\n"
+            "| A | 3 | 75.0% |\n| B | 1 | 25.0% |\n"
+            "## Manufacturers\n| Manufacturer | Count | Share |\n| --- | --- | --- |\n"
+            "| X | 2 | 50.0% |\n| Y | 2 | 50.0% |\n"
+        ),
+        query_snapshots={"q_assets": _query_snapshot(
+            sql, columns=["asset_id", "category", "manufacturer"],
+        )},
+    )
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+    assert bundle["status"] == "complete", bundle["diagnostics"]
+    refs = sorted(bundle["report_trace_refs"], key=lambda ref: ref["start"])
+    assert [ref["text"] for ref in refs] == ["3", "75.0", "1", "25.0", "2", "50.0", "2", "50.0"]
+    assert refs[0]["evidence_key"] != refs[4]["evidence_key"]
+    assert refs[1]["evidence_key"] != refs[5]["evidence_key"]
+
+
 def test_named_conditional_prose_fragments_keep_every_numeric_slot_and_occurrence():
     sql = "SELECT status, power FROM assets"
     code = r'''
@@ -1844,6 +2065,115 @@ priority_df["clean_cnt"] = priority_df["cnt"].fillna(0)
 
     assert "score" not in aliases.get("priority_df", {})
     assert aliases["priority_df"]["clean_cnt"] == "cnt"
+
+
+def test_named_column_projection_keeps_each_table_calculation_boundary():
+    code = '''
+sql = "SELECT alpha, beta, gamma FROM facts"
+data = load_data_with_sql(sql=sql)
+first_columns = ["beta", "alpha"]
+first = data[first_columns].copy()
+first.columns = ["B", "A"]
+second_columns = ["gamma", "beta"]
+second = data[second_columns].copy()
+second.columns = ["G", "B"]
+tables = [
+    build_table_result(title="First", columns=["B", "A"], data=first),
+    build_table_result(title="Second", columns=["G", "B"], data=second),
+]
+result = save_analysis_result(analysis_report="Summary", tables=tables)
+'''
+    aliases = LineageIndexer._column_aliases(ast.parse(code))
+    assert aliases['first'] == {'B': 'beta', 'A': 'alpha'}
+    assert aliases['second'] == {'G': 'gamma', 'B': 'beta'}
+    snapshot = _snapshot(code=code, report='Summary', tables=[
+        {'title': 'First', 'columns': ['B', 'A'], 'rows': [{'B': 20, 'A': 10}]},
+        {'title': 'Second', 'columns': ['G', 'B'], 'rows': [{'G': 30, 'B': 20}]},
+    ], query_snapshots={'q': _query_snapshot('SELECT alpha, beta, gamma FROM facts', columns=['alpha', 'beta', 'gamma'])})
+    outputs = [item for item in LineageIndexer().build(snapshot)['output_nodes'] if item['artifact_type'] == 'table']
+    assert {(item['artifact_index'], item['field']): item['lineage_fields'] for item in outputs} == {
+        (0, 'B'): ['beta'], (0, 'A'): ['alpha'], (1, 'G'): ['gamma'], (1, 'B'): ['beta'],
+    }
+
+
+def test_dictionary_aggregation_and_positional_rename_keep_query_ownership():
+    code = '''
+left = load_data_with_sql(sql="SELECT category, alpha, beta FROM left_facts")
+right = load_data_with_sql(sql="SELECT category, amount FROM right_facts")
+summary = left.groupby("category").agg({"alpha": "mean", "beta": "mean"}).reset_index()
+summary.columns = ["category", "mean_alpha", "mean_beta"]
+totals = right.groupby("category").agg({"amount": "sum"}).reset_index()
+combined = pd.merge(summary, totals, on="category")
+fields = ["mean_beta", "amount", "mean_alpha"]
+display = combined[fields].copy()
+display.columns = ["B", "Total", "A"]
+table = build_table_result(title="Summary", columns=["B", "Total", "A"], data=display)
+result = save_analysis_result(analysis_report="Summary", tables=[table])
+'''
+    snapshot = _snapshot(code=code, report='Summary', tables=[{
+        'title': 'Summary', 'columns': ['B', 'Total', 'A'], 'rows': [{'B': 2, 'Total': 30, 'A': 1}],
+    }], query_snapshots={
+        'left': _query_snapshot('SELECT category, alpha, beta FROM left_facts', columns=['category', 'alpha', 'beta']),
+        'right': _query_snapshot('SELECT category, amount FROM right_facts', columns=['category', 'amount']),
+    })
+    outputs = {o['field']: o for o in LineageIndexer().build(snapshot)['output_nodes'] if o['artifact_type'] == 'table'}
+    assert outputs['A']['candidate_query_node_ids'] == ['left']
+    assert outputs['B']['candidate_query_node_ids'] == ['left']
+    assert outputs['Total']['candidate_query_node_ids'] == ['right']
+    assert outputs['A']['boundary_operation_node_ids'] == outputs['B']['boundary_operation_node_ids']
+    assert outputs['A']['boundary_operation_node_ids'] != outputs['Total']['boundary_operation_node_ids']
+
+
+def test_named_grouping_and_identity_fields_keep_distinct_count_boundaries():
+    code = '''
+data = load_data_with_sql(sql="SELECT category, state, entity_id FROM facts")
+category_field = "category"
+state_field = "state"
+identity_field = "entity_id"
+categories = data.groupby(category_field)[identity_field].nunique().reset_index()
+categories.columns = ["Category", "Count"]
+states = data.groupby(state_field)[identity_field].nunique().reset_index()
+states.columns = ["State", "Count"]
+tables = [build_table_result(title="Categories", columns=["Category", "Count"], data=categories),
+          build_table_result(title="States", columns=["State", "Count"], data=states)]
+result = save_analysis_result(analysis_report="Summary", tables=tables)
+'''
+    snapshot = _snapshot(code=code, report='Summary', tables=[
+        {'title': 'Categories', 'columns': ['Category', 'Count'], 'rows': [{'Category': 'A', 'Count': 2}]},
+        {'title': 'States', 'columns': ['State', 'Count'], 'rows': [{'State': 'Open', 'Count': 3}]},
+    ], query_snapshots={'q': _query_snapshot('SELECT category, state, entity_id FROM facts', columns=['category', 'state', 'entity_id'])})
+    outputs = [o for o in LineageIndexer().build(snapshot)['output_nodes'] if o['artifact_type'] == 'table']
+    assert len(outputs) == 2
+    assert all(o['boundary_operation_node_ids'] for o in outputs)
+    assert outputs[0]['boundary_operation_node_ids'] != outputs[1]['boundary_operation_node_ids']
+    assert all(not any(b.startswith('op_source_field_') for b in o['boundary_operation_node_ids']) for o in outputs)
+
+
+@pytest.mark.parametrize('extra', [
+    'fields.append("gamma")', 'fields[0] = "gamma"', 'fields = ["gamma", "beta"]',
+    'alias = fields', 'mutate(fields)',
+])
+def test_mutable_or_reassigned_named_column_list_is_not_claimed_as_constant(extra):
+    from service.post_analysis_evidence_service import _constant_column_sequences
+
+    tree = ast.parse('fields = ["alpha", "beta"]\n' + extra + '\nview = data[fields].copy()')
+    assert 'fields' not in _constant_column_sequences(tree)
+
+
+@pytest.mark.parametrize('binding', ['def select(fields):\n    return data[fields]', 'del fields'])
+def test_named_column_selector_does_not_cross_shadowing_or_deletion(binding):
+    from service.post_analysis_evidence_service import _constant_column_sequences
+
+    tree = ast.parse('fields = ["alpha", "beta"]\n' + binding)
+    assert 'fields' not in _constant_column_sequences(tree)
+
+
+@pytest.mark.parametrize('binding', ['def select(field):\n    return data[field]', 'del field'])
+def test_named_field_does_not_cross_shadowing_or_deletion(binding):
+    from service.post_analysis_evidence_service import _constant_field_names
+
+    tree = ast.parse('field = "alpha"\n' + binding)
+    assert 'field' not in _constant_field_names(tree)
 
 
 def test_named_lambda_aggregates_on_same_source_keep_independent_table_metrics():
@@ -3582,6 +3912,307 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     ]
 
 
+@pytest.mark.parametrize('expression', [
+    'calculate_ratio(total_profit, total_sales, scale=100)',
+    'calculate_ratio(denominator=total_sales, numerator=total_profit, scale=100)',
+])
+def test_ratio_helper_preserves_evidence_operands_formula_and_query(expression):
+    sql = 'SELECT gross_profit, sales_revenue FROM product_profit'
+    code = f'''
+sql = "{sql}"
+data = load_data_with_sql(sql=sql)
+total_profit = data["gross_profit"].sum()
+total_sales = data["sales_revenue"].sum()
+gross_margin = {expression}
+analysis_report = f"Gross margin: {{gross_margin:.2f}}%."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code, report='Gross margin: 71.48%.',
+        query_snapshots={'q_profit': _query_snapshot(sql, columns=['gross_profit', 'sales_revenue'])},
+    )
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+    assert bundle['status'] == 'complete', bundle['diagnostics']
+    assert len(bundle['report_trace_refs']) == 1
+    definition = bundle['evidence_definitions'][0]
+    assert definition['calculation']['formula'] == '(SUM(gross_profit) ÷ SUM(sales_revenue)) × 100'
+    assert definition['calculation']['metric_fields'] == ['gross_profit', 'sales_revenue']
+
+
+def test_comparison_result_members_have_distinct_formulas_and_evidence():
+    sql = 'SELECT current_value, baseline_value FROM observations'
+    code = f'''
+sql = "{sql}"
+data = load_data_with_sql(sql=sql)
+current = data["current_value"].sum()
+baseline = data["baseline_value"].sum()
+comparison = evaluate_numeric_comparison(right=baseline, left=current)
+difference = comparison["difference"]
+relative = comparison["relative_change"]
+analysis_report = f"Difference: {{difference:.1f}}; relative: {{relative:.2f}}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code, report='Difference: 10.0; relative: 0.50.',
+        query_snapshots={'q_observations': _query_snapshot(sql, columns=['current_value', 'baseline_value'])},
+    )
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+    assert bundle['status'] == 'complete', bundle['diagnostics']
+    assert len(bundle['report_trace_refs']) == 2
+    formulas = {item['calculation']['formula'] for item in bundle['evidence_definitions']}
+    assert 'SUM(current_value) - SUM(baseline_value)' in formulas
+    assert '(SUM(current_value) - SUM(baseline_value)) ÷ SUM(baseline_value)' in formulas
+    assert len({item['evidence_key'] for item in bundle['report_trace_refs']}) == 2
+    assert all(item['calculation']['metric_fields'] == ['current_value', 'baseline_value']
+               for item in bundle['evidence_definitions'])
+
+
+@pytest.mark.parametrize('source,expected', [
+    ('comparison = evaluate_numeric_comparison(3, 2)\nvalue = comparison["difference"]', True),
+    ('comparison = evaluate_numeric_comparison(3, 2)\nalias = comparison\nvalue = alias["relative_change"]', True),
+    ('comparison = {"difference": 1}\nvalue = comparison["difference"]', False),
+    ('comparison = evaluate_numeric_comparison(3, 2)\ncomparison = {}\nvalue = comparison["difference"]', False),
+    ('comparison = evaluate_numeric_comparison(3, 2)\ncomparison["difference"] = 100\nvalue = comparison["difference"]', False),
+    ('comparison = evaluate_numeric_comparison(3, 2)\nif flag:\n    comparison = {}\nvalue = comparison["difference"]', False),
+    ('comparison = evaluate_numeric_comparison(3, 2)\nvalue = comparison["greater"]', False),
+])
+def test_comparison_member_recognition_requires_known_unambiguous_producer(source, expected):
+    import ast
+
+    tree = ast.parse(source)
+    assert LineageIndexer._comparison_result_projection(tree.body[-1], tree) is expected
+
+
+def test_extrema_helper_keeps_query_lineage_for_tied_rows():
+    sql = 'SELECT category, amount FROM sales'
+    code = f'''
+sql = "{sql}"
+data = load_data_with_sql(sql=sql)
+summary = data.groupby("category", as_index=False)["amount"].sum()
+leaders = select_extreme_rows(summary, "amount", mode="max")
+largest = leaders["amount"].max()
+analysis_report = f"Largest value: {{largest:.1f}}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code, report='Largest value: 10.0.',
+        query_snapshots={'q_sales': _query_snapshot(sql, columns=['category', 'amount'])},
+    )
+    lineage = LineageIndexer().build(snapshot)
+    selection = next(item for item in lineage['operation_nodes'] if 'select_extreme_rows' in item['source'])
+    assert selection['semantic_kind'] == 'ranking'
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+    assert bundle['status'] == 'complete', bundle['diagnostics']
+    assert len(bundle['report_trace_refs']) == 1
+
+
+def test_composite_extrema_keeps_query_and_structured_artifact_lineage():
+    sql = 'SELECT category, amount FROM sales'
+    code = f'''
+sql = "{sql}"
+data = load_data_with_sql(sql=sql)
+summary = data.groupby("category", as_index=False)["amount"].sum()
+ranking = summarize_extrema(summary, "amount")
+leaders = ranking["rows"]
+tables = [build_table_result(title="Leaders", columns=[
+    {{"key": "category", "label": "Category"}},
+    {{"key": "amount", "label": "Amount"}},
+], data=leaders)]
+result = save_analysis_result(analysis_report="", charts=[], tables=tables)
+'''
+    snapshot = _snapshot(
+        code=code, tables=[{'title': 'Leaders', 'columns': [
+            {'key': 'category', 'label': 'Category'}, {'key': 'amount', 'label': 'Amount'},
+        ], 'rows': [{'category': 'A', 'amount': 10}, {'category': 'B', 'amount': 10}]}],
+        query_snapshots={'q_sales': _query_snapshot(sql, columns=['category', 'amount'])},
+    )
+    lineage = LineageIndexer().build(snapshot)
+    operation = next(item for item in lineage['operation_nodes'] if 'summarize_extrema(' in item['source'])
+    assert operation['semantic_kind'] == 'ranking'
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+    assert bundle['status'] == 'complete', bundle['diagnostics']
+    assert len(bundle['table_trace_refs']) == 1
+    assert bundle['table_trace_refs'][0]['column_key'] == 'amount'
+
+
+def test_composite_comparison_preserves_computed_report_difference_lineage():
+    sql = 'SELECT current_value, baseline_value FROM observations'
+    code = f'''
+sql = "{sql}"
+data = load_data_with_sql(sql=sql)
+current = data["current_value"].sum()
+baseline = data["baseline_value"].sum()
+comparison = evaluate_numeric_comparison(current, baseline)
+difference = comparison["difference"]
+analysis_report = f"Difference: {{difference:.1f}}."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code, report='Difference: 10.0.',
+        query_snapshots={'q_observations': _query_snapshot(sql, columns=['current_value', 'baseline_value'])},
+    )
+    lineage = LineageIndexer().build(snapshot)
+    operation = next(item for item in lineage['operation_nodes'] if 'evaluate_numeric_comparison(' in item['source'])
+    assert operation['semantic_kind'] == 'formula'
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+    assert bundle['status'] == 'complete', bundle['diagnostics']
+    assert len(bundle['report_trace_refs']) == 1
+
+
+@pytest.mark.parametrize('left,right,report', [
+    (80, 70, 'Difference 10.0; change 14.3%.'),
+    (60, 70, 'Difference -10.0.'),
+    (70, 70, 'Both values are 70.0.'),
+])
+def test_comparison_expression_templates_keep_actual_calculation_boundaries(left, right, report):
+    from analysis_runtime.expressions import render_numeric_comparison
+    cases = dict(less='Difference {difference:.1f}.', equal='Both values are {left:.1f}.',
+                 greater='Difference {difference:.1f}; change {relative_change:.1%}.',
+                 missing='Comparison unavailable.')
+    assert render_numeric_comparison(left, right, **cases) == report
+    sql = 'SELECT current_value, baseline_value FROM observations'
+    code = f'''
+data = load_data_with_sql(sql="{sql}")
+current = data["current_value"].sum()
+baseline = data["baseline_value"].sum()
+finding = render_numeric_comparison(current, baseline,
+    less="Difference {{difference:.1f}}.", equal="Both values are {{left:.1f}}.",
+    greater="Difference {{difference:.1f}}; change {{relative_change:.1%}}.",
+    missing="Comparison unavailable.")
+analysis_report = f"{{finding}}"
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(code=code, report=report,
+                         query_snapshots={'q': _query_snapshot(sql, columns=['current_value', 'baseline_value'])})
+    bundle = PostAnalysisEvidenceCompiler(planner=lambda _: EvidencePlan()).compile(snapshot)
+    assert bundle['status'] == 'complete', bundle['diagnostics']
+    import json
+    assert len(bundle['report_trace_refs']) == (2 if left > right else 1), json.dumps(bundle['report_trace_refs'])
+    if left > right:
+        assert len({ref['evidence_key'] for ref in bundle['report_trace_refs']}) == 2
+        formulas = {item['calculation']['formula'] for item in bundle['evidence_definitions']}
+        assert 'SUM(current_value) - SUM(baseline_value)' in formulas
+        assert '(SUM(current_value) - SUM(baseline_value)) ÷ SUM(baseline_value)' in formulas
+
+
+@pytest.mark.parametrize('values,report', [
+    ([10, 10], 'All equal A, B: 10.0.'),
+    ([10, 8], 'Unique A: 10.0.'),
+    ([None, 8], 'B: 8.0.'),
+    ([10, 10, 8], 'Tied A, B: 10.0.'),
+])
+def test_extrema_expression_templates_preserve_all_equal_and_file_lineage(values, report):
+    from analysis_runtime.expressions import render_extrema
+    import pandas as pd
+    data = pd.DataFrame({'category': list('ABC')[:len(values)], 'amount': values})
+    cases = dict(empty='No values.', single='{labels}: {value:.1f}.',
+                 unique='Unique {labels}: {value:.1f}.', tied='Tied {labels}: {value:.1f}.',
+                 all_equal='All equal {labels}: {value:.1f}.')
+    assert render_extrema(data, 'amount', 'category', **cases) == report
+    code = '''
+data = load_local_file(file_path="selected.csv")
+finding = render_extrema(data, "amount", "category",
+    empty="No values.", single="{labels}: {value:.1f}.",
+    unique="Unique {labels}: {value:.1f}.", tied="Tied {labels}: {value:.1f}.",
+    all_equal="All equal {labels}: {value:.1f}.")
+analysis_report = f"{finding}"
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(code=code, report=report,
+                         query_snapshots={'q': _loader_snapshot('selected.csv', columns=['category', 'amount'])})
+    bundle = PostAnalysisEvidenceCompiler(planner=lambda _: EvidencePlan()).compile(snapshot)
+    assert bundle['status'] == 'complete', bundle['diagnostics']
+    assert len(bundle['report_trace_refs']) == 1
+
+
+@pytest.mark.parametrize('values,mode', [
+    ([10, 10], 'max'), ([10, 8], 'max'), ([10, 10, 8], 'max'),
+    ([10, 8], 'min'), ([None, 10, 8], 'max'),
+])
+@pytest.mark.parametrize('language', ['zh', 'en'])
+def test_default_extrema_expression_keeps_count_and_value_evidence_separate(values, mode, language):
+    from analysis_runtime.expressions import render_extrema
+    import pandas as pd
+
+    data = pd.DataFrame({'category': list('ABC')[:len(values)], 'amount': values})
+    report = render_extrema(data, 'amount', 'category', mode=mode, language=language)
+    code = f'''
+data = load_local_file(file_path="selected.csv")
+finding = render_extrema(data, "amount", "category", mode="{mode}", language="{language}")
+analysis_report = f"{{finding}}"
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(code=code, report=report,
+                         query_snapshots={'q': _loader_snapshot('selected.csv', columns=['category', 'amount'])})
+    bundle = PostAnalysisEvidenceCompiler(planner=lambda _: EvidencePlan()).compile(snapshot)
+    assert bundle['status'] == 'complete', bundle['diagnostics']
+    expected_count = 3 if None in values else 2
+    assert len(bundle['report_trace_refs']) == expected_count
+    definitions = bundle['evidence_definitions']
+    assert len(definitions) == expected_count
+    assert len({item['calculation']['calculation_signature'] for item in definitions}) == expected_count
+    operations = {
+        item['operation_node_id']: item
+        for item in LineageIndexer().build(snapshot)['operation_nodes']
+    }
+    sources = [
+        {operations[operation_id]['source']
+         for operation_id in item['calculation']['operation_node_ids']}
+        for item in definitions
+    ]
+    assert any('data[\'amount\'].count()' in group for group in sources), sources
+    assert any(f'data[\'amount\'].{mode}()' in group for group in sources), sources
+
+
+def test_extrema_helper_keeps_structured_metrics_for_file_sources():
+    code = '''
+data = load_local_file(file_path="selected.csv")
+summary = data.groupby("category", as_index=False)["amount"].sum()
+leaders = select_extreme_rows(summary, "amount")
+tables = [build_table_result(title="Leaders", columns=[
+    {"key": "category", "label": "Category"},
+    {"key": "amount", "label": "Amount"},
+], data=leaders)]
+result = save_analysis_result(analysis_report="", charts=[], tables=tables)
+'''
+    snapshot = _snapshot(
+        code=code, tables=[{'title': 'Leaders', 'columns': [
+            {'key': 'category', 'label': 'Category'}, {'key': 'amount', 'label': 'Amount'},
+        ], 'rows': [{'category': 'A', 'amount': 10}, {'category': 'B', 'amount': 10}]}],
+        query_snapshots={'q_file': _loader_snapshot('selected.csv', columns=['category', 'amount'])},
+    )
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+    assert bundle['status'] == 'complete', bundle['diagnostics']
+    assert len(bundle['table_trace_refs']) == 1
+    assert bundle['table_trace_refs'][0]['column_key'] == 'amount'
+
+
+def test_ratio_helper_does_not_merge_reversed_calculation_boundaries():
+    sql = 'SELECT gross_profit, sales_revenue FROM product_profit'
+    code = f'''
+sql = "{sql}"
+data = load_data_with_sql(sql=sql)
+profit = data["gross_profit"].sum()
+revenue = data["sales_revenue"].sum()
+margin = calculate_ratio(profit, revenue, scale=100)
+inverse = calculate_ratio(revenue, profit, scale=100)
+analysis_report = f"Margin: {{margin:.1f}}%. Inverse: {{inverse:.1f}}%."
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(
+        code=code, report='Margin: 50.0%. Inverse: 200.0%.',
+        query_snapshots={'q_profit': _query_snapshot(sql, columns=['gross_profit', 'sales_revenue'])},
+    )
+    bundle = PostAnalysisEvidenceCompiler(planner=_semantic_plan).compile(snapshot)
+    assert bundle['status'] == 'complete', bundle['diagnostics']
+    assert len(bundle['report_trace_refs']) == 2
+    assert len(bundle['evidence_definitions']) == 2
+    assert {item['calculation']['formula'] for item in bundle['evidence_definitions']} == {
+        '(SUM(gross_profit) ÷ SUM(sales_revenue)) × 100',
+        '(SUM(sales_revenue) ÷ SUM(gross_profit)) × 100',
+    }
+
+
 def test_report_ratio_formula_unwraps_numeric_casts_around_query_fields():
     sql = "SELECT total_batches, pass_first_batches FROM quality_summary"
     code = r'''
@@ -4419,7 +5050,12 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
             value_type="currency",
         )])
 
-    with patch.object(LineageIndexer, "_locate_report_outputs", return_value=[]):
+    classify = LineageIndexer._expression_semantic_kind
+    with (
+        patch.object(LineageIndexer, "_locate_report_outputs", return_value=[]),
+        patch.object(LineageIndexer, "_expression_semantic_kind", side_effect=lambda expression:
+                     "presentation" if expression == "sum(data['amount'])" else classify(expression)),
+    ):
         bundle = PostAnalysisEvidenceCompiler(planner=discover).compile(snapshot)
 
     assert bundle["status"] == "complete", bundle["diagnostics"]
@@ -5639,6 +6275,87 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     assert bundle["status"] == "complete", bundle["diagnostics"]
 
 
+def test_report_repair_scope_keeps_source_facts_and_atomic_metric_positions():
+    compiler = PostAnalysisEvidenceCompiler(planner=lambda _: EvidencePlan())
+    compiler._resolver_id_maps = {
+        'report_candidate': {'rc1': 'c1', 'rc2': 'c2', 'rc3': 'c3'},
+        'anchor': {'a1': 'anchor1', 'a2': 'anchor2'},
+    }
+    payload = {
+        'analysis_code_with_lines': 'Complete successful program',
+        'query_catalog': [{'query_node_id': 'q1', 'columns': ['amount']}],
+        'operation_catalog': [{'operation_node_id': 'op1'}],
+        'report_candidate_catalog': [{'candidate_id': identity} for identity in ('rc1', 'rc2', 'rc3')],
+        'source_anchor_catalog': [{'anchor_id': identity} for identity in ('a1', 'a2')],
+    }
+    plan = EvidencePlan(metrics=[PlannedMetric(
+        metric_key='related', business_name='Related positions', business_explanation='Same calculation',
+        report_candidate_ids=['c2', 'c3'], source_anchors=[ReportSourceAnchorRef(anchor_id='anchor2')],
+    )])
+    lineage = {'output_nodes': [{'output_node_id': 'out2', 'posthoc_report_candidate': True,
+                                 'report_candidate_group_id': 'c2'}]}
+    original = copy.deepcopy(payload)
+    scoped, candidates, anchors = compiler._report_repair_scope(
+        payload, plan, [UnresolvedEvidenceOutput(output_node_id='out2', reason='source locator')], lineage,
+    )
+    assert candidates == {'c2', 'c3'}
+    assert anchors == {'anchor2'}
+    assert scoped['report_candidate_catalog'] == [{'candidate_id': 'rc2'}, {'candidate_id': 'rc3'}]
+    assert scoped['source_anchor_catalog'] == [{'anchor_id': 'a2'}]
+    for key in ('analysis_code_with_lines', 'query_catalog', 'operation_catalog'):
+        assert scoped[key] == payload[key]
+    assert payload == original
+
+
+def test_report_repair_merges_delta_without_reclassifying_settled_claims():
+    def metric(key, candidates):
+        return PlannedMetric(metric_key=key, business_name=key, business_explanation=key,
+                             report_candidate_ids=candidates)
+    first = EvidencePlan(
+        metrics=[metric('keep', ['c1']), metric('broken', ['c2'])],
+        non_metric_report_candidate_ids=['c3'],
+        unresolved_outputs=[UnresolvedEvidenceOutput(output_node_id='rc2', reason='did not classify')],
+    )
+    repair = EvidencePlan(metrics=[metric('fixed', ['c2']), metric('outside', ['c1']),
+                                   metric('cross_scope', ['c1', 'c2'])],
+                          non_metric_report_candidate_ids=['c1'])
+    compiler = PostAnalysisEvidenceCompiler(planner=lambda _: EvidencePlan())
+    compiler._resolver_id_maps = {'report_candidate': {'rc2': 'c2'}}
+    before = first.model_dump()
+    merged = compiler._merge_report_repair_plan(first, repair, {'c2'}, set())
+    assert [item.metric_key for item in merged.metrics] == ['keep', 'fixed']
+    assert merged.metrics[0].model_dump() == first.metrics[0].model_dump()
+    assert merged.non_metric_report_candidate_ids == ['c3']
+    assert merged.unresolved_outputs == []
+    assert first.model_dump() == before
+
+
+def test_report_repair_can_classify_unresolved_candidate_as_non_metric():
+    compiler = PostAnalysisEvidenceCompiler(planner=lambda _: EvidencePlan())
+    first = EvidencePlan(unresolved_outputs=[
+        UnresolvedEvidenceOutput(output_node_id='c1', reason='did not classify'),
+        UnresolvedEvidenceOutput(output_node_id='c2', reason='Other unresolved position'),
+    ])
+    merged = compiler._merge_report_repair_plan(
+        first, EvidencePlan(non_metric_report_candidate_ids=['c1']), {'c1'}, set(),
+    )
+    assert merged.non_metric_report_candidate_ids == ['c1']
+    assert [item.output_node_id for item in merged.unresolved_outputs] == ['c2']
+
+
+def test_report_repair_unlocated_diagnostic_keeps_original_scope():
+    compiler = PostAnalysisEvidenceCompiler(planner=lambda _: EvidencePlan())
+    payload = {'analysis_code_with_lines': 'All source',
+               'report_candidate_catalog': [{'candidate_id': 'c1'}],
+               'source_anchor_catalog': [{'anchor_id': 'a1'}]}
+    scoped, candidates, anchors = compiler._report_repair_scope(
+        payload, EvidencePlan(), [UnresolvedEvidenceOutput(reason='source locator')], {},
+    )
+    assert scoped == payload
+    assert candidates == {'c1'}
+    assert anchors == {'a1'}
+
+
 def test_default_planner_does_not_recheck_locally_verified_report_output():
     sql = "SELECT amount FROM sales"
     code = '''
@@ -5754,6 +6471,27 @@ evidence["Process"] = {
     ]
 
 
+def test_ast_report_calendar_slots_share_rendered_temporal_classification():
+    sql = "SELECT year, amount FROM records"
+    code = '''
+data = load_data_with_sql(sql="SELECT year, amount FROM records")
+start_year = data["year"].min()
+end_year = data["year"].max()
+total = data["amount"].sum()
+analysis_report = f"覆盖 {start_year} 至 {end_year} 年，金额 {total} 元。"
+result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
+'''
+    snapshot = _snapshot(code=code, report="覆盖 2019 至 2023 年，金额 2023 元。",
+                         query_snapshots={"q_records": _query_snapshot(sql, columns=["year", "amount"])})
+    outputs = [item for item in LineageIndexer().build(snapshot)["output_nodes"]
+               if item.get("artifact_type") == "report"]
+    assert [(item["text"], bool(item.get("presentation_temporal_literal"))) for item in outputs] == [
+        ("2019", True), ("2023", True), ("2023", False),
+    ]
+    bundle = PostAnalysisEvidenceCompiler(planner=lambda _: EvidencePlan()).compile(snapshot)
+    assert [item["text"] for item in bundle["report_trace_refs"]] == ["2023"]
+
+
 def test_rendered_report_year_month_is_not_a_metric_candidate():
     candidates = LineageIndexer._locate_report_numeric_candidates(
         "2026年3月销售收入为 1,280.50 元。",
@@ -5858,8 +6596,13 @@ def test_rendered_report_unitless_comparison_cutoff_is_not_a_metric_candidate():
     assert metric_texts == ["33"]
 
 
-def test_rendered_report_labelled_interval_endpoints_are_not_metric_candidates():
-    report = "偏离度 20%~50%（中等偏离）风险批次 0 个。"
+@pytest.mark.parametrize("report, expected", [
+    ("偏离度 20%~50%（中等偏离）风险批次 0 个。", ["0"]),
+    ("3-5年（成熟设备）：7 台；6-10年（老旧设备）：3 台。", ["7", "3"]),
+    ("功率 10-30 kW（中功率）：4 台。", ["4"]),
+    ("实际最小值 3 年，最大值 10 年，共 7 台。", ["3", "10", "7"]),
+])
+def test_rendered_report_labelled_interval_endpoints_are_not_metric_candidates(report, expected):
 
     candidates = LineageIndexer._locate_report_numeric_candidates(
         report,
@@ -5874,7 +6617,7 @@ def test_rendered_report_labelled_interval_endpoints_are_not_metric_candidates()
         )
     ]
 
-    assert metric_texts == ["0"]
+    assert metric_texts == expected
 
 
 def test_rendered_report_bold_list_ordinals_are_not_metric_candidates():
@@ -6184,6 +6927,7 @@ def test_markdown_table_candidates_inherit_build_markdown_table_column_origins()
 summary_table_md = build_markdown_table(
     display_df,
     columns=[
+        {"key": "product", "label": "Product"},
         {"key": "amount", "label": "Amount"},
         {"key": "count", "label": "Count"},
     ],
@@ -6197,6 +6941,100 @@ summary_table_md = build_markdown_table(
 
     assert {item["field"] for item in resolved} == {"amount", "count"}
     assert all(item["source_frame"] == "display_df" for item in resolved)
+
+
+@pytest.mark.parametrize("expression", [
+    'build_markdown_table(frame[["Product", "Amount", "Count"]])',
+    'build_markdown_table(frame, ["Product", "Amount", "Count"])',
+    'build_markdown_table(frame, columns=["Product", {"field": "amount", "title": "Amount"}, {"key": "count", "label": "Count"}])',
+])
+def test_markdown_table_origins_cover_public_helper_column_forms(expression):
+    report = "| Product | Amount | Count |\n| --- | --- | --- |\n| A | 12.5 | 3 |"
+    candidates = LineageIndexer._locate_report_numeric_candidates(report, occupied=set())
+    resolved = LineageIndexer._attach_report_markdown_table_origins(
+        candidates, code=f"table_md = {expression}",
+    )
+    assert all(item.get("markdown_table_column_origin") for item in resolved)
+    assert {item["field"].lower() for item in resolved} == {"amount", "count"}
+
+
+def test_unresolved_markdown_table_contract_keeps_following_table_identity():
+    report = (
+        "| Product | Unknown |\n| --- | --- |\n| A | 7 |\n\n"
+        "| Product | Amount |\n| --- | --- |\n| B | 12 |"
+    )
+    candidates = LineageIndexer._locate_report_numeric_candidates(report, occupied=set())
+    resolved = LineageIndexer._attach_report_markdown_table_origins(
+        candidates,
+        code='first = build_markdown_table(first_frame)\nsecond = build_markdown_table(second_frame, columns=["Product", "Amount"])',
+    )
+    amount = next(item for item in resolved if item["label"] == "Amount")
+    assert amount["source_frame"] == "second_frame"
+    assert not next(item for item in resolved if item["label"] == "Unknown").get("markdown_table_column_origin")
+
+
+def test_identical_markdown_table_schemas_do_not_guess_source_identity():
+    candidates = LineageIndexer._locate_report_numeric_candidates(
+        "| Product | Amount |\n| --- | --- |\n| A | 12 |", occupied=set(),
+    )
+    resolved = LineageIndexer._attach_report_markdown_table_origins(
+        candidates,
+        code='first = build_markdown_table(left, ["Product", "Amount"])\nsecond = build_markdown_table(right, ["Product", "Amount"])',
+    )
+    assert not any(item.get("markdown_table_column_origin") for item in resolved)
+
+
+def test_report_table_reuses_frame_column_origins_without_crossing_same_named_fields():
+    sql = "SELECT product, price, revenue FROM sales"
+    code = '''
+data = load_data_with_sql(sql="SELECT product, price, revenue FROM sales")
+prices = data.groupby("product", as_index=False).agg(value=("price", "mean"))
+revenues = data.groupby("product", as_index=False).agg(value=("revenue", "sum"))
+report = build_markdown_table(prices[["product", "value"]])
+'''
+    snapshot = _snapshot(
+        code=code,
+        report="| product | value |\n| --- | --- |\n| A | 12.5 |",
+        query_snapshots={"q_sales": _query_snapshot(sql, columns=["product", "price", "revenue"])},
+    )
+    index = LineageIndexer().build(snapshot)
+    output = next(item for item in index["output_nodes"] if item.get("markdown_table_column_origin"))
+    operations = {item["operation_node_id"]: item for item in index["operation_nodes"]}
+    assert output["structured_origin"] is True
+    assert output["source_frame"] == "prices"
+    boundary_sources = [operations[key]["source"] for key in output["boundary_operation_node_ids"]]
+    assert any('price' in source and 'mean' in source for source in boundary_sources)
+    assert not any('revenue' in source for source in boundary_sources)
+    compiled = PostAnalysisEvidenceCompiler(
+        planner=lambda _: EvidencePlan(), structured_planner=lambda _: EvidencePlan(),
+    ).compile(snapshot)
+    assert compiled["status"] == "complete", compiled["diagnostics"]
+    assert len(compiled["report_trace_refs"]) == 1
+
+
+def test_report_table_numeric_group_keys_are_not_metrics_but_counts_are():
+    sql = "SELECT period, asset_id FROM assets"
+    code = '''
+data = load_data_with_sql(sql="SELECT period, asset_id FROM assets")
+summary = data.groupby("period", as_index=False).agg(count=("asset_id", "nunique"))
+report = build_markdown_table(summary[["period", "count"]])
+'''
+    snapshot = _snapshot(
+        code=code, report="| period | count |\n| --- | --- |\n| 2,019 | 3 |\n| 2,020 | 4 |",
+        query_snapshots={"q_assets": _query_snapshot(sql, columns=["period", "asset_id"])},
+    )
+    index = LineageIndexer().build(snapshot)
+    report_outputs = [item for item in index["output_nodes"] if item.get("markdown_table_column_origin")]
+    keys = [item for item in report_outputs if item["field"] == "period"]
+    counts = [item for item in report_outputs if item["field"] == "count"]
+    assert len(keys) == len(counts) == 2
+    assert all(not PostAnalysisEvidenceCompiler._is_report_metric_output(item, index) for item in keys)
+    assert all(PostAnalysisEvidenceCompiler._is_report_metric_output(item, index) for item in counts)
+    compiler = PostAnalysisEvidenceCompiler(planner=lambda _: pytest.fail("Locally proven columns need no LLM"))
+    compiler._uses_default_planner = True
+    compiled = compiler.compile(snapshot)
+    assert compiled["status"] == "complete", compiled["diagnostics"]
+    assert len(compiled["report_trace_refs"]) == 2
 
 
 def test_discovery_contract_requires_every_verified_report_anchor_to_be_classified():
@@ -6214,6 +7052,36 @@ def test_discovery_contract_requires_every_verified_report_anchor_to_be_classifi
     )
 
     assert errors == ["verified report source anchors are unclassified: ['a1']"]
+
+
+def test_source_locator_metric_does_not_require_a_local_calculation_candidate_id():
+    plan = EvidencePlan.model_validate({
+        "metrics": [{
+            "source_anchors": [{"anchor_id": "a1"}],
+            "calculation_source_refs": [{"source_line": 8, "expression": "rows['amount'].sum()"}],
+            "claimed_query_node_ids": ["q1"],
+            "metric_key": "total_amount",
+            "business_name": "Total amount",
+            "business_explanation": "Sum of the queried amount field.",
+        }],
+    })
+    payload = {
+        "source_anchor_catalog": [{"anchor_id": "a1", "verified_report_output": True}],
+        "operation_catalog": [],
+        "query_catalog": [{"query_node_id": "q1"}],
+    }
+    assert plan.metrics[0].calculation_id == ""
+    assert PostAnalysisEvidenceCompiler._discovery_plan_reference_errors(plan, payload) == []
+
+    missing_locator = plan.model_copy(deep=True)
+    missing_locator.metrics[0].calculation_source_refs = []
+    assert any("no calculation operation or source locator" in error
+               for error in PostAnalysisEvidenceCompiler._discovery_plan_reference_errors(missing_locator, payload))
+
+    unknown_query = plan.model_copy(deep=True)
+    unknown_query.metrics[0].claimed_query_node_ids = ["not_executed"]
+    assert any("unknown claimed query" in error
+               for error in PostAnalysisEvidenceCompiler._discovery_plan_reference_errors(unknown_query, payload))
 
 
 def test_discovery_contract_rejects_merging_distinct_mapping_selectors():
@@ -8061,6 +8929,38 @@ chart = build_chart_result(
     assert sources[0]["source_frame"] == ""
 
 
+def test_inline_chart_renames_are_scoped_to_each_call():
+    tree = ast.parse('''
+first = build_chart_result(data=summary[['category', 'count']].rename(columns={'count': 'value'}), value_field='value')
+second = build_chart_result(data=summary[['category', 'amount']].rename(columns={'amount': 'value'}), value_field='value')
+third = build_chart_result(data=summary.rename(columns={'count': 'intermediate'}).rename(columns={'intermediate': 'value'}), value_field='value')
+''')
+    sources = LineageIndexer._chart_data_sources(tree)
+    assert [item['source_frame'] for item in sources] == ['summary'] * 3
+    assert [item['field_aliases']['value'] for item in sources] == ['count', 'amount', 'count']
+
+
+def test_inline_chart_rename_reaches_its_original_calculation_locally():
+    sql = 'SELECT category, amount FROM sales'
+    snapshot = _snapshot(
+        code='''
+data = load_data_with_sql(sql="SELECT category, amount FROM sales")
+summary = data.groupby('category').agg(total=('amount', 'sum')).reset_index()
+chart = build_chart_result(data=summary[['category', 'total']].rename(columns={'total': 'value'}), chart_kind='bar', category_field='category', value_field='value')
+result = save_analysis_result(analysis_report='Summary', charts=[chart], tables=[])
+''',
+        charts=[{'chart_data_contract': {'encoding': {'category_field': 'category', 'value_field': 'value'}}}],
+        query_snapshots={'q_sales': _query_snapshot(sql, columns=['category', 'amount'])},
+    )
+    lineage = LineageIndexer().build(snapshot)
+    output = next(item for item in lineage['output_nodes'] if item['artifact_type'] == 'chart')
+    assert output['lineage_fields'] == ['total']
+    assert output['candidate_query_node_ids'] == ['q_sales']
+    candidates = PostAnalysisEvidenceCompiler._build_calculation_candidates(lineage)
+    plan = PostAnalysisEvidenceCompiler._build_structured_evidence_plan(candidates, lineage)
+    assert not PostAnalysisEvidenceCompiler._unresolved_structured_outputs(lineage, plan)
+
+
 def test_compiled_multi_series_chart_selection_resolves_current_value():
     service = InsightNsConversationService(None)
     artifact = {
@@ -9066,6 +9966,47 @@ result = save_analysis_result(analysis_report=analysis_report, charts=[], tables
     assert bundle["status"] == "complete", bundle["diagnostics"]
     assert [item["text"] for item in bundle["report_trace_refs"]] == ["20"]
     assert bundle["evidence_definitions"][0]["query_refs"] == ["q_sales"]
+
+
+def test_source_locator_unwraps_single_value_fstring_without_format_dependencies():
+    code = 'report = f"Share: {share:.1f}%"'
+    index = {"operation_nodes": []}
+    operations, errors = PostAnalysisEvidenceCompiler._resolve_calculation_source_refs(
+        code, index, [CalculationSourceRef(
+            source_line=1, expression='f"Share: {share:.1f}%"',
+        )],
+    )
+    assert not errors
+    assert len(operations) == 1
+    assert index["operation_nodes"][0]["source"] == "share"
+    assert index["operation_nodes"][0]["loads"] == ["share"]
+
+
+def test_source_locator_does_not_merge_multiple_fstring_values():
+    code = 'report = f"Count: {count}; Share: {share:.1f}%"'
+    index = {"operation_nodes": []}
+    operations, errors = PostAnalysisEvidenceCompiler._resolve_calculation_source_refs(
+        code, index, [CalculationSourceRef(
+            source_line=1, expression='f"Count: {count}; Share: {share:.1f}%"',
+        )],
+    )
+    assert operations == []
+    assert errors
+    assert index["operation_nodes"] == []
+
+
+def test_source_locator_resolves_single_display_fragment_in_multiline_report():
+    code = 'report = f"""Count: {count}\nShare: {share:.1f}%\n"""'
+    index = {"operation_nodes": []}
+    operations, errors = PostAnalysisEvidenceCompiler._resolve_calculation_source_refs(
+        code, index, [CalculationSourceRef(
+            source_line=2, expression='f"Share: {share:.1f}%"',
+        )],
+    )
+    assert not errors
+    assert len(operations) == 1
+    assert index["operation_nodes"][0]["source"] == "share"
+    assert index["operation_nodes"][0]["loads"] == ["share"]
 
 
 def test_filtered_generator_report_builder_keeps_dynamic_precision_slots():

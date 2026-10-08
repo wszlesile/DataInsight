@@ -80,7 +80,7 @@ frame = load_data_with_sql("SELECT MAX(amount) AS amount FROM sales")
 report = f"Highest amount: {frame.iloc[0]['amount']}"
 ```
 
-SQL 已计算唯一最大值，`_validate_report_extrema_selection_contract()` 在基线与当前都会拒绝。对 `ORDER BY amount DESC` 的合法写法，基线拒绝，当前接受，说明待提交的三态改进有价值，但不完整。
+历史审计发现：SQL 已计算唯一最大值，极值词面检查仍可能拒绝执行；三态推断也不能解决文本与计算关系的歧义。2026-10-03 已删除这类检查的实现和调用，不再保留诊断路径。
 
 配对指标/括号、时间窗、最高最低等检查仍包含对 Python 文本常量和格式的解释。不能因为分析经过 AST 就声称它是确定性业务校验；字段不同也不自动证明总体不同。
 
@@ -166,7 +166,7 @@ SQL 已计算唯一最大值，`_validate_report_extrema_selection_contract()` �
 
 ### 8.4 静态校验的证明边界
 
-- 极值 SQL 检查使用已有 sqlglot 解析顶层聚合/排序，而不是用 ORDER BY 文本搜索推断子查询或外层排序；组合查询 API 的位置参数按真实签名读取。
+- 历史极值 SQL 推断方案已撤销，相关实现已删除；SQL 可执行性与 API 签名检查不受影响。
 - 单行 SQL 聚合不再因没有 ORDER BY 被拒绝。明确相反的排序方向仍阻断；未知排序、动态方向和不支持的表达式保留 unknown 诊断，不推导成确定错误。
 - 成对百分比与数量使用不同筛选字段，只能证明实现不同，不能证明业务群体不等价。保留计算依赖诊断，改为非阻断提示；不宣布该指标已校验正确。
 - 非阻断诊断写入本地审计日志；同时存在真实阻断错误时，附在该次修复 diagnostics.unproven_advisories 中，不为提示单独增加模型调用。

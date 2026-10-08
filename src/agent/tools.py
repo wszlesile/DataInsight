@@ -10,13 +10,14 @@ from queue import Empty
 import re
 import tempfile
 import time
+import tokenize
 import traceback
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, time as datetime_time, timedelta
 from difflib import SequenceMatcher
 from io import StringIO
-from typing import Any, Literal, Optional
+from typing import Any, ClassVar, Literal, Optional
 from zoneinfo import ZoneInfo
 
 from langchain_core.messages import ToolMessage
@@ -28,6 +29,21 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from agent.context_engineering_runtime import CustomContext
+from analysis_runtime.calculations import (
+    calculate_ratio,
+    compare_numeric_values,
+    evaluate_numeric_comparison,
+    select_extreme_rows,
+    summarize_extrema,
+)
+from analysis_runtime.expressions import (
+    render_extrema, render_numeric_comparison,
+)
+from analysis_runtime.provenance import record_query_frame, reset_capture, execution_traces, fact_view_receipt, snapshot_digest, set_program_source
+from analysis_runtime.provenance import calculation_delivery_requirements, set_delivery_requirements, execution_delivery_coverage, record_table_consumption, execute_registered_definitions
+from analysis_runtime.provenance import normalize_chart_consumption
+from analysis_runtime.semantic_execution import SemanticExecution, DistinctCount, RowProductSum, OneToOneJoin, DecimalColumns, PythonCalculation
+from analysis_runtime.executable_program import compile_python_analysis_definition, validate_python_analysis_definition
 from analysis_runtime.parameters import (
     attach_relative_time_runtime_default,
     strip_generated_runtime_parameter_metadata,
@@ -45,6 +61,7 @@ from utils import (
 )
 from utils.analysis_task_cancel import AnalysisTaskCancelled, CANCELLED_MESSAGE, is_analysis_task_cancelled
 from agent.invocation_policy import validate_json_output
+from utils.chart_spec_utils import finalize_chart_specs
 
 CURRENT_USERNAME = ContextVar('current_username', default='anonymous')
 CURRENT_EXPECTED_TIME_RANGE = ContextVar('current_expected_time_range', default={})
@@ -54,6 +71,8 @@ CURRENT_QUERY_SNAPSHOTS = ContextVar('current_query_snapshots', default={})
 CURRENT_PROBE_QUERY_OBSERVATIONS = ContextVar('current_probe_query_observations', default=[])
 CURRENT_LAST_QUERY_KEY = ContextVar('current_last_query_key', default='')
 CURRENT_DATASOURCE_NUMERIC_FIELDS = ContextVar('current_datasource_numeric_fields', default=[])
+CURRENT_LOCAL_FILE_DATASOURCES = ContextVar('current_local_file_datasources', default={})
+CURRENT_LOCAL_FILE_QUERY_OWNER = ContextVar('current_local_file_query_owner', default=None)
 CURRENT_EXECUTION_INTENT = ContextVar('current_execution_intent', default='')
 CURRENT_CONFIRMED_NO_DATA_RESULT = ContextVar('current_confirmed_no_data_result', default=False)
 CURRENT_OUTPUT_CONTRACT = ContextVar(
@@ -405,6 +424,16 @@ def _build_generated_code_error_context(
                     for current_line_no in range(related_start, related_end + 1)
                 ]
 
+    multiline_string_span = None
+    if isinstance(error, SyntaxError) and line_no:
+        try:
+            for token in tokenize.generate_tokens(StringIO(code).readline):
+                if (token.type == tokenize.STRING and token.start[0] < token.end[0]
+                        and token.start[0] <= line_no <= token.end[0]):
+                    multiline_string_span = (token.start[0], token.end[0])
+                    break
+        except (tokenize.TokenError, IndentationError):
+            pass
     statement_ranges = _source_statement_patch_ranges(code, line_no)
     if (
         not statement_ranges
@@ -414,12 +443,19 @@ def _build_generated_code_error_context(
     ):
         local_start = max(1, line_no - GENERATED_CODE_CONTEXT_RADIUS)
         local_end = min(len(code_lines), line_no + GENERATED_CODE_CONTEXT_RADIUS)
+        if multiline_string_span:
+            local_start, local_end = multiline_string_span
+            context_lines = [{
+                'line_no': current_line_no,
+                'code': code_lines[current_line_no - 1],
+                'is_error_line': current_line_no == line_no,
+            } for current_line_no in range(local_start, local_end + 1)]
         statement_ranges = [{
             'start_line': line_no,
             'end_line': line_no,
             'kind': 'SyntaxErrorLine',
             'source': code_lines[line_no - 1],
-            'role': 'syntax_error_line',
+            'role': 'multiline_string_error_location' if multiline_string_span else 'syntax_error_line',
         }, {
             'start_line': local_start,
             'end_line': local_end,
@@ -435,6 +471,8 @@ def _build_generated_code_error_context(
 
     symbol_references = _generated_code_error_symbol_references(code, error)
     related_contexts: list[dict[str, Any]] = []
+    if isinstance(error, TypeError) and line_no:
+        related_contexts.extend(_consecutive_call_repair_contexts(code, line_no))
     for reference in symbol_references:
         reference_line = int(reference.get('line_no') or 0)
         if reference_line == line_no:
@@ -460,6 +498,44 @@ def _build_generated_code_error_context(
         'suggested_patch_ranges': statement_ranges,
         'traceback_excerpt': _clip_retry_context_text(traceback_text, TOOL_ERROR_CODE_CONTEXT_MAX_CHARS),
     }
+
+
+def _consecutive_call_repair_contexts(code: str, line_no: int) -> list[dict[str, Any]]:
+    """Offer adjacent uses for inspection, without declaring them erroneous."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    for parent in ast.walk(tree):
+        for _, body in ast.iter_fields(parent):
+            if not isinstance(body, list):
+                continue
+            for position, statement in enumerate(body):
+                if not (
+                    isinstance(statement, ast.Expr)
+                    and isinstance(statement.value, ast.Call)
+                    and statement.lineno <= line_no <= statement.end_lineno
+                ):
+                    continue
+                call = statement.value
+                if not isinstance(call.func, (ast.Name, ast.Attribute)):
+                    return []
+                callee = ast.dump(call.func, include_attributes=False)
+                contexts = []
+                for following in body[position + 1:]:
+                    if not (
+                        isinstance(following, ast.Expr)
+                        and isinstance(following.value, ast.Call)
+                        and following.end_lineno <= line_no + GENERATED_CODE_CONTEXT_RADIUS
+                        and ast.dump(following.value.func, include_attributes=False) == callee
+                    ):
+                        break
+                    context = _static_node_code_context(code, following)
+                    context['related_usage_kind'] = 'consecutive_same_callable'
+                    context['confirmed_error'] = False
+                    contexts.append(context)
+                return contexts
+    return []
 
 
 def _generated_code_error_symbols(error: Exception) -> list[str]:
@@ -595,12 +671,20 @@ def _source_statement_patch_ranges(
     )
     start_line = int(getattr(node, 'lineno', line_no) or line_no)
     end_line = int(getattr(node, 'end_lineno', line_no) or line_no)
+    targets = node.targets if isinstance(node, ast.Assign) else (
+        [node.target] if isinstance(node, ast.AnnAssign) else []
+    )
+    defined_names = sorted({
+        item.id for target in targets for item in ast.walk(target)
+        if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store)
+    })
     return [{
         'start_line': start_line,
         'end_line': end_line,
         'kind': type(node).__name__,
         'source': '\n'.join(source_lines[start_line - 1:end_line]),
         'role': 'failing_statement',
+        'defined_names': defined_names,
     }]
 
 
@@ -1139,10 +1223,22 @@ def _month_grain_filter_satisfies_time_range(
 ) -> bool:
     if not start or not end or not bool(time_range.get('end_exclusive')):
         return False
+
+    def parse_month_boundary(value: str):
+        """Parse a boundary while retaining any explicit day precision."""
+        for pattern in ('%Y-%m-%d', '%Y-%m'):
+            try:
+                return datetime.strptime(value, pattern).date()
+            except ValueError:
+                continue
+        return None
+
     try:
-        start_date = datetime.strptime(start, '%Y-%m-%d').date()
-        end_date = datetime.strptime(end, '%Y-%m-%d').date()
-    except ValueError:
+        start_date = parse_month_boundary(start)
+        end_date = parse_month_boundary(end)
+    except (TypeError, ValueError):
+        return False
+    if start_date is None or end_date is None:
         return False
 
     if start_date.day != 1 or end_date.day != 1:
@@ -3212,8 +3308,10 @@ def _begin_loader_snapshot_execution(
     if not identifier:
         return
     snapshots = dict(CURRENT_QUERY_SNAPSHOTS.get() or {})
+    owner = CURRENT_LOCAL_FILE_QUERY_OWNER.get()
     identity = json.dumps(
-        {"loader": loader, "datasource_identifier": identifier, "options": options or {}},
+        {"loader": loader, "datasource_identifier": identifier, "options": options or {},
+         **({'datasource_id': owner} if owner is not None else {})},
         ensure_ascii=False,
         sort_keys=True,
         default=str,
@@ -3250,6 +3348,8 @@ def _begin_loader_snapshot_execution(
             'access_hash': access_hash,
             'physical_execution': True,
         })
+        if owner is not None:
+            parent_implementation['datasource_id'] = owner
         parent['implementation'] = parent_implementation
         parent['execution'] = {'status': 'running'}
         snapshots[parent_key] = parent
@@ -3285,6 +3385,8 @@ def _begin_loader_snapshot_execution(
         },
         'execution': {'status': 'running'},
     }
+    if owner is not None:
+        snapshots[query_key]['implementation']['datasource_id'] = owner
     CURRENT_QUERY_SNAPSHOTS.set(snapshots)
     CURRENT_LAST_QUERY_KEY.set(query_key)
 
@@ -3349,6 +3451,8 @@ def _mark_latest_query_snapshot_execution(
     snapshot["execution"] = execution
     snapshots[query_key] = snapshot
     CURRENT_QUERY_SNAPSHOTS.set(snapshots)
+
+    record_query_frame(query_key, data, snapshot)
 
 
 def _probe_profile_scalar(value: Any) -> Any:
@@ -3754,6 +3858,10 @@ class StructuredResult(BaseModel):
     analysis_parameters_schema: dict[str, Any] = Field(default_factory=dict, description="Reusable parameter schema")
     analysis_parameters: dict[str, Any] = Field(default_factory=dict, description="Actual parameter values")
     query_snapshots: dict[str, Any] = Field(default_factory=dict, description="Runtime query snapshots collected by backend")
+    semantic_execution_traces: list[dict[str, Any]] = Field(default_factory=list, description="Executed opt-in semantic definitions and query receipts")
+    runtime_evidence: dict[str, Any] = Field(default_factory=dict, description='Runtime-owned execution and presentation receipts; no semantic certification')
+    report_finding_bindings: list[dict[str, Any]] = Field(default_factory=list, description='Exact report spans referencing current saved cells or findings; no business certification')
+    semantic_execution_coverage: dict[str, Any] = Field(default_factory=dict, description="Host-required calculation result execution coverage; presentation and business meaning separately unverified")
     output_format: Literal["standard", "text", "json"] = Field(
         default="standard",
         description="当前调用采用的结果协议。",
@@ -3761,6 +3869,10 @@ class StructuredResult(BaseModel):
     output_payload: Any = Field(
         default=None,
         description="纯文本或 JSON 调用的原始结果；standard 模式为空。",
+    )
+    presentation_pending: bool = Field(
+        default=False,
+        description="Worker 已完成本次查询与计算，等待同一 Runtime 根据事实撰写最终表达。",
     )
 
 
@@ -4334,899 +4446,6 @@ def _validate_query_mapping_default_contract(tree: ast.AST) -> RetryResult | Non
     return None
 
 
-def _validate_report_extrema_selection_contract(
-    tree: ast.AST,
-    code: str,
-) -> RetryResult | None:
-    """Require explicit extrema calculations for superlative report claims.
-
-    A positional row can represent the latest period, the first category, or an
-    arbitrary SQL order. It is not proof of a maximum/minimum unless the metric
-    extremum was calculated explicitly. Restrict this check to report templates
-    that make a superlative claim; ordinary positional presentation remains valid.
-    """
-
-    superlative_markers = (
-        "最高", "最低", "最多", "最少", "峰值", "高峰", "为主", "主导",
-        "highest", "lowest", "largest", "smallest", "peak", "dominant", "most ",
-    )
-    frame_assignments: dict[str, ast.AST] = {}
-    static_strings: dict[str, str] = {}
-
-    def sorted_frame_orders() -> dict[str, set[tuple[str, bool]]]:
-        """Collect explicit DataFrame sort orders assigned back to a frame."""
-        orders: dict[str, set[tuple[str, bool]]] = {}
-        for assignment in ast.walk(tree):
-            if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
-                continue
-            targets = (
-                assignment.targets
-                if isinstance(assignment, ast.Assign)
-                else [assignment.target]
-            )
-            target_names = {
-                target.id for target in targets if isinstance(target, ast.Name)
-            }
-            if not target_names:
-                continue
-            for target_name in target_names:
-                frame_assignments[target_name] = assignment.value
-                if (
-                    isinstance(assignment.value, ast.Constant)
-                    and isinstance(assignment.value.value, str)
-                ):
-                    static_strings[target_name] = assignment.value.value
-            for call in ast.walk(assignment.value):
-                if not (
-                    isinstance(call, ast.Call)
-                    and isinstance(call.func, ast.Attribute)
-                    and call.func.attr == "sort_values"
-                    and call.args
-                    and isinstance(call.args[0], ast.Constant)
-                    and isinstance(call.args[0].value, str)
-                ):
-                    continue
-                ascending = True
-                for keyword in call.keywords:
-                    if keyword.arg == "ascending" and not (
-                        isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, bool)
-                    ):
-                        ascending = None
-                        break
-                    if (
-                        keyword.arg == "ascending"
-                        and isinstance(keyword.value, ast.Constant)
-                        and isinstance(keyword.value.value, bool)
-                    ):
-                        ascending = keyword.value.value
-                if ascending is None:
-                    continue
-                for target_name in target_names:
-                    orders.setdefault(target_name, set()).add((
-                        str(call.args[0].value), ascending,
-                    ))
-        return orders
-
-    frame_orders = sorted_frame_orders()
-
-    def unwrap_display_call(value: ast.AST) -> ast.AST:
-        current = value
-        while (
-            isinstance(current, ast.Call)
-            and isinstance(current.func, ast.Name)
-            and current.func.id in {"int", "float", "str", "round"}
-            and current.args
-        ):
-            current = current.args[0]
-        return current
-
-    def positional_row_signature(value: ast.AST) -> tuple[str, int] | None:
-        """Return the DataFrame and row position for ``frame.iloc[n]['field']``."""
-        value = unwrap_display_call(value)
-        if not isinstance(value, ast.Subscript):
-            return None
-        if not (
-            isinstance(value.slice, ast.Constant)
-            and isinstance(value.slice.value, str)
-        ):
-            return None
-        row = value.value
-        if not (
-            isinstance(row, ast.Subscript)
-            and isinstance(row.value, ast.Attribute)
-            and row.value.attr == "iloc"
-            and isinstance(row.value.value, (ast.Name, ast.Call))
-        ):
-            return None
-        if isinstance(row.slice, ast.Constant) and isinstance(row.slice.value, int):
-            row_index = row.slice.value
-        elif (
-            isinstance(row.slice, ast.UnaryOp)
-            and isinstance(row.slice.op, ast.USub)
-            and isinstance(row.slice.operand, ast.Constant)
-            and isinstance(row.slice.operand.value, int)
-        ):
-            row_index = -row.slice.operand.value
-        else:
-            return None
-        frame_expression = row.value.value
-        frame_key = (
-            frame_expression.id
-            if isinstance(frame_expression, ast.Name)
-            else ast.dump(frame_expression, include_attributes=False)
-        )
-        return frame_key, row_index
-
-    def static_sql_from_call(call: ast.Call) -> str | None:
-        function_name = (
-            call.func.id
-            if isinstance(call.func, ast.Name)
-            else call.func.attr
-            if isinstance(call.func, ast.Attribute)
-            else ""
-        )
-        if function_name not in {"load_data_with_sql", "query_data_with_sql"}:
-            return None
-        sql_position = 2 if function_name == "query_data_with_sql" else 0
-        sql_node: ast.AST | None = call.args[sql_position] if len(call.args) > sql_position else None
-        for keyword in call.keywords:
-            if keyword.arg == "sql":
-                sql_node = keyword.value
-                break
-        if isinstance(sql_node, ast.Constant) and isinstance(sql_node.value, str):
-            return sql_node.value
-        if isinstance(sql_node, ast.Name):
-            return static_strings.get(sql_node.id)
-        return None
-
-    def sql_order_state(
-        frame_name: str,
-        metric_field: str,
-        required_ascending: bool,
-    ) -> Literal["valid", "invalid", "unknown"]:
-        source = frame_assignments.get(frame_name)
-        if source is None:
-            return "unknown"
-        load_calls = [
-            item for item in ast.walk(source)
-            if isinstance(item, ast.Call)
-            and (
-                (isinstance(item.func, ast.Name) and item.func.id in {"load_data_with_sql", "query_data_with_sql"})
-                or (isinstance(item.func, ast.Attribute) and item.func.attr in {"load_data_with_sql", "query_data_with_sql"})
-            )
-        ]
-        if len(load_calls) == 1 and source is load_calls[0]:
-            sql = static_sql_from_call(load_calls[0])
-            if sql is None:
-                return "unknown"
-            try:
-                from sqlglot import exp, parse_one
-                statement = parse_one(sql)
-            except Exception:
-                return "unknown"
-            if not isinstance(statement, exp.Select):
-                return "unknown"
-            projections = statement.expressions
-            if (
-                statement.args.get("group") is None
-                and all(isinstance(p.unalias(), exp.AggFunc) for p in projections)
-            ):
-                # A scalar aggregate has one output row, not an unordered ranking.
-                return "valid"
-            order = statement.args.get("order")
-            if not order or not order.expressions:
-                return "unknown"
-            first = order.expressions[0]
-            expression = first.this
-            if not isinstance(expression, exp.Column):
-                return "unknown"
-            if expression.name.lower() != metric_field.lower():
-                return "unknown"
-            actual_ascending = not bool(first.args.get("desc"))
-            return "valid" if actual_ascending == required_ascending else "invalid"
-        return "unknown"
-
-    def ordered_extremum_state(
-        value: ast.AST,
-        claim_text: str,
-    ) -> Literal["valid", "invalid", "unknown"]:
-        """Classify whether a positional row is ordered by the claimed metric."""
-        value = unwrap_display_call(value)
-        if not isinstance(value, ast.Subscript):
-            return "unknown"
-        if not (
-            isinstance(value.slice, ast.Constant)
-            and isinstance(value.slice.value, str)
-        ):
-            return "unknown"
-        metric_field = str(value.slice.value)
-        row_signature = positional_row_signature(value)
-        if row_signature is None:
-            return "unknown"
-        frame_name, row_index = row_signature
-        if row_index not in {0, -1}:
-            return "unknown"
-        lower = claim_text.lower()
-        highest_markers = (
-            "highest", "largest", "peak", "dominant", "most ",
-            "\u6700\u9ad8", "\u6700\u5927", "\u6700\u591a", "\u5cf0\u503c", "\u4e3b\u5bfc", "\u4e3a\u4e3b",
-        )
-        lowest_markers = (
-            "lowest", "smallest", "\u6700\u4f4e", "\u6700\u5c0f",
-        )
-        claims_highest = any(marker in lower for marker in highest_markers)
-        claims_lowest = any(marker in lower for marker in lowest_markers)
-        if claims_highest == claims_lowest:
-            return "unknown"
-        if claims_highest:
-            required_ascending = row_index < 0
-        else:
-            required_ascending = row_index >= 0
-        row = value.value
-        frame_expression = row.value.value
-        orders = set(frame_orders.get(frame_name, set()))
-        if (
-            isinstance(frame_expression, ast.Call)
-            and isinstance(frame_expression.func, ast.Attribute)
-            and frame_expression.func.attr == "sort_values"
-            and frame_expression.args
-            and isinstance(frame_expression.args[0], ast.Constant)
-            and isinstance(frame_expression.args[0].value, str)
-        ):
-            ascending = True
-            for keyword in frame_expression.keywords:
-                if keyword.arg == "ascending" and not (
-                    isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, bool)
-                ):
-                    return "unknown"
-                if (
-                    keyword.arg == "ascending"
-                    and isinstance(keyword.value, ast.Constant)
-                    and isinstance(keyword.value.value, bool)
-                ):
-                    ascending = keyword.value.value
-            orders.add((str(frame_expression.args[0].value), ascending))
-        if (metric_field, required_ascending) in orders:
-            return "valid"
-        if any(field == metric_field for field, _ in orders):
-            return "invalid"
-        return sql_order_state(frame_name, metric_field, required_ascending)
-
-    findings: list[dict[str, Any]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.JoinedStr):
-            continue
-        literal_text = "".join(
-            str(item.value)
-            for item in node.values
-            if isinstance(item, ast.Constant) and isinstance(item.value, str)
-        )
-        normalized_text = literal_text.lower()
-        if not any(marker.lower() in normalized_text for marker in superlative_markers):
-            continue
-        positional_values: list[ast.AST] = []
-        for formatted in node.values:
-            if not isinstance(formatted, ast.FormattedValue):
-                continue
-            if any(
-                isinstance(item, ast.Attribute) and item.attr == "iloc"
-                for item in ast.walk(formatted.value)
-            ):
-                positional_values.append(formatted.value)
-        row_states: dict[tuple[str, int], set[str]] = {}
-        for value in positional_values:
-            signature = positional_row_signature(value)
-            if signature is None or signature[1] not in {0, -1}:
-                continue
-            row_states.setdefault(signature, set()).add(
-                ordered_extremum_state(value, literal_text)
-            )
-        invalid_rows = {
-            signature
-            for signature, states in row_states.items()
-            if "valid" not in states and "invalid" in states
-        }
-        unproven_rows = {
-            signature for signature, states in row_states.items()
-            if "valid" not in states and "unknown" in states
-        }
-        positional_expressions = [
-            ast.get_source_segment(code, value) or ast.unparse(value)
-            for value in positional_values
-            if positional_row_signature(value) in invalid_rows | unproven_rows
-        ]
-        if positional_expressions:
-            findings.append({
-                "line_no": int(getattr(node, "lineno", 0) or 0),
-                "claim_preview": literal_text[:240],
-                "positional_expressions": positional_expressions,
-                "proof_state": "invalid" if invalid_rows else "unknown",
-            })
-    if not findings:
-        return None
-    return request_retry(
-        retry_type="contract_error",
-        message=(
-            "报告使用位置行表达极值判断；需核实排序方向或查询聚合是否支撑该判断。"
-        ),
-        diagnostics={
-            "violated_contract": "report_superlative_requires_explicit_extrema",
-            "proof_state": "invalid" if any(item['proof_state'] == 'invalid' for item in findings) else "unknown",
-            "findings": findings[:12],
-        },
-        repair_instructions=[
-            "保留现有查询、指标、图表和报告结构，只修正极值/主导项的计算变量及其引用。",
-            "按报告声称的业务度量显式使用 idxmax()/idxmin()，或先按该度量明确排序后选行；不要用未证明顺序的 iloc[0]/iloc[-1] 直接声称最高、最低、最多、峰值或主导。",
-            "维度值与对应度量必须来自同一条已选中的极值记录；同步修正报告中复用该记录的结论和建议。",
-        ],
-    )
-
-
-def _validate_bounded_interval_direction_contract(
-    tree: ast.AST,
-    code: str,
-) -> RetryResult | None:
-    """Keep nearest-boundary margins distinct from outward deviations.
-
-    For a value inside ``[lower, upper]``, ``min(value - lower, upper - value)``
-    decreases as the value approaches either limit.  Treating that direct
-    margin as a higher-is-riskier deviation reverses the calculation semantics.
-    This check follows the calculation AST and only uses the accompanying
-    direction statement to disambiguate intent; it does not inspect rendered
-    report numbers.
-    """
-
-    def static_string(node: ast.AST) -> str:
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            return node.value
-        if isinstance(node, ast.JoinedStr):
-            return "".join(
-                str(item.value)
-                for item in node.values
-                if isinstance(item, ast.Constant) and isinstance(item.value, str)
-            )
-        return ""
-
-    def dataframe_field_target(node: ast.AST) -> tuple[str, str] | None:
-        if not isinstance(node, ast.Subscript):
-            return None
-        if (
-            isinstance(node.value, ast.Name)
-            and isinstance(node.slice, ast.Constant)
-            and isinstance(node.slice.value, str)
-        ):
-            return node.value.id, str(node.slice.value)
-        if not (
-            isinstance(node.value, ast.Attribute)
-            and node.value.attr in {"at", "loc"}
-            and isinstance(node.value.value, ast.Name)
-            and isinstance(node.slice, ast.Tuple)
-            and len(node.slice.elts) >= 2
-            and isinstance(node.slice.elts[1], ast.Constant)
-            and isinstance(node.slice.elts[1].value, str)
-        ):
-            return None
-        return node.value.value.id, str(node.slice.elts[1].value)
-
-    def direct_nearest_boundary_ratio(node: ast.AST) -> bool:
-        current = node
-        while (
-            isinstance(current, ast.Call)
-            and isinstance(current.func, ast.Name)
-            and current.func.id in {"float", "round"}
-            and current.args
-        ):
-            current = current.args[0]
-        if isinstance(current, ast.BinOp) and isinstance(current.op, ast.Div):
-            numerator = current.left
-        elif isinstance(current, ast.Call):
-            numerator = current
-        else:
-            return False
-        return any(
-            isinstance(item, ast.Call)
-            and isinstance(item.func, ast.Name)
-            and item.func.id == "min"
-            and len(item.args) >= 2
-            and all(isinstance(arg, ast.BinOp) and isinstance(arg.op, ast.Sub) for arg in item.args[:2])
-            for item in ast.walk(numerator)
-        )
-
-    proximity_fields: dict[tuple[str, str], int] = {}
-    for assignment in ast.walk(tree):
-        if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
-            continue
-        value = getattr(assignment, "value", None)
-        if value is None or not direct_nearest_boundary_ratio(value):
-            continue
-        targets = assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
-        for target in targets:
-            signature = dataframe_field_target(target)
-            if signature is not None:
-                proximity_fields[signature] = int(getattr(assignment, "lineno", 0) or 0)
-    if not proximity_fields:
-        return None
-
-    reversed_direction_lines: list[int] = []
-    direction_pattern = re.compile(
-        r"(?:越高|越大|higher|larger).{0,32}(?:接近|贴近|nearer|closer).{0,48}(?:限值|边界|规格|控制限|limit|boundary)",
-        re.IGNORECASE,
-    )
-    for node in ast.walk(tree):
-        literal = static_string(node)
-        if literal and direction_pattern.search(literal):
-            reversed_direction_lines.append(int(getattr(node, "lineno", 0) or 0))
-    if not reversed_direction_lines:
-        return None
-
-    descending_sorts: list[dict[str, Any]] = []
-    proximity_names = {field for _, field in proximity_fields}
-    for call in ast.walk(tree):
-        if not (
-            isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Attribute)
-            and call.func.attr == "sort_values"
-            and call.args
-            and isinstance(call.args[0], ast.Constant)
-            and isinstance(call.args[0].value, str)
-            and str(call.args[0].value) in proximity_names
-        ):
-            continue
-        ascending = True
-        for keyword in call.keywords:
-            if (
-                keyword.arg == "ascending"
-                and isinstance(keyword.value, ast.Constant)
-                and isinstance(keyword.value.value, bool)
-            ):
-                ascending = keyword.value.value
-        if not ascending:
-            descending_sorts.append({
-                "line_no": int(getattr(call, "lineno", 0) or 0),
-                "field": str(call.args[0].value),
-            })
-
-    first_line = min(
-        [line for line in proximity_fields.values() if line > 0]
-        + [line for line in reversed_direction_lines if line > 0]
-        + [1]
-    )
-    return request_retry(
-        retry_type="contract_error",
-        message=(
-            "区间内到最近边界的距离被解释成了数值越高越接近限值，"
-            "计算方向与业务判断相反。"
-        ),
-        diagnostics={
-            "violated_contract": "bounded_interval_metric_direction_mismatch",
-            "proximity_fields": [
-                {"frame": frame, "field": field, "line_no": line}
-                for (frame, field), line in sorted(proximity_fields.items())
-            ],
-            "reversed_direction_lines": sorted(set(reversed_direction_lines)),
-            "descending_sorts": descending_sorts,
-        },
-        repair_instructions=[
-            "保留现有查询、分析范围和产物结构，只统一该区间指标的定义、排序方向和报告判断。",
-            "若指标是区间内到最近上下限的距离，则值越小越贴近边界，应按升序识别高风险项。",
-            "若需要值越大风险越高的统一指标，请显式转换成同方向风险分数；不要把区间内安全余量与区间外超限幅度混在同一字段中排序。",
-            "同步修正使用该指标的图表说明、极值选择和报告结论。",
-        ],
-        code_error_context={"line_no": first_line},
-    )
-
-
-def _validate_report_bounded_time_window_contract(
-    tree: ast.AST,
-    code: str,
-) -> RetryResult | None:
-    """Reject one-sided date filters presented as a bounded report period.
-
-    The check follows AST assignments from the numeric slot next to an explicit
-    bounded-period phrase. It does not scan rendered Markdown numbers or attempt
-    open-ended natural-language validation. SQL-backed metrics and calculations
-    whose date predicate cannot be proven statically remain untouched.
-    """
-
-    bounded_period = re.compile(
-        r"(?:未来|接下来|随后)\s*(?:半(?:年|个月)|[一二三四五六七八九十百\d]+(?:个)?(?:天|周|月|季度|年))"
-        r"|\bnext\s+(?:half\s+year|\d+\s+(?:day|week|month|quarter|year)s?)\b",
-        re.IGNORECASE,
-    )
-    date_markers = re.compile(
-        r"date|time|day|week|month|quarter|year|日期|时间|日|周|月|季度|年|到期|签约|创建",
-        re.IGNORECASE,
-    )
-    assignments: dict[str, list[ast.AST]] = {}
-
-    def assignment_target_names(node: ast.Assign | ast.AnnAssign) -> list[str]:
-        raw_targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        return [
-            item.id
-            for target in raw_targets
-            for item in ast.walk(target)
-            if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store)
-        ]
-
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-            continue
-        value = getattr(node, "value", None)
-        if value is None:
-            continue
-        for target_name in assignment_target_names(node):
-            assignments.setdefault(target_name, []).append(value)
-
-    def dependency_nodes(expression: ast.AST) -> list[ast.AST]:
-        collected: list[ast.AST] = []
-        pending = [expression]
-        visited_names: set[str] = set()
-        while pending:
-            current = pending.pop()
-            collected.append(current)
-            for loaded in (
-                item.id for item in ast.walk(current)
-                if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load)
-            ):
-                if loaded in visited_names:
-                    continue
-                visited_names.add(loaded)
-                pending.extend(assignments.get(loaded) or [])
-        return collected
-
-    def is_numeric_metric_expression(formatted: ast.FormattedValue) -> bool:
-        if formatted.format_spec is not None:
-            return True
-        direct_nodes = [formatted.value]
-        if isinstance(formatted.value, ast.Name):
-            direct_nodes.extend(assignments.get(formatted.value.id) or [])
-        numeric_calls = {"abs", "count", "float", "int", "len", "max", "mean", "min", "nunique", "round", "size", "sum"}
-        for direct in direct_nodes:
-            for item in ast.walk(direct):
-                if isinstance(item, ast.BinOp) and isinstance(
-                    item.op,
-                    (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow),
-                ):
-                    return True
-                if isinstance(item, ast.Call):
-                    function_name = (
-                        item.func.id if isinstance(item.func, ast.Name)
-                        else item.func.attr if isinstance(item.func, ast.Attribute)
-                        else ""
-                    )
-                    if function_name in numeric_calls:
-                        return True
-        return False
-
-    findings: list[dict[str, Any]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.JoinedStr):
-            continue
-        values = list(node.values)
-        for index, formatted in enumerate(values):
-            if not isinstance(formatted, ast.FormattedValue):
-                continue
-            prefix = (
-                str(values[index - 1].value)
-                if index > 0
-                and isinstance(values[index - 1], ast.Constant)
-                and isinstance(values[index - 1].value, str)
-                else ""
-            )
-            claim = bounded_period.search(prefix[-120:])
-            if claim is None or not is_numeric_metric_expression(formatted):
-                continue
-            related_nodes = dependency_nodes(formatted.value)
-            date_comparison_count = 0
-            has_between = False
-            has_unresolved_filter_helper = False
-            for related in related_nodes:
-                for item in ast.walk(related):
-                    if isinstance(item, ast.Compare):
-                        comparison_source = ast.get_source_segment(code, item) or ast.unparse(item)
-                        if date_markers.search(comparison_source):
-                            date_comparison_count += max(1, len(item.ops))
-                    elif (
-                        isinstance(item, ast.Call)
-                        and isinstance(item.func, ast.Attribute)
-                        and item.func.attr == "between"
-                    ):
-                        call_source = ast.get_source_segment(code, item) or ast.unparse(item)
-                        if date_markers.search(call_source):
-                            has_between = True
-                    elif isinstance(item, ast.Call):
-                        function_name = (
-                            item.func.id
-                            if isinstance(item.func, ast.Name)
-                            else item.func.attr
-                            if isinstance(item.func, ast.Attribute)
-                            else ""
-                        )
-                        if function_name and function_name not in {
-                            "DateOffset",
-                            "Timestamp",
-                            "abs",
-                            "copy",
-                            "count",
-                            "dropna",
-                            "float",
-                            "int",
-                            "len",
-                            "load_data_with_sql",
-                            "max",
-                            "mean",
-                            "min",
-                            "now",
-                            "nunique",
-                            "query_data_with_sql",
-                            "round",
-                            "size",
-                            "sum",
-                            "to_datetime",
-                        }:
-                            has_unresolved_filter_helper = True
-            # No statically visible date predicate means there is no safe basis
-            # for a rejection (the boundary may live in SQL or a helper API).
-            if (
-                has_between
-                or has_unresolved_filter_helper
-                or date_comparison_count == 0
-                or date_comparison_count >= 2
-            ):
-                continue
-            findings.append({
-                "line_no": int(getattr(formatted, "lineno", 0) or 0),
-                "period_claim": claim.group(0),
-                "metric_expression": (
-                    ast.get_source_segment(code, formatted.value)
-                    or ast.unparse(formatted.value)
-                ),
-                "date_comparison_count": date_comparison_count,
-            })
-    if not findings:
-        return None
-    return request_retry(
-        retry_type="contract_error",
-        message=(
-            "报告把只有单侧日期边界的计算表述为固定长度的未来时间窗口，"
-            "该计算会把窗口之外的数据一并计入。"
-        ),
-        diagnostics={
-            "violated_contract": "bounded_report_period_requires_two_date_boundaries",
-            "findings": findings[:12],
-        },
-        repair_instructions=[
-            "保留现有查询、产物和报告结构，只修正该时间窗口指标的日期范围计算。",
-            "固定长度的未来窗口必须同时包含开始边界和结束边界；可使用 between，或显式组合 >= 开始时间与 < 结束时间。",
-            "窗口结束时间必须由报告声明的天、周、月、季度或年长度计算，不要把所有未来记录表述成有限窗口。",
-            "图表、报告结论及建议必须复用修正后的同一窗口数据。",
-        ],
-    )
-
-
-def _validate_report_paired_metric_population_contract(
-    tree: ast.AST,
-    code: str,
-) -> RetryResult | None:
-    """Keep an explicitly paired percentage and count on one population.
-
-    This is intentionally narrower than natural-language report validation. It
-    only handles a structural report form such as ``80% (120 items)`` where the
-    count is presented as the concrete population behind the percentage. The
-    check follows Python assignments and derived DataFrame columns; it never
-    scans rendered Markdown for arbitrary numbers.
-    """
-    assignments: dict[str, list[tuple[int, ast.AST]]] = {}
-    column_assignments: dict[tuple[str, str], list[tuple[int, ast.AST]]] = {}
-
-    def subscript_field(node: ast.AST) -> tuple[str, str] | None:
-        if not (
-            isinstance(node, ast.Subscript)
-            and isinstance(node.value, ast.Name)
-            and isinstance(node.slice, ast.Constant)
-            and isinstance(node.slice.value, str)
-        ):
-            return None
-        return node.value.id, str(node.slice.value)
-
-    for node in sorted(
-        (
-            item for item in ast.walk(tree)
-            if isinstance(item, (ast.Assign, ast.AnnAssign))
-        ),
-        key=lambda item: int(getattr(item, "lineno", 0) or 0),
-    ):
-        value = getattr(node, "value", None)
-        if value is None:
-            continue
-        raw_targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        line_no = int(getattr(node, "lineno", 0) or 0)
-        for target in raw_targets:
-            if isinstance(target, ast.Name):
-                assignments.setdefault(target.id, []).append((line_no, value))
-            field = subscript_field(target)
-            if field is not None:
-                column_assignments.setdefault(field, []).append((line_no, value))
-
-    def latest_definition(
-        definitions: list[tuple[int, ast.AST]],
-        before_line: int,
-    ) -> tuple[int, ast.AST] | None:
-        eligible = [item for item in definitions if item[0] <= before_line]
-        return max(eligible, key=lambda item: item[0], default=None)
-
-    def dependency_nodes(expression: ast.AST) -> list[ast.AST]:
-        pending = [(expression, int(getattr(expression, "lineno", 0) or 10**9))]
-        collected: list[ast.AST] = []
-        visited_names: set[tuple[str, int]] = set()
-        visited_fields: set[tuple[str, str, int]] = set()
-        while pending:
-            current, before_line = pending.pop()
-            collected.append(current)
-            for item in ast.walk(current):
-                if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load):
-                    definition = latest_definition(assignments.get(item.id) or [], before_line)
-                    marker = (item.id, definition[0] if definition else 0)
-                    if definition is not None and marker not in visited_names:
-                        visited_names.add(marker)
-                        pending.append((definition[1], definition[0]))
-                field = subscript_field(item)
-                if field is not None:
-                    definition = latest_definition(column_assignments.get(field) or [], before_line)
-                    marker = (*field, definition[0] if definition else 0)
-                    if definition is not None and marker not in visited_fields:
-                        visited_fields.add(marker)
-                        pending.append((definition[1], definition[0]))
-        return collected
-
-    def root_fields(expression: ast.AST) -> set[str]:
-        fields: set[str] = set()
-        for related in dependency_nodes(expression):
-            for item in ast.walk(related):
-                field = subscript_field(item)
-                if field is None:
-                    continue
-                before_line = int(getattr(item, "lineno", 0) or 10**9)
-                if latest_definition(column_assignments.get(field) or [], before_line) is not None:
-                    continue
-                fields.add(field[1])
-        return fields
-
-    def population_selector_fields(expression: ast.AST) -> set[str]:
-        """Return fields that explicitly select the metric population."""
-        fields: set[str] = set()
-        selector_methods = {"groupby", "value_counts"}
-        for related in dependency_nodes(expression):
-            for item in ast.walk(related):
-                if isinstance(item, ast.Compare):
-                    for nested in ast.walk(item):
-                        field = subscript_field(nested)
-                        if field is not None:
-                            fields.add(field[1])
-                elif (
-                    isinstance(item, ast.Call)
-                    and isinstance(item.func, ast.Attribute)
-                    and item.func.attr in selector_methods
-                ):
-                    field = subscript_field(item.func.value)
-                    if field is not None:
-                        fields.add(field[1])
-                    elif item.args:
-                        fields.update(_static_string_values(item.args[0]))
-        return fields
-
-    def has_population_selector(expression: ast.AST) -> bool:
-        selector_calls = {"groupby", "value_counts", "nunique", "count"}
-        return any(
-            isinstance(item, ast.Compare)
-            or (
-                isinstance(item, ast.Call)
-                and isinstance(item.func, ast.Attribute)
-                and item.func.attr in selector_calls
-            )
-            for related in dependency_nodes(expression)
-            for item in ast.walk(related)
-        )
-
-    def format_spec_text(node: ast.FormattedValue) -> str:
-        if not isinstance(node.format_spec, ast.JoinedStr):
-            return ""
-        return "".join(
-            str(item.value)
-            for item in node.format_spec.values
-            if isinstance(item, ast.Constant)
-        )
-
-    count_unit = re.compile(
-        r"^\s*(?:万元|亿元|公斤|千克|个|份|台|条|笔|项|家|人|次|件|套|辆|座|吨|元)"
-        r"(?=\s|[）)\]】,，。；;]|$)"
-    )
-    findings: list[dict[str, Any]] = []
-    for joined in ast.walk(tree):
-        if not isinstance(joined, ast.JoinedStr):
-            continue
-        values = list(joined.values)
-        formatted_positions = [
-            index for index, item in enumerate(values)
-            if isinstance(item, ast.FormattedValue)
-        ]
-        for pair_index in range(len(formatted_positions) - 1):
-            percent_pos = formatted_positions[pair_index]
-            count_pos = formatted_positions[pair_index + 1]
-            percent_expr = values[percent_pos]
-            count_expr = values[count_pos]
-            if not isinstance(percent_expr, ast.FormattedValue) or not isinstance(count_expr, ast.FormattedValue):
-                continue
-            between = "".join(
-                str(item.value)
-                for item in values[percent_pos + 1:count_pos]
-                if isinstance(item, ast.Constant) and isinstance(item.value, str)
-            )
-            suffix = (
-                str(values[count_pos + 1].value)
-                if count_pos + 1 < len(values)
-                and isinstance(values[count_pos + 1], ast.Constant)
-                and isinstance(values[count_pos + 1].value, str)
-                else ""
-            )
-            is_percentage = (
-                "%" in format_spec_text(percent_expr)
-                or bool(re.match(r"^\s*%", between))
-            )
-            is_parenthesized_count = (
-                (between.count("（") + between.count("("))
-                > (between.count("）") + between.count(")"))
-                and bool(count_unit.match(suffix))
-            )
-            if not is_percentage or not is_parenthesized_count:
-                continue
-            percent_fields = root_fields(percent_expr.value)
-            count_fields = root_fields(count_expr.value)
-            percent_selectors = population_selector_fields(percent_expr.value)
-            count_selectors = population_selector_fields(count_expr.value)
-            if (
-                not percent_fields
-                or not count_fields
-                or not percent_selectors
-                or not count_selectors
-                or not percent_selectors.isdisjoint(count_selectors)
-                or not has_population_selector(percent_expr.value)
-                or not has_population_selector(count_expr.value)
-            ):
-                continue
-            findings.append({
-                "line_no": int(getattr(joined, "lineno", 0) or 0),
-                "percentage_expression": (
-                    ast.get_source_segment(code, percent_expr.value)
-                    or ast.unparse(percent_expr.value)
-                ),
-                "count_expression": (
-                    ast.get_source_segment(code, count_expr.value)
-                    or ast.unparse(count_expr.value)
-                ),
-                "percentage_population_fields": sorted(percent_fields),
-                "count_population_fields": sorted(count_fields),
-                "percentage_selector_fields": sorted(percent_selectors),
-                "count_selector_fields": sorted(count_selectors),
-            })
-    if not findings:
-        return None
-    return request_retry(
-        retry_type="contract_error",
-        message=(
-            "报告中成对展示的占比和数量使用不同筛选字段；静态分析无法确定两个业务群体是否等价。"
-        ),
-        diagnostics={
-            "violated_contract": "paired_report_metrics_require_shared_population",
-            "proof_state": "unknown",
-            "findings": findings[:12],
-        },
-        repair_instructions=[
-            "保留现有洞察结构，只修正成对展示的占比和数量口径。",
-            "先为该业务群体构造一份明确的布尔筛选、分组行或数量变量；括号内数量直接复用该变量，占比分子也必须复用同一变量或同一筛选结果。",
-            "如果两个指标本来描述不同业务群体，不要放在占比（数量）的成对表达中，应分别陈述并明确各自口径。",
-        ],
-    )
 
 
 def _validate_analysis_relationship_contract(
@@ -7353,6 +6572,18 @@ def _complete_analysis_result_terminal(
     return completed, True
 
 
+def _is_host_scheduled_definition_program(tree: ast.AST) -> bool:
+    """Recognize the fixed host runner emitted for the native definition port."""
+    imports_runner = any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == 'analysis_runtime.executable_program'
+        and any(alias.name == 'ExecutablePythonProgram' for alias in node.names)
+        for node in ast.walk(tree)
+    )
+    calls = _called_function_names(tree)
+    return imports_runner and {'ExecutablePythonProgram', 'build_analysis', 'deliver', 'save_analysis_result'}.issubset(calls)
+
+
 def _validate_generated_code_contract(
     code: str,
     *,
@@ -7408,6 +6639,15 @@ def _validate_generated_code_contract(
                 '如果当前代码要正式回答用户问题，应改成完整 analysis：execution_intent、query_constraints、SQL/filter_expressions、validate_query_constraints(...)、数据加载、空数据检查、图表/表格和 result = save_analysis_result(...) 必须一次性齐全。',
             ],
         )
+
+    # The native definition port delegates query execution, dependency ordering,
+    # and result persistence to a fixed host runner. The legacy source contract
+    # below requires each of those host-owned operations to appear in model code,
+    # which incorrectly rejects the new protocol before it can reach runtime.
+    # Its actual query and result contracts are enforced by the registered query
+    # helpers, SemanticExecution, and save_analysis_result during execution.
+    if execution_intent == 'analysis' and _is_host_scheduled_definition_program(tree):
+        return None
 
     sql_load_error_retry = _validate_sql_load_error_handling_contract(tree)
     if sql_load_error_retry is not None:
@@ -7536,10 +6776,6 @@ def _validate_generated_code_contract(
 
         static_checks = [
             incomplete_analysis_retry,
-            _validate_report_extrema_selection_contract(tree, code or ''),
-            _validate_bounded_interval_direction_contract(tree, code or ''),
-            _validate_report_bounded_time_window_contract(tree, code or ''),
-            _validate_report_paired_metric_population_contract(tree, code or ''),
             (
             _validate_analysis_query_result_consumption_contract(tree, code or '')
                 if incomplete_analysis_retry is None
@@ -8167,17 +7403,90 @@ def _validate_analysis_parameter_defaults_contract(
     )
 
 
+def _raise_local_file_constraint_retry(validation: RetryResult, helper_name: str) -> None:
+    if validation.retry_type != 'query_constraint_violation':
+        raise QueryConstraintRetrySignal(validation)
+    feedback = validation.model_copy(deep=True)
+    feedback.diagnostics['query_helper'] = helper_name
+    feedback.diagnostics['implementation_parameters'] = ['file_filters', 'filter_expressions']
+    feedback.diagnostics['validator_repair_instructions'] = list(validation.repair_instructions)
+    feedback.repair_instructions = [
+        f'保留 {helper_name}(...) 的 query_constraints；文件筛选用 file_filters=[{{"field":真实字段,"op":"eq","value":筛选值}}] 等结构化条件，helper 会实际执行并登记快照。',
+        '复杂派生筛选才传 list[str] 类型的 filter_expressions，并在读取后执行同一表达式；只声明 target_filters 不会自动过滤文件。',
+        '文件 helper 返回过滤后的明细；aggregation 使用 None 或 detail，分组计算在读取后完成。不要改成无口径登记的底层 loader 来绕过反馈。',
+    ]
+    raise QueryConstraintRetrySignal(feedback)
+
+
+def _resolve_local_file_path(*, datasource_id: int | None, file_path: str | None) -> str:
+    """Resolve a selected local-file datasource without copying its long path into code."""
+    explicit_path = str(file_path or '').strip()
+    if datasource_id is None:
+        if explicit_path:
+            return explicit_path
+        raise ValueError('query_local_file requires a selected datasource_id or file_path.')
+
+    try:
+        normalized_id = int(datasource_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('datasource_id must be an integer selected for this turn.') from exc
+    source = (CURRENT_LOCAL_FILE_DATASOURCES.get() or {}).get(str(normalized_id))
+    if not isinstance(source, dict):
+        raise ValueError(
+            f'datasource_id={normalized_id} is not an available local-file datasource in this turn.'
+        )
+    if str(source.get('datasource_type') or '').strip().lower() != 'local_file':
+        raise ValueError(f'datasource_id={normalized_id} is not a local-file datasource.')
+    resolved_path = str(source.get('datasource_identifier') or '').strip()
+    if not resolved_path:
+        raise ValueError(f'datasource_id={normalized_id} has no local-file identifier.')
+    if explicit_path and os.path.normcase(os.path.normpath(explicit_path)) != os.path.normcase(
+        os.path.normpath(resolved_path)
+    ):
+        raise ValueError(
+            f'file_path does not match selected datasource_id={normalized_id}; '
+            'omit file_path and use the datasource_id.'
+        )
+    return resolved_path
+
+
+def _local_file_query_sheet(datasource_id, sheet_name):
+    if datasource_id is None or sheet_name is not None:
+        return sheet_name
+    source = (CURRENT_LOCAL_FILE_DATASOURCES.get() or {}).get(str(int(datasource_id))) or {}
+    return source.get('sheet_name')
+
+
+@contextmanager
+def _local_file_query_access(datasource_id, sheet_name):
+    owner = int(datasource_id) if datasource_id is not None else None
+    source = (CURRENT_LOCAL_FILE_DATASOURCES.get() or {}).get(str(owner)) or {}
+    if source.get('sheet_name') is not None and sheet_name != source['sheet_name']:
+        owner = None
+    token = CURRENT_LOCAL_FILE_QUERY_OWNER.set(owner)
+    try:
+        yield
+    finally:
+        CURRENT_LOCAL_FILE_QUERY_OWNER.reset(token)
+
+
 def query_local_file(
     *,
     query_key: str,
     query_constraints: dict[str, Any],
-    file_path: str,
+    file_path: Optional[str] = None,
+    datasource_id: Optional[int] = None,
     sheet_name: Optional[str] = None,
     filter_expressions: Optional[list[str]] = None,
     file_filters: Optional[list[dict[str, Any]]] = None,
     aggregation_hints: Optional[list[str]] = None,
 ):
     """Validate, register and load one local file as a single operation."""
+    resolved_file_path = _resolve_local_file_path(
+        datasource_id=datasource_id,
+        file_path=file_path,
+    )
+    sheet_name = _local_file_query_sheet(datasource_id, sheet_name)
     _validate_file_filter_expressions(filter_expressions)
     normalized_file_filters = _normalize_file_filters(file_filters)
     effective_filter_expressions = [
@@ -8201,11 +7510,12 @@ def query_local_file(
         validation_kwargs['file_filters'] = normalized_file_filters
     validation = validate_query_constraints(**validation_kwargs)
     if validation is not None:
-        raise QueryConstraintRetrySignal(validation)
-    data = load_local_file(
-        file_path=file_path,
-        sheet_name=sheet_name,
-    )
+        _raise_local_file_constraint_retry(validation, 'query_local_file')
+    with _local_file_query_access(datasource_id, sheet_name):
+        data = load_local_file(
+            file_path=resolved_file_path,
+            sheet_name=sheet_name,
+        )
     data = _apply_file_filters(data, normalized_file_filters)
     _mark_file_filter_execution(normalized_file_filters, data)
     return data
@@ -8215,7 +7525,8 @@ def query_local_file_low_memory(
     *,
     query_key: str,
     query_constraints: dict[str, Any],
-    file_path: str,
+    file_path: Optional[str] = None,
+    datasource_id: Optional[int] = None,
     sheet_name: Optional[str] = None,
     filter_expressions: Optional[list[str]] = None,
     file_filters: Optional[list[dict[str, Any]]] = None,
@@ -8227,6 +7538,11 @@ def query_local_file_low_memory(
     low_memory: bool = True,
 ):
     """Validate, register and stream one local file as a single operation."""
+    resolved_file_path = _resolve_local_file_path(
+        datasource_id=datasource_id,
+        file_path=file_path,
+    )
+    sheet_name = _local_file_query_sheet(datasource_id, sheet_name)
     _validate_file_filter_expressions(filter_expressions)
     normalized_file_filters = _normalize_file_filters(file_filters)
     effective_filter_expressions = [
@@ -8250,16 +7566,17 @@ def query_local_file_low_memory(
         validation_kwargs['file_filters'] = normalized_file_filters
     validation = validate_query_constraints(**validation_kwargs)
     if validation is not None:
-        raise QueryConstraintRetrySignal(validation)
-    stream = load_local_file_low_memory(
-        file_path=file_path,
-        sheet_name=sheet_name,
-        chunk_size=chunk_size,
-        usecols=usecols,
-        dtype=dtype,
-        parse_dates=parse_dates,
-        low_memory=low_memory,
-    )
+        _raise_local_file_constraint_retry(validation, 'query_local_file_low_memory')
+    with _local_file_query_access(datasource_id, sheet_name):
+        stream = load_local_file_low_memory(
+            file_path=resolved_file_path,
+            sheet_name=sheet_name,
+            chunk_size=chunk_size,
+            usecols=usecols,
+            dtype=dtype,
+            parse_dates=parse_dates,
+            low_memory=low_memory,
+        )
     if not normalized_file_filters:
         return stream
 
@@ -8325,6 +7642,7 @@ def _normalize_chart_items(
 ) -> list[dict[str, Any]]:
     """统一图表结果结构。"""
     normalized_items: list[dict[str, Any]] = []
+    original_items: list[Any] = []
 
     flattened: list[Any] = []
     pending = list(charts or [])
@@ -8337,7 +7655,9 @@ def _normalize_chart_items(
 
     for index, chart in enumerate(flattened, start=1):
         try:
-            normalized_items.append(normalize_chart_result_item(chart, index=index))
+            normalized = normalize_chart_result_item(chart, index=index, finalize_layout=False)
+            normalized_items.append(normalized)
+            original_items.append(chart)
         except ValueError as exc:
             title = str(chart.get('title') or '') if isinstance(chart, dict) else ''
             raise ChartArtifactContractError(
@@ -8346,6 +7666,18 @@ def _normalize_chart_items(
                 cause=exc,
             ) from exc
 
+    finalized_specs = finalize_chart_specs(
+        [item['chart_spec'] for item in normalized_items if item.get('chart_spec')]
+    )
+    spec_iterator = iter(finalized_specs)
+    for item in normalized_items:
+        if item.get('chart_spec'):
+            item['chart_spec'] = next(spec_iterator)
+    # Layout finalization can rewrite chart_spec. Refresh consumption receipts only
+    # after that rewrite so the receipt digest describes the artifact we return.
+    for item_index, (original, normalized) in enumerate(zip(original_items, normalized_items)):
+        if isinstance(original, dict):
+            normalized_items[item_index] = normalize_chart_consumption(original, normalized)
     return normalized_items
 
 
@@ -8376,12 +7708,16 @@ def _normalize_table_items(tables: Optional[list[dict[str, Any]]] = None) -> lis
         if not isinstance(columns, list) or not isinstance(rows, list):
             raise ValueError('表格产物必须包含 columns(list) 与 rows(list)。')
 
-        normalized_items.append({
+        normalized = {
             "title": title,
             "description": description,
             "columns": columns,
             "rows": rows,
-        })
+        }
+        binding = table.get('_semantic_execution_binding')
+        if isinstance(binding, dict):
+            normalized['_semantic_execution_binding'] = dict(binding)
+        normalized_items.append(normalized)
     return normalized_items
 
 
@@ -8468,12 +7804,21 @@ def build_table_result(
                     clean_row[key] = round(float(value), value_precision)
         clean_rows.append(clean_row)
 
-    return {"table": {
+    table = {
         "title": str(title or '表格').strip() or '表格',
         "description": str(description or '').strip(),
         "columns": clean_columns,
         "rows": clean_rows,
-    }}
+    }
+    receipt = fact_view_receipt(data) if data is not None else None
+    if receipt:
+        receipt = {**receipt, 'helper': 'build_table_result',
+                   'helper_options': {'value_precision': value_precision, 'columns': _copy_jsonable(clean_columns, [])}}
+        table['_semantic_execution_binding'] = {
+            **receipt, 'artifact_digest': snapshot_digest({'columns': clean_columns, 'rows': clean_rows}),
+        }
+        record_table_consumption(receipt, table['_semantic_execution_binding']['artifact_digest'])
+    return {"table": table}
 
 
 def get_analysis_parameters(defaults: Optional[dict[str, Any]] = None) -> dict[str, Any]:
@@ -8501,6 +7846,7 @@ def save_analysis_result(
     analysis_parameters: Optional[dict[str, Any]] = None,
     output_text: str = '',
     output_json: Optional[dict[str, Any]] = None,
+    defer_presentation: bool = False,
 ) -> StructuredResult:
     """
     结束一次由生成代码驱动的分析任务，并返回标准结构化结果。
@@ -8516,29 +7862,42 @@ def save_analysis_result(
     if output_format == "standard":
         if output_text or output_json is not None:
             raise ValueError("standard 输出只能使用 analysis_report、charts 和 tables。")
-        report_text = _strip_structural_empty_report_lines(analysis_report)
-        if not report_text:
+        report_text = '' if defer_presentation else _strip_structural_empty_report_lines(analysis_report)
+        if not defer_presentation and not report_text:
             raise ValueError('analysis_report 不能为空，必须传入完整的 Markdown 分析报告。')
         output_payload: Any = None
     elif output_format == "text":
         if analysis_report or charts or tables or output_json is not None:
             raise ValueError("text 输出只能传入 output_text，不能混入标准产物或 JSON。")
-        report_text = str(output_text or '').strip()
-        if not report_text:
+        report_text = '' if defer_presentation else str(output_text or '').strip()
+        if not defer_presentation and not report_text:
             raise ValueError("output_text 不能为空。")
-        output_payload = report_text
+        output_payload = None if defer_presentation else report_text
     elif output_format == "json":
         if analysis_report or charts or tables or output_text:
             raise ValueError("json 输出只能传入 output_json，不能混入标准产物或文本。")
-        if not isinstance(output_json, dict):
+        if not defer_presentation and not isinstance(output_json, dict):
             raise ValueError("output_json 必须是 Python dict。")
-        validate_json_output(output_json, dict(output_contract.get("schema") or {}))
-        output_payload = _copy_jsonable(output_json, {})
-        report_text = json.dumps(output_payload, ensure_ascii=False, indent=2)
+        if defer_presentation:
+            output_payload = None
+            report_text = ''
+        else:
+            validate_json_output(output_json, dict(output_contract.get("schema") or {}))
+            output_payload = _copy_jsonable(output_json, {})
+            report_text = json.dumps(output_payload, ensure_ascii=False, indent=2)
     else:
         raise ValueError(f"未知输出协议: {output_format}")
 
     _raise_if_all_query_snapshots_no_data()
+
+    execute_registered_definitions()
+    delivery_coverage = execution_delivery_coverage()
+    if delivery_coverage['execution_status'] == 'incomplete':
+        unresolved = [item for item in delivery_coverage['results'] if item['status'] != 'executed']
+        raise ValueError('Planned calculation results need one actual execution producer. '
+                         'Use SemanticExecution.bind_result(question_id, result_id, fact); '
+                         'preserve all planned calculations, queries and analytical scope. '
+                         + json.dumps(unresolved, ensure_ascii=False))
 
     normalized_charts = _copy_jsonable(
         _normalize_chart_items(charts=_copy_jsonable(charts or [], [])),
@@ -8556,6 +7915,9 @@ def save_analysis_result(
         _normalize_table_items(tables=_copy_jsonable(tables or [], [])),
         [],
     ) if output_format == "standard" else []
+    original_report = analysis_report if output_format == 'standard' else output_text
+    delivery_coverage = execution_delivery_coverage(normalized_tables, normalized_charts,
+        original_report if str(original_report) == report_text else '')
     generated_parameter_schema, generated_parameter_values = strip_generated_runtime_parameter_metadata(
         _copy_jsonable(analysis_parameters_schema or {}, {}),
         _copy_jsonable(analysis_parameters or {}, {}),
@@ -8566,15 +7928,24 @@ def save_analysis_result(
         expected_time_range=_copy_jsonable(CURRENT_EXPECTED_TIME_RANGE.get() or {}, {}),
         concrete_values=normalized_parameter_values,
     )
+    from analysis_runtime.runtime_evidence import build_runtime_evidence
+    from analysis_runtime.provenance import runtime_evidence_enabled
+    traces = _copy_jsonable(execution_traces(), [])
+    queries = _copy_jsonable(CURRENT_QUERY_SNAPSHOTS.get() or {}, {})
     return StructuredResult(
         analysis_report=report_text,
         charts=normalized_charts,
         tables=normalized_tables,
         analysis_parameters_schema=normalized_parameter_schema,
         analysis_parameters=normalized_parameter_values,
-        query_snapshots=_copy_jsonable(CURRENT_QUERY_SNAPSHOTS.get() or {}, {}),
+        query_snapshots=queries,
+        semantic_execution_traces=traces,
+        runtime_evidence=(build_runtime_evidence(traces, queries, normalized_tables, normalized_charts, report_text, delivery_coverage)
+                          if runtime_evidence_enabled() else {}),
+        semantic_execution_coverage=_copy_jsonable(delivery_coverage, {}),
         output_format=output_format,
         output_payload=output_payload,
+        presentation_pending=bool(defer_presentation),
     )
 
 
@@ -8658,7 +8029,7 @@ class ExePythonCodeInput(BaseModel):
             "查询、计算、图表/表格、报告并以 result = save_analysis_result(...) 收口；"
             "execution_intent='probe' 时必须以 result = request_retry(...) 返回结构化探测反馈。"
             "不同 execute_python 调用之间不会保留 DataFrame、变量或中间状态。首次生成及查询、字段、聚合、计算或产物调整时"
-            "都填写完整 code；仅反馈明确提供 repair_target 的孤立 API 调用错误可使用 base_execution_id + patches。"
+            "都填写完整 code；局部技术修复仅在反馈明确提供 repair_target 时使用 base_execution_id + patches，保留授权语句的输出。"
         )
     )
     title: str = Field(default='', description="本次代码执行任务的简短标题；省略时使用默认任务标题。")
@@ -8731,6 +8102,7 @@ class ProbeAnalysisDataInput(BaseModel):
 
 
 class SubmitAnalysisProgramInput(BaseModel):
+    definition_source: str = ''
     progress_summary: str = Field(
         default='',
         max_length=600,
@@ -8740,10 +8112,10 @@ class SubmitAnalysisProgramInput(BaseModel):
         default='',
         description=(
             "一份独立、完整、可执行的正式洞察分析程序。执行用途由此工具确定，无需重复声明 execution_intent；"
-            "并在同一次提交内完成查询、计算、空数据处理、当前结果协议要求的产物构造，"
-            "最后以 result = save_analysis_result(...) 收口。此工具不是数据观察工作台；"
+            "并在同一次提交内完成查询、计算、空数据处理和图表/表格构造；计算事实随后返回给同一 Runtime，"
+            "再由 compose_analysis_presentation 撰写报告并保存。此工具不是数据观察工作台；"
             "如果还需要观察真实枚举、格式、覆盖或关联，请先调用 probe_analysis_data。"
-            "首次生成及查询、字段、聚合、计算或产物调整时填写完整 code；仅反馈明确提供 repair_target 的孤立 API 调用错误可使用 base_execution_id + patches。"
+            "首次生成及查询、字段、聚合、计算或产物调整时填写完整 code；局部技术修复以反馈明确提供的 repair_target 为准，使用 base_execution_id + patches 完整修订授权语句并保留其输出。"
         ),
     )
     title: str = Field(default='', description="正式洞察分析任务的简短标题。")
@@ -8759,8 +8131,8 @@ class SubmitAnalysisProgramInput(BaseModel):
     base_execution_id: int = Field(
         default=0,
         description=(
-            "局部修复所基于的失败 execution_id。局部修复时填写并让 code 为空；"
-            "后端从不可变执行记录恢复完整源码。"
+            "当前轮次的失败 execution_id。完整修复可携带它记录来源，仍需声明 used_datasource_ids；"
+            "行级补丁必须让 code 为空，由后端恢复并修改原源码。"
         ),
     )
     patches: list[SourceCodePatch] = Field(
@@ -8779,7 +8151,92 @@ class SubmitAnalysisProgramInput(BaseModel):
     @model_validator(mode='after')
     def _canonicalize_code(self):
         self.code = str(self.code or self.program or self.analysis_code or self.analysis_program or '')
+        has_definition = bool(self.definition_source.strip())
+        if has_definition and (self.code.strip() or self.patches):
+            raise ValueError('Submit one executable definition or one legacy program, not both.')
+        if (self.code.strip() or has_definition) and not self.used_datasource_ids:
+            raise ValueError(
+                'A complete program requires used_datasource_ids, including a complete repair. '
+                'Only a code-free base_execution_id + patches submission can inherit the original scope.'
+            )
         return self
+
+
+class FullAnalysisProgramInput(SubmitAnalysisProgramInput):
+    """Model-facing delivery contract when no line patch is authorized."""
+
+    code: str = Field(description=SubmitAnalysisProgramInput.model_fields['code'].description)
+    used_datasource_ids: list[int] = Field(
+        description='本次完整程序实际访问的数据源 ID 列表；完整修复也必须显式提供。',
+    )
+    patches: ClassVar[list[SourceCodePatch]] = []
+    program: ClassVar[str] = ''
+    analysis_code: ClassVar[str] = ''
+    analysis_program: ClassVar[str] = ''
+    definition_source: ClassVar[str] = ''
+
+
+class NarrativeReportBlock(BaseModel):
+    model_config = {'extra': 'forbid'}
+    kind: Literal['text']
+    text: str
+
+
+class FindingReportBlock(BaseModel):
+    model_config = {'extra': 'forbid'}
+    kind: Literal['finding']
+    trace_execution_id: str
+    finding_id: str
+
+
+class ValueReportBlock(BaseModel):
+    model_config = {'extra': 'forbid'}
+    kind: Literal['value']
+    trace_execution_id: str
+    fact_id: str
+    row_index: int = Field(ge=0, description='facts[fact_id].values 中从 0 开始的行位置。')
+    field: str
+    precision: int = Field(default=2, ge=0, le=12, description='仅控制显示小数位，不缩放或重算数值。')
+
+
+class ComposeAnalysisPresentationInput(BaseModel):
+    execution_id: int = Field(description='当前 Runtime 刚完成计算并返回的 execution_id。')
+    analysis_report: str = Field(default='', description='standard 输出的完整 Markdown 分析报告。')
+    output_text: str = Field(default='', description='text 输出的完整文本。')
+    output_json: dict[str, Any] | None = Field(default=None, description='json 输出的完整 JSON 对象。')
+    report_blocks: list[NarrativeReportBlock | FindingReportBlock | ValueReportBlock] | None = Field(
+        default=None, description='standard/text 完整有序报告。text 保留自然叙述；value 引用候选 facts 的 fact_id、row_index、field，宿主读取并格式化该单元格；finding 引用候选已执行发现。不重算。')
+    report_text: str | None = Field(default=None, description='完整 Markdown/text；{{ref_id}} 在原位置插入 report_refs 中的执行结果。')
+    report_refs: dict[str, ValueReportBlock | FindingReportBlock] = Field(default_factory=dict)
+
+
+class ComposeBoundPresentationInput(BaseModel):
+    """Current result-bound authoring surface; legacy saved calls still replay."""
+    model_config = {'extra': 'forbid'}
+    execution_id: int = Field(description='当前待表达候选的 execution_id。')
+    report_text: str = Field(description='完整自由 Markdown/text。在计算值或已执行发现的位置写 {{ref_id}}，宿主原位替换；保留段落、标题、表格和完整叙述。')
+    report_refs: dict[str, ValueReportBlock | FindingReportBlock] = Field(default_factory=dict,
+        description='ref_id 到当前候选 value/finding 引用的映射。ref_id 使用字母开头的英文标识符。value 使用实际 fact_id、从 0 开始的 row_index、field；precision 仅格式化，不缩放或重算。')
+
+
+class ExecutableAnalysisProgramInput(BaseModel):
+    model_config = {'extra': 'forbid'}
+    definition_source: str = Field(description='完整 Python 定义模块：可定义 analysis_parameters_schema；必须定义 build_analysis(program, parameters)，注册实际查询函数、计算/变换及图表/表格产物函数。宿主执行一次查询和计算后将真实事实交回同一 Runtime；模型再调用 compose_analysis_presentation 定稿。不要另写主程序或 save_analysis_result。任意 Python 算法及原有查询/产物能力保留。')
+    used_datasource_ids: list[int]
+    title: str = ''
+    description: str = ''
+    progress_summary: str = Field(default='', max_length=600)
+
+    @field_validator('definition_source')
+    @classmethod
+    def _validate_definition_source(cls, value):
+        validate_python_analysis_definition(value)
+        return value
+
+    @field_validator('used_datasource_ids', mode='before')
+    @classmethod
+    def _decode_used_datasource_ids(cls, value):
+        return _decode_tool_id_list(value)
 
 
 def _decode_tool_id_list(value: Any) -> Any:
@@ -10660,6 +10117,12 @@ def _locate_unrendered_placeholder_source(
             })
     return {
         "filename": GENERATED_CODE_FILENAME,
+        "location_domain": "python_source",
+        "suggested_patch_ranges": _source_statement_patch_ranges(generated_code, line_no),
+        "related_contexts": [
+            _static_node_code_context(generated_code, node)
+            for node in matched_nodes[1:8]
+        ],
         "line_no": line_no or None,
         "column_no": int(getattr(primary, "col_offset", 0) or 0) + 1,
         "error_line": source_lines[line_no - 1] if 1 <= line_no <= len(source_lines) else "",
@@ -10939,8 +10402,25 @@ def _apply_source_code_patches(
         if patch.start_line <= previous_end:
             raise ValueError('patches 不能包含重叠的源码行区间。')
         if (patch.start_line, patch.end_line) not in valid_statement_ranges:
+            if source_syntax_error is not None:
+                allowed = ', '.join(
+                    f'{start}-{end}' for start, end in sorted(valid_statement_ranges)
+                )
+                raise ValueError(
+                    f'语法修复 patches 请求区间 {patch.start_line}-{patch.end_line} '
+                    f'不在 repair_target.allowed_ranges 中；可用区间：{allowed}。'
+                    '按授权原始行号精确替换，不包含相邻注释或空行；'
+                    '需要扩大修复范围时提交完整 code。'
+                ) from source_syntax_error
             raise ValueError(
                 'patches 必须完整替换一个 Python 语句或代码块，不能从字典、字符串、调用参数或缩进块中间截断。'
+            )
+        if authorized_ranges is not None and (patch.start_line, patch.end_line) not in authorized_ranges:
+            allowed = ', '.join(f'{start}-{end}' for start, end in sorted(authorized_ranges))
+            raise ValueError(
+                f'patches 请求区间 {patch.start_line}-{patch.end_line} '
+                f'不在 repair_target.allowed_ranges 中；可用区间：{allowed or "无"}。'
+                '需要扩大修复范围时提交完整 code。'
             )
         previous_end = patch.end_line
 
@@ -10977,6 +10457,7 @@ class SourcePatchResolutionError(ValueError):
         patches: list[SourceCodePatch],
         datasource_ids: list[int],
         syntax_error: SyntaxError | None = None,
+        repair_target: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.execution_id = execution_id
@@ -11004,6 +10485,7 @@ class SourcePatchResolutionError(ValueError):
             'base_source_unchanged': True,
             'inherited_used_datasource_ids': datasource_ids,
         }
+        self.repair_target = dict(repair_target or {})
         if syntax_error is not None:
             self.diagnostics['candidate_syntax_error'] = {
                 'location_domain': 'uncommitted_patch_candidate',
@@ -11012,6 +10494,10 @@ class SourcePatchResolutionError(ValueError):
                 'message': syntax_error.msg,
                 'source_line': str(syntax_error.text or '').rstrip('\r\n'),
             }
+
+
+class FullProgramRequiredError(ValueError):
+    """The selected execution has no authorization for a line patch."""
 
 
 def _resolve_execute_python_source(
@@ -11038,7 +10524,7 @@ def _resolve_execute_python_source(
         if not normalized_code.strip():
             raise ValueError('首次执行必须提供完整 code。')
         return normalized_code, normalized_ids, 0, 'llm_generated'
-    if normalized_code.strip():
+    if normalized_code.strip() and normalized_patches:
         raise ValueError('局部修复只能提交 base_execution_id + patches，不能同时提交完整 code。')
 
     from config.database import SessionLocal
@@ -11055,6 +10541,12 @@ def _resolve_execute_python_source(
         if base_execution is None:
             raise ValueError('base_execution_id 不属于当前会话轮次或执行记录不存在。')
         base_status = str(base_execution.execution_status or '')
+        if normalized_code.strip():
+            if base_status == 'success':
+                raise ValueError('成功执行不是失败修复基线；新分析请提交完整 code，base_execution_id=0。')
+            # A full replacement is not a line patch. Retain its provenance,
+            # but require the caller to declare its own actual source scope.
+            return normalized_code, normalized_ids, base_execution_id, 'llm_generated'
         try:
             base_payload = json.loads(base_execution.result_payload_json or '{}')
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -11096,7 +10588,7 @@ def _resolve_execute_python_source(
                 raise ValueError('语义修订 patches 只能使用 Review 返回的 allowed_ranges。')
         else:
             if not isinstance(repair_target, dict) or repair_target.get('mode') != 'line_patch':
-                raise ValueError(
+                raise FullProgramRequiredError(
                     '该失败属于查询、计算、范围或产物结构的完整程序修复，'
                     '不允许使用 base_execution_id + patches；请提交完整 code。'
                 )
@@ -11117,7 +10609,7 @@ def _resolve_execute_python_source(
         try:
             authorized_ranges = {
                 (int(item.get('start_line') or 0), int(item.get('end_line') or 0))
-                for item in (repair_target or {}).get('allowed_ranges') or []
+                for item in (review_target if base_status == 'success' else repair_target or {}).get('allowed_ranges') or []
                 if isinstance(item, dict)
             }
             resolved_code = _apply_source_code_patches(
@@ -11142,6 +10634,7 @@ def _resolve_execute_python_source(
                 patches=normalized_patches,
                 datasource_ids=base_ids,
                 syntax_error=syntax_error,
+                repair_target=repair_target,
             )
         execution_source = 'llm_review_patch' if base_status == 'success' else 'llm_patch_repair'
         return resolved_code, base_ids, base_execution_id, execution_source
@@ -11257,6 +10750,50 @@ def _update_execution_record(
         execution.updated_at = datetime.now()
         execution.finished_at = datetime.now()
         session.commit()
+    finally:
+        session.close()
+
+
+def _store_presentation_candidate(
+    execution_id: int,
+    candidate: StructuredResult,
+    *,
+    stdout_text: str = '',
+    stderr_text: str = '',
+    execution_seconds: int = 0,
+    used_datasource_ids: list[int] | None = None,
+) -> bool:
+    """Keep an unfinalized candidate private in the existing running record."""
+    if execution_id <= 0 or not candidate.presentation_pending:
+        return False
+    from config.database import SessionLocal
+    from model import InsightNsExecution
+
+    session = SessionLocal()
+    try:
+        record = session.query(InsightNsExecution).filter(
+            InsightNsExecution.id == execution_id,
+            InsightNsExecution.execution_status == 'running',
+            InsightNsExecution.is_deleted == 0,
+        ).with_for_update().first()
+        if record is None:
+            return False
+        record.result_payload_json = candidate.model_dump_json()
+        record.analysis_report = ''
+        record.stdout_text = stdout_text or ''
+        record.stderr_text = stderr_text or ''
+        record.execution_seconds = max(int(execution_seconds or 0), 0)
+        if used_datasource_ids is not None:
+            record.used_datasource_ids_json = json.dumps(used_datasource_ids, ensure_ascii=False)
+        record.analysis_parameters_schema_json = json.dumps(
+            candidate.analysis_parameters_schema or {}, ensure_ascii=False,
+        )
+        record.analysis_parameters_json = json.dumps(candidate.analysis_parameters or {}, ensure_ascii=False)
+        record.updated_at = datetime.now()
+        # Keep status=running and finished_at unset. The record is not a visible
+        # successful analysis until the expression tool atomically finalizes it.
+        session.commit()
+        return True
     finally:
         session.close()
 
@@ -11443,6 +10980,12 @@ def _build_execution_namespace() -> dict[str, Any]:
 
     return {
         'pd': pd,
+        'SemanticExecution': SemanticExecution,
+        'DistinctCount': DistinctCount,
+        'RowProductSum': RowProductSum,
+        'OneToOneJoin': OneToOneJoin,
+        'DecimalColumns': DecimalColumns,
+        'PythonCalculation': PythonCalculation,
         'load_local_file': load_local_file,
         'load_local_file_low_memory': load_local_file_low_memory,
         'load_minio_file': load_minio_file,
@@ -11458,6 +11001,13 @@ def _build_execution_namespace() -> dict[str, Any]:
         'probe_distinct_values': probe_distinct_values,
         'probe_text_candidates': probe_text_candidates,
         'get_analysis_parameters': get_analysis_parameters,
+        'select_extreme_rows': select_extreme_rows,
+        'compare_numeric_values': compare_numeric_values,
+        'evaluate_numeric_comparison': evaluate_numeric_comparison,
+        'summarize_extrema': summarize_extrema,
+        'render_numeric_comparison': render_numeric_comparison,
+        'render_extrema': render_extrema,
+        'calculate_ratio': calculate_ratio,
         'validate_query_constraints': validate_query_constraints,
         'build_markdown_table': build_markdown_table,
         'build_table_result': build_table_result,
@@ -11479,6 +11029,17 @@ def _serialize_runtime_user_context(runtime_context: CustomContext | None) -> di
 
     selected_snapshot = _get_runtime_selected_datasource_snapshot(runtime_context)
     numeric_field_profiles = _build_datasource_numeric_field_profiles(selected_snapshot)
+    local_file_datasources = {
+        str(int(item.get('datasource_id') or item.get('id') or 0)): {
+            'datasource_type': str(item.get('datasource_type') or '').strip().lower(),
+            'datasource_identifier': str(item.get('datasource_identifier') or '').strip(),
+        }
+        for item in selected_snapshot
+        if isinstance(item, dict)
+        and int(item.get('datasource_id') or item.get('id') or 0) > 0
+        and str(item.get('datasource_type') or '').strip().lower() == 'local_file'
+        and str(item.get('datasource_identifier') or '').strip()
+    }
     return {
         'platform_authorization': getattr(runtime_context, 'platform_authorization', '') or '',
         'fedquery_authorization': getattr(runtime_context, 'fedquery_authorization', '') or '',
@@ -11486,8 +11047,12 @@ def _serialize_runtime_user_context(runtime_context: CustomContext | None) -> di
         'expected_time_range': dict(getattr(runtime_context, 'expected_time_range', {}) or {}),
         'analysis_parameters_override': dict(getattr(runtime_context, 'analysis_parameters_override', {}) or {}),
         'datasource_numeric_fields': numeric_field_profiles,
+        'local_file_datasources': local_file_datasources,
         'output_contract': dict(
             getattr(runtime_context, 'output_contract', {}) or {"type": "standard"}
+        ),
+        'semantic_delivery_requirements': calculation_delivery_requirements(
+            (getattr(runtime_context, 'runtime_work_packet', {}) or {}).get('semantic_plan') or {}
         ),
     }
 
@@ -11543,7 +11108,9 @@ def _build_datasource_numeric_field_profiles(
 
 def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -> None:
     """在子进程里恢复数据库访问所需的最小运行时上下文。"""
+    reset_capture()
     payload = runtime_user_context or {}
+    set_delivery_requirements(payload.get('semantic_delivery_requirements') or [])
     CURRENT_EXPECTED_TIME_RANGE.set(dict(payload.get('expected_time_range') or {}))
     CURRENT_TIME_RANGE_GUARD_ACTIVE.set(bool(payload.get('time_range_guard_active')))
     CURRENT_ANALYSIS_PARAMETERS_OVERRIDE.set(dict(payload.get('analysis_parameters_override') or {}))
@@ -11552,6 +11119,11 @@ def _prime_worker_runtime_context(runtime_user_context: dict[str, Any] | None) -
         for item in payload.get('datasource_numeric_fields') or []
         if isinstance(item, dict)
     ])
+    CURRENT_LOCAL_FILE_DATASOURCES.set({
+        str(key): dict(value)
+        for key, value in (payload.get('local_file_datasources') or {}).items()
+        if isinstance(value, dict)
+    })
     CURRENT_QUERY_SNAPSHOTS.set(_copy_jsonable(
         payload.get('initial_query_snapshots') or {},
         {},
@@ -12380,6 +11952,7 @@ def _execute_generated_code_worker(
     result_queue: mp.Queue,
 ) -> None:
     _prime_worker_runtime_context(runtime_user_context)
+    set_program_source(code)
     try:
         execution_tree = ast.parse(code)
         CURRENT_EXECUTION_INTENT.set(
@@ -15127,8 +14700,9 @@ def _apply_probe_no_data_retry_limit(
 def _build_repair_instructions(error_type: str) -> list[str]:
     """根据错误类型生成定向修复建议。"""
     common_instructions = [
-        '只有反馈明确提供 repair_target 的孤立 API 调用错误，才可按 repair_target.allowed_ranges 中的原版本行号提交 patches；'
-        '查询、字段、范围、聚合、计算、结果结构或报告表达变化必须提交完整可执行 code。',
+        '只有反馈明确提供 repair_target.allowed_ranges，才可按其中的原版本行号提交 patches。'
+        'replacement 是该完整语句的修正版，不是插入其位置的修复思路；defined_names 标明该语句原本交付的变量。'
+        '保留该语句的输出及未受错误影响的内容。涉及授权范围之外的查询、算法、结果结构或报告变化时提交完整 code。',
         '正式分析代码应以 result = save_analysis_result(...) 收口；专用 probe_analysis_data 会返回查询事实与打印摘要，'
         '也可通过 result = request_retry(...) 返回自定义结构化观察。',
         '修复技术错误时保留当前业务问题、已确认规则及已有分析内容；依据 Schema、真实查询观察和用户澄清修正错误假设，不把技术错误当作缩减分析范围的理由。',
@@ -15340,6 +14914,7 @@ def _tool_error_message(
     stdout_text: str = '',
     stderr_text: str = '',
     formal_program_work_packet: dict[str, Any] | None = None,
+    retained_repair_target: dict[str, Any] | None = None,
 ) -> ToolMessage:
     """构造统一的结构化工具错误反馈，供 Agent 循环继续修正。"""
     if error_type == 'probe_feedback':
@@ -15372,6 +14947,17 @@ def _tool_error_message(
     if patch_ranges:
         clipped_code_error_context['location_domain'] = 'python_source'
         clipped_code_error_context['suggested_patch_ranges'] = patch_ranges
+    if any(
+        item.get('related_usage_kind') == 'consecutive_same_callable'
+        for item in clipped_code_error_context.get('related_contexts') or []
+        if isinstance(item, dict)
+    ):
+        repair_instructions = [
+            'related_contexts 包含随后连续使用同一调用对象的语句，供检查同类调用问题；'
+            '它们不是已确认错误。若具有相同根因，可在同次 patches 中修复；'
+            '保留正确调用和业务内容，不要只修首先报错的一处。',
+            *repair_instructions,
+        ]
     # A line patch is an implementation optimization for failures whose
     # affected Python statements were located and verified above. It preserves
     # the last executed program instead of asking the model to regenerate an
@@ -15389,6 +14975,16 @@ def _tool_error_message(
     syntax_patch_available = bool(
         error_type == 'contract_error'
         and (diagnostics or {}).get('violated_contract') == 'invalid_python_syntax'
+    )
+    signature_patch_available = bool(
+        error_type == 'contract_error'
+        and (diagnostics or {}).get('violated_contract') == 'runtime_helper_signature_mismatch'
+        and (diagnostics or {}).get('findings')
+    )
+    formatting_patch_available = bool(
+        error_type in {'contract_error', 'result_contract_error'}
+        and (diagnostics or {}).get('violated_contract') == 'unrendered_report_placeholder'
+        and (diagnostics or {}).get('placeholders')
     )
     patch_required_error_types = {
         'data_type_or_time_mismatch',
@@ -15408,11 +15004,14 @@ def _tool_error_message(
         execution_id > 0
         and current_failed_code
         and authorized_patch_ranges
-        and (error_type in patch_available_error_types or syntax_patch_available)
+        and (
+            error_type in patch_available_error_types
+            or syntax_patch_available
+            or signature_patch_available
+            or formatting_patch_available
+        )
     )
-    patch_required = patch_available and (
-        error_type in patch_required_error_types or syntax_patch_available
-    )
+    patch_required = patch_available and error_type in patch_required_error_types
 
     symbol_references = clipped_code_error_context.get('symbol_references')
     if isinstance(symbol_references, list) and len(symbol_references) > 1:
@@ -15506,6 +15105,16 @@ def _tool_error_message(
             ),
             'full_source_location': 'preceding assistant tool call arguments',
         }
+    if (
+        isinstance(retained_repair_target, dict)
+        and retained_repair_target.get('mode') == 'line_patch'
+        and retained_repair_target.get('base_execution_id') == execution_id
+        and retained_repair_target.get('source_sha256')
+        == _build_analysis_logic_signature(current_failed_code)
+        and retained_repair_target.get('allowed_ranges')
+    ):
+        # A rejected edit does not revoke or broaden its immutable base's authorization.
+        payload['repair_target'] = retained_repair_target
     if feedback_kind:
         payload['feedback_kind'] = feedback_kind
     if query_snapshots:
@@ -15996,6 +15605,114 @@ def _build_artifact_review_packet(
     return {'charts': chart_items[:8], 'tables': table_items[:8]}
 
 
+def _build_expression_fact_view(traces: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Expose actual computed facts to the authoring pass with explicit truncation."""
+    output: list[dict[str, Any]] = []
+    remaining_chars = 24000
+    for trace in traces or []:
+        if not isinstance(trace, dict):
+            continue
+        facts = trace.get('facts') if isinstance(trace.get('facts'), dict) else {}
+        decisions = trace.get('decisions') if isinstance(trace.get('decisions'), dict) else {}
+        sources = trace.get('sources') if isinstance(trace.get('sources'), dict) else {}
+        source_scopes = {}
+        for source_id, raw_source in list(sources.items())[:100]:
+            if not isinstance(raw_source, dict):
+                continue
+            source_scopes[str(source_id)] = {
+                key: _copy_jsonable(raw_source.get(key), None)
+                for key in ('query_keys', 'grain', 'row_count', 'binding', 'transform_kind', 'parents')
+                if raw_source.get(key) not in (None, '', [], {})
+            }
+        trace_item = {
+            'execution_id': trace.get('execution_id'),
+            'result_bindings': _copy_jsonable((trace.get('result_bindings') or [])[:100], []),
+            'result_binding_count': len(trace.get('result_bindings') or []),
+            'result_bindings_truncated': len(trace.get('result_bindings') or []) > 100,
+            'source_scopes': source_scopes,
+            'source_scope_count': len(sources),
+            'source_scopes_truncated': len(sources) > 100,
+            'facts': {},
+            'findings': {},
+            'decisions': _copy_jsonable(dict(list(decisions.items())[:50]), {}),
+            'decision_count': len(decisions),
+            'decisions_truncated': len(decisions) > 50,
+        }
+        for fact_id, raw_fact in facts.items():
+            if not isinstance(raw_fact, dict):
+                continue
+            values = raw_fact.get('values') if isinstance(raw_fact.get('values'), list) else []
+            limit = min(len(values), 100)
+            selected = _copy_jsonable(values[:limit], [])
+            raw_definition = raw_fact.get('definition')
+            raw_definition = raw_definition if isinstance(raw_definition, dict) else {}
+            input_source_ids = raw_definition.get('input_source_ids')
+            input_source_ids = input_source_ids if isinstance(input_source_ids, list) else []
+            input_source_scopes = {
+                str(source_id): source_scopes[str(source_id)]
+                for source_id in input_source_ids
+                if str(source_id) in source_scopes
+            }
+            item = {
+                'state': raw_fact.get('state'),
+                'operation': raw_fact.get('operation'),
+                'value_field': raw_fact.get('value_field'),
+                'input_rows': raw_fact.get('input_rows'),
+                'input_fact_ids': _copy_jsonable(raw_fact.get('input_fact_ids') or [], []),
+                'input_source_scopes': input_source_scopes,
+                'definition': {
+                    key: _copy_jsonable(raw_definition[key], None)
+                    for key in (
+                        'definition_id', 'source_id', 'input_source_ids', 'entity_field',
+                        'group_by', 'value_field', 'quantity_field', 'output_field',
+                        'unit', 'output_grain', 'value_kind', 'missing_policy',
+                    )
+                    if raw_definition.get(key) not in (None, '', [], {})
+                },
+                'row_count': len(values),
+                'values': selected,
+                'values_truncated': limit < len(values),
+            }
+            # Bound the entire model-facing view, while retaining complete
+            # low-cardinality facts such as the ties/distributions used in reports.
+            encoded_size = len(json.dumps(item, ensure_ascii=False, separators=(',', ':')))
+            if encoded_size > remaining_chars:
+                limit = min(limit, 20)
+                item['values'] = _copy_jsonable(values[:limit], [])
+                item['values_truncated'] = limit < len(values)
+                encoded_size = len(json.dumps(item, ensure_ascii=False, separators=(',', ':')))
+            if encoded_size > remaining_chars:
+                item['values'] = []
+                item['values_truncated'] = bool(values)
+                encoded_size = len(json.dumps(item, ensure_ascii=False, separators=(',', ':')))
+            if encoded_size <= remaining_chars:
+                trace_item['facts'][str(fact_id)] = item
+                remaining_chars -= encoded_size
+            else:
+                trace_item['facts'][str(fact_id)] = {
+                    'state': raw_fact.get('state'), 'row_count': len(values),
+                    'values': [], 'values_truncated': bool(values),
+                }
+        for finding_id, finding in (trace.get('findings') or {}).items():
+            # The canonical finding stays in the candidate. Its rendered text
+            # already includes the comparison values; do not send a second
+            # copy of all ranked rows to the expression model.
+            item = _copy_jsonable({key: value for key, value in finding.items()
+                if key not in {'rows', 'source_scopes'}}, {})
+            size = len(json.dumps(item, ensure_ascii=False, separators=(',', ':')))
+            if size <= remaining_chars:
+                trace_item['findings'][finding_id] = item
+                remaining_chars -= size
+            else:
+                # References remain available even if a complete distribution
+                # cannot fit the model view; the host renders the full finding.
+                trace_item['findings'][finding_id] = {
+                    key: item.get(key) for key in ('finding_id', 'fact_id', 'kind', 'field', 'category_field')}
+                trace_item['findings'][finding_id]['view_truncated'] = True
+        output.append(trace_item)
+    return output
+
+
 def _tool_success_message(
     *,
     tool_call_id: str,
@@ -16006,6 +15723,7 @@ def _tool_success_message(
     used_datasource_ids: list[int] | None = None,
     query_snapshots: dict[str, Any] | None = None,
     static_analysis_advisories: list[dict[str, Any]] | None = None,
+    include_candidate_review_contract: bool = True,
 ) -> ToolMessage:
     """
     构造成功的工具结果反馈。
@@ -16019,7 +15737,7 @@ def _tool_success_message(
         'tool': 'execute_python',
         'status': 'success',
         'execution_id': int(execution_id or 0),
-        'review_required': True,
+        'review_required': bool(include_candidate_review_contract),
         'analysis_report': (analysis_report or '').strip(),
         'chart_count': len(charts or []),
         'table_count': len(tables or []),
@@ -16047,7 +15765,7 @@ def _tool_success_message(
                 if isinstance(snapshot, dict)
             ][:32],
         },
-        'candidate_review_contract': {
+        **({'candidate_review_contract': {
             'required_checks': [
                 'question_coverage',
                 'population_and_grain',
@@ -16060,7 +15778,7 @@ def _tool_success_message(
                 'evidence_basis', 'qualification_text', 'supported_as_written',
             ],
             'decision': 'accept only when every required check passes; otherwise request one revision containing every material issue',
-        },
+        }} if include_candidate_review_contract else {}),
         'static_analysis_advisories': _copy_jsonable(
             static_analysis_advisories or [],
             [],
@@ -16070,6 +15788,42 @@ def _tool_success_message(
         content=json.dumps(payload, ensure_ascii=False),
         tool_call_id=tool_call_id,
     )
+
+
+def _presentation_candidate_message(
+    *, tool_call_id: str, execution_id: int, candidate: StructuredResult,
+) -> ToolMessage:
+    payload = {
+        'tool': 'submit_analysis_program',
+        'status': 'presentation_pending',
+        'execution_id': int(execution_id),
+        'output_format': candidate.output_format,
+        'facts': _build_expression_fact_view(candidate.semantic_execution_traces),
+        'artifacts': _build_artifact_review_packet(candidate.charts, candidate.tables),
+        'parameters': _copy_jsonable(candidate.analysis_parameters or {}, {}),
+        'query_receipt_row_count_semantics': (
+            'loaded_row_count counts rows returned by the physical query/file loader; '
+            'it may be broader than the rows later passed to a calculation.'
+        ),
+        'query_receipts': [
+            {
+                'query_key': str(query_key),
+                'status': str((snapshot.get('execution') or {}).get('status') or ''),
+                'loaded_row_count': (snapshot.get('execution') or {}).get('row_count'),
+                'columns': list((snapshot.get('execution') or {}).get('columns') or [])[:24],
+            }
+            for query_key, snapshot in (candidate.query_snapshots or {}).items()
+            if isinstance(snapshot, dict)
+        ][:32],
+        'expression_instruction': (
+            'Compose the final user-facing output from these actual computed facts and existing artifacts. '
+            'This is authorship, not a review. Do not re-query or invent calculations. '
+            'For a population count, use a calculation fact input_rows value (rows actually supplied to that calculation); '
+            'loaded_row_count in a query receipt is the physical loader result and may include rows excluded downstream. '
+            'A fact with values_truncated=true is only a sample; never present it as a complete population.'
+        ),
+    }
+    return ToolMessage(content=json.dumps(payload, ensure_ascii=False), tool_call_id=tool_call_id)
 
 
 def _terminal_tool_success(message: ToolMessage) -> Command:
@@ -16919,6 +16673,8 @@ def run_generated_code_locally(
         'charts': exec_result.charts,
         'tables': exec_result.tables,
         'query_snapshots': exec_result.query_snapshots,
+        'semantic_execution_traces': exec_result.semantic_execution_traces,
+        'semantic_execution_coverage': exec_result.semantic_execution_coverage,
         'analysis_parameters_schema': result_schema,
         'analysis_parameters': result_parameters,
         'stdout_text': stdout_text,
@@ -17003,7 +16759,11 @@ def execute_python(
             diagnostics=patch_error.diagnostics if patch_error else None,
             code_error_context=patch_error.code_error_context if patch_error else None,
             current_failed_code=patch_error.source if patch_error else '',
+            retained_repair_target=patch_error.repair_target if patch_error else None,
             repair_instructions=[
+                '本次失败没有行级补丁授权。请提交完整 code，base_execution_id=0，patches=[]。',
+                '完整程序仍需保留原分析范围、查询、计算和产物；只修复反馈指出的问题。',
+            ] if isinstance(exc, FullProgramRequiredError) else [
                 '首次执行请提交完整 code；局部修复请提交 code=""、失败的 base_execution_id 和非重叠 patches。',
                 'patches 的 start_line/end_line 必须引用错误反馈 code_error_context 中的原始行号。',
                 '被拒绝的补丁没有执行或改变原版本。下一次仍基于原 base_execution_id 的行号；'
@@ -17543,9 +17303,10 @@ def execute_python(
     execution_seconds = int((time.time() - start_time) * 1000)
     with logger.context(**execution_log_context):
         logger.info(f"执行完成，耗时 {execution_seconds / 1000:.2f} 秒")
+    candidate_pending = isinstance(exec_result, StructuredResult) and exec_result.presentation_pending
     emit(
         'status',
-        stage='tool_finished',
+        stage='calculation_complete' if candidate_pending else 'tool_finished',
         level='success',
         tool='execute_python',
         message=f'代码执行完成，耗时 {execution_seconds / 1000:.2f} 秒',
@@ -17698,6 +17459,40 @@ def execute_python(
                 previous_failure_hints=failure_memory.get('previous_failure_hints', []),
                 stdout_text=stdout_text,
                 stderr_text=stderr_text,
+            )
+        if exec_result.presentation_pending:
+            _raise_if_runtime_task_cancelled(runtime.context, execution_id=execution_id, start_time=start_time)
+            exec_result.query_snapshots = _copy_jsonable(
+                worker_payload.get('query_snapshots') or exec_result.query_snapshots or {}, {}
+            )
+            if not _store_presentation_candidate(
+                execution_id,
+                exec_result,
+                stdout_text=stdout_text,
+                stderr_text=stderr_text,
+                execution_seconds=execution_seconds,
+                used_datasource_ids=normalized_used_datasource_ids,
+            ):
+                _update_execution_record(
+                    execution_id,
+                    execution_status='failed',
+                    execution_seconds=execution_seconds,
+                    error_message='无法保留计算候选供同一 Runtime 表达。',
+                    used_datasource_ids=normalized_used_datasource_ids,
+                )
+                return ToolMessage(
+                    content=json.dumps({
+                        'tool': 'submit_analysis_program', 'status': 'failed',
+                        'execution_id': execution_id,
+                        'error_type': 'candidate_persistence_failed',
+                        'message': '无法保留本次计算候选供表达阶段使用。',
+                    }, ensure_ascii=False),
+                    tool_call_id=runtime.tool_call_id,
+                )
+            return _presentation_candidate_message(
+                tool_call_id=runtime.tool_call_id,
+                execution_id=execution_id,
+                candidate=exec_result,
             )
         contract_retry = None
         if exec_result.output_format == "standard":
@@ -18060,14 +17855,15 @@ def _review_patch_submission_is_authorized(
 
 @tool(
     description=(
-        "提交一份独立闭环的正式 Python 洞察分析程序。一次提交必须完成查询、计算、产物构造和"
-        "save_analysis_result(...)；该工具不是数据观察工作台。局部技术修复可使用失败反馈中的"
-        "base_execution_id 与行级 patches，并保留原程序的洞察范围。"
+        "提交一份完整、独立、只读的 Python 洞察分析程序，在同一程序中完成查询、计算、"
+        "图表与表格；计算成功后，Runtime 将真实结果交给表达阶段定稿并保存。"
+        "此工具不是数据观察工作台；技术修复须保留原分析范围。"
     ),
     args_schema=SubmitAnalysisProgramInput,
 )
 def submit_analysis_program(
     runtime: ToolRuntime[CustomContext],
+    definition_source: str = '',
     code: str = '',
     title: str = '',
     description: str = '',
@@ -18081,6 +17877,15 @@ def submit_analysis_program(
 ) -> Optional[ToolMessage | Command]:
     """Submit one complete formal program through the shared execution implementation."""
     code = str(code or program or analysis_code or analysis_program or '')
+    if definition_source.strip():
+        if code.strip() or patches:
+            raise ValueError('Submit one actual implementation, not multiple programs.')
+        output_format = (getattr(runtime.context, 'output_contract', {}) or {}).get('type') or 'standard'
+        code = compile_python_analysis_definition(
+            definition_source,
+            output_format=output_format,
+            defer_presentation=True,
+        )
     return execute_python.func(
         runtime=runtime,
         code=code,
@@ -18091,3 +17896,241 @@ def submit_analysis_program(
         patches=patches,
         execution_mode='analysis',
     )
+
+
+def _selected_datasource_bindings(context: CustomContext) -> list[dict[str, Any]]:
+    for snapshot in (
+        getattr(context, 'execution_datasource_snapshot', {}) or {},
+        getattr(context, 'active_datasource_snapshot', {}) or {},
+    ):
+        if isinstance(snapshot, dict):
+            items = snapshot.get('selected_datasource_snapshot') or snapshot.get('datasources') or []
+            if isinstance(items, list):
+                return items
+    return []
+
+
+def _presentation_error_message(tool_call_id: str, execution_id: int, error_type: str, message: str) -> ToolMessage:
+    return ToolMessage(content=json.dumps({
+        'tool': 'compose_analysis_presentation',
+        'status': 'failed',
+        'execution_id': int(execution_id or 0),
+        'error_type': str(error_type or 'presentation_submission_failed'),
+        'message': str(message or '表达结果未保存。'),
+    }, ensure_ascii=False), tool_call_id=tool_call_id)
+
+
+@tool(
+    description=(
+        '根据本次执行返回的真实计算事实，撰写最终用户表达。只接受当前 Runtime 的 execution_id；'
+        '不查询、不计算、不复核业务语义。产物和数据源范围沿用该执行候选，成功后一次性保存。'
+    ),
+    args_schema=ComposeAnalysisPresentationInput,
+)
+def compose_analysis_presentation(
+    runtime: ToolRuntime[CustomContext],
+    execution_id: int,
+    analysis_report: str = '',
+    output_text: str = '',
+    output_json: dict[str, Any] | None = None,
+    report_blocks: list[NarrativeReportBlock | FindingReportBlock | ValueReportBlock] | None = None,
+    report_text: str | None = None,
+    report_refs: dict[str, ValueReportBlock | FindingReportBlock] | None = None,
+) -> ToolMessage | Command:
+    context = runtime.context
+    emit = _get_stream_emitter()
+    try:
+        from agent.runtime_driver_state import RuntimePhase, runtime_work_packet_from_dict
+        packet = runtime_work_packet_from_dict(getattr(context, 'runtime_work_packet', None))
+        if (packet is None or packet.phase is not RuntimePhase.EXPRESS
+                or packet.active_execution_id != int(execution_id or 0)):
+            return _presentation_error_message(
+                runtime.tool_call_id, execution_id, 'presentation_candidate_mismatch',
+                'execution_id 不属于当前 Runtime 的待表达候选。',
+            )
+    except (TypeError, ValueError):
+        return _presentation_error_message(
+            runtime.tool_call_id, execution_id, 'presentation_candidate_mismatch',
+            '当前 Runtime 工作状态无法确认待表达候选。',
+        )
+
+    from config.database import SessionLocal
+    from model import InsightNsExecution
+
+    session = SessionLocal()
+    try:
+        record = session.query(InsightNsExecution).filter(
+            InsightNsExecution.id == int(execution_id),
+            InsightNsExecution.conversation_id == int(getattr(context, 'conversation_id', 0) or 0),
+            InsightNsExecution.is_deleted == 0,
+            InsightNsExecution.execution_status == 'running',
+        ).with_for_update().first()
+        if record is None:
+            return _presentation_error_message(
+                runtime.tool_call_id, execution_id, 'presentation_candidate_unavailable',
+                '当前执行候选已过期、已完成或不属于本会话。',
+            )
+        try:
+            candidate = StructuredResult.model_validate_json(record.result_payload_json or '{}')
+        except Exception:
+            return _presentation_error_message(
+                runtime.tool_call_id, execution_id, 'presentation_candidate_invalid',
+                '执行候选数据无法恢复，不能重复查询后继续。',
+            )
+        if not candidate.presentation_pending:
+            return _presentation_error_message(
+                runtime.tool_call_id, execution_id, 'presentation_candidate_finalized',
+                '该执行记录不是待表达候选。',
+            )
+
+        if candidate.runtime_evidence:
+            from analysis_runtime.runtime_evidence import compile_runtime_evidence
+            try:
+                compile_runtime_evidence(candidate.runtime_evidence, traces=candidate.semantic_execution_traces,
+                    queries=candidate.query_snapshots, tables=candidate.tables, charts=candidate.charts,
+                    report=candidate.analysis_report)
+            except (KeyError, TypeError, ValueError):
+                return _presentation_error_message(runtime.tool_call_id, execution_id,
+                    'presentation_candidate_changed', '执行证据与计算候选不一致，不能复用原候选的引用。')
+
+        output_contract = dict(getattr(context, 'output_contract', {}) or {'type': 'standard'})
+        output_format = str(output_contract.get('type') or 'standard').strip().lower()
+        if candidate.output_format != output_format:
+            return _presentation_error_message(
+                runtime.tool_call_id, execution_id, 'presentation_output_contract_mismatch',
+                '当前输出协议与计算候选的输出协议不同。',
+            )
+        if report_text is not None:
+            if output_format not in {'standard', 'text'} or analysis_report or output_text or output_json is not None or report_blocks is not None:
+                return _presentation_error_message(runtime.tool_call_id, execution_id,
+                    'presentation_output_shape_invalid', '引用正文只能用于 standard/text，且不能同时提交其他完整报告。')
+            from analysis_runtime.findings import compose_referenced_report
+            try:
+                rendered, bindings = compose_referenced_report(candidate.semantic_execution_traces, report_text, report_refs or {})
+            except (KeyError, ValueError) as error:
+                return _presentation_error_message(runtime.tool_call_id, execution_id,
+                    'presentation_reference_invalid', str(error))
+            candidate.report_finding_bindings = bindings
+            if output_format == 'standard':
+                analysis_report = rendered
+            else:
+                output_text = rendered
+        elif report_refs:
+            return _presentation_error_message(runtime.tool_call_id, execution_id,
+                'presentation_output_shape_invalid', 'report_refs 需要配套的 report_text。')
+        if report_blocks is not None:
+            if output_format not in {'standard', 'text'} or analysis_report or output_text or output_json is not None:
+                return _presentation_error_message(runtime.tool_call_id, execution_id,
+                    'presentation_output_shape_invalid', '报告块只能用于 standard/text，且不能同时提交另一个完整报告。')
+            from analysis_runtime.findings import compose_bound_report
+            try:
+                bound_text, bindings = compose_bound_report(candidate.semantic_execution_traces, report_blocks)
+            except (KeyError, TypeError, ValueError):
+                return _presentation_error_message(runtime.tool_call_id, execution_id,
+                    'presentation_finding_reference_invalid', '报告块必须引用当前候选唯一存在的执行发现。')
+            candidate.report_finding_bindings = bindings
+            if output_format == 'standard':
+                analysis_report = bound_text
+            else:
+                output_text = bound_text
+        if output_format == 'standard':
+            if output_text or output_json is not None:
+                return _presentation_error_message(
+                    runtime.tool_call_id, execution_id, 'presentation_output_shape_invalid',
+                    'standard 输出只能提交 analysis_report。',
+                )
+            report_text = _strip_structural_empty_report_lines(analysis_report)
+            if not report_text:
+                return _presentation_error_message(
+                    runtime.tool_call_id, execution_id, 'missing_report',
+                    'analysis_report 不能为空。',
+                )
+            from service.report_presentation_service import normalize_report_presentation
+            report_text = normalize_report_presentation(
+                report_text,
+                getattr(context, 'execution_datasource_snapshot', {}) or
+                getattr(context, 'active_datasource_snapshot', {}),
+            )
+            candidate.analysis_report = report_text
+        elif output_format == 'text':
+            if analysis_report or output_json is not None or not str(output_text or '').strip():
+                return _presentation_error_message(
+                    runtime.tool_call_id, execution_id, 'presentation_output_shape_invalid',
+                    'text 输出必须只提交非空 output_text。',
+                )
+            candidate.analysis_report = str(output_text).strip()
+            candidate.output_payload = candidate.analysis_report
+        elif output_format == 'json':
+            if analysis_report or output_text or not isinstance(output_json, dict):
+                return _presentation_error_message(
+                    runtime.tool_call_id, execution_id, 'presentation_output_shape_invalid',
+                    'json 输出必须只提交 output_json 对象。',
+                )
+            validate_json_output(output_json, dict(output_contract.get('schema') or {}))
+            candidate.output_payload = _copy_jsonable(output_json, {})
+            candidate.analysis_report = json.dumps(candidate.output_payload, ensure_ascii=False, indent=2)
+        else:
+            return _presentation_error_message(
+                runtime.tool_call_id, execution_id, 'unknown_output_contract',
+                f'未知输出协议: {output_format}',
+            )
+
+        from analysis_runtime.runtime_evidence import finalize_runtime_evidence
+        candidate.runtime_evidence = finalize_runtime_evidence(candidate.runtime_evidence,
+            traces=candidate.semantic_execution_traces, queries=candidate.query_snapshots,
+            tables=candidate.tables, charts=candidate.charts, report=candidate.analysis_report,
+            bindings=candidate.report_finding_bindings)
+        candidate.presentation_pending = False
+        if _is_runtime_task_cancelled(context):
+            record.execution_status = 'failed'
+            record.error_message = CANCELLED_MESSAGE
+            record.content_enabled = 0
+            record.updated_at = datetime.now()
+            record.finished_at = datetime.now()
+            session.commit()
+            return _presentation_error_message(
+                runtime.tool_call_id, execution_id, 'analysis_task_cancelled', CANCELLED_MESSAGE,
+            )
+        record.execution_status = 'success'
+        record.analysis_report = candidate.analysis_report
+        record.result_payload_json = candidate.model_dump_json()
+        record.analysis_parameters_schema_json = json.dumps(
+            candidate.analysis_parameters_schema or {}, ensure_ascii=False,
+        )
+        record.analysis_parameters_json = json.dumps(candidate.analysis_parameters or {}, ensure_ascii=False)
+        record.execution_seconds = max(
+            int(((datetime.now() - record.created_at).total_seconds() * 1000)
+                if record.created_at else record.execution_seconds or 0),
+            0,
+        )
+        record.error_message = ''
+        record.updated_at = datetime.now()
+        record.finished_at = datetime.now()
+        try:
+            used_ids = _normalize_used_datasource_ids(json.loads(record.used_datasource_ids_json or '[]'))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            used_ids = []
+        success_message = _tool_success_message(
+            tool_call_id=runtime.tool_call_id,
+            execution_id=execution_id,
+            analysis_report=candidate.analysis_report,
+            charts=candidate.charts,
+            tables=candidate.tables,
+            used_datasource_ids=used_ids,
+            query_snapshots=candidate.query_snapshots,
+            include_candidate_review_contract=False,
+        )
+        terminal_result = _terminal_tool_success(success_message)
+        emit('status', stage='tool_result', level='success',
+             tool='compose_analysis_presentation', message='本次结果表达已保存。')
+        session.commit()
+        return terminal_result
+    except Exception as exc:
+        session.rollback()
+        logger.error('presentation finalization failed: %s', type(exc).__name__)
+        return _presentation_error_message(
+            runtime.tool_call_id, execution_id, 'presentation_submission_failed',
+            '最终表达保存失败；当前执行候选仍保留，未重新查询或计算。',
+        )
+    finally:
+        session.close()

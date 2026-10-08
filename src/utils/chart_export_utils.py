@@ -87,36 +87,37 @@ def validate_chart_spec_layout(chart_spec: dict[str, Any], timeout_ms: int = 150
     Validate a chart option by rendering it in a headless browser and inspecting
     the rendered text boxes.
     """
+    return validate_chart_spec_layouts([chart_spec], timeout_ms=timeout_ms)[0]
+
+
+def validate_chart_spec_layouts(
+    chart_specs: list[dict[str, Any]], timeout_ms: int = 15000,
+) -> list[dict[str, Any]]:
+    """Validate multiple chart options in one browser session."""
     default_result = {
         "passed": True,
         "issues": [],
         "metrics": {},
         "skipped": False,
     }
-    if not isinstance(chart_spec, dict) or not chart_spec:
-        return {
-            "passed": True,
-            "issues": [],
-            "metrics": {},
-            "skipped": True,
-        }
-
     echarts_script = _load_local_echarts_script()
+    skipped_result = {
+        "passed": True, "issues": [], "metrics": {}, "skipped": True,
+    }
     if not echarts_script:
-        return {
-            "passed": True,
-            "issues": [],
-            "metrics": {},
-            "skipped": True,
-        }
+        return [dict(skipped_result) for _ in chart_specs]
 
-    html = _build_chart_runtime_html(chart_spec)
-    temp_path: Path | None = None
+    html_documents = [
+        _build_chart_runtime_html(spec) if isinstance(spec, dict) and spec else None
+        for spec in chart_specs
+    ]
+    results = [dict(skipped_result) if html is None else dict(default_result)
+               for html in html_documents]
+    active_indices = [index for index, html in enumerate(html_documents) if html is not None]
+    if not active_indices:
+        return results
+
     try:
-        with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as temp_file:
-            temp_file.write(html)
-            temp_path = Path(temp_file.name)
-
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
             try:
@@ -126,33 +127,30 @@ def validate_chart_spec_layout(chart_spec: dict[str, Any], timeout_ms: int = 150
                     ignore_https_errors=True,
                 )
                 page = context.new_page()
-                page.goto(temp_path.as_uri(), wait_until="networkidle", timeout=timeout_ms)
-                page.wait_for_function("window.__chartValidationResult !== undefined", timeout=timeout_ms)
-                payload = page.evaluate("window.__chartValidationResult")
-                if isinstance(payload, dict):
-                    payload.setdefault("skipped", False)
-                    payload.setdefault("passed", True)
-                    payload.setdefault("issues", [])
-                    payload.setdefault("metrics", {})
-                    return payload
+                for index in active_indices:
+                    try:
+                        page.set_content(html_documents[index], wait_until="load", timeout=timeout_ms)
+                        page.wait_for_function(
+                            "window.__chartValidationResult !== undefined", timeout=timeout_ms,
+                        )
+                        payload = page.evaluate("window.__chartValidationResult")
+                        if isinstance(payload, dict):
+                            payload.setdefault("skipped", False)
+                            payload.setdefault("passed", True)
+                            payload.setdefault("issues", [])
+                            payload.setdefault("metrics", {})
+                            results[index] = payload
+                    except Exception as exc:
+                        logger.warning("Chart layout validation skipped: index=%s error=%s", index + 1, exc)
+                        results[index] = dict(skipped_result)
+                page.close()
             finally:
                 browser.close()
     except Exception as exc:
-        logger.warning("Chart layout validation skipped: error=%s", exc)
-        return {
-            "passed": True,
-            "issues": [],
-            "metrics": {},
-            "skipped": True,
-        }
-    finally:
-        if temp_path and temp_path.exists():
-            try:
-                temp_path.unlink()
-            except OSError:
-                pass
-
-    return default_result
+        logger.warning("Chart layout validation batch skipped: error=%s", exc)
+        return [dict(skipped_result) if html is not None else dict(skipped_result)
+                for html in html_documents]
+    return results
 
 
 def _open_chart_runtime_page(chart_spec: dict[str, Any], timeout_ms: int) -> tuple[Any, Any] | None:

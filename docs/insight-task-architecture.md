@@ -40,13 +40,17 @@
 
 ## 部署角色
 
-- `INSIGHT_APP_ROLE=all`：首版单容器，同时运行 API 与唯一任务 Runner 进程。
+- `INSIGHT_APP_ROLE=all`：首版单容器，同时运行 API、洞察任务 Runner 与 Evidence Runner。
 - `INSIGHT_APP_ROLE=api`：只运行在线 API。
-- `INSIGHT_APP_ROLE=task-runner`：只运行调度和本地执行。
+- `INSIGHT_APP_ROLE=task-runner`：只运行调度、本地执行与 Evidence Runner。
 
 当前保持单一镜像。负载需要隔离时，用同一镜像启动 `api` 和 `task-runner` 两个容器；只有镜像体积本身成为问题时再拆分镜像。
 
-本地通过 `bootstrap.py` 启动时也遵循同一角色语义：`all` 会以守护线程启动 Runner，`api` 不启动 Runner，`task-runner` 只运行 Runner。本地 Runner 使用 `.env.local` 中的短 Token 与 FedQuery JWT 直接调用同进程执行服务，不绕行已部署环境；生产 Runner 仍通过 Gateway 和 Service Account 派发。
+本地通过 `bootstrap.py` 启动时也遵循同一角色语义：`all` 会以守护线程启动两个 Runner，`api` 不启动 Runner，`task-runner` 启动洞察任务 Runner 并以守护线程启动 Evidence Runner。本地洞察任务 Runner 使用 `.env.local` 中的短 Token 与 FedQuery JWT 直接调用同进程执行服务，不绕行已部署环境；生产 Runner 仍通过 Gateway 和 Service Account 派发。若 API 与 Runner 分容器部署，至少一个 `task-runner` 实例必须运行，否则新分析的 Evidence 会保持 `queued`。
+
+## 会话 Evidence 后处理
+
+成功分析先提交报告和产物，再持久化 `insight_ns_execution_evidence.compilation_status=queued` 并立即返回。后台 Evidence Runner 以数据库条件更新抢占任务，将状态设为 `running`，编译后写回 `complete`、`partial` 或 `failed` 与诊断；会话轮次详情同步返回 `evidence_compilation` 状态。详情页面在排队/编译期间轮询轻量状态接口，完成后刷新产物引用。进程中断留下的 `running` 任务在 15 分钟无更新后重新排队。该队列复用既有 Evidence 表，不增加任务表；Evidence 生成规则和覆盖标准不变。
 
 ## 运行参数
 
@@ -59,6 +63,6 @@
 
 ## Evidence 与 LLM
 
-首版任务执行沿用本地重跑契约，不重新规划或编译 Evidence。未来若任务结果需要可点击 Evidence，应复用冻结的 Evidence 定义并基于新 QuerySnapshot 本地物化，不把 Evidence 职责重新放回正式分析代码。
+任务执行沿用本地重跑契约，不重新规划或调用模型推断 Evidence。新原生程序冻结计算与展示定义，Runtime 在每次实际执行中依据新的 QuerySnapshot、参数和结果生成当前执行的消费回执，Evidence Runner 仅本地投影与持久化。旧程序继续复用既有冻结 Evidence 定义的兼容路径。不得复用父执行的结果摘要、执行 token 或位置绑定；不得要求正式分析代码另写一份 Evidence 字典或重算指标。
 
 默认任务执行不得调用 LLM。阈值触发后的结论增强属于独立的后处理能力，即使增强失败，本地运行结果仍应保持成功和可查看。

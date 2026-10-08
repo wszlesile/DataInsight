@@ -787,13 +787,16 @@
       </template>
     </el-dialog>
 
-    <el-drawer v-model="turnDetailVisible" title="轮次详情" size="48%" destroy-on-close>
+    <el-drawer v-model="turnDetailVisible" title="轮次详情" size="48%" destroy-on-close @closed="onTurnDetailClosed">
       <div v-if="turnDetailLoading" class="detail-empty">正在加载详情...</div>
       <div v-else-if="turnDetail" class="turn-detail">
         <div class="detail-header">
           <div>
             <div class="detail-title">第 {{ turnDetail.turn.turn_no }} 轮分析</div>
             <div class="detail-meta">状态：{{ turnDetail.turn.status }} | 开始时间：{{ formatDateTime(turnDetail.turn.started_at) }}</div>
+            <div v-if="turnDetail.evidence_compilation" class="detail-meta">
+              Evidence：{{ evidenceCompilationStatusLabel(turnDetail.evidence_compilation.status) }}
+            </div>
           </div>
           <div class="detail-list-actions">
             <button
@@ -1106,6 +1109,7 @@ import DataSourcePanel from './components/DataSourcePanel.vue'
 import ChatInput from './components/ChatInput.vue'
 import ChartDisplay from './components/ChartDisplay.vue'
 import { applyPieLegendSafety } from './utils/chartSpecSafety'
+import { replaceUnsupportedMarkdownImages } from './utils/reportMarkdown'
 import {
   createConversation,
   createNamespace,
@@ -1119,6 +1123,7 @@ import {
   getInsightTask,
   getInsightTaskRun,
   getConversationHistory,
+  getEvidenceCompilationStatus,
   getTurnDetail,
   getTurnVersionDetail,
   listLlmModels,
@@ -1179,6 +1184,8 @@ const turnDetailVisible = ref(false)
 const turnDetailLoading = ref(false)
 const turnDetail = ref(null)
 const turnDetailActiveTab = ref('current')
+let evidenceStatusPollingTimer = null
+let evidenceStatusPollingInFlight = false
 const turnVersionsLoading = ref(false)
 const turnVersions = ref([])
 const selectedVersionKey = ref('')
@@ -1291,7 +1298,7 @@ const selectedLlmModel = computed(() =>
   llmModels.value.find((item) => item.id === selectedLlmModelId.value) || null
 )
 
-const renderMarkdown = (content) => (content ? marked.parse(content) : '')
+const renderMarkdown = (content) => (content ? marked.parse(replaceUnsupportedMarkdownImages(content)) : '')
 const escapeHtml = (value) => String(value ?? '')
   .replace(/&/g, '&amp;')
   .replace(/</g, '&lt;')
@@ -1320,7 +1327,7 @@ const renderTraceableReport = (content, refs = []) => {
     cursor = ref.end
   })
   markdown += characters.slice(cursor).join('')
-  return marked.parse(markdown)
+  return marked.parse(replaceUnsupportedMarkdownImages(markdown))
 }
 const collectKey = (collectType, targetId) => `${collectType}:${targetId}`
 const parseCollectMetadata = (collect) => {
@@ -1643,6 +1650,14 @@ const getVersionReportEvidenceRefs = (detail) => {
   const reportArtifact = getVersionArtifactsByType(detail, 'report')[0]
   return getArtifactEvidenceRefs(reportArtifact)?.report_trace_refs || []
 }
+
+const evidenceCompilationStatusLabel = (status) => ({
+  queued: '排队中',
+  running: '编译中',
+  complete: '已完成',
+  partial: '部分完成',
+  failed: '失败'
+}[status] || status || '未知')
 
 const getTurnDetailReportEvidenceRefs = (detail) => {
   const reportArtifact = Array.isArray(detail?.artifacts)
@@ -2874,6 +2889,7 @@ const resetTurnVersionState = () => {
 
 const openTurnDetail = async (turnId, options = {}) => {
   if (!activeConversationId.value || !turnId) return
+  stopEvidenceStatusPolling()
   const resetTab = options.resetTab !== false
   turnDetailVisible.value = true
   turnDetailLoading.value = true
@@ -2883,6 +2899,9 @@ const openTurnDetail = async (turnId, options = {}) => {
   try {
     const response = await getTurnDetail(activeConversationId.value, turnId)
     turnDetail.value = response.data.success ? response.data.data : null
+    if (turnDetail.value && ['queued', 'running'].includes(turnDetail.value.evidence_compilation?.status)) {
+      startEvidenceStatusPolling(activeConversationId.value, turnId)
+    }
     if (!resetTab && turnDetailActiveTab.value === 'versions') {
       await loadTurnVersions(turnId)
     }
@@ -2893,6 +2912,77 @@ const openTurnDetail = async (turnId, options = {}) => {
   } finally {
     turnDetailLoading.value = false
   }
+}
+
+const stopEvidenceStatusPolling = () => {
+  if (evidenceStatusPollingTimer) {
+    window.clearInterval(evidenceStatusPollingTimer)
+    evidenceStatusPollingTimer = null
+  }
+  evidenceStatusPollingInFlight = false
+}
+
+const onTurnDetailClosed = () => {
+  const conversationId = Number(activeConversationId.value || 0)
+  const turnId = Number(turnDetail.value?.turn?.id || 0)
+  const status = turnDetail.value?.evidence_compilation?.status
+  stopEvidenceStatusPolling()
+  if (conversationId && turnId && ['queued', 'running'].includes(status)) {
+    startEvidenceStatusPolling(conversationId, turnId)
+  }
+}
+
+const startEvidenceStatusPolling = (conversationId, turnId) => {
+  stopEvidenceStatusPolling()
+  evidenceStatusPollingTimer = window.setInterval(async () => {
+    const detailIsOpen = turnDetailVisible.value && Number(turnDetail.value?.turn?.id) === Number(turnId)
+    const turnIsInHistory = chatHistory.value.some((item) => Number(item.turnId) === Number(turnId))
+    if (Number(activeConversationId.value) !== Number(conversationId) || (!detailIsOpen && !turnIsInHistory)) {
+      stopEvidenceStatusPolling()
+      return
+    }
+    if (evidenceStatusPollingInFlight) return
+    evidenceStatusPollingInFlight = true
+    try {
+      const response = await getEvidenceCompilationStatus(conversationId, turnId)
+      if (!response.data.success) return
+      const status = response.data.data
+      if (detailIsOpen && Number(turnDetail.value?.turn?.id) === Number(turnId)) {
+        turnDetail.value = { ...turnDetail.value, evidence_compilation: status }
+      }
+      if (!['queued', 'running'].includes(status.status)) {
+        stopEvidenceStatusPolling()
+        if (['complete', 'partial', 'failed'].includes(status.status)) {
+          const detailResponse = await getTurnDetail(conversationId, turnId)
+          if (detailResponse.data.success) {
+            const refreshedDetail = detailResponse.data.data
+            if (detailIsOpen && Number(turnDetail.value?.turn?.id) === Number(turnId)) {
+              turnDetail.value = refreshedDetail
+            }
+            if (Number(currentTurnId.value) === Number(turnId)) {
+              const reportArtifact = refreshedDetail.artifacts?.find((artifact) => artifact?.artifact_type === 'report')
+              currentReportRefs.value = reportArtifact?.metadata_json?.evidence_refs || {}
+            }
+          }
+          const historyResponse = await getConversationHistory(conversationId)
+          if (historyResponse.data.success && Number(activeConversationId.value) === Number(conversationId)) {
+            const completedHistory = (historyResponse.data.data.history || []).find(
+              (item) => Number(item.turn_id) === Number(turnId)
+            )
+            if (completedHistory) {
+              chatHistory.value = chatHistory.value.map((item) => (
+                Number(item.turnId) === Number(turnId) ? mapHistoryItem(completedHistory) : item
+              ))
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.warn('Evidence status polling failed:', error)
+    } finally {
+      evidenceStatusPollingInFlight = false
+    }
+  }, 3000)
 }
 
 const toggleCollect = async ({
@@ -3693,12 +3783,17 @@ const handleStreamEvent = async (event) => {
       return
   }
   if (event.type === 'done') {
+    const completedConversationId = Number(activeConversationId.value || 0)
+    const completedTurnId = Number(currentTurnId.value || 0)
     if (!currentReport.value && currentAssistantMessage.value) {
       currentReport.value = currentAssistantMessage.value
     } else if (!currentReport.value && currentCharts.value.length === 0) {
       currentReport.value = '本轮分析未生成可展示的图表或分析报告，请重试。'
     }
     await finalizeStreamRound()
+    if (completedConversationId && completedTurnId) {
+      startEvidenceStatusPolling(completedConversationId, completedTurnId)
+    }
     return
   }
   if (event.type === 'clarification_required') {
@@ -3911,6 +4006,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopInsightTaskPolling()
+  stopEvidenceStatusPolling()
 })
 </script>
 

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 TOOL_TITLES = {
     'select_runtime_work': '确定下一步分析工作',
+    'plan_runtime_semantics': '规划洞察语义与统计口径',
     'request_runtime_probe': '核实分析所需的技术事实',
     'plan_runtime_materials': '整理分析计划',
     'read_runtime_datasource_context': '读取数据字段与关系',
@@ -15,14 +16,16 @@ TOOL_TITLES = {
     'read_runtime_query_context': '核对已执行查询',
     'probe_analysis_data': '核实数据与查询口径',
     'submit_analysis_program': '执行分析程序',
+    'compose_analysis_presentation': '根据计算结果撰写表达',
     'accept_analysis_result': '复核并确认分析结果',
     'request_analysis_revision': '反馈候选结果问题',
     'execute_python': '执行分析程序',
 }
 WORK_TITLES = {
-    'understand': '理解分析目标', 'plan': '制定资料读取计划',
+    'understand': '规划洞察语义', 'plan': '制定资料读取计划',
     'probe': '准备数据探测', 'probe_repair': '修正数据探测',
     'implement': '生成分析程序', 'repair': '修复分析程序',
+    'express': '撰写分析结果表达',
     'review': '复核分析结果',
 }
 

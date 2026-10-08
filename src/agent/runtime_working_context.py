@@ -16,7 +16,7 @@ from langchain.tools import tool
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.prebuilt import ToolRuntime
 from langgraph.types import Command
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model, field_validator, model_validator
 
 from agent.context_engineering_runtime import (
     CustomContext,
@@ -57,6 +57,7 @@ class WorkingMemoryKind(str, Enum):
     SCHEMA_SOURCE = 'schema_source'
     PROTOCOL = 'protocol'
     WORK_DECISION = 'work_decision'
+    SEMANTIC_PLAN = 'semantic_plan'
     MATERIAL_PLAN = 'material_plan'
     PROGRAM = 'program'
     PROGRAM_PATCH = 'program_patch'
@@ -188,6 +189,7 @@ class WorkingMemoryIndex:
             if item.kind in {
                 WorkingMemoryKind.WORK_DECISION,
                 WorkingMemoryKind.MATERIAL_PLAN,
+                WorkingMemoryKind.SEMANTIC_PLAN,
             }
             and item.status == 'superseded'
         )
@@ -247,7 +249,7 @@ def build_working_memory_index(messages) -> WorkingMemoryIndex:
                 args = call.get('args', {})
                 calls[call_id] = (name, args, index)
                 if name == 'submit_analysis_program':
-                    if any(args.get(key) for key in _execution_source_keys(name)):
+                    if args.get('definition_source') or any(args.get(key) for key in _execution_source_keys(name)):
                         item_index = add(
                             WorkingMemoryKind.PROGRAM, 'formal-program', index, call_id, args,
                             scope=('formal-analysis',),
@@ -279,7 +281,9 @@ def build_working_memory_index(messages) -> WorkingMemoryIndex:
         # trusting payload.tool here used to classify every Probe observation
         # as a generic execution result and left its source/stdout replayable.
         owner = call_name or str(payload.get('tool') or '')
-        if owner in {'select_runtime_work', 'request_runtime_probe'} and payload.get('status') == 'success':
+        if owner == 'plan_runtime_semantics' and payload.get('status') == 'success':
+            add(WorkingMemoryKind.SEMANTIC_PLAN, 'runtime-semantic-plan', index, call_id, payload)
+        elif owner in {'select_runtime_work', 'request_runtime_probe'} and payload.get('status') == 'success':
             add(WorkingMemoryKind.WORK_DECISION, 'runtime-work', index, call_id, payload,
                 scope=(payload.get('work'),))
         elif owner == 'plan_runtime_materials' and payload.get('status') == 'success':
@@ -290,9 +294,6 @@ def build_working_memory_index(messages) -> WorkingMemoryIndex:
                     identity = source.get('datasource_id')
                     add(WorkingMemoryKind.SCHEMA_SOURCE, f'schema-read:{call_id}:{identity}',
                         index, call_id, source, scope=(identity,))
-            if payload.get('business_context'):
-                add(WorkingMemoryKind.PREPARATION_FACT, f'lineage-read:{call_id}',
-                    index, call_id, payload['business_context'])
         elif owner == 'read_runtime_query_context':
             for identity, query in (payload.get('queries') or {}).items():
                 add(WorkingMemoryKind.QUERY_DEFINITION, f'query-read:{call_id}:{identity}', index, call_id, query,
@@ -362,6 +363,7 @@ def build_working_memory_index(messages) -> WorkingMemoryIndex:
         if record['kind'] not in {
             WorkingMemoryKind.WORK_DECISION,
             WorkingMemoryKind.MATERIAL_PLAN,
+            WorkingMemoryKind.SEMANTIC_PLAN,
         }:
             continue
         previous = latest_control_by_key.get(record['logical_key'])
@@ -515,6 +517,528 @@ def build_context_memory_items(context, contract_ids) -> tuple[WorkingMemoryItem
             scope=(contract_id,),
         ))
     return tuple(items)
+
+
+class RuntimeCalculationRequirement(BaseModel):
+    purpose: str = Field(min_length=1, max_length=240, description='The business quantity to calculate, not a report section.')
+    definition: str = Field(min_length=1, max_length=600, description='Business meaning and supplied calculation requirements, including selection scope and unresolved meaning. This text is not executable algorithm authority: the formal program owns one native definition or Python function. Retain original user/schema formulas as requirements rather than rewriting them into a second algorithm.')
+    basis: Literal['user', 'conversation_rule', 'schema', 'analytical_derivation', 'unresolved']
+    input_grain: str = Field(default='', max_length=300, description='What one input row represents; include join multiplicity when combining sources.')
+    output_grain: str = Field(default='', max_length=300, description='Dimensions retained in the computed result.')
+    unit: str = Field(default='', max_length=160, description='Input/output units and conversion or weighting required by aggregation.')
+    result_fields: dict[str, str] = Field(default_factory=dict, description='Business meaning and unit of output fields within output_grain. Distinguish counts, shares, totals and averages. Executable formulas live once in the formal program, not in this description. Legacy formula descriptions remain readable requirements, not independently executed definitions.')
+
+
+class RuntimeCalculationRule(RuntimeCalculationRequirement):
+    """Legacy plan dependencies; new generation declares them in executable definitions."""
+
+    input_fact_ids: list[str] = Field(default_factory=list, description='Existing source fact IDs or previously computed result IDs consumed by this calculation, within the same question.')
+    output_fact_ids: list[str] = Field(default_factory=list, description='New result IDs produced directly by this rule. Each ID is unique within the question and distinct from all facts[].fact_id and other calculation results, even when an input column and its aggregate have similar names. Other rules reuse these results through input_fact_ids. Result meaning is defined by this rule purpose, definition, grain and unit; results are not repeated in facts[].')
+    group_by_fact_ids: list[str] | None = Field(default=None, description='Exact facts retained as output grouping keys. [] means a single overall result; null means grouping is not settled. Context/display attributes do not become grouping keys.')
+    entity_key_fact_ids: list[str] = Field(default_factory=list, description='Facts that identify the counted business entity, when counting distinct entities rather than input records.')
+
+
+class RuntimeSemanticUnknown(BaseModel):
+    kind: Literal['schema', 'probe', 'business_clarification']
+    issue: str = Field(min_length=1, max_length=400)
+    consequence: str = Field(min_length=1, max_length=400)
+
+
+class RuntimeCriterionSource(BaseModel):
+    source: Literal['user', 'conversation_rule', 'schema']
+    reference: str = Field(min_length=1, max_length=240, description='Locate the supplied rule: user question, conversation rule, or datasource ID + field/schema property path.')
+    excerpt: str = Field(min_length=1, max_length=500, description='Actual supplied rule text supporting this criterion, not a paraphrased conclusion or an invented numeric cutoff. This is a source citation, not proof of the model interpretation.')
+
+
+class RuntimeDecisionIntent(BaseModel):
+    """Interpretation needs and supplied authority, before executable decisions exist."""
+    purpose: str = Field(min_length=1, max_length=240, description='Business comparison or recommendation that needs a runtime decision.')
+    basis: Literal['user', 'conversation_rule', 'schema', 'mathematical', 'analytical_derivation', 'unresolved'] = Field(
+        description='Basis stated by the analysis plan, not whether the predicate can be calculated and not proof that a business judgement is valid. user/conversation_rule/schema means an actual supplied criterion supports the judgement. mathematical means a direct arithmetic or ordering relation such as equal, greater, lower or tied. analytical_derivation means a transparent computation from supplied facts and does not itself establish a business standard. A chosen numeric cutoff does not establish business risk, health, efficiency or adequacy; absent supplied authority, such interpretations remain unresolved.'
+    )
+    criterion: str = Field(default='', max_length=500, description='The actual supplied business criterion and where it comes from, or the observable mathematical relation being interpreted. A numeric predicate alone is not a business criterion. When no business criterion is supplied, describe the missing basis and keep the interpretation factual.')
+    source_references: list[RuntimeCriterionSource] = Field(default_factory=list, description='Supplied business-rule citations, separate from supporting_fact_ids which locate computed inputs. A Schema field or enumeration alone is not a business judgement rule. No external rule is needed for a mathematical equality/order/difference; without a supplied business criterion, retain factual comparison rather than asserting health/risk.')
+
+
+class RuntimeDecisionCondition(RuntimeDecisionIntent):
+    """Stored-plan reader; retain legacy prose without requesting a second algorithm."""
+
+    condition: str = Field(default='', max_length=500, description='Legacy predicate requirement, not merely whether inputs exist. Executable conditions are defined in the formal program.')
+    when_true: str = Field(default='', max_length=400, description='Legacy candidate expression, not an evaluated conclusion.')
+    otherwise: str = Field(default='', max_length=400, description='Legacy candidate expression; not just a missing-input message and not proof of health or safety.')
+    supporting_fact_ids: list[str] = Field(default_factory=list, description='Facts used to evaluate the predicate, referenced within the same question. This does not supply external benchmarks or business authority.')
+
+
+class RuntimeFactSourceBinding(BaseModel):
+    datasource_id: int = Field(gt=0)
+    fields: list[str] = Field(min_length=1)
+    role: str = Field(
+        min_length=1, max_length=80,
+        description='Analytical use of the bound source fields, e.g. measure, dimension, time, join or context. Descriptive metadata, not a work-state or execution permission.'
+    )
+
+
+class RuntimeSemanticFact(BaseModel):
+    fact_id: str = Field(min_length=1, description='Unique ID of this source or unresolved fact within the question, distinct from all calculation_rules[].output_fact_ids. A source field and its aggregated result have separate identities.')
+    meaning: str = Field(min_length=1, max_length=400)
+    status: Literal['direct', 'derived', 'unresolved']
+    source_bindings: list[RuntimeFactSourceBinding] = Field(default_factory=list)
+    derived_from_fact_ids: list[str] = Field(default_factory=list)
+    unresolved_reason: str = Field(default='', max_length=400)
+
+    @model_validator(mode='after')
+    def check_grounding(self) -> 'RuntimeSemanticFact':
+        if self.status == 'direct' and not self.source_bindings:
+            raise ValueError('direct fact requires a source binding')
+        if self.status == 'derived' and not (self.derived_from_fact_ids or self.source_bindings):
+            raise ValueError('derived fact requires fact dependencies or source bindings')
+        if self.status == 'unresolved' and not self.unresolved_reason:
+            raise ValueError('unresolved fact requires a reason')
+        if self.fact_id in self.derived_from_fact_ids:
+            raise ValueError('fact cannot depend on itself')
+        return self
+
+
+class RuntimeQuestionSemantics(BaseModel):
+    question_id: str = Field(min_length=1)
+    analysis_focus: str = Field(min_length=1, max_length=500)
+    population: str = Field(default='', max_length=500)
+    time_basis: str = Field(default='', max_length=500)
+    grouping_and_comparison: str = Field(default='', max_length=500)
+    facts: list[RuntimeSemanticFact] = Field(default_factory=list, description='Source-bound facts and unresolved business meanings needed by the analysis. Results declared in calculation_rules.output_fact_ids need not be declared again here.')
+    relationship_ids: list[str] = Field(default_factory=list)
+    calculation_rules: list[RuntimeCalculationRule] = Field(default_factory=list, description='Business quantities, supplied requirements and input/output scope for this question. Actual algorithms are defined once in the formal program. Named results may be declared in output_fact_ids; not an exhaustive metric catalogue.')
+    decision_conditions: list[RuntimeDecisionCondition] = Field(default_factory=list, description='Concrete Runtime branches for planned comparisons or recommendations; not predicted conclusions. An empty list means no judgement is planned. An unresolved judgement must retain a factual fallback.')
+    unknowns: list[RuntimeSemanticUnknown] = Field(default_factory=list)
+
+    @model_validator(mode='after')
+    def check_fact_references(self) -> 'RuntimeQuestionSemantics':
+        fact_ids = [fact.fact_id for fact in self.facts]
+        if len(fact_ids) != len(set(fact_ids)):
+            raise ValueError('fact IDs must be unique within a question')
+        output_ids = [identifier for rule in self.calculation_rules for identifier in rule.output_fact_ids]
+        if len(output_ids) != len(set(output_ids)):
+            producers: dict[str, list[str]] = {}
+            for rule_index, rule in enumerate(self.calculation_rules):
+                for output_index, identifier in enumerate(rule.output_fact_ids):
+                    producers.setdefault(identifier, []).append(
+                        f'calculation_rules[{rule_index}].output_fact_ids[{output_index}]'
+                    )
+            conflicts = {identifier: locations for identifier, locations in producers.items() if len(locations) > 1}
+            raise ValueError(
+                'each calculation result must have one producer within a question; conflicting declarations: '
+                + json.dumps(conflicts, ensure_ascii=False)
+            )
+        source_ids = {fact.fact_id for fact in self.facts if fact.status != 'derived'}
+        if set(output_ids) & source_ids:
+            collisions = set(output_ids) & source_ids
+            locations = {
+                identifier: {
+                    'facts': [f'facts[{index}].fact_id' for index, fact in enumerate(self.facts)
+                              if fact.fact_id == identifier],
+                    'results': [f'calculation_rules[{rule_index}].output_fact_ids[{output_index}]'
+                                for rule_index, rule in enumerate(self.calculation_rules)
+                                for output_index, value in enumerate(rule.output_fact_ids)
+                                if value == identifier],
+                }
+                for identifier in sorted(collisions)
+            }
+            raise ValueError('calculation result IDs cannot overwrite source or unresolved facts; '
+                             'conflicting declarations: ' + json.dumps(locations, ensure_ascii=False))
+        references: dict[str, list[str]] = {}
+
+        def record(values: list[str], path: str) -> None:
+            for position, identifier in enumerate(values):
+                references.setdefault(identifier, []).append(f'{path}[{position}]')
+
+        for index, fact in enumerate(self.facts):
+            record(fact.derived_from_fact_ids, f'facts[{index}].derived_from_fact_ids')
+        for index, rule in enumerate(self.calculation_rules):
+            for field in ('input_fact_ids', 'group_by_fact_ids', 'entity_key_fact_ids'):
+                record(getattr(rule, field) or [], f'calculation_rules[{index}].{field}')
+        for index, condition in enumerate(self.decision_conditions):
+            record(condition.supporting_fact_ids, f'decision_conditions[{index}].supporting_fact_ids')
+        missing = set(references) - (set(fact_ids) | set(output_ids))
+        if missing:
+            raise ValueError(
+                f'unknown fact references within question: {sorted(missing)}; reference locations: '
+                + json.dumps({identifier: references[identifier] for identifier in sorted(missing)}, ensure_ascii=False)
+            )
+        return self
+
+
+class RuntimeSemanticPlanInput(BaseModel):
+    progress_summary: str = Field(default='', max_length=600, description='Brief user-facing approach summary in the user language; no private reasoning or raw data.')
+    analysis_goal: str = Field(min_length=1, max_length=600)
+    questions: list[RuntimeQuestionSemantics] = Field(min_length=1)
+
+    @field_validator('questions', mode='before')
+    @classmethod
+    def decode_questions(cls, value):
+        if isinstance(value, str):
+            return json.loads(value)
+        return value
+
+
+class RuntimeIntentQuestion(RuntimeQuestionSemantics):
+    calculation_rules: list['RuntimeIntentCalculationRule'] = Field(
+        default_factory=list,
+        description='Business quantities and supplied requirements. Actual result identities and dependencies are declared by executable definitions, not a second symbolic graph here.',
+    )
+    decision_conditions: list['RuntimeIntentDecision'] = Field(
+        default_factory=list,
+        description='Comparisons or recommendations to investigate and their supplied authority. Executable inputs, predicates and result-dependent prose are defined once in the formal program.',
+    )
+
+    @model_validator(mode='before')
+    @classmethod
+    def discard_legacy_execution_links_from_new_intents(cls, value):
+        if not isinstance(value, dict):
+            return value
+        decisions = value.get('decision_conditions') or []
+        legacy_branch_fields = {'condition', 'when_true', 'otherwise'}
+        if not any(isinstance(item, dict) and legacy_branch_fields & item.keys() for item in decisions):
+            legacy_calculation_fields = {
+                'input_fact_ids', 'output_fact_ids', 'group_by_fact_ids', 'entity_key_fact_ids',
+            }
+            for rule in value.get('calculation_rules') or []:
+                if isinstance(rule, dict):
+                    for field in legacy_calculation_fields:
+                        rule.pop(field, None)
+        return value
+
+    @model_validator(mode='after')
+    def check_fact_references(self) -> 'RuntimeIntentQuestion':
+        # Only source-material references belong to planning. The calculation
+        # graph is declared and resolved by the actual execution definitions.
+        RuntimeQuestionSemantics.model_validate({
+            **self.model_dump(), 'calculation_rules': [], 'decision_conditions': [],
+        })
+        return self
+
+
+class RuntimeIntentCalculationRule(RuntimeCalculationRequirement):
+    """New requirement schema that can losslessly read older plan payloads."""
+
+    model_config = ConfigDict(extra='allow')
+
+    @model_validator(mode='before')
+    @classmethod
+    def preserve_only_legacy_execution_links(cls, value):
+        if not isinstance(value, dict):
+            return value
+        legacy_fields = {'input_fact_ids', 'output_fact_ids', 'group_by_fact_ids', 'entity_key_fact_ids'}
+        allowed = {'purpose', 'definition', 'basis', 'result_fields'}
+        if legacy_fields & value.keys():
+            allowed |= legacy_fields
+        return {key: item for key, item in value.items() if key in allowed}
+
+
+class RuntimeIntentDecision(RuntimeDecisionIntent):
+    """New intent schema with lossless acceptance of legacy decision fields.
+
+    The old predicate and branch prose are deliberately absent from the public
+    schema, but historical callers may still send them. Preserve those extra
+    values for snapshot compatibility instead of silently discarding them.
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    @model_validator(mode='before')
+    @classmethod
+    def preserve_only_legacy_branch_payload(cls, value):
+        if not isinstance(value, dict):
+            return value
+        legacy_branch_fields = {'condition', 'when_true', 'otherwise'}
+        allowed = {
+            'purpose', 'basis', 'criterion', 'source_references',
+        }
+        if legacy_branch_fields & value.keys():
+            allowed |= legacy_branch_fields | {'supporting_fact_ids'}
+        return {key: item for key, item in value.items() if key in allowed}
+
+
+class RuntimeSemanticIntentInput(RuntimeSemanticPlanInput):
+    """Generation input; legacy executable-looking prose stays in the storage reader."""
+
+    questions: list[RuntimeIntentQuestion] = Field(min_length=1)
+
+
+def semantic_plan_work_view(plan: dict) -> dict:
+    """Compact display defaults, preserving explicit semantic boundaries."""
+    if not plan:
+        return {}
+    try:
+        typed = RuntimeSemanticPlanInput.model_validate(plan)
+    except ValidationError:
+        return copy.deepcopy(plan)
+    supplied = {key: value for key, value in plan.items() if key != 'progress_summary'}
+    if typed.model_dump(exclude_unset=True, exclude={'progress_summary'}) != supplied:
+        return copy.deepcopy(plan)
+    view = typed.model_dump(exclude_defaults=True, exclude={'progress_summary'})
+    def preserve_boundaries(target: dict, original: dict) -> None:
+        # Empty dependencies/citations and unknown grouping are decisions, not
+        # reconstructible display defaults for an LLM consumer.
+        for key, value in original.items():
+            if value is None or value == [] or value == {}:
+                target[key] = copy.deepcopy(value)
+            elif isinstance(value, dict) and isinstance(target.get(key), dict):
+                preserve_boundaries(target[key], value)
+            elif isinstance(value, list) and isinstance(target.get(key), list):
+                for child, supplied_child in zip(target[key], value):
+                    if isinstance(child, dict) and isinstance(supplied_child, dict):
+                        preserve_boundaries(child, supplied_child)
+
+    preserve_boundaries(view, supplied)
+    return view
+
+
+def semantic_reporting_scope(plan: dict) -> dict:
+    """Project planned judgment authority for the post-execution authoring state."""
+    questions = plan.get('questions') if isinstance(plan, dict) else []
+    scopes = []
+    for question in questions or []:
+        if not isinstance(question, dict):
+            continue
+        decisions = question.get('decision_conditions') or []
+        scopes.append({
+            'question_id': question.get('question_id'),
+            'decision_conditions': copy.deepcopy(decisions),
+            'judgment_scope': 'planned' if decisions else 'descriptive_only',
+        })
+    return {'questions': scopes}
+
+
+def semantic_implementation_bindings(plan: dict) -> list[dict]:
+    """Resolve plan identities without copying algorithms or certifying meaning."""
+    bindings = []
+    for question in plan.get('questions') or []:
+        if not isinstance(question, dict):
+            continue
+        symbols = {}
+        for index, fact in enumerate(question.get('facts') or []):
+            if isinstance(fact, dict) and fact.get('fact_id'):
+                symbols[fact['fact_id']] = f'facts[{index}]'
+        for index, rule in enumerate(question.get('calculation_rules') or []):
+            if not isinstance(rule, dict):
+                continue
+            for identifier in rule.get('output_fact_ids') or []:
+                symbols[identifier] = f'calculation_rules[{index}]'
+        decisions = []
+        for index, decision in enumerate(question.get('decision_conditions') or []):
+            if not isinstance(decision, dict):
+                continue
+            basis = decision.get('basis')
+            mode = ('mathematical_comparison' if basis == 'mathematical' else
+                    'declared_business_rule' if basis in {'user', 'conversation_rule', 'schema'} else
+                    'factual_only')
+            decisions.append({
+                'path': f'decision_conditions[{index}]',
+                'mode': mode,
+                'inputs': {
+                    identifier: symbols.get(identifier)
+                    for identifier in decision.get('supporting_fact_ids') or []
+                },
+            })
+        bindings.append({
+            'question_id': question.get('question_id'),
+            'result_definitions': symbols,
+            'decision_execution': decisions,
+        })
+    return bindings
+
+
+def _semantic_plan_input_for_context(context):
+    semantic = (getattr(context, 'active_datasource_snapshot', {}) or {}).get('analysis_semantic_context') or {}
+    question_ids = list(dict.fromkeys(
+        str(item['question_id']) for item in semantic.get('business_questions') or []
+        if isinstance(item, dict) and item.get('question_id')
+    ))
+    if not question_ids:
+        return RuntimeSemanticIntentInput
+    question_schema = create_model(
+        'CurrentRuntimeQuestionSemantics',
+        __base__=RuntimeIntentQuestion,
+        question_id=(str, Field(
+            min_length=1,
+            description='Existing business-question identity. Put its analytical facets inside this question, not additional question objects.',
+            json_schema_extra={'enum': question_ids},
+        )),
+    )
+    return create_model(
+        'CurrentRuntimeSemanticPlanInput',
+        __base__=RuntimeSemanticIntentInput,
+        questions=(list[question_schema], Field(
+            min_length=len(question_ids), max_length=len(question_ids),
+            description='One item per existing business question; retain each identity exactly once.',
+        )),
+    )
+
+
+@tool(args_schema=RuntimeSemanticIntentInput)
+def plan_runtime_semantics(
+    runtime: ToolRuntime[CustomContext],
+    analysis_goal: str,
+    questions: list[dict],
+    progress_summary: str = '',
+) -> dict:
+    """Record the analytical meaning before selecting execution materials.
+
+    The JSON plan owns fact requirements, population, time attribution, supplied
+    interpretation authority and consequential unknowns. Executable algorithms,
+    predicates and result-dependent expressions belong to the formal program.
+    Stored legacy plans remain readable. A Probe may justify revising the plan.
+    """
+    plan = RuntimeSemanticIntentInput.model_validate({
+        'analysis_goal': analysis_goal,
+        'questions': questions,
+        'progress_summary': progress_summary,
+    })
+    semantic = (
+        (getattr(runtime.context, 'active_datasource_snapshot', {}) or {})
+        .get('analysis_semantic_context') or {}
+    )
+    expected_ids = {
+        str(item.get('question_id') or '')
+        for item in semantic.get('business_questions') or []
+        if isinstance(item, dict) and item.get('question_id')
+    }
+    actual_ids = [item.question_id for item in plan.questions]
+    # A single input and output question have an unambiguous identity even
+    # when the model assigns its own label. Never infer multi-question mapping.
+    if len(expected_ids) == len(plan.questions) == 1:
+        plan.questions[0].question_id = next(iter(expected_ids))
+        actual_ids = [plan.questions[0].question_id]
+    if len(actual_ids) != len(set(actual_ids)) or (expected_ids and set(actual_ids) != expected_ids):
+        return {
+            'tool': 'plan_runtime_semantics',
+            'status': 'failed',
+            'message': 'Semantic plan must cover each current business question exactly once.',
+            'expected_question_ids': sorted(expected_ids),
+        }
+    active_snapshot = getattr(runtime.context, 'active_datasource_snapshot', {}) or {}
+    execution_snapshot = getattr(runtime.context, 'execution_datasource_snapshot', {}) or {}
+    selected_ids = set(active_snapshot.get('selected_datasource_ids') or [])
+    # The outbound Schema projection is a work view, never the authority for
+    # field existence. Detail reads may reveal fields absent from that view.
+    selected_sources = {
+        int(source.get('datasource_id') or source.get('id') or 0): source
+        for source in (execution_snapshot.get('selected_datasource_snapshot')
+                       or active_snapshot.get('selected_datasource_snapshot') or [])
+        if isinstance(source, dict) and source.get('datasource_id', source.get('id'))
+        and (not selected_ids or int(source.get('datasource_id') or source.get('id') or 0) in selected_ids)
+    }
+    available_relationship_ids = {
+        str(relationship.get('relationship_id'))
+        for source in selected_sources.values()
+        for relationship in ((source.get('metadata_schema') or {}).get('relationships') or [])
+        if isinstance(relationship, dict) and relationship.get('relationship_id')
+    }
+    problems = []
+    for question in plan.questions:
+        # Selection requirements describe coverage, not Runtime fact identities.
+        # Requiring identical IDs rejects valid decompositions and encourages a
+        # single umbrella fact instead of meaningful calculation dependencies.
+        unknown_relationships = set(question.relationship_ids) - available_relationship_ids
+        if unknown_relationships and selected_sources:
+            problems.append(f'{question.question_id}: unknown relationship IDs {sorted(unknown_relationships)}')
+        for fact in question.facts:
+            for binding in fact.source_bindings:
+                source = selected_sources.get(binding.datasource_id)
+                if selected_sources and source is None:
+                    problems.append(f'{fact.fact_id}: datasource {binding.datasource_id} is not selected')
+                    continue
+                properties = ((source or {}).get('metadata_schema') or {}).get('properties') or {}
+                if properties:
+                    unknown_fields = set(binding.fields) - set(properties)
+                    if unknown_fields:
+                        problems.append(f'{fact.fact_id}: unknown fields {sorted(unknown_fields)} in datasource {binding.datasource_id}')
+    if problems:
+        return {
+            'tool': 'plan_runtime_semantics',
+            'status': 'failed',
+            'message': 'Semantic facts must reference the current questions and selected Schema.',
+            'problems': problems,
+        }
+    semantic_plan = plan.model_dump(exclude={'progress_summary'})
+    for question, stored_question in zip(plan.questions, semantic_plan['questions']):
+        # Do not manufacture empty legacy predicates for a newly generated
+        # intent. Retain every explicitly supplied field in an old plan.
+        stored_question['decision_conditions'] = [
+            decision.model_dump(exclude_unset=True) for decision in question.decision_conditions
+        ]
+        stored_question['calculation_rules'] = [
+            rule.model_dump(exclude_unset=True) for rule in question.calculation_rules
+        ]
+    return {
+        'tool': 'plan_runtime_semantics',
+        'status': 'success',
+        'progress_summary': progress_summary,
+        'semantic_plan': semantic_plan,
+    }
+
+
+def _semantic_plan_argument_failure(request: ToolCallRequest) -> ToolMessage | None:
+    if request.tool_call.get('name') != 'plan_runtime_semantics':
+        return None
+    try:
+        RuntimeSemanticIntentInput.model_validate(request.tool_call.get('args') or {})
+    except ValidationError as error:
+        # The paired call already carries the candidate plan. Return precise
+        # errors without duplicating that potentially large object in feedback.
+        semantic = ((getattr(request.runtime.context, 'active_datasource_snapshot', {}) or {})
+                    .get('analysis_semantic_context') or {})
+        expected_ids = sorted({str(item['question_id'])
+                               for item in semantic.get('business_questions') or []
+                               if isinstance(item, dict) and item.get('question_id')})
+        return ToolMessage(
+            tool_call_id=request.tool_call['id'], name='plan_runtime_semantics', status='error',
+            content=json.dumps({
+                'tool': 'plan_runtime_semantics', 'status': 'failed',
+                'error_type': 'invalid_arguments',
+                'message': 'Correct the indicated fields in the submitted semantic plan.',
+                **({'expected_question_ids': expected_ids} if expected_ids else {}),
+                'problems': [
+                    {'location': list(item['loc']), 'type': item['type'], 'message': item['msg']}
+                    for item in error.errors(include_input=False, include_context=False, include_url=False)
+                ],
+            }, ensure_ascii=False),
+        )
+    return None
+
+
+def _program_protocol_argument_failure(request: ToolCallRequest) -> ToolMessage | None:
+    """Enforce the advertised authoring protocol at the execution boundary.
+
+    Model tool schemas are guidance; the registered tool retains a legacy
+    replay schema. A new malformed call must not create a legacy ancestor.
+    """
+    if request.tool_call.get('name') != 'submit_analysis_program':
+        return None
+    messages = (request.state or {}).get('messages') or []
+    call_id = request.tool_call.get('id')
+    for index, message in enumerate(messages):
+        if isinstance(message, AIMessage) and any(call.get('id') == call_id for call in message.tool_calls):
+            messages = messages[:index]
+            break
+    context = request.runtime.context
+    work = runtime_phase_work(_ensure_runtime_work_packet(context, messages).phase)
+    if not _uses_native_definition(messages, work):
+        return None
+    from agent.tools import ExecutableAnalysisProgramInput
+    try:
+        ExecutableAnalysisProgramInput.model_validate(request.tool_call.get('args') or {})
+    except ValidationError as error:
+        return ToolMessage(tool_call_id=call_id, name='submit_analysis_program', status='error',
+                           content=json.dumps({
+                               'tool': 'submit_analysis_program', 'status': 'failed',
+                               'error_type': 'invalid_arguments',
+                               'message': 'Submit the complete definition_source required by the current tool schema.',
+                               'diagnostics': {'new_execution_created': False},
+                               'problems': [{'location': list(item['loc']), 'type': item['type'], 'message': item['msg']}
+                                            for item in error.errors(include_input=False, include_context=False, include_url=False)],
+                           }, ensure_ascii=False))
+    return None
 
 
 class RuntimeWorkInput(BaseModel):
@@ -769,7 +1293,12 @@ def _resolve_work_view(messages):
             continue
         call_name = calls.get(message.tool_call_id)
         name = call_name or payload.get('tool')
-        if name in {'select_runtime_work', 'request_runtime_probe'} and payload.get('status') == 'success':
+        if name == 'plan_runtime_semantics' and payload.get('status') == 'success':
+            work = 'plan'
+            focus = str((payload.get('semantic_plan') or {}).get('analysis_goal') or focus)
+            datasource_ids, fields = [], {}
+            probe_return = None
+        elif name in {'select_runtime_work', 'request_runtime_probe'} and payload.get('status') == 'success':
             if payload.get('work') in {'plan', 'probe', 'implement'}:
                 if payload['work'] == 'probe' and work not in {'probe', 'probe_repair'}:
                     probe_return = (
@@ -807,26 +1336,7 @@ def _resolve_work_view(messages):
             if payload.get('status') == 'success':
                 work = 'review'
             elif payload.get('status') == 'failed' or payload.get('error_type'):
-                diagnostics = payload.get('diagnostics') or {}
-                # A model-generated ``execution_intent=probe`` is not itself
-                # a state transition.  The tool identity and the current
-                # lifecycle decide the work state; otherwise a stale model
-                # call can bounce a completed Probe back into probe_repair and
-                # repeat the same observation indefinitely.
-                if (
-                    isinstance(diagnostics, dict)
-                    and diagnostics.get('violated_contract')
-                    == 'formal_tool_received_probe_program'
-                ):
-                    if work in {'probe', 'probe_repair'}:
-                        work = 'probe_repair'
-                    elif work not in {'implement', 'repair'}:
-                        # No established implementation lifecycle exists yet;
-                        # preserve the old safe recovery path for an initial
-                        # formal-tool/probe mismatch.
-                        work = 'probe_repair'
-                else:
-                    work = 'repair'
+                work = 'repair'
         elif call_name == 'probe_analysis_data':
             if (
                 payload.get('error_type') in {
@@ -948,6 +1458,37 @@ def _resolve_prompt_material_scope(
         for message in messages
     )
     return datasource_ids, fields if explicit else {}
+
+
+def _merge_semantic_source_scope(
+    datasource_ids: list[int],
+    fields: dict[str, list[str]],
+    semantic_plan: dict,
+    selected_ids: set[int],
+) -> tuple[list[int], dict[str, list[str]]]:
+    """Carry declared bindings into implementation, without inferring any."""
+    result_ids = list(datasource_ids)
+    result_fields = copy.deepcopy(fields)
+    for question in semantic_plan.get('questions') or []:
+        if not isinstance(question, dict):
+            continue
+        for fact in question.get('facts') or []:
+            if not isinstance(fact, dict):
+                continue
+            for binding in fact.get('source_bindings') or []:
+                if not isinstance(binding, dict):
+                    continue
+                identity = _positive_int(binding.get('datasource_id'))
+                if identity not in selected_ids:
+                    continue
+                if identity not in result_ids:
+                    result_ids.append(identity)
+                key = str(identity)
+                result_fields[key] = list(dict.fromkeys([
+                    *result_fields.get(key, []),
+                    *(field for field in binding.get('fields') or [] if isinstance(field, str)),
+                ]))
+    return result_ids, result_fields
 
 
 def collect_runtime_schema_sources(messages, existing=()):
@@ -1154,7 +1695,7 @@ def _positive_int(value) -> int:
         return 0
 
 
-def work_contracts(context, work, references=()):
+def work_contracts(context, work, references=(), *, definition_program=False):
     snapshot = context.execution_datasource_snapshot or context.active_datasource_snapshot
     required = required_runtime_contract_ids(
         infer_query_capabilities_from_snapshot(snapshot),
@@ -1164,7 +1705,9 @@ def work_contracts(context, work, references=()):
     )
     if work in {'understand', 'plan'}:
         required = tuple(item for item in required if item.startswith(('context.', 'interaction.')))
-        if work == 'plan':
+        if work == 'understand':
+            required = tuple(dict.fromkeys([*required, 'execution.semantic_planning']))
+        else:
             required = tuple(dict.fromkeys([*required, 'execution.planning']))
     elif work in {'probe', 'probe_repair'}:
         required = tuple(
@@ -1173,9 +1716,16 @@ def work_contracts(context, work, references=()):
         )
     elif work in {'implement', 'repair'}:
         required = tuple(
-            'execution.implementation' if item == 'execution.core' else item
+            ('execution.definition' if definition_program else 'execution.implementation')
+            if item == 'execution.core' else item
             for item in required
         )
+    elif work == 'express':
+        required = tuple(
+            item for item in required
+            if item.startswith(('context.', 'interaction.', 'result.'))
+        )
+        required = tuple(dict.fromkeys([*required, 'execution.expression']))
     elif work == 'review':
         required = tuple(
             item for item in required
@@ -1196,7 +1746,7 @@ def work_contracts(context, work, references=()):
             # code packs are deliberately queued for that compatible state;
             # otherwise a speculative read silently turns planning back into
             # the full-program prompt it is intended to avoid.
-            return item.startswith(('context.', 'interaction.'))
+            return item.startswith(('context.', 'interaction.')) or item == 'execution.semantic_planning'
         if work in {'probe', 'probe_repair'}:
             return not item.startswith('result.')
         return True
@@ -1244,7 +1794,7 @@ def _reference_replayed_source(context, source: str, call_id: str):
                     item['source_ref'] = {'tool_call_id': call_id, 'line_no': match[0]}
                 projected.append(item)
             result[key] = projected
-        for key in ('related_contexts', 'suggested_patch_ranges'):
+        for key in ('related_contexts', 'suggested_patch_ranges', 'allowed_ranges'):
             if isinstance(value.get(key), list):
                 result[key] = [project(item) for item in value[key]]
         return result
@@ -1273,7 +1823,13 @@ def _active_formal_program_chain(messages) -> tuple[str | None, frozenset[str]]:
                 execution_id = int(payload.get('execution_id') or 0)
             except (TypeError, ValueError):
                 execution_id = 0
-            if execution_id > 0 and str(message.tool_call_id or '') in calls:
+            diagnostics = payload.get('diagnostics') or {}
+            created_execution = not (
+                isinstance(diagnostics, dict)
+                and diagnostics.get('new_execution_created') is False
+            )
+            if (created_execution and execution_id > 0
+                    and str(message.tool_call_id or '') in calls):
                 execution_owner[execution_id] = str(message.tool_call_id)
     if not ordered:
         return None, frozenset()
@@ -1282,6 +1838,9 @@ def _active_formal_program_chain(messages) -> tuple[str | None, frozenset[str]]:
     current = latest
     while current:
         args = calls[current].get('args') or {}
+        if args.get('definition_source') or any(str(args.get(key) or '').strip()
+               for key in _execution_source_keys(calls[current].get('name', ''))):
+            break
         try:
             base_execution_id = int(args.get('base_execution_id') or 0)
         except (TypeError, ValueError):
@@ -1292,6 +1851,32 @@ def _active_formal_program_chain(messages) -> tuple[str | None, frozenset[str]]:
         active.add(parent)
         current = parent
     return latest, frozenset(active)
+
+
+def _uses_native_definition(messages, work: str) -> bool:
+    """A diagnostic does not select a program protocol; its actual producer does."""
+    if work == 'implement':
+        return True
+    _, active_calls = _active_formal_program_chain(messages)
+    for message in reversed(messages):
+        if not isinstance(message, AIMessage):
+            continue
+        for call in reversed(message.tool_calls):
+            if str(call.get('id') or '') not in active_calls:
+                continue
+            args = call.get('args') or {}
+            if args.get('definition_source'):
+                return True
+            if any(str(args.get(key) or '').strip() for key in _execution_source_keys(call.get('name', ''))):
+                rejected = any(isinstance(result, ToolMessage) and result.tool_call_id == call.get('id')
+                               and ((_payload(result) or {}).get('diagnostics') or {}).get('new_execution_created') is False
+                               for result in messages)
+                if rejected:
+                    continue
+                return False
+    # A Probe failure or malformed first submission has no legacy program to
+    # preserve. Keep the fresh-analysis contract rather than inventing one.
+    return True
 
 
 def _repair_uses_query_context(messages, work: str | None) -> bool:
@@ -1336,6 +1921,9 @@ def project_history(
     memory: WorkingMemoryIndex | None = None,
     work: str | None = None,
     compact_schema_reader_results: bool = False,
+    semantic_plan_available: bool = False,
+    discard_invalidated_plans: bool = False,
+    material_plan_available: bool = False,
     retain_query_context: bool = True,
 ):
     """Remove replaced code and repeated protocol material, never business facts."""
@@ -1343,6 +1931,9 @@ def project_history(
     superseded_program_events = memory.superseded_program_events
     obsolete_probe_events = set(memory.obsolete_probe_events)
     superseded_control_events = set(memory.superseded_control_events)
+    successful_semantic_calls = {
+        item.source_event_id for item in memory.of_kind(WorkingMemoryKind.SEMANTIC_PLAN)
+    }
     # The latest action/observation must close the visible ReAct step. The
     # memory lifecycle archives it after a newer execution, not merely because
     # the next work is implement. Its facts are independently de-duplicated.
@@ -1357,10 +1948,49 @@ def project_history(
                                if call['args'].get(key)), None)
                 if isinstance(source, str):
                     program_sources[call['id']] = source
+    pending_presentation_calls = {
+        str(message.tool_call_id or '')
+        for message in messages
+        if isinstance(message, ToolMessage)
+        and calls.get(str(message.tool_call_id or '')) == 'submit_analysis_program'
+        and (_payload(message) or {}).get('status') == 'presentation_pending'
+    }
     for index, message in enumerate(messages):
         if isinstance(message, AIMessage):
             for call in message.tool_calls:
                 call_indices[str(call['id'])] = index
+    failed_semantic_calls = set()
+    for message in messages:
+        if not isinstance(message, ToolMessage):
+            continue
+        identity = str(message.tool_call_id or '')
+        if calls.get(identity) != 'plan_runtime_semantics':
+            continue
+        payload = _payload(message)
+        if message.status == 'error' or (payload and payload.get('status') in {'failed', 'error'}):
+            failed_semantic_calls.add(identity)
+    latest_semantic_failure_index = max(
+        (call_indices.get(identity, -1) for identity in failed_semantic_calls), default=-1,
+    )
+    # A failed plan revision replaces the earlier failed candidate, not the
+    # accepted plan. Keep its complete arguments and latest protocol feedback.
+    superseded_control_events.update(
+        identity for identity in failed_semantic_calls
+        if call_indices.get(identity, -1) < latest_semantic_failure_index
+    )
+    for kind, owner, available in (
+        (WorkingMemoryKind.SEMANTIC_PLAN, 'plan_runtime_semantics', semantic_plan_available),
+        (WorkingMemoryKind.MATERIAL_PLAN, 'plan_runtime_materials', material_plan_available),
+    ):
+        if not available:
+            continue
+        success_ids = {item.source_event_id for item in memory.of_kind(kind)}
+        latest_success_index = max((call_indices.get(identity, -1) for identity in success_ids), default=-1)
+        superseded_control_events.update(
+            identity for identity, name in calls.items()
+            if name == owner and identity not in success_ids
+            and call_indices.get(identity, -1) < latest_success_index
+        )
     latest_formal_call_id, active_formal_call_ids = _active_formal_program_chain(messages)
     latest_revision_call_id = next(
         (
@@ -1395,8 +2025,37 @@ def project_history(
         message = copy.deepcopy(original)
         if isinstance(message, AIMessage):
             retained_calls = []
+            completed_actions = []
             covered_probe_call_count = 0
             for call in message.tool_calls:
+                if (
+                    discard_invalidated_plans
+                    and (
+                        (call['name'] == 'plan_runtime_semantics' and not semantic_plan_available)
+                        or (call['name'] == 'plan_runtime_materials' and not material_plan_available)
+                    )
+                ):
+                    archived += 1
+                    continue
+                if (
+                    semantic_plan_available
+                    and call['name'] == 'plan_runtime_semantics'
+                    and str(call.get('id') or '') in successful_semantic_calls
+                    and str(call.get('id') or '') not in superseded_control_events
+                ):
+                    completed_actions.append({
+                        'action': 'plan_runtime_semantics',
+                        'tool_call_id': str(call['id']),
+                        'status': 'success',
+                        'analysis_goal': str(call['args'].get('analysis_goal') or ''),
+                        'question_ids': [
+                            str(item.get('question_id') or '')
+                            for item in call['args'].get('questions') or []
+                            if isinstance(item, dict)
+                        ],
+                        'delivery': 'Current semantic plan is in runtime_semantic_plan.',
+                    })
+                    continue
                 if call['name'] == 'read_runtime_query_context' and not retain_query_context:
                     archived += 1
                     continue
@@ -1421,11 +2080,27 @@ def project_history(
                 # Match the execution tool's accepted spellings and precedence.
                 # Only the outbound copy is normalized; audit source is intact.
                 source_keys = _execution_source_keys(call['name'])
-                source = next((call['args'][key] for key in source_keys if call['args'].get(key)), None)
+                source = (call['args'].get('definition_source')
+                          if call['name'] == 'submit_analysis_program' else None)
+                source = source or next((call['args'][key] for key in source_keys if call['args'].get(key)), None)
                 if source is not None:
-                    for key in source_keys:
-                        call['args'].pop(key, None)
-                    call['args']['code'] = source
+                    if work == 'express' and str(call.get('id') or '') in pending_presentation_calls:
+                        # The worker has already consumed this source. The
+                        # expression model needs the preserved plan and the
+                        # actual candidate facts, not another copy of the
+                        # implementation that produced them. Keep the paired
+                        # tool-call shape valid while projecting only the
+                        # outbound history; the canonical transcript is intact.
+                        for key in (*source_keys, 'definition_source'):
+                            call['args'].pop(key, None)
+                        call['args']['definition_source'] = (
+                            '[已执行的定义源码仅保留在原始 Runtime 历史；表达阶段使用下方本次候选事实，不重新执行。]'
+                        )
+                        archived += 1
+                    else:
+                        for key in source_keys:
+                            call['args'].pop(key, None)
+                        call['args']['code'] = source
                 if call['id'] in superseded_program_events:
                     call['args']['code'] = f"[Superseded program: original retained under tool call {call['id']} in execution history.]"
                     archived += 1
@@ -1438,7 +2113,19 @@ def project_history(
                     covered_probe_call_count += 1
                     continue
                 retained_calls.append(call)
-            if retained_calls:
+            if completed_actions:
+                # An assistant JSON completion example invites the model to
+                # announce another completed action instead of calling its tool.
+                memory = HumanMessage(
+                    content=json.dumps({'runtime_recorded_history': completed_actions}, ensure_ascii=False),
+                    name='runtime_memory',
+                )
+                if retained_calls:
+                    result.append(memory)
+                    message = message.model_copy(update={'content': '', 'tool_calls': retained_calls})
+                else:
+                    message = memory
+            elif retained_calls:
                 # Tool arguments/results are the canonical work memory. The
                 # free-form preamble attached to the same AI message is useful
                 # for the lossless audit/SSE stream, but replaying it duplicates
@@ -1451,6 +2138,15 @@ def project_history(
                 message = message.model_copy(update={'content': '', 'tool_calls': []})
             elif message.tool_calls and not retained_calls:
                 message = message.model_copy(update={'content': '', 'tool_calls': []})
+        if (
+            isinstance(message, ToolMessage)
+            and discard_invalidated_plans
+            and (
+                (calls.get(message.tool_call_id) == 'plan_runtime_semantics' and not semantic_plan_available)
+                or (calls.get(message.tool_call_id) == 'plan_runtime_materials' and not material_plan_available)
+            )
+        ):
+            continue
         if (
             isinstance(message, ToolMessage)
             and calls.get(message.tool_call_id) == 'read_runtime_query_context'
@@ -1471,6 +2167,13 @@ def project_history(
             continue
         if (
             isinstance(message, ToolMessage)
+            and semantic_plan_available
+            and str(message.tool_call_id or '') in successful_semantic_calls
+            and calls.get(message.tool_call_id) == 'plan_runtime_semantics'
+        ):
+            continue
+        if (
+            isinstance(message, ToolMessage)
             and str(message.tool_call_id or '') in revision_events_to_archive
         ):
             continue
@@ -1486,6 +2189,16 @@ def project_history(
             continue
         payload = _payload(message)
         if payload is not None:
+            if (
+                semantic_plan_available
+                and calls.get(message.tool_call_id) == 'plan_runtime_semantics'
+                and payload.get('status') == 'success'
+            ):
+                payload = {
+                    'tool': 'plan_runtime_semantics',
+                    'status': 'success',
+                    'delivery': 'Current semantic plan is in runtime_semantic_plan.',
+                }
             if payload.get('tool') == 'read_runtime_reference':
                 for reference in payload.get('references', []):
                     if isinstance(reference, dict):
@@ -1524,6 +2237,13 @@ def project_history(
                         and isinstance(payload.get('code_error_context'), dict)):
                     payload['code_error_context'] = _reference_replayed_source(
                         payload['code_error_context'], program_sources[message.tool_call_id],
+                        message.tool_call_id,
+                    )
+                if (message.tool_call_id == latest_formal_call_id
+                        and program_sources.get(message.tool_call_id)
+                        and isinstance(payload.get('repair_target'), dict)):
+                    payload['repair_target'] = _reference_replayed_source(
+                        payload['repair_target'], program_sources[message.tool_call_id],
                         message.tool_call_id,
                     )
                 diagnostics = payload.get('diagnostics')
@@ -2009,17 +2729,38 @@ def _reduce_runtime_tool_call(request: ToolCallRequest, result):
 def build_working_request(request):
     context = request.runtime.context
     packet = _ensure_runtime_work_packet(context, request.messages)
-    _, legacy_focus, references, legacy_material_plan = resolve_effective_work(request.messages)
+    _, legacy_focus, references, _ = resolve_effective_work(request.messages)
     work = runtime_phase_work(packet.phase)
     focus = packet.focus or legacy_focus
-    material_plan = packet.material_manifest or legacy_material_plan
+    material_plan = packet.material_manifest
     material_datasource_ids, material_fields = _resolve_prompt_material_scope(
         request.messages,
         work=work,
         material_plan=material_plan,
         packet=packet,
     )
-    contract_ids = work_contracts(context, work, references)
+    if work in {'plan', 'implement', 'repair'} and packet.semantic_plan:
+        active_snapshot = context.active_datasource_snapshot or {}
+        selected_ids = {
+            _positive_int(identity) for identity in active_snapshot.get('selected_datasource_ids') or []
+        }
+        if not selected_ids:
+            selected_ids = {
+                _positive_int(source.get('datasource_id') or source.get('id'))
+                for source in (active_snapshot.get('selected_datasource_snapshot')
+                               or (context.execution_datasource_snapshot or {}).get('selected_datasource_snapshot') or [])
+                if isinstance(source, dict)
+            }
+        selected_ids.discard(0)
+        material_datasource_ids, material_fields = _merge_semantic_source_scope(
+            material_datasource_ids, material_fields, packet.semantic_plan, selected_ids,
+        )
+    latest_program, _ = _active_formal_program_chain(request.messages)
+    # New analysis enters through the host-scheduled definition contract.
+    # Repairs keep the protocol of the active persisted program so legacy
+    # snapshots remain repairable without rewriting their execution model.
+    definition_program = _uses_native_definition(request.messages, work)
+    contract_ids = work_contracts(context, work, references, definition_program=definition_program)
     message_memory = build_working_memory_index(request.messages)
     fact_messages, query_facts, probe_facts = collect_runtime_facts(request.messages)
     probe_facts = merge_runtime_probe_facts(
@@ -2052,6 +2793,7 @@ def build_working_request(request):
         )
     )
     schema_loaded_from_reader = bool(canonical_schema_covered)
+    planning_schema_in_view = bool(schema_detail_workspace) and work in {'understand', 'plan'}
     schema_loaded_from_snapshot = bool(
         schema_scope_available and not schema_loaded_from_reader
     )
@@ -2063,7 +2805,10 @@ def build_working_request(request):
         # candidate artifacts. Replaying exploratory Schema reads adds no new
         # evidence and can make this deliberately focused state larger than
         # implementation itself.
-        compact_schema_reader_results=(canonical_schema_covered or work == 'review'),
+        compact_schema_reader_results=(canonical_schema_covered or planning_schema_in_view or work == 'review'),
+        semantic_plan_available=bool(packet.semantic_plan),
+        discard_invalidated_plans=packet.goal_revision > 1 or bool(packet.semantic_plan),
+        material_plan_available=bool(packet.material_manifest),
         retain_query_context=retain_query_context,
     )
     memory = message_memory.with_items(build_context_memory_items(context, contract_ids))
@@ -2076,11 +2821,11 @@ def build_working_request(request):
         context.active_datasource_snapshot,
         context.execution_datasource_snapshot,
         work=work,
-        datasource_ids=material_datasource_ids if work in {'probe', 'probe_repair', 'implement', 'repair'} else (),
-        field_names_by_datasource=material_fields if work in {'probe', 'probe_repair', 'implement', 'repair'} else {},
+        datasource_ids=material_datasource_ids if work in {'plan', 'probe', 'probe_repair', 'implement', 'repair'} else (),
+        field_names_by_datasource=material_fields if work in {'plan', 'probe', 'probe_repair', 'implement', 'repair'} else {},
         material_plan=material_plan if work in {'probe', 'probe_repair', 'implement', 'repair'} else None,
         schema_detail_workspace=schema_detail_workspace,
-        omit_replayed_details=canonical_schema_covered,
+        omit_replayed_details=canonical_schema_covered or planning_schema_in_view,
     )
     exact_schema_required = bool(
         material_plan
@@ -2117,28 +2862,35 @@ def build_working_request(request):
             'focus': focus,
             'contract_ids': contract_ids,
             'runtime_material_plan': material_plan,
+            'runtime_semantic_plan': semantic_plan_work_view(packet.semantic_plan),
+            **({'expression_scope': semantic_reporting_scope(packet.semantic_plan)}
+               if work == 'express' and packet.semantic_plan else {}),
+            **({'semantic_implementation_bindings': semantic_implementation_bindings(packet.semantic_plan)}
+               if work in {'implement', 'repair'} and packet.semantic_plan else {}),
             'material_datasource_ids': material_datasource_ids if work in {'probe', 'probe_repair', 'implement', 'repair'} else [],
             'material_fields_by_datasource': material_fields if work in {'probe', 'probe_repair', 'implement', 'repair'} else {},
             'pending_review_patch': (
                 packet.pending_review_patch if work == 'repair' and packet.pending_review_patch else {}
             ),
         }, ensure_ascii=False)
-        + ('\n理解阶段先选择 plan。计划阶段只组织业务事实、来源、字段和已确认关系，不定义指标、图表或报告。'
-           '计划产物是后续 Probe、正式实现和修复共同复用的材料范围，不改变完整分析范围。'
+        + ('\n当前先用 plan_runtime_semantics 提交完整 JSON 语义对象，确认全部问题的事实来源、总体、时间归属、必要计算语义和待核实项。'
+           '尚未读取的字段定义可通过 read_runtime_datasource_context 获取；不得预设真实数值或无数据。'
            if work == 'understand' else
-           '\n计划阶段使用 plan_runtime_materials 组织当前问题的事实、来源、字段和关系；技术未知才标记为需要 Probe。'
-           '计划只固化可读取的材料范围，不定义指标、图表或报告。'
+           '\n计划阶段依据 runtime_semantic_plan 使用 plan_runtime_materials 组织来源、字段和关系；'
+           '技术未知才标记为需要 Probe。材料计划不能改变已经确认的总体与计算语义。'
            if work == 'plan' else
            work_schema_instruction)
+        + ('\n计算已在当前 execution_id 完成。请只依据紧邻工具结果中的本次事实和产物撰写完整用户表达，'
+           '不得查询或重算；标记为截断的事实只是样本，不能当总体。'
+           '这是创作步骤，不是语义复核。只有存在会改变答案的关键业务歧义且上下文无法确定时才澄清。'
+           '用 compose_analysis_presentation 一次提交当前输出协议要求的完整内容。'
+           if work == 'express' else '')
         + ('每次 Probe 完成后必须先基于事实账本重新选择下一项工作；只有新的、未被账本覆盖的技术未知才选择 Probe。'
            if work == 'understand' and probe_facts else '')
         + ('当前 Review 已授权局部源码修订；必须以 pending_review_patch.base_execution_id 和 allowed_ranges '
            '提交 patches，不能重写完整程序。'
            if work == 'repair' and packet.pending_review_patch else
            '修复保持完整分析目标。若需要进一步探测，可以切换回 probe；探测完成不自动代表全部未知已解决。')
-        + '\n' + load_runtime_work_contract_text(
-            contract_ids, work=work, output_format=context.output_contract.get('type', 'standard'),
-            example_contract_ids=references)
         + ('\n<executed-query-facts>\n'
            + '工具消息中的 query_snapshot_refs 指向下列执行依据索引。不同版本分别保留，不代表旧失败已经解决。\n'
            + '需要实际执行语句或精确查询实现时，用 definition_id 调用 read_runtime_query_context；该工具只读取本轮记录，不执行查询。\n'
@@ -2150,7 +2902,13 @@ def build_working_request(request):
            + '\n</probe-fact-ledger>' if probe_facts else '')
         + '\n</runtime-working-context>'
     )
-    system = SystemMessage('\n\n'.join([*system_parts, datasource_view.content, current.content]))
+    work_protocol = SystemMessage('<runtime-contracts>\n' + load_runtime_work_contract_text(
+        contract_ids, work=work, output_format=context.output_contract.get('type', 'standard'),
+        example_contract_ids=references,
+    ) + '\n</runtime-contracts>')
+    system = SystemMessage('\n\n'.join([
+        *system_parts, work_protocol.content, datasource_view.content, current.content,
+    ]))
     allowed_execution = {'probe': 'probe_analysis_data', 'probe_repair': 'probe_analysis_data', 'implement': 'submit_analysis_program',
                          'repair': 'submit_analysis_program'}.get(work)
     def tool_name(item):
@@ -2166,16 +2924,20 @@ def build_working_request(request):
         # public semantic tools so their execution-mode binding is enforceable.
         if name == 'execute_python':
             return False
+        if work == 'express':
+            return name in {'compose_analysis_presentation', 'request_analysis_clarification'}
         # ``plan`` has one producer: the material-plan tool.  Letting the
         # model select Probe/implementation again at this point made the
         # plan optional, so executable work could start without the focused
         # source/field view that the plan is responsible for producing.
+        if name == 'plan_runtime_semantics':
+            return work in {'understand', 'plan', 'implement', 'repair'}
         if name == 'select_runtime_work':
             # Work selection owns only the entry into the material-plan
             # lifecycle. Exposing the generic selector after that point permits
             # same-state transitions such as implement -> implement: they do no
             # analytical work, but become fresh control memory and defer code.
-            return work == 'understand'
+            return False
         if name == 'request_runtime_probe':
             # Executable work has one explicit escape hatch. A newly discovered
             # technical unknown can enter Probe and then resume its caller;
@@ -2183,6 +2945,8 @@ def build_working_request(request):
             return work in {'implement', 'repair'}
         if name in {'probe_analysis_data', 'submit_analysis_program'}:
             return name == allowed_execution
+        if name == 'compose_analysis_presentation':
+            return work == 'express'
         if name == 'accept_analysis_result':
             return work == 'review'
         if name == 'request_analysis_revision':
@@ -2208,8 +2972,6 @@ def build_working_request(request):
         if name == 'read_runtime_datasource_context':
             if work == 'review':
                 return False
-            if work == 'understand':
-                return False
             # A material plan is a working selection, not proof that all
             # implementation dependencies were discovered. Reads preserve
             # the current focus and return exact Schema through tool results.
@@ -2218,6 +2980,51 @@ def build_working_request(request):
         return True
 
     tools = [item for item in request.tools if visible_in_work(item)]
+    if work == 'express' and str((getattr(context, 'output_contract', {}) or {}).get('type', 'standard')) in {'standard', 'text'}:
+        has_bound_results = any(
+            isinstance(message, ToolMessage)
+            and (_payload(message) or {}).get('status') == 'presentation_pending'
+            and (_payload(message) or {}).get('execution_id') == packet.active_execution_id
+            and any(trace.get('findings') or trace.get('facts') for trace in (_payload(message) or {}).get('facts', [])
+                    if isinstance(trace, dict))
+            for message in request.messages
+        )
+        if has_bound_results:
+            from agent.tools import ComposeBoundPresentationInput
+            tools = [item.model_copy(update={'args_schema': ComposeBoundPresentationInput})
+                     if tool_name(item) == 'compose_analysis_presentation' and hasattr(item, 'model_copy')
+                     else item for item in tools]
+    tools = [
+        item.model_copy(update={'args_schema': _semantic_plan_input_for_context(context)})
+        if tool_name(item) == 'plan_runtime_semantics' and hasattr(item, 'model_copy')
+        else item
+        for item in tools
+    ]
+    if work in {'implement', 'repair'}:
+        latest_formal_call, _ = _active_formal_program_chain(request.messages)
+        current_definition = _uses_native_definition(request.messages, work)
+        patch_authorized = False
+        for message in reversed(request.messages):
+            if isinstance(message, ToolMessage) and message.tool_call_id == latest_formal_call:
+                target = (_payload(message) or {}).get('repair_target') or {}
+                patch_authorized = (
+                    isinstance(target, dict)
+                    and target.get('mode') == 'line_patch'
+                    and bool(target.get('base_execution_id'))
+                )
+                break
+        if not patch_authorized or current_definition:
+            from agent.tools import FullAnalysisProgramInput, ExecutableAnalysisProgramInput
+
+            delivery_schema = (ExecutableAnalysisProgramInput
+                               if current_definition else FullAnalysisProgramInput)
+
+            tools = [
+                item.model_copy(update={'args_schema': delivery_schema})
+                if item.name == 'submit_analysis_program' and hasattr(item, 'model_copy')
+                else item
+                for item in tools
+            ]
     logger.debug(
         'Runtime tool surface work=%s available=%s selected=%s',
         work,
@@ -2231,6 +3038,7 @@ def build_working_request(request):
     }
     base_system_tokens = estimate_work_messages([SystemMessage('\n\n'.join(system_parts))]) if system_parts else 0
     datasource_tokens = estimate_work_messages([datasource_view])
+    protocol_tokens = estimate_work_messages([work_protocol])
     work_context_tokens = estimate_work_messages([current])
     history_tokens = estimate_work_messages(messages)
     tool_schema_chars = sum(
@@ -2245,6 +3053,7 @@ def build_working_request(request):
                 {
                     'base_system_tokens': base_system_tokens,
                     'datasource_tokens': datasource_tokens,
+                    'protocol_tokens': protocol_tokens,
                     'work_context_tokens': work_context_tokens,
                     'history_tokens': history_tokens,
                     'tool_schema_chars': tool_schema_chars,
@@ -2255,13 +3064,17 @@ def build_working_request(request):
 class RuntimeWorkingContextMiddleware(AgentMiddleware):
     @staticmethod
     def _log_model_turn(work: str, started_at: float, result) -> None:
-        tool_calls = list(getattr(result, 'tool_calls', None) or [])
-        content = getattr(result, 'content', '')
+        messages = getattr(result, 'result', None)
+        if not isinstance(messages, list):
+            messages = [result]
+        tool_calls = [call for message in messages
+                      for call in (getattr(message, 'tool_calls', None) or [])]
+        output_chars = sum(len(str(getattr(message, 'content', '') or '')) for message in messages)
         logger.info(
             'Runtime model turn completed: work=%s elapsed_seconds=%.3f output_chars=%s tool_calls=%s',
             work,
             time.perf_counter() - started_at,
-            len(str(content or '')),
+            output_chars,
             [str(call.get('name') or '') for call in tool_calls if isinstance(call, dict)],
         )
 
@@ -2300,7 +3113,9 @@ class RuntimeWorkingContextMiddleware(AgentMiddleware):
         return result
 
     def wrap_tool_call(self, request, handler):
-        return _reduce_runtime_tool_call(request, handler(request))
+        failure = _semantic_plan_argument_failure(request) or _program_protocol_argument_failure(request)
+        return _reduce_runtime_tool_call(request, failure if failure is not None else handler(request))
 
     async def awrap_tool_call(self, request, handler):
-        return _reduce_runtime_tool_call(request, await handler(request))
+        failure = _semantic_plan_argument_failure(request) or _program_protocol_argument_failure(request)
+        return _reduce_runtime_tool_call(request, failure if failure is not None else await handler(request))

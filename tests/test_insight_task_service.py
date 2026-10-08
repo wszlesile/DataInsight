@@ -158,6 +158,19 @@ def test_monthly_schedule_rejects_invalid_day(day_of_month):
         })
 
 
+def test_task_snapshot_retains_calculation_identities_without_prior_receipts():
+    session = _session()
+    try:
+        execution = _source_execution(session)
+        execution.result_payload_json = dump_json({'semantic_execution_coverage': {'results': [{
+            'question_id': 'q1', 'result_id': 'contracts', 'execution_token': 'old',
+            'report_spans': [{'start': 10}]}]}})
+        snapshot = InsightTaskService(session)._snapshot_from_execution(execution)
+        assert snapshot.semantic_delivery_requirements == [{'question_id': 'q1', 'result_id': 'contracts'}]
+    finally:
+        session.close()
+
+
 def test_task_snapshot_is_private_and_fixed_parameter_analysis_is_runnable():
     session = _session()
     try:

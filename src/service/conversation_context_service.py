@@ -456,22 +456,20 @@ class ConversationContextService:
             raise AnalysisTaskCancelled(CANCELLED_MESSAGE)
 
         self._refresh_memories(conversation)
-        # Commit the successful analysis before optional Evidence post-processing.
-        # Evidence persistence uses the next transaction and cannot roll the result back.
+        # Commit the successful analysis before queuing optional post-processing.
         self.session.commit()
         if evidence_enabled:
             try:
-                EvidenceAssemblyService(self.session).assemble_for_execution(
+                EvidenceAssemblyService(self.session).enqueue_for_execution(
                     conversation_id=conversation.id,
                     turn_id=turn.id,
                     execution=latest_execution,
-                    artifacts=artifacts,
                 )
                 self.session.commit()
             except Exception as exc:
                 self.session.rollback()
                 logger.warning(
-                    "post-analysis evidence persistence failed without affecting analysis: execution_id=%s error=%s",
+                    "post-analysis evidence enqueue failed: execution_id=%s error=%s",
                     int(getattr(latest_execution, 'id', 0) or 0),
                     exc,
                     exc_info=True,

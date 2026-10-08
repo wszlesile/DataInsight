@@ -4,16 +4,16 @@
 
 <!-- runtime-helper-reference -->
 
-- `query_local_file(...)`、`query_local_file_low_memory(...)`、`load_local_file(...)`、`load_local_file_low_memory(...)` 已直接注入代码执行命名空间，按函数名直接调用，不需要也不能从 `query.local_file`、`runtime_api` 或其他模块 import。`query.local_file` 只是本契约的标识，不是 Python 包路径。
-- 本地文件使用 `datasource_identifier` 作为路径，不使用 `load_data_with_sql`。
-- 普通文件优先使用 `query_local_file(...)`，由后端一次完成约束校验、QuerySnapshot 注册和 `load_local_file(...)` 加载。
-- 当查询范围是完整文件、没有时间或对象筛选且粒度为 `detail` 时，组合 helper 会直接确认全量明细读取；不需要为了通过校验重复填写 `aggregation_hints=["detail"]`。存在筛选或非明细聚合时，仍须提供与真实 DataFrame 实现一致的 `filter_expressions` / `aggregation_hints`。
+- 文件 helper 已直接注入代码执行命名空间，直接调用，不能从 `query.local_file`、`runtime_api` import；契约标识不是 Python 包。
+- 组合 helper 从本轮快照用选定的 `datasource_id` 解析路径，不要抄写或编造路径；旧代码可传 `file_path`。不使用 `load_data_with_sql`。
+- 普通文件优先使用 `query_local_file(...)` 一次完成校验、快照和加载。
+- 无筛选完整明细可省略 `aggregation_hints`；有筛选或非明细聚合时，需提供与实际 DataFrame 实现一致的 `filter_expressions` / `aggregation_hints`。
 - 数据源推荐低内存读取或全量读取发生内存错误时，优先使用 `query_local_file_low_memory(...)`；它返回批次迭代器，必须在每批内过滤和累计，禁止把全部批次重新拼成超大 DataFrame。
-- `validate_query_constraints(...)`、`load_local_file(...)` 和 `load_local_file_low_memory(...)` 继续用于需要拆分校验、派生范围或特殊控制流的场景。
+- 特殊控制流才拆开 `validate_query_constraints(...)` 和底层 loader。
 - Excel 带 `sheet_name` 时必须传入。同一工作簿的多个工作表可共享路径，但用 `datasource_id` 和 `sheet_name` 区分。
-- `usecols/dtype/parse_dates` 只声明实际需要的字段，字段严格来自当前文件完整 Schema。
-- 文件 Probe 遵守推荐 loader，只累计行数、时间范围、Top 候选等轻量观察。
-- 多文件业务独立则分别分析；存在已确认关系时先在各自粒度过滤/聚合，再做受控关联。
+- `usecols/dtype/parse_dates` 仅供低内存读取；字段必须来自当前文件完整 Schema。
+- 文件 Probe 用推荐 loader，只累计总行数、时间范围和 Top 候选。
+- 多文件先分别分析；关系已确认时，先按各自粒度过滤/聚合再关联。
 
 ## 低内存与完整范围
 
@@ -25,15 +25,32 @@
 ## 过滤与校验
 
 - 正式文件分析优先由 `analysis_parameters` 构造 `file_filters`，再交给组合查询 API；校验通过后 loader 会对 DataFrame 实际执行这些结构化过滤，并把它们写入 QuerySnapshot。
+- Helper 返回过滤后的明细，不分组聚合；查询 `aggregation` 为 `None` 或 `detail`，分组在后续计算中完成。
 - `file_filters` 是 `list[dict]`，每项为 `{field, op, value}`；支持 `eq`、`in`、`gt`、`gte`、`lt`、`lte`、`is_null`、`not_null`。字段必须来自当前文件 Schema。`is_null` / `not_null` 不传 `value`。
-- `filter_expressions` 的类型仍是 `list[str]`，仅用于复杂派生 DataFrame 过滤的约束校验，不由 loader 执行。使用它时，代码必须在读取后对 DataFrame 实际应用同一表达式；不要把结构化筛选对象塞进 `filter_expressions`。
+- `filter_expressions` 是 `list[str]`，仅校验复杂派生筛选，不会被 loader 执行；读取后必须应用同一表达式，不能放结构化筛选对象。
 - 最小调用与执行关系如下：
 
 ```python
+data = query_local_file(
+    query_key="q_file_detail",
+    query_constraints={"time_range": None, "target_filters": [],
+                       "aggregation": {"grain": "detail", "metric": "detail"}},
+    datasource_id=123,  # 替换为本轮选定数据源的真实 ID
+)
+```
+
+返回 DataFrame；筛选时添加 `file_filters` 并同步口径。校验失败自动反馈。
+
+```python
 file_filters = [{"field": "category", "op": "eq", "value": category}]
-data = query_local_file(query_key=query_key, query_constraints=query_constraints,
-                       file_path=file_path, file_filters=file_filters)
-filtered = data
+data = query_local_file(
+    query_key="q_category_detail",
+    query_constraints={"time_range": None, "target_filters": [
+        {"semantic_role": "business_category", "field_hint": "category",
+         "value": str(category), "match_mode": "exact"}], "aggregation": None},
+    datasource_id=123,  # 替换为本轮选定数据源的真实 ID
+    file_filters=file_filters,
+)
 ```
 
 - 精确匹配使用 `==/.eq/.isin`。`str.contains`、正则和候选集合用于 Probe 发现真实值，不能未经收敛直接作为正式统计口径。
@@ -43,7 +60,7 @@ filtered = data
 <!-- runtime-prompt-omit-start -->
 ## 完整组合示例
 
-下面示例只说明文件查询约束、真实过滤和最终产物的闭环。路径与字段必须替换为当前文件 Schema 中的真实值。
+下面示例只说明文件查询约束、真实过滤和最终产物的闭环。数据源 ID 与字段必须替换为当前选择和文件 Schema 中的真实值。
 
 <!-- canonical-runtime-example: local_file -->
 ```python
@@ -72,18 +89,17 @@ query_constraints = {
         "value": target_categories,
         "match_mode": "exact",
     }],
-    "aggregation": {"grain": "category", "metric": "metric_value"},
-    "notes": "按用户选择的类别汇总文件中的核心指标。",
+    "aggregation": {"grain": "detail", "metric": "detail"},
+    "notes": "读取用户选择类别的明细，随后在 DataFrame 中按类别汇总。",
 }
-filter_expressions = [f"data['category'].isin({target_categories!r})"]
+file_filters = [{"field": "category", "op": "in", "value": target_categories}]
 data = query_local_file(
-    query_key="q_local_category_summary",
+    query_key="q_local_category_detail",
     query_constraints=query_constraints,
-    file_path=r"D:\\path\\selected_file.csv",
-    filter_expressions=filter_expressions,
-    aggregation_hints=["category", "metric_value", "sum"],
+    datasource_id=123,  # 替换为本轮选定数据源的真实 ID
+    file_filters=file_filters,
 )
-filtered = data[data["category"].astype(str).isin(target_categories)].copy()
+filtered = data.copy()
 if filtered.empty:
     raise_no_data_error("文件读取成功，但目标类别范围内没有记录。")
 
@@ -95,7 +111,7 @@ summary = (
 )
 total_value = float(summary["metric_value"].sum())
 top_row = summary.iloc[0]
-leader_rows = summary[summary["metric_value"] == top_row["metric_value"]]
+leader_rows = select_extreme_rows(summary, "metric_value", mode="max")
 if len(summary) == 1:
     comparison = "当前只有一个类别，尚不能比较类别差异。"
 elif len(leader_rows) > 1:

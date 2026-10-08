@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from agent.tools import run_generated_code_locally
 from analysis_runtime import AnalysisExecutionSnapshot, LocalAnalysisRuntime
+from analysis_runtime.contracts import delivery_requirements_from_result
 from analysis_runtime.parameters import (
     build_reusable_parameter_defaults,
     normalize_parameter_schema,
@@ -565,6 +566,7 @@ class InsightTaskService:
                 safe_json_loads(execution.analysis_parameters_json, {}),
             ),
             logic_signature=execution.analysis_logic_signature or '',
+            semantic_delivery_requirements=delivery_requirements_from_result(source_payload),
         )
 
     def _snapshot_signature(self, snapshot: AnalysisExecutionSnapshot) -> str:

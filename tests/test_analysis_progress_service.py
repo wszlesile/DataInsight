@@ -5,7 +5,14 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from config.database import Base
-from model import InsightAnalysisTask, InsightNamespace, InsightNsConversation, InsightNsTurn
+from model import (
+    InsightAnalysisTask,
+    InsightNamespace,
+    InsightNsConversation,
+    InsightNsExecution,
+    InsightNsExecutionEvidence,
+    InsightNsTurn,
+)
 from service.analysis_progress_service import load_progress, save_progress
 from service.insight_ns_conversation_service import InsightNsConversationService
 
@@ -46,6 +53,26 @@ def test_progress_history_returns_only_latest_task_version():
     service = InsightNsConversationService(session)
     assert [event['event_id'] for event in service.get_conversation_history('alice', 19)['history'][0]['progress']] == ['new']
     assert [event['event_id'] for event in service.get_turn_detail('alice', 19, 39)['progress']] == ['new']
+    execution = InsightNsExecution(
+        id=47,
+        conversation_id=19,
+        turn_id=39,
+        execution_status='success',
+        content_enabled=1,
+    )
+    session.add(execution)
+    session.add(InsightNsExecutionEvidence(
+        conversation_id=19,
+        turn_id=39,
+        execution_id=47,
+        compilation_status='queued',
+        diagnostics_json='{}',
+        query_snapshots_json='{}',
+        evidence_map_json='{}',
+        is_deleted=0,
+    ))
+    session.commit()
+    assert service.get_evidence_compilation_status('alice', 19, 39)['status'] == 'queued'
     rows = session.execute(Base.metadata.tables['insight_ns_message'].select()).mappings().all()
     assert {json.loads(row['content_json'])['event_id'] for row in rows} == {'old', 'new'}
     session.close()

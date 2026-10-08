@@ -45,29 +45,52 @@ def finalize_chart_spec(chart_spec: Any, max_rounds: int = 3) -> dict[str, Any]:
     3. optional browser-side validation
     4. deterministic repair
     """
-    option = normalize_chart_spec(chart_spec)
-    seen_snapshots: set[str] = set()
+    return finalize_chart_specs([chart_spec], max_rounds=max_rounds)[0]
+
+
+def finalize_chart_specs(chart_specs: list[Any], max_rounds: int = 3) -> list[dict[str, Any]]:
+    """Finalize charts together, sharing browser startup across layout checks."""
+    options = [normalize_chart_spec(spec) for spec in chart_specs]
+    seen_snapshots: list[set[str]] = [set() for _ in options]
+    pending = set(range(len(options)))
 
     for _ in range(max_rounds):
-        snapshot = json.dumps(option, ensure_ascii=False, sort_keys=True)
-        if snapshot in seen_snapshots:
-            break
-        seen_snapshots.add(snapshot)
+        current: dict[int, list[dict[str, Any]]] = {}
+        browser_indices: list[int] = []
+        for index in tuple(pending):
+            snapshot = json.dumps(options[index], ensure_ascii=False, sort_keys=True)
+            if snapshot in seen_snapshots[index]:
+                pending.remove(index)
+                continue
+            seen_snapshots[index].add(snapshot)
+            issues = collect_chart_layout_issues(options[index])
+            current[index] = issues
+            if _should_run_browser_validation(options[index], issues):
+                browser_indices.append(index)
 
-        issues = collect_chart_layout_issues(option)
-        browser_report = _run_browser_validation(option, issues)
-        if browser_report and not browser_report.get("skipped"):
-            issues.extend(browser_report.get("issues") or [])
+        browser_reports = _run_browser_validation_batch(
+            [options[index] for index in browser_indices],
+            [current[index] for index in browser_indices],
+        ) if browser_indices else []
+        reports_by_index = dict(zip(browser_indices, browser_reports))
 
-        if not issues:
-            return option
+        for index in tuple(pending):
+            if index not in current:
+                continue
+            issues = current[index]
+            browser_report = reports_by_index.get(index)
+            if browser_report and not browser_report.get('skipped'):
+                issues.extend(browser_report.get('issues') or [])
+            if not issues:
+                pending.remove(index)
+                continue
+            repaired = repair_chart_spec(options[index], issues)
+            if repaired == options[index]:
+                pending.remove(index)
+                continue
+            options[index] = normalize_chart_spec(repaired)
 
-        repaired = repair_chart_spec(option, issues)
-        if repaired == option:
-            return option
-        option = normalize_chart_spec(repaired)
-
-    return option
+    return options
 
 
 def collect_chart_layout_issues(chart_spec: Any) -> list[dict[str, Any]]:
@@ -219,19 +242,18 @@ def estimate_chart_height(chart_spec: Any) -> int:
     return min(max(height, 320), 720)
 
 
-def _run_browser_validation(option: dict[str, Any], issues: list[dict[str, Any]]) -> dict[str, Any] | None:
-    if not _should_run_browser_validation(option, issues):
-        return None
+def _run_browser_validation_batch(
+    options: list[dict[str, Any]], issues: list[list[dict[str, Any]]],
+) -> list[dict[str, Any] | None]:
+    try:
+        from utils.chart_export_utils import validate_chart_spec_layouts
+    except Exception:
+        return [None for _ in options]
 
     try:
-        from utils.chart_export_utils import validate_chart_spec_layout
+        return validate_chart_spec_layouts(options, timeout_ms=12000)
     except Exception:
-        return None
-
-    try:
-        return validate_chart_spec_layout(option, timeout_ms=12000)
-    except Exception:
-        return None
+        return [None for _ in options]
 
 
 def _should_run_browser_validation(option: dict[str, Any], issues: list[dict[str, Any]]) -> bool:

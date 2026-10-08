@@ -5,7 +5,7 @@ from collections import defaultdict
 from datetime import date, datetime, time
 from typing import Any
 
-from utils.chart_spec_utils import finalize_chart_spec
+from utils.chart_spec_utils import finalize_chart_spec, normalize_chart_spec
 
 
 SUPPORTED_CHART_KINDS = {"bar", "line", "pie", "scatter", "boxplot"}
@@ -141,7 +141,11 @@ def build_chart_result(
     source_query_key = _data_source_query_key(data)
     if source_query_key:
         result["chart_data_contract"] = {"source_query_key": source_query_key}
-    return result
+    from analysis_runtime.provenance import bind_chart_frame
+    return bind_chart_frame(result, data, {'chart_kind': chart_kind, 'category_field': category_field,
+        'value_field': value_field, 'series_field': series_field, 'x_field': x_field, 'y_field': y_field,
+        'sort_field': sort_field, 'sort_order': sort_order, 'limit': limit, 'top_n': top_n,
+        'merge_tail': merge_tail, 'value_precision': value_precision})
 
 
 def build_multi_metric_chart_result(
@@ -255,7 +259,10 @@ def build_multi_metric_chart_result(
     source_query_key = _data_source_query_key(data)
     if source_query_key:
         result["chart_data_contract"] = {"source_query_key": source_query_key}
-    return result
+    from analysis_runtime.provenance import bind_chart_frame
+    return bind_chart_frame(result, data, {'chart_kind': chart_kind_value, 'category_field': category_name,
+        'value_fields': normalized_value_fields, 'series_field': series_field,
+        'sort_field': sort_field, 'sort_order': sort_order, 'limit': limit, 'value_precision': value_precision})
 
 
 def build_chart_suite(
@@ -381,7 +388,9 @@ def build_chart_suite(
     return deduped_suite
 
 
-def normalize_chart_result_item(chart: Any, index: int = 1) -> dict[str, Any]:
+def normalize_chart_result_item(
+    chart: Any, index: int = 1, *, finalize_layout: bool = True,
+) -> dict[str, Any]:
     if not isinstance(chart, dict):
         raise ValueError("charts items must be dict objects.")
 
@@ -411,7 +420,7 @@ def normalize_chart_result_item(chart: Any, index: int = 1) -> dict[str, Any]:
             "title": document.get("title") or str(chart.get("title") or f"Chart {index}").strip(),
             "chart_type": "echarts",
             "description": document.get("description") or str(chart.get("description") or "").strip(),
-            "chart_spec": finalize_chart_spec(compiled_spec),
+            "chart_spec": _finalize_chart_spec(compiled_spec, finalize_layout),
             "chart_data_contract": data_contract,
         }
 
@@ -427,9 +436,9 @@ def normalize_chart_result_item(chart: Any, index: int = 1) -> dict[str, Any]:
         fallback_description=description,
     )
     final_spec = (
-        finalize_chart_spec(mark_chart_spec_backend_managed(compile_chart_document(inferred_document)))
+        _finalize_chart_spec(mark_chart_spec_backend_managed(compile_chart_document(inferred_document)), finalize_layout)
         if inferred_document
-        else finalize_chart_spec(mark_chart_spec_backend_managed(chart_spec))
+        else _finalize_chart_spec(mark_chart_spec_backend_managed(chart_spec), finalize_layout)
     )
     normalized = {
         "title": title,
@@ -442,6 +451,10 @@ def normalize_chart_result_item(chart: Any, index: int = 1) -> dict[str, Any]:
             "encoding": dict(inferred_document.get("encoding") or {}),
         }
     return normalized
+
+
+def _finalize_chart_spec(chart_spec: dict[str, Any], finalize_layout: bool) -> dict[str, Any]:
+    return finalize_chart_spec(chart_spec) if finalize_layout else normalize_chart_spec(chart_spec)
 
 
 def _data_source_query_key(data: Any) -> str:

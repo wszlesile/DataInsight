@@ -1,4 +1,5 @@
 import re
+from html import escape as escape_html
 from typing import Any
 
 
@@ -11,6 +12,7 @@ _COMPOUND_TAIL = re.compile(
     r"(\s*(?:\u3001|/|\u4e0e|\u548c|\u53ca)\s*)(?:\u6570\u636e\u6e90\s*#?\s*)?(\d+)"
 )
 _NUMERIC_RANGE_TILDE = re.compile(r"(?<=\d)\s*~\s*(?=\d)")
+_MARKDOWN_IMAGE = re.compile(r"!\[([^\]]*)\]\(([^)\r\n]*)\)")
 
 
 def _datasource_name_map(
@@ -57,6 +59,19 @@ def _replace_datasource_references(report: str, names: dict[int, str]) -> str:
     )
 
 
+def _replace_unsupported_markdown_images(report: str) -> str:
+    """Keep report text readable without emitting unsupported image artifacts."""
+    def replace_image(match: re.Match[str]) -> str:
+        alt_text = escape_html(match.group(1).strip(), quote=False)
+        destination = match.group(2).strip()
+        if destination.lower().startswith("chart:"):
+            label = alt_text or destination[len("chart:"):].strip()
+            return f"（图表：{label}）" if label else "（图表产物）"
+        return alt_text or "（图片产物暂不支持）"
+
+    return _MARKDOWN_IMAGE.sub(replace_image, report)
+
+
 def normalize_report_presentation(
     analysis_report: Any,
     datasource_bindings: list[dict[str, Any]] | None,
@@ -64,6 +79,7 @@ def normalize_report_presentation(
     """Normalize user-visible report notation without changing analytic meaning."""
     report = str(analysis_report or "")
     report = _replace_datasource_references(report, _datasource_name_map(datasource_bindings))
+    report = _replace_unsupported_markdown_images(report)
     # Markdown treats two unrelated ASCII tildes as one strikethrough span. A
     # full-width range separator preserves the intended date/number expression.
     return _NUMERIC_RANGE_TILDE.sub("\uff5e", report)

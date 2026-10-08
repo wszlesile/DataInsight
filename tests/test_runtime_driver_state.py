@@ -74,6 +74,40 @@ def test_formal_failure_keeps_only_latest_program_and_diagnostic_for_repair():
     assert completed.latest_diagnostic == {}
 
 
+def test_execution_candidate_advances_to_post_execution_authorship_not_review():
+    packet = new_runtime_work_packet(workspace_id='post-calc-expression', focus='Analyze ties')
+    packet = replace(packet, phase=RuntimePhase.IMPLEMENT, active_datasource_ids=(12,))
+    candidate = reduce_runtime_tool_result(
+        packet,
+        tool_name='submit_analysis_program',
+        tool_call_id='calc',
+        arguments={},
+        result={'status': 'presentation_pending', 'execution_id': 41},
+    )
+    assert candidate.phase is RuntimePhase.EXPRESS
+    assert candidate.active_execution_id == 41
+    assert candidate.active_datasource_ids == (12,)
+
+    completed = reduce_runtime_tool_result(
+        candidate,
+        tool_name='compose_analysis_presentation',
+        tool_call_id='expression',
+        arguments={'execution_id': 41},
+        result={'status': 'success', 'execution_id': 41},
+    )
+    assert completed.phase is RuntimePhase.COMPLETED
+
+    rejected = reduce_runtime_tool_result(
+        candidate,
+        tool_name='compose_analysis_presentation',
+        tool_call_id='wrong-expression',
+        arguments={'execution_id': 42},
+        result={'status': 'failed', 'execution_id': 42, 'error_type': 'candidate_mismatch'},
+    )
+    assert rejected.phase is RuntimePhase.EXPRESS
+    assert rejected.latest_diagnostic['error_type'] == 'candidate_mismatch'
+
+
 def test_clarification_resets_materialization_without_discarding_probe_audit():
     probing = record_material_manifest(new_workspace(), manifest(probe_required=True))
     observed = record_probe_result(probing, {
@@ -94,12 +128,15 @@ def test_runtime_work_packet_owns_the_complete_action_lifecycle():
 
     packet = reduce_runtime_tool_result(
         packet,
-        tool_name="select_runtime_work",
-        tool_call_id="select",
-        arguments={"work": "plan"},
-        result={"status": "success", "work": "plan"},
+        tool_name="plan_runtime_semantics",
+        tool_call_id="semantics",
+        arguments={},
+        result={"status": "success", "semantic_plan": {
+            "analysis_goal": "Analyze", "questions": [{"question_id": "question_1"}],
+        }},
     )
     assert packet.phase is RuntimePhase.PLAN
+    assert packet.semantic_plan["questions"][0]["question_id"] == "question_1"
 
     packet = reduce_runtime_tool_result(
         packet,
@@ -168,8 +205,54 @@ def test_runtime_work_packet_round_trip_and_clarification_resume_are_lossless():
     assert restored.phase is RuntimePhase.WAITING_CLARIFICATION
 
     resumed = resume_runtime_work_packet(restored)
-    assert resumed.phase is RuntimePhase.PLAN
+    assert resumed.phase is RuntimePhase.UNDERSTAND
     assert resumed.goal_revision == waiting.goal_revision + 1
+    assert resumed.semantic_plan == {}
+
+
+def test_semantic_revision_invalidates_material_scope_but_preserves_probe_facts():
+    packet = new_runtime_work_packet(workspace_id="w", focus="Analyze")
+    packet = reduce_runtime_tool_result(
+        packet,
+        tool_name="plan_runtime_semantics",
+        tool_call_id="semantics-1",
+        arguments={},
+        result={"status": "success", "semantic_plan": {
+            "analysis_goal": "Analyze", "questions": [{"question_id": "q1"}],
+        }},
+    )
+    packet = reduce_runtime_tool_result(
+        packet,
+        tool_name="plan_runtime_materials",
+        tool_call_id="materials",
+        arguments={},
+        result={"status": "success", **manifest(probe_required=True)},
+    )
+    packet = reduce_runtime_tool_result(
+        packet,
+        tool_name="probe_analysis_data",
+        tool_call_id="probe",
+        arguments={},
+        result={
+            "status": "observation",
+            "diagnostics": {"probe_fact_ledger": {"confirmed_facts": [{"fact_id": "f1"}]}},
+        },
+    )
+    revised = reduce_runtime_tool_result(
+        packet,
+        tool_name="plan_runtime_semantics",
+        tool_call_id="semantics-2",
+        arguments={},
+        result={"status": "success", "semantic_plan": {
+            "analysis_goal": "Analyze with observed enum",
+            "questions": [{"question_id": "q1", "time_basis": "observed"}],
+        }},
+    )
+    assert revised.phase is RuntimePhase.PLAN
+    assert revised.material_manifest == {}
+    assert revised.active_datasource_ids == ()
+    assert revised.probe_ledgers == packet.probe_ledgers
+    assert revised.semantic_plan["questions"][0]["time_basis"] == "observed"
 
 
 def test_material_and_probe_scope_return_with_the_parent_focus():
@@ -248,7 +331,7 @@ def test_all_unavailable_probe_paths_block_runtime_instead_of_entering_implement
     assert blocked.latest_diagnostic["error_type"] == "data_source_unavailable"
 
 
-def test_formal_probe_program_only_enters_initial_probe_once():
+def test_formal_probe_intent_is_repaired_without_implicit_probe():
     packet = reduce_runtime_tool_result(
         new_runtime_work_packet(workspace_id="w", focus="Analyze"),
         tool_name="plan_runtime_materials",
@@ -271,7 +354,8 @@ def test_formal_probe_program_only_enters_initial_probe_once():
             "diagnostics": {"violated_contract": "formal_tool_received_probe_program"},
         },
     )
-    assert first.phase is RuntimePhase.PROBE
+    assert first.phase is RuntimePhase.REPAIR
+    assert first.resume_phase is None
 
     observed = reduce_runtime_tool_result(
         first,
@@ -296,8 +380,8 @@ def test_formal_probe_program_only_enters_initial_probe_once():
             "diagnostics": {"violated_contract": "formal_tool_received_probe_program"},
         },
     )
-    assert repeated.phase is RuntimePhase.IMPLEMENT
-    assert repeated.reason == "formal_program_must_reuse_probe_facts"
+    assert repeated.phase is RuntimePhase.REPAIR
+    assert repeated.reason == "formal_program_requires_repair"
 
 
 def test_stale_probe_tool_call_does_not_reopen_probe_repair():

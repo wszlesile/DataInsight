@@ -2,6 +2,7 @@ import sys
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -13,16 +14,19 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from config.database import Base
+from config.config import Config
 from model import (
     InsightDatasource,
     InsightNamespace,
     InsightNsConversation,
     InsightNsExecution,
+    InsightNsExecutionEvidence,
     InsightNsMessage,
     InsightNsRelDatasource,
     InsightNsTurn,
 )
 from service.conversation_context_service import ConversationContextService, _attach_chart_artifact_refs
+from service.evidence_assembly_service import EvidenceAssemblyService
 
 
 class ConversationContextServiceTestCase(unittest.TestCase):
@@ -34,6 +38,72 @@ class ConversationContextServiceTestCase(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.session.close()
+
+    def test_successful_analysis_enqueues_evidence_without_waiting_for_compilation(self) -> None:
+        namespace = InsightNamespace(
+            username="alice",
+            name="test",
+            namespace_kind="interactive",
+            is_deleted=0,
+        )
+        self.session.add(namespace)
+        self.session.flush()
+        conversation = InsightNsConversation(
+            insight_namespace_id=namespace.id,
+            title="分析会话",
+            status="active",
+            summary_text="",
+            active_datasource_snapshot="{}",
+            last_turn_no=1,
+            user_message="分析问题",
+            insight_result="",
+            is_deleted=0,
+        )
+        self.session.add(conversation)
+        self.session.flush()
+        turn = InsightNsTurn(
+            conversation_id=conversation.id,
+            turn_no=1,
+            user_query="分析问题",
+            selected_datasource_ids_json="[]",
+            selected_datasource_snapshot_json="[]",
+            final_answer="",
+            status="running",
+            error_message="",
+            is_deleted=0,
+        )
+        self.session.add(turn)
+        self.session.flush()
+        self.session.add(InsightNsExecution(
+            conversation_id=conversation.id,
+            turn_id=turn.id,
+            generated_code="result = {}",
+            execution_status="success",
+            result_payload_json="{}",
+            used_datasource_ids_json="[]",
+            is_deleted=0,
+            content_enabled=1,
+        ))
+        self.session.commit()
+        service = ConversationContextService(self.session)
+        service._refresh_memories = lambda _conversation: None
+
+        with patch.object(Config, "POST_ANALYSIS_EVIDENCE_ENABLED", True), patch.object(
+            EvidenceAssemblyService,
+            "assemble_for_execution",
+            side_effect=AssertionError("Evidence compilation must not block analysis completion"),
+        ) as compile_evidence:
+            result = service.complete_run(
+                conversation_id=conversation.id,
+                turn_id=turn.id,
+                assistant_message="已完成分析",
+                analysis_report="报告正文",
+            )
+
+        compile_evidence.assert_not_called()
+        evidence = self.session.query(InsightNsExecutionEvidence).one()
+        self.assertEqual(evidence.compilation_status, "queued")
+        self.assertEqual(result["turn"].status, "success")
 
     def test_interactive_runtime_cannot_open_hidden_workflow_conversation(self) -> None:
         namespace = InsightNamespace(

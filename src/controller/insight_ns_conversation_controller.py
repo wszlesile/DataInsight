@@ -34,6 +34,7 @@ def create_insight_ns_conversation_controller() -> Blueprint:
     blueprint.route('/<int:conversation_id>/history', methods=['GET'])(controller.get_history)
     blueprint.route('/<int:conversation_id>/running-turn', methods=['GET'])(controller.get_running_turn)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>', methods=['GET'])(controller.get_turn_detail)
+    blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/evidence/status', methods=['GET'])(controller.get_evidence_compilation_status)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/versions', methods=['GET'])(controller.list_turn_versions)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/versions/initial', methods=['GET'])(controller.get_initial_turn_version)
     blueprint.route('/<int:conversation_id>/turns/<int:turn_id>/versions/<int:analysis_task_id>', methods=['GET'])(controller.get_turn_version_detail)
@@ -216,6 +217,22 @@ class InsightNsConversationController(BaseController):
             if detail is None:
                 return self.error_response('轮次详情不存在', 404)
             return jsonify(Result.success(data=detail).to_dict())
+        finally:
+            session.close()
+
+    def get_evidence_compilation_status(self, conversation_id: int, turn_id: int):
+        """Return the compact Evidence state without loading the full turn detail."""
+        session = SessionLocal()
+        try:
+            service = InsightNsConversationService(session)
+            status = service.get_evidence_compilation_status(
+                username=self._get_username(),
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+            )
+            if status is None:
+                return self.error_response('轮次详情不存在', 404)
+            return jsonify(Result.success(data=status).to_dict())
         finally:
             session.close()
 

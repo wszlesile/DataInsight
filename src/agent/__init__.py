@@ -20,6 +20,7 @@ from agent.context_engineering_runtime import (
 )
 from agent.tools import (
     accept_analysis_result,
+    compose_analysis_presentation,
     probe_analysis_data,
     request_analysis_clarification,
     request_analysis_revision,
@@ -40,10 +41,10 @@ from agent.invocation_policy import normalize_output_contract
 from agent.runtime_workspace import read_runtime_datasource_context
 from agent.runtime_working_context import (
     RuntimeWorkingContextMiddleware,
+    plan_runtime_semantics,
     plan_runtime_materials,
     read_runtime_query_context,
     request_runtime_probe,
-    select_runtime_work,
 )
 from config import Config
 from utils import logger
@@ -127,11 +128,12 @@ def create_data_insight_agent(
     clarification_mode: str = "same_turn",
 ):
     """创建数据洞察 Agent，并保持现有工具契约不变。"""
-    tools = [select_runtime_work, plan_runtime_materials, request_runtime_probe]
+    tools = [plan_runtime_semantics, plan_runtime_materials, request_runtime_probe]
     if clarification_mode == "same_turn":
         tools.append(request_analysis_clarification)
     tools.append(probe_analysis_data)
     tools.append(submit_analysis_program)
+    tools.append(compose_analysis_presentation)
     tools.append(accept_analysis_result)
     tools.append(request_analysis_revision)
     tools.append(read_runtime_datasource_context)

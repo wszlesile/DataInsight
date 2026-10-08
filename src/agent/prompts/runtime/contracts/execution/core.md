@@ -8,7 +8,7 @@
 - `probe` 只做有界真实观察，不计算正式指标，不创建正式产物，不保存半成品报告。`probe_analysis_data` 会自动返回查询执行事实和代码打印的有界摘要；需要给观察命名或组织更丰富的诊断时，可用 `result = request_retry(retry_type="probe_feedback", diagnostics=...)` 自定义反馈。
 - Probe 反馈中的 `_query_execution_outcomes` 由后端按真实查询快照提供执行状态和错误；`failed` 不表示无数据。结合对应查询与模型记录的观察判断后续动作。
 - 需要查看行数、样例、枚举、格式或覆盖范围时，调用 `probe_analysis_data`，返回结构化观察。
-- 已具备正式分析所需事实时，调用 `submit_analysis_program`，提交完整分析程序，不分段提交数据加载、中间 DataFrame 或报告草稿。
+- 已具备正式分析所需事实时，调用 `submit_analysis_program`，一次提交完整 Python 分析程序，不分段提交数据加载、中间 DataFrame 或报告草稿。
 - 代码只读，不访问网络、进程或系统敏感资源，不硬编码凭据，不修改数据源。
 
 ## Python 执行环境
@@ -171,7 +171,7 @@ child_data = query_data_with_sql(
 - 多条候选查询必须在同一次 Probe 中逐项检查，不因第一条成功而提前结束。`probe_data_with_sql` 的 `success + row_count>0`、`success/no_data + row_count=0`、`query_error` 分别对应可分析、成功空集和路径不可用。
 - diagnostics 返回真实观察，包括逐路径 datasource、status、row_count、columns、时间覆盖、候选值或错误类型；不能只返回 SQL、计划或推测。
 - 探测可以确认空格、大小写、连接符、日期边界和真实枚举；只有观察证明语义一致时才纠偏。Probe 中的模糊候选不能直接变成正式统计口径。
-- 全部必要路径成功查询但为空且原因尚待核实时，调用 `raise_no_data_error(...)`，不能生成全零报告、空排名或伪图表。依据真实观察确认查询口径仍为空后，使用当前输出协议说明无数据原因与建议；不需要为了收口重复探测到次数上限。
+- 全部必要路径成功查询但为空且原因尚待核实时，调用 `raise_no_data_error(...)`，不能生成全零报告、空排名或伪图表。依据真实观察确认查询口径仍为空后，使用当前输出协议说明无数据原因；只有用户要求或观察到的原因支持明确后续行动时才给建议，不需要为了收口重复探测到次数上限。
 - 聚合查询即使返回一行，代表目标业务总体的 `COUNT` 为 0 时仍没有可分析人群，不能仅以 DataFrame 非空判断有数据。某个金额、比率或其他指标为 0 不等于总体为空；多路径仍须分别判断，不能因此丢弃其他非空路径。
 - 部分路径为空时保留成功路径并披露受影响结论；`no_data` 与 `data_source_unavailable/query_error` 分开说明。
 - 文件不存在、表不存在、接口不可访问和认证失败不是无数据，应返回相应结构化错误。
@@ -194,8 +194,8 @@ result = request_retry(
 ## 保存、修复与安全
 
 - 正式分析只调用一次 `result = save_analysis_result(...)`，并且只使用本轮加载的 `result.*` contract pack 所规定的终态参数。
-- `used_datasource_ids` 与真实访问范围一致；结果不能声称使用未查询来源。
-- 只有反馈明确给出 `repair_target` 且错误是孤立的工具/API 调用问题时，才可使用 `code=""`、`base_execution_id + patches`；每个 patch 必须完整替换一个 Python 语句或代码块。查询范围、字段归属、JOIN、聚合、计算、报告求值或产物结构受影响时，必须在当前完整洞察语义下提交完整 `code`，不能用局部 patch 保留旧数据流。
+- 外层执行工具参数 `used_datasource_ids` 与代码真实访问范围一致，由后端记录来源；Python 内的 `save_analysis_result` 只接收当前结果协议的保存参数。
+- 局部技术修复只有在反馈明确给出 `repair_target` 时，才可使用 `code=""`、`base_execution_id + patches`；每个 patch 必须完整替换一个授权 Python 语句或代码块，并继续交付该语句的输出。查询范围、字段归属、JOIN、聚合、计算或产物结构需要超出授权范围调整时，必须在当前完整洞察语义下提交完整 `code`。
 - 禁止 `except Exception: pass`，也不能把数据访问、字段、类型、图表或保存错误改写成空 DataFrame、空列表或“无数据”。
 - 维度键缺失不等于数值为零。先统一键类型并检查存在性，不能用 `mapping.get(key, 0)` 把口径缺失伪装成真实零值。
 - 最终结果来自工具执行，不把 Python 代码、工具参数、内部错误或调用过程作为用户答复。

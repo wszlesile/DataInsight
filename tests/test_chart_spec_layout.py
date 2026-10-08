@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -9,10 +10,37 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from utils.chart_export_utils import validate_chart_spec_layout
-from utils.chart_spec_utils import finalize_chart_spec
+from utils.chart_spec_utils import finalize_chart_spec, finalize_chart_specs
 
 
 class ChartSpecLayoutTestCase(unittest.TestCase):
+    def test_batch_finalization_shares_one_browser_validation_round(self) -> None:
+        specs = [
+            {
+                "title": {"text": f"Chart {chart_index}"},
+                "legend": {"data": [f"Series-{index}" for index in range(7)]},
+                "xAxis": {"type": "category", "data": ["A", "B"]},
+                "yAxis": {"type": "value"},
+                "series": [{"type": "bar", "name": "Series-0", "data": [1, 2]}],
+            }
+            for chart_index in range(2)
+        ]
+        calls = []
+
+        def validate_batch(chart_specs, timeout_ms=15000):
+            calls.append((chart_specs, timeout_ms))
+            return [
+                {"passed": True, "issues": [], "metrics": {}, "skipped": False}
+                for _ in chart_specs
+            ]
+
+        with patch('utils.chart_export_utils.validate_chart_spec_layouts', side_effect=validate_batch):
+            finalized = finalize_chart_specs(specs)
+
+        self.assertEqual(len(finalized), 2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0][0]), 2)
+
     def test_vertical_legend_reserves_space_outside_plot_grid(self) -> None:
         legend_names = [f"Batch-{index:02d}" for index in range(10)]
         raw_spec = {

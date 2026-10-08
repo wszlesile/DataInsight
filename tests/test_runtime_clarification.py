@@ -563,11 +563,11 @@ def test_runtime_prompt_keeps_clarification_inside_unified_runtime():
     ])
 
     assert "request_analysis_clarification" in prompt
-    assert "不生成独立指标计划或报告模板" in prompt
+    assert "不是固定指标清单或报告模板" in prompt
     assert 'execution_intent = "probe"' in prompt
-    assert "于当前 ReAct 内完成必要的口径落地" in prompt
+    assert "先形成可修订的洞察语义工作记录" in prompt
     assert "父实体定义统计总体时，先形成父实体范围" in prompt
-    assert "不再增加一次语义确认工具回合" in prompt
+    assert "恢复后先用它修订当前语义计划" in prompt
 
 
 def test_runtime_path_has_no_secondary_semantic_compiler_or_reviewer():

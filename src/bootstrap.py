@@ -16,11 +16,24 @@ def _start_task_runner() -> threading.Thread:
     return thread
 
 
+def _start_evidence_runner() -> threading.Thread:
+    from service.evidence_task_runner import EvidenceTaskRunner
+
+    thread = threading.Thread(
+        target=EvidenceTaskRunner().run_forever,
+        name='insight-evidence-runner',
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def main():
     role = Config.INSIGHT_APP_ROLE
     if role == 'task-runner':
         from insight_task.runner import InsightTaskRunner
 
+        _start_evidence_runner()
         InsightTaskRunner().run_forever()
         return
     if role not in {'all', 'api'}:
@@ -29,6 +42,7 @@ def main():
     app = create_app(Config)
     if role == 'all':
         _start_task_runner()
+        _start_evidence_runner()
     host = os.environ.get('HOST', '0.0.0.0')
     port = int(os.environ.get('PORT', 5000))
     debug = Config.DEBUG

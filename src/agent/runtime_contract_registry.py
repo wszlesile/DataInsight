@@ -26,7 +26,7 @@ RUNTIME_CONTRACT_PACKS: tuple[RuntimeContractPack, ...] = (
     RuntimeContractPack(
         "context.analysis", "context/analysis.md", "完整 Schema、准备信息和分析上下文的解释边界",
         initial_summary=(
-            "当前问题优先；会话规则解释业务语义；Preparation 提供已选范围、确认关系和业务血缘，"
+            "当前问题优先；会话规则解释业务语义；Preparation 提供已选范围及补全字段语义和关系的 Schema，"
             "但不预定查询、指标、图表或结论。所有 datasource_id 和字段名都在 Schema 工作视图中；"
             "需要未展开字段的精确定义时使用本地 Schema 详情工具，不得扩大选源范围或混用来源字段。"
         ),
@@ -39,7 +39,7 @@ RUNTIME_CONTRACT_PACKS: tuple[RuntimeContractPack, ...] = (
         "Probe 与正式程序是独立执行单元。必要技术未知先 Probe；正式程序在一份代码中完成参数、"
         "范围校验、读取、计算、产物和一次保存。每条物理查询使用稳定 query_key，并使参数、"
         "query_constraints、实际过滤和计算粒度一致。成功空集才是无数据；技术失败不得伪装为空集。"
-        "正式程序通过 submit_analysis_program 提交，修复保留业务范围和已确认事实。\n\n"
+        "正式程序通过 submit_analysis_program 提交完整 Python 源码，修复保留业务范围和已确认事实。\n\n"
         "正式代码最小闭环：先定义 `analysis_parameters_schema={\"parameters\":[...],\"defaults\":{...}}`，"
         "再执行 `analysis_parameters=get_analysis_parameters(...)`；每条读取构造"
         "`query_constraints={\"time_range\":...,\"target_filters\":[...],\"aggregation\":...,\"notes\":...}`。"
@@ -57,10 +57,31 @@ RUNTIME_CONTRACT_PACKS: tuple[RuntimeContractPack, ...] = (
         "normalize_relationship_key", "raise_no_data_error", "request_retry",
     )),
     RuntimeContractPack("execution.planning", "execution/planning.md", "洞察语义到数据访问材料的工作计划"),
-    RuntimeContractPack("execution.implementation", "execution/implementation.md", "正式 Python 洞察程序的最小实现闭环", (
+    RuntimeContractPack("execution.semantic_planning", "execution/semantic_planning.md", "洞察问题的总体、时间和计算语义规划"),
+    RuntimeContractPack(
+        "execution.expression", "execution/expression.md",
+        "基于本次真实计算事实撰写最终表达",
+    ),
+    RuntimeContractPack("execution.definition", "execution/definition.md", "显式计算与图表/表格定义；报告在计算后表达", (
+        "DistinctCount", "RowProductSum", "OneToOneJoin", "DecimalColumns", "PythonCalculation",
         "get_day_range", "describe_time_coverage", "get_analysis_parameters",
+        "select_extreme_rows", "compare_numeric_values", "calculate_ratio", "render_extrema",
+        "validate_query_constraints", "raise_no_data_error",
+    )),
+    RuntimeContractPack("execution.implementation", "execution/implementation.md", "正式 Python 洞察程序的最小实现闭环", (
+        "SemanticExecution", "DistinctCount", "RowProductSum", "OneToOneJoin", "DecimalColumns", "PythonCalculation",
+        "get_day_range", "describe_time_coverage", "get_analysis_parameters",
+        "select_extreme_rows", "compare_numeric_values", "calculate_ratio",
+        "render_extrema",
         "validate_query_constraints", "raise_no_data_error", "save_analysis_result",
     )),
+    RuntimeContractPack(
+        "execution.numeric_interpretation", "execution/numeric_interpretation.md",
+        "数值比较结果及按结果选择的局部表达模板", (
+            "evaluate_numeric_comparison", "summarize_extrema",
+            "render_numeric_comparison", "render_extrema",
+        ),
+    ),
     RuntimeContractPack(
         "execution.result_review",
         "execution/result_review.md",
@@ -84,8 +105,9 @@ RUNTIME_CONTRACT_PACKS: tuple[RuntimeContractPack, ...] = (
     RuntimeContractPack("query.local_file", "query/local_file.md", "本地文件和低内存读取", (
         "query_local_file", "query_local_file_low_memory", "load_local_file", "load_local_file_low_memory",
     ), example_output_formats=("standard",), initial_summary=(
-        "文件以 datasource_identifier 作为路径，直接调用已注入的文件函数，不 import 契约名。"
-        "查询 API 先登记约束再加载；正式过滤与 filter_expressions 保持一致。大文件按批处理累计，"
+        "查询用本轮已选 datasource_id，由宿主解析路径；直接调用 helper，不 import 契约名。"
+        "普通文件优先使用 `query_local_file(...)` 完成约束登记和实际读取；"
+        "结构化筛选用 file_filters，复杂过滤与 filter_expressions 保持一致。大文件按批处理累计，"
         "不得重新拼接成超大 DataFrame。"
     )),
     RuntimeContractPack(
@@ -109,7 +131,7 @@ RUNTIME_CONTRACT_PACKS: tuple[RuntimeContractPack, ...] = (
     ), initial_summary=(
         "正式结果调用 save_analysis_result 一次收口。图表、表格与报告复用同一真实计算变量、"
         "总体、筛选和粒度；空产物不入结果。表头和叙事使用业务名称，报告先结论、再数据发现、"
-        "业务含义和有事实支撑的建议；不输出内部实现、空章节或指标清单。\n\n"
+        "业务含义；只有用户要求建议或现有依据支持行动方向时才提出建议，不输出通用经营话术、内部实现、空章节或指标清单。\n\n"
         "常规表格使用 `build_table_result(title=..., columns=[{\"key\":真实字段,\"label\":业务名称}], data=DataFrame)`；"
         "columns 必须是字典列表，data 传 DataFrame 或 records，不传 values.tolist()。常规图表使用"
         "`build_chart_result(chart_kind=..., data=已聚合DataFrame, category_field=..., value_field=...)`。"
@@ -139,16 +161,29 @@ RUNTIME_CONTRACT_PACKS: tuple[RuntimeContractPack, ...] = (
 _PACK_BY_ID = {pack.contract_id: pack for pack in RUNTIME_CONTRACT_PACKS}
 _HELPER_REFERENCE_MARKER = "<!-- runtime-helper-reference -->"
 _HELPER_RESULTS = {
+    "SemanticExecution": "本次执行定义/事实/判断工作区；查询前创建并用 add_query_source 注册真实输入。define(definition, question_id=..., result_id=...) 登记唯一算法，依赖可引用保存结果；result(definition_id) 自动按依赖求值一次。define_extrema 登记数学判断，decision 读取本次求值。保存时宿主调度全部登记定义并注册实际结果，table/chart/render_value/render_extrema/compose_report 共同消费保存事实或判断。旧 execute/bind_result 仍可用。不是业务语义认证器",
+    "DistinctCount": "不可变的分组实体去重计数定义，交给 SemanticExecution.execute",
+    "RowProductSum": "不可变的逐行量价乘积求和定义，要求已检查的输入粒度；数量含义和单位仍需业务依据",
+    "OneToOneJoin": "不可变的一对一连接定义，交给 materialize；实际检查键非空唯一，source_observations 保留匹配和未匹配范围",
+    "DecimalColumns": "不可变的十进制字段转换定义，交给 materialize，保留缺失并拒绝非法值",
+    "PythonCalculation": "自定义函数唯一执行定义；函数接收 inputs/parameters 副本，返回数值标量或 DataFrame；value_kind 描述主结果字段类型，value_field 可在含分组/辅助列的 DataFrame 中指定数值列供比较；只有无主数值列的对象结果才用 value_field=None/value_kind='object'；只记录 execution_only，不自动证明任意函数公式、字段血缘或业务含义",
     "get_day_range": "(start, end)，带业务时区的 datetime，当日零点与当日最后一微秒",
     "describe_time_coverage": "dict，时间列的真实覆盖范围",
     "probe_distinct_values": "list[dict]，真实取值及频数",
     "probe_text_candidates": "list[dict]，真实值的匹配候选，不自动确认业务含义",
     "normalize_relationship_key": "规范化后的标量或 Series，不改变编码体系",
     "get_analysis_parameters": "dict，默认值与本次执行参数覆盖后的值",
+    "select_extreme_rows": "DataFrame，mode='max'/'min'，保留所有并列极值行及原列、原顺序；空集或全缺失返回同结构空表。结果可能为空、唯一、部分并列或全体相等，不指定唯一赢家，也不评价集中度",
+    "compare_numeric_values": "less/equal/greater 或 None（任一数值缺失），只表达数值关系；相等不是大于或小于，None 不是相等",
+    "calculate_ratio": "numerator / denominator × scale，默认 scale=1 为比例，scale=100 为百分比；零分母或缺失返回 None，不舍入，不将不可计算解释为零",
+    "evaluate_numeric_comparison": "dict：left/right、relation、less/equal/greater、difference、relative_change；统一计算大小关系、差额与相对变化，缺失关系为 None，零基期相对变化为 None；equal 不同时命中 greater/less。不设业务阈值",
+    "summarize_extrema": "dict：rows（完整极值 DataFrame）、kind（empty/single/all_equal/tied/unique）、extreme_value、valid_count/missing_count/matched_count、mode；统计可比较行而非业务实体，保留全部并列对象，不作集中度或风险评价",
+    "render_numeric_comparison": "str；按真实数值关系选择 less/equal/greater/missing 四个必填表达之一。使用普通字符串的命名占位符 left/right/difference/relative_change/left_label/right_label，支持 Python 数值格式，relative_change 用 .1% 展示百分比；不可计算值显示 unavailable（默认 N/A）。不提前用 f-string 求值各分支，也不提供业务判据",
+    "render_extrema": "str；传入完整比较结果表、数值列和名称列，直接生成真实极值关系的事实表达。默认覆盖空集、单项、唯一极值、部分并列和全体相等，保留全部命中名称并披露不可比较记录；value_label/unit 指定数值含义和单位，language='zh'/'en'。不需要提供各分支模板；只有一个极值不等于只有一个总体对象。可选模板使用 labels/value/valid_count/missing_count/matched_count/value_label/unit，占位符在所选分支求值。底层 render_extrema 与 results.extrema 是不同接口；后者从数值定义继承单位，不接受 unit 参数。函数不提供健康、风险或集中度评价标准，自定义文本的业务依据仍由分析负责",
     "validate_query_constraints": "None 表示通过；RetryResult 表示应停止本次查询并反馈",
     "raise_no_data_error": "抛出无数据信号，不返回正常分析结果",
     "request_retry": "RetryResult，结构化观察或修复反馈",
-    "save_analysis_result": "StructuredResult，按当前输出协议保存结果",
+    "save_analysis_result": "StructuredResult；赋给result交由运行时保存，无execution_id属性",
     "query_data_with_sql": "DataFrame；校验、登记快照后执行，校验失败自动中止查询",
     "load_data_with_sql": "DataFrame；底层 SQL loader，正式查询须先通过约束校验",
     "probe_data_with_sql": (
@@ -158,9 +193,9 @@ _HELPER_RESULTS = {
         "DataFrame 操作作用于 outcome.data（如 len(outcome.data)、outcome.data['field']），"
         "不作用于外层状态字典。Probe 统计 helper 可直接接收 outcome；查询失败会保留原错误"
     ),
-    "query_local_file": "DataFrame；校验、登记快照后加载文件",
+    "query_local_file": "DataFrame；文件读取入口，校验并登记快照，失败自动反馈",
     "query_local_file_low_memory": "iterator[DataFrame]；校验后分批加载，逐批处理",
-    "load_local_file": "DataFrame，底层文件 loader",
+    "load_local_file": "DataFrame；底层loader，需预先校验；通常用query_local_file",
     "load_local_file_low_memory": "iterator[DataFrame]，底层分批文件 loader",
     "load_minio_file": "DataFrame，对象文件内容",
     "load_data_with_api": "DataFrame，API 返回的数据",
@@ -313,6 +348,7 @@ def _load_runtime_contract_body(contract_id: str, include_examples: bool = False
     source = (CONTRACT_ROOT / pack.filename).read_text(encoding="utf-8")
     inherited_sections = {
         'execution.probe': ('Python 执行环境',),
+        'execution.definition': ('Python 执行环境', '查询结果与计算语义', '可复跑分析参数'),
         'execution.implementation': ('Python 执行环境', '查询结果与计算语义', '可复跑分析参数', '保存、修复与安全'),
     }.get(normalized)
     if inherited_sections:
@@ -353,8 +389,20 @@ def runtime_helper_signature(name: str) -> str:
     if not callable(helper):
         raise ValueError(f"Unknown Runtime helper: {name}")
     signature = inspect.signature(helper)
+    dataclass_fields = getattr(helper, '__dataclass_fields__', {})
+    rendered_parameters = []
+    for parameter in signature.parameters.values():
+        if repr(parameter.default) == '<factory>':
+            dataclass_field = dataclass_fields.get(parameter.name)
+            factory = getattr(dataclass_field, 'default_factory', None)
+            factory_name = getattr(factory, '__name__', '')
+            if factory_name:
+                parameter = parameter.replace(default=factory())
+        rendered_parameters.append(
+            parameter.replace(annotation=inspect.Parameter.empty)
+        )
     signature = signature.replace(
-        parameters=[p.replace(annotation=inspect.Parameter.empty) for p in signature.parameters.values()],
+        parameters=rendered_parameters,
         return_annotation=inspect.Signature.empty,
     )
     return f"{name}{signature}"
@@ -375,6 +423,14 @@ def _render_contract_pack(
             entries.append(f"- `{runtime_helper_signature(name)}`\n  返回：{_HELPER_RESULTS[name]}。")
             seen_helpers.add(name)
     reference = "\n\n".join(entries) or "本节使用前文已列出的同名查询 API。"
+    if contract_id == 'execution.definition':
+        from analysis_runtime.executable_program import ExecutablePythonProgram
+        methods = []
+        for method_name in ('register_query', 'register_calculation', 'register_transform', 'register_extrema', 'register_presentation'):
+            signature = inspect.signature(getattr(ExecutablePythonProgram, method_name))
+            signature = signature.replace(parameters=list(signature.parameters.values())[1:])
+            methods.append(f'- `program.{method_name}{signature}`')
+        reference += '\n\n宿主传入 program 的实际接口（函数由宿主随后调用，不在建图时调用查询函数）：\n\n' + '\n'.join(methods)
     return body.replace(_HELPER_REFERENCE_MARKER, reference)
 
 
@@ -461,14 +517,18 @@ def load_runtime_work_contract_text(
     seen_helpers: set[str] = set()
     rendered = []
     active_non_code_contracts = {
+        "understand": {"execution.semantic_planning"},
         "plan": {"execution.planning"},
+        "express": {"execution.expression"},
         "review": {"execution.result_review"},
     }.get(str(work or "").strip(), set())
     for contract_id in normalized_ids:
         pack = _PACK_BY_ID[contract_id]
         is_code_execution_work = work in {"probe", "probe_repair", "implement", "repair"}
         wants_example = (
-            contract_id in example_contract_ids
+            (contract_id in example_contract_ids
+             or (work == 'implement' and 'execution.definition' not in normalized_ids and contract_id.startswith('query.')
+                 and bool(pack.example_output_formats)))
             and (not pack.example_output_formats or output_format in pack.example_output_formats)
         )
         if is_code_execution_work or contract_id in active_non_code_contracts or wants_example:

@@ -39,6 +39,30 @@ class ReportPresentationServiceTest(unittest.TestCase):
         self.assertEqual(result, "\u65f6\u95f4\u8303\u56f4 2024-01\uff5e2026-06\uff0c\u5dee\u5f02\u7387 10\uff5e20%\u3002")
         self.assertNotIn("~", result)
 
+    def test_replaces_unsupported_markdown_image_artifacts_with_text(self) -> None:
+        report = (
+            "## \u53ef\u89c6\u5316\u56fe\u8868\n\n"
+            "![\u8bbe\u5907\u7c7b\u578b\u5206\u5e03](chart:\u8bbe\u5907\u7c7b\u578b\u5206\u5e03)\n"
+            "![\u73b0\u573a\u7167\u7247](https://example.invalid/device.png)\n"
+            "![](chart:\u72b6\u6001\u56fe)"
+        )
+
+        result = normalize_report_presentation(report, self.bindings)
+
+        self.assertEqual(
+            result,
+            "## \u53ef\u89c6\u5316\u56fe\u8868\n\n"
+            "（\u56fe\u8868：\u8bbe\u5907\u7c7b\u578b\u5206\u5e03）\n"
+            "\u73b0\u573a\u7167\u7247\n"
+            "（\u56fe\u8868：\u72b6\u6001\u56fe）",
+        )
+        self.assertNotIn("![", result)
+
+    def test_escapes_markup_from_unsupported_image_alt_text(self) -> None:
+        result = normalize_report_presentation("![<img src=x onerror=alert(1)>](chart:unsafe)", self.bindings)
+
+        self.assertEqual(result, "（\u56fe\u8868：&lt;img src=x onerror=alert(1)&gt;）")
+
 
 if __name__ == "__main__":
     unittest.main()

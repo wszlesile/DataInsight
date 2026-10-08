@@ -3,7 +3,9 @@
 ## 正式分析程序闭环
 
 - 当前工作提交一份完整、独立、只读的 Python 洞察程序。它在同一代码单元完成参数、查询范围、真实读取、计算、空数据判断、当前输出协议要求的产物与一次保存。
-- 不继承 Probe 或旧程序的变量、DataFrame、代码片段和推测；可复用的只有结构化 Probe 事实、Preparation 事实和当前精确 Schema。
+- 正式执行从头查询和计算，不把 Probe 或旧执行产生的变量、DataFrame、推测当成本次已执行结果；结构化 Probe 事实、Preparation 事实和当前精确 Schema 可供程序使用。
+- 失败修复以当前完整源码和最新失败反馈为基准；正式执行使用新进程，不继承上次进程中的变量，但继续修复这份完整源码，不是重新设计整份分析。
+- 计划中 `basis=unresolved` 的判断不得仅因条件可计算就升级为业务评价；条件可计算并不意味着评价已成立。从实际结果组织事实说明与待补依据，不能因作为回退文本就认证其中的评价。
 - 先定义 `analysis_parameters_schema={"parameters":[...],"defaults":{...}}`，再用 `analysis_parameters=get_analysis_parameters(...)` 获取本次值。相对时间必须从运行时触发时刻派生，不能固化任务创建时间。
 - 每条物理读取都有稳定 `query_key` 和结构化 `query_constraints`：`time_range` 为 `None` 或 `{start,end,end_exclusive}`；`target_filters` 是语义角色、字段、值、匹配方式对象列表；`aggregation` 是真实返回粒度/指标或 `None`。实际 SQL、文件过滤和计算必须与之对应。
 - 查询后先确认真实列、类型、粒度和总体，再做计算。多维结果保留必要维度；一对多关系先在事实粒度聚合，避免重复计量。比较窗口保持可比，比例、百分点差和相对增幅必须区分。

@@ -1,5 +1,17 @@
 from dataclasses import asdict, dataclass, field
+from copy import deepcopy
 from typing import Any
+
+
+def delivery_requirements_from_result(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """Retain required identities for rerun, never the previous execution's receipts."""
+    coverage = payload.get('semantic_execution_coverage') or {}
+    requirements = []
+    for row in coverage.get('results') or []:
+        identity = {'question_id': row['question_id'], 'result_id': row['result_id']}
+        if identity not in requirements:
+            requirements.append(identity)
+    return requirements
 
 
 @dataclass(frozen=True)
@@ -20,9 +32,13 @@ class AnalysisExecutionSnapshot:
     default_parameters: dict[str, Any] = field(default_factory=dict)
     logic_signature: str = ''
     runtime_contract_version: str = 'v1'
+    semantic_delivery_requirements: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        if not self.semantic_delivery_requirements:
+            payload.pop('semantic_delivery_requirements')
+        return payload
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> 'AnalysisExecutionSnapshot':
@@ -49,6 +65,7 @@ class AnalysisExecutionSnapshot:
             ),
             logic_signature=str(value.get('logic_signature') or ''),
             runtime_contract_version=str(value.get('runtime_contract_version') or 'v1'),
+            semantic_delivery_requirements=deepcopy(value.get('semantic_delivery_requirements') or []),
         )
 
 
@@ -67,6 +84,10 @@ class AnalysisRuntimeResult:
     execution_seconds: int = 0
     error_type: str = ''
     error_message: str = ''
+    semantic_execution_traces: list[dict[str, Any]] = field(default_factory=list)
+    runtime_evidence: dict[str, Any] = field(default_factory=dict)
+    report_finding_bindings: list[dict[str, Any]] = field(default_factory=list)
+    semantic_execution_coverage: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_raw(cls, value: dict[str, Any]) -> 'AnalysisRuntimeResult':
@@ -88,10 +109,14 @@ class AnalysisRuntimeResult:
             execution_seconds=int(value.get('execution_seconds') or 0),
             error_type=str(value.get('error_type') or ''),
             error_message=str(value.get('error_message') or ''),
+            semantic_execution_traces=deepcopy(value.get('semantic_execution_traces') or []),
+            runtime_evidence=deepcopy(value.get('runtime_evidence') or {}),
+            report_finding_bindings=deepcopy(value.get('report_finding_bindings') or []),
+            semantic_execution_coverage=deepcopy(value.get('semantic_execution_coverage') or {}),
         )
 
     def result_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             'analysis_report': self.analysis_report,
             'charts': self.charts,
             'tables': self.tables,
@@ -99,3 +124,12 @@ class AnalysisRuntimeResult:
             'analysis_parameters': self.parameters,
             'query_snapshots': self.query_snapshots,
         }
+        if self.semantic_execution_traces:
+            payload['semantic_execution_traces'] = deepcopy(self.semantic_execution_traces)
+        if self.runtime_evidence:
+            payload['runtime_evidence'] = deepcopy(self.runtime_evidence)
+        if self.report_finding_bindings:
+            payload['report_finding_bindings'] = deepcopy(self.report_finding_bindings)
+        if self.semantic_execution_coverage.get('results'):
+            payload['semantic_execution_coverage'] = deepcopy(self.semantic_execution_coverage)
+        return payload

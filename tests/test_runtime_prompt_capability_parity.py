@@ -15,6 +15,7 @@ if str(SRC_ROOT) not in sys.path:
 from agent.runtime_contract_registry import (
     infer_query_capabilities_from_snapshot,
     load_runtime_contract_text,
+    load_runtime_work_contract_text,
     runtime_contract_pack_ids,
 )
 from agent.runtime_prompt_loader import load_runtime_prompt
@@ -23,6 +24,38 @@ from agent.tools import _validate_generated_code_contract
 
 RUNTIME_ROOT = SRC_ROOT / "agent" / "prompts" / "runtime"
 CONTRACT_ROOT = RUNTIME_ROOT / "contracts"
+
+
+def test_first_implementation_gets_applicable_query_example_without_replaying_it_in_repair():
+    contracts = ['execution.implementation', 'query.local_file', 'result.artifacts']
+    first = load_runtime_work_contract_text(contracts, work='implement')
+    repaired = load_runtime_work_contract_text(contracts, work='repair')
+    external = load_runtime_work_contract_text(contracts, work='implement', output_format='json')
+    assert '<!-- canonical-runtime-example: local_file -->' in first
+    assert '<!-- canonical-runtime-example: local_file -->' not in repaired
+    assert '<!-- canonical-runtime-example: local_file -->' not in external
+    assert 'query.timeseries' not in first
+    assert 'query_local_file(' in repaired
+
+
+def test_definition_port_receives_complete_physical_and_output_capabilities_without_legacy_dispatch():
+    contracts = ['execution.definition', 'query.local_file', 'result.artifacts']
+    prompt = load_runtime_work_contract_text(contracts, work='implement')
+    assert 'query_local_file(' in prompt
+    assert 'build_table_result(' in prompt
+    assert 'results' in prompt and 'calculate(inputs, parameters)' in prompt
+    assert '可复跑分析参数' in prompt
+    assert 'source_id' in prompt and 'DecimalColumns' in prompt
+    assert 'program.register_query(identifier: str, loader:' in prompt
+    assert 'program.register_calculation(definition:' in prompt
+    assert 'PythonCalculation' in prompt
+    assert 'inputs.frame("events_source")' in prompt
+    assert 'inputs[0]' in prompt and '明确错误' in prompt
+    assert 'status(id)' in prompt and '不包含指标值' in prompt
+    assert '(question_id, result_id)' in prompt
+    assert '<!-- canonical-runtime-example: local_file -->' not in prompt
+    assert 'execution.execute(' not in prompt
+    assert 'base_execution_id + patches' not in prompt
 
 
 def _contract(name: str) -> str:
@@ -115,11 +148,11 @@ def test_context_and_artifact_contracts_preserve_semantic_capabilities():
         "metadata_schema.properties",
         "没有按 Prompt 预算截断",
         "analysis_semantic_context",
-        "不是 SQL、指标、图表或报告模板",
+        "洞察总体、计算口径和判断条件由 Runtime 的语义计划负责",
         "analysis_semantic_context.explicit_time_range",
         "不能用扩展窗口替换用户总体",
         "requested_value_resolutions",
-        "unsupported_field_bindings",
+        "semantic_enrichment",
         "aggregation_safety=unsafe_repeated_by_join",
         "used_datasource_ids",
     ):
@@ -161,7 +194,9 @@ def test_compiled_prompt_is_capability_complete_without_tool_round():
     assert "# query.relational" not in time_series
     assert "# query.cross_source" in mixed
     assert "# context.followup" in mixed
-    assert len(mixed) < 35000
+    # This is the diagnostic union of all dialects, not a single work request.
+    # Retain executable filtering examples instead of trimming API semantics.
+    assert len(mixed) < 36000
 
 
 def test_runtime_prompt_keeps_evidence_out_of_formal_analysis():
@@ -233,6 +268,7 @@ def test_delivered_prompt_preserves_common_semantics_across_modes(
     ([10.0, 4.0], "高 6.00"),
 ])
 def test_file_example_judgment_uses_actual_results(values, expected):
+    from analysis_runtime.calculations import select_extreme_rows
     match = re.search(
         r"<!-- canonical-runtime-example: local_file -->\s*```python\s*(.*?)\s*```",
         _contract("query/local_file.md"), re.DOTALL,
@@ -246,6 +282,7 @@ def test_file_example_judgment_uses_actual_results(values, expected):
 
     namespace = {
         "get_analysis_parameters": lambda defaults: defaults,
+        "select_extreme_rows": select_extreme_rows,
         "query_local_file": lambda **kwargs: data.copy(),
         "raise_no_data_error": fail_no_data,
         "build_chart_result": lambda **kwargs: kwargs,
@@ -257,6 +294,47 @@ def test_file_example_judgment_uses_actual_results(values, expected):
     assert expected in result["analysis_report"]
     assert result["charts"] and result["tables"]
     assert len(result["tables"][0]["data"]) == len(values)
+
+
+def test_file_example_uses_real_query_protocol_and_filters_before_aggregation(monkeypatch):
+    from agent import tools
+
+    match = re.search(
+        r"<!-- canonical-runtime-example: local_file -->\s*```python\s*(.*?)\s*```",
+        _contract("query/local_file.md"), re.DOTALL,
+    )
+    assert match is not None
+    data = pd.DataFrame({
+        "category": ["类别A", "类别A", "类别B", "未选择类别"],
+        "metric_value": [4.0, 6.0, 3.0, 1000.0],
+    })
+    monkeypatch.setattr(tools, "load_local_file", lambda **kwargs: data.copy())
+    namespace = {
+        "get_analysis_parameters": lambda defaults: defaults,
+        "query_local_file": tools.query_local_file,
+        "select_extreme_rows": tools.select_extreme_rows,
+        "raise_no_data_error": tools.raise_no_data_error,
+        "build_chart_result": lambda **kwargs: kwargs,
+        "build_table_result": lambda **kwargs: kwargs,
+        "save_analysis_result": lambda **kwargs: kwargs,
+    }
+    token = tools.CURRENT_QUERY_SNAPSHOTS.set({})
+    source_token = tools.CURRENT_LOCAL_FILE_DATASOURCES.set({
+        '123': {
+            'datasource_type': 'local_file',
+            'datasource_identifier': 'D:/path/selected_file.csv',
+        },
+    })
+    try:
+        exec(compile(match.group(1), "<local-file-contract-example>", "exec"), namespace)
+        snapshot = tools.CURRENT_QUERY_SNAPSHOTS.get()["q_local_category_detail"]
+    finally:
+        tools.CURRENT_QUERY_SNAPSHOTS.reset(token)
+        tools.CURRENT_LOCAL_FILE_DATASOURCES.reset(source_token)
+    assert snapshot["query_constraints"]["aggregation"]["grain"] == "detail"
+    assert snapshot["execution"]["row_count"] == 3
+    assert namespace["summary"]["metric_value"].tolist() == [10.0, 3.0]
+    assert "合计为 13.00" in namespace["result"]["analysis_report"]
 
 
 @pytest.mark.parametrize("source", [

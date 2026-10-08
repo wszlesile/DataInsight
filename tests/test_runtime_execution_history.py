@@ -512,36 +512,3 @@ def test_backup_recovery_obeys_invocation_policy_without_inventing_filter(mode, 
     assert '禁止继续使用 LIKE' not in text
     assert '只有成功生成完整的结构化图表' not in text
     assert 'observation' in text
-
-
-@pytest.mark.parametrize('loader', ['load_data_with_sql', 'query_data_with_sql'])
-def test_scalar_sql_aggregate_is_not_rejected_as_unordered_extremum(loader):
-    prefix = '"q", {}, ' if loader == 'query_data_with_sql' else ''
-    code = f'''frame = {loader}({prefix}"SELECT MAX(amount) AS amount FROM sales")
-report = f"Highest amount: {{frame.iloc[0]['amount']}}"
-'''
-    assert tools._validate_report_extrema_selection_contract(ast.parse(code), code) is None
-
-
-@pytest.mark.parametrize('query,state', [
-    ('SELECT amount FROM sales ORDER BY amount DESC', None),
-    ('SELECT amount FROM sales ORDER BY amount ASC', 'invalid'),
-    ('SELECT amount FROM sales', 'unknown'),
-    ('SELECT amount FROM sales ORDER BY other ASC', 'unknown'),
-    ('SELECT amount FROM sales WHERE id IN (SELECT id FROM t ORDER BY amount ASC)', 'unknown'),
-])
-def test_extremum_check_distinguishes_contradiction_from_unproven_order(query, state):
-    code = f'''frame = load_data_with_sql({query!r})
-report = f"Highest amount: {{frame.iloc[0]['amount']}}"
-'''
-    result = tools._validate_report_extrema_selection_contract(ast.parse(code), code)
-    assert (result.diagnostics['proof_state'] if result else None) == state
-
-
-def test_dynamic_sort_direction_is_not_silently_assumed_ascending():
-    code = '''ascending = choose_direction()
-frame = data.sort_values("amount", ascending=ascending)
-report = f"Highest amount: {frame.iloc[0]['amount']}"
-'''
-    result = tools._validate_report_extrema_selection_contract(ast.parse(code), code)
-    assert result.diagnostics['proof_state'] == 'unknown'

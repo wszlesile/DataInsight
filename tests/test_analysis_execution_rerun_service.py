@@ -45,7 +45,8 @@ def test_local_rerun_does_not_compile_or_persist_evidence():
             generated_code="result = save_analysis_result(analysis_report='ok')",
             execution_status="success",
             analysis_report="Original report",
-            result_payload_json="{}",
+            result_payload_json=dump_json({'semantic_execution_coverage': {'results': [{
+                'question_id': 'q1', 'result_id': 'contracts', 'execution_token': 'old'}]}}),
             analysis_parameters_schema_json=dump_json({
                 "parameters": [],
                 "defaults": {"limit": 5},
@@ -56,6 +57,8 @@ def test_local_rerun_does_not_compile_or_persist_evidence():
         session.commit()
 
         def run_locally(**kwargs):
+            assert kwargs['runtime_user_context']['semantic_delivery_requirements'] == [
+                {'question_id': 'q1', 'result_id': 'contracts'}]
             execution = InsightNsExecution(
                 conversation_id=conversation.id,
                 turn_id=turn.id,

@@ -20,6 +20,7 @@ class RuntimePhase(StrEnum):
     PROBE = "probe"
     PROBE_REPAIR = "probe_repair"
     IMPLEMENT = "implement"
+    EXPRESS = "express"
     REVIEW = "review"
     REPAIR = "repair"
     WAITING_CLARIFICATION = "waiting_clarification"
@@ -34,6 +35,7 @@ ACTIVE_PHASES = frozenset({
     RuntimePhase.PROBE,
     RuntimePhase.PROBE_REPAIR,
     RuntimePhase.IMPLEMENT,
+    RuntimePhase.EXPRESS,
     RuntimePhase.REVIEW,
     RuntimePhase.REPAIR,
 })
@@ -59,6 +61,7 @@ class RuntimeWorkPacket:
     probe_revision: int = 0
     program_revision: int = 0
     diagnostic_revision: int = 0
+    semantic_plan: dict[str, Any] = field(default_factory=dict)
     material_manifest: dict[str, Any] = field(default_factory=dict)
     schema_requirements: dict[str, tuple[str, ...]] = field(default_factory=dict)
     active_datasource_ids: tuple[int, ...] = ()
@@ -202,6 +205,7 @@ def runtime_phase_from_work(work: str) -> RuntimePhase:
         "probe": RuntimePhase.PROBE,
         "probe_repair": RuntimePhase.PROBE_REPAIR,
         "implement": RuntimePhase.IMPLEMENT,
+        "express": RuntimePhase.EXPRESS,
         "repair": RuntimePhase.REPAIR,
         "review": RuntimePhase.REVIEW,
         "completed": RuntimePhase.COMPLETED,
@@ -242,6 +246,21 @@ def reduce_runtime_tool_result(
             reason="analysis_complete",
             **common,
         )
+    if tool_name == "plan_runtime_semantics" and status == "success":
+        semantic_plan = result.get("semantic_plan")
+        if isinstance(semantic_plan, dict) and semantic_plan.get("questions"):
+            return _next(
+                packet,
+                phase=RuntimePhase.PLAN,
+                focus=str(semantic_plan.get("analysis_goal") or focus).strip(),
+                semantic_plan=dict(semantic_plan),
+                material_manifest={},
+                active_datasource_ids=(),
+                active_fields_by_datasource={},
+                latest_diagnostic={},
+                reason="semantic_plan_ready",
+                **common,
+            )
     if tool_name == "select_runtime_work" and status == "success":
         selected = str(result.get("work") or arguments.get("work") or "").strip()
         phase = {
@@ -385,6 +404,20 @@ def reduce_runtime_tool_result(
         )
     if tool_name in {"submit_analysis_program", "execute_python"}:
         execution_id = _positive_int(result.get("execution_id"))
+        if status == "presentation_pending" and execution_id > 0:
+            return _next(
+                packet,
+                phase=RuntimePhase.EXPRESS,
+                focus=focus or "Write the final presentation from this execution's actual facts.",
+                resume_phase=None,
+                active_program_call_id=str(tool_call_id or ""),
+                active_execution_id=execution_id,
+                program_revision=packet.program_revision + 1,
+                pending_review_patch={},
+                latest_diagnostic={},
+                reason="execution_candidate_ready_for_expression",
+                **common,
+            )
         if status == "success":
             return _next(
                 packet,
@@ -409,31 +442,14 @@ def reduce_runtime_tool_result(
             str(diagnostics.get("violated_contract") or "")
             if isinstance(diagnostics, dict) else ""
         )
-        requires_probe = violation == "formal_tool_received_probe_program"
-        # A formal tool receiving Probe source is a mode error, not itself
-        # proof that another Probe is needed. Before any successful Probe, it
-        # is safe to enter the initial observation pass. Once an observation
-        # is already in the work packet, returning to Probe would let a model
-        # repeat the same inspection with cosmetically different code. Keep
-        # the next turn in formal implementation so it must consume the fact
-        # ledger and submit an end-to-end analysis program instead.
-        probe_already_available = bool(packet.probe_ledgers or packet.probe_revision > 0)
-        enter_probe = requires_probe and not probe_already_available
-        resume_phase = (
-            packet.phase
-            if packet.phase in {RuntimePhase.IMPLEMENT, RuntimePhase.REPAIR}
-            else RuntimePhase.IMPLEMENT
-        )
+        # A mismatched program intent is a code repair, not an observation
+        # request. Keep implementation protocols until an explicit Probe call.
         return _next(
             packet,
-            phase=(
-                RuntimePhase.PROBE if enter_probe
-                else RuntimePhase.IMPLEMENT if requires_probe
-                else RuntimePhase.REPAIR
-            ),
+            phase=RuntimePhase.REPAIR,
             focus=focus,
-            resume_phase=resume_phase if enter_probe else None,
-            resume_focus=packet.focus if enter_probe else "",
+            resume_phase=None,
+            resume_focus="",
             program_revision=packet.program_revision + 1,
             diagnostic_revision=packet.diagnostic_revision + 1,
             active_program_call_id=str(tool_call_id or ""),
@@ -446,11 +462,30 @@ def reduce_runtime_tool_result(
                 "violated_contract": violation,
                 "call_id": str(tool_call_id or ""),
             },
-            reason=(
-                "formal_program_requires_probe" if enter_probe
-                else "formal_program_must_reuse_probe_facts" if requires_probe
-                else "formal_program_requires_repair"
-            ),
+            reason="formal_program_requires_repair",
+            **common,
+        )
+    if tool_name == "compose_analysis_presentation":
+        if status == "success" and _positive_int(result.get("execution_id")) == packet.active_execution_id:
+            return _next(
+                packet,
+                phase=RuntimePhase.COMPLETED,
+                focus=focus,
+                resume_phase=None,
+                pending_review_patch={},
+                latest_diagnostic={},
+                reason="post_execution_presentation_saved",
+                **common,
+            )
+        return _next(
+            packet,
+            phase=RuntimePhase.EXPRESS,
+            diagnostic_revision=packet.diagnostic_revision + 1,
+            latest_diagnostic={
+                "error_type": result.get("error_type") or "presentation_submission_incomplete",
+                "call_id": str(tool_call_id or ""),
+            },
+            reason="presentation_submission_requires_adjustment",
             **common,
         )
     if tool_name == "request_analysis_revision" and status == "revision_required":
@@ -493,7 +528,7 @@ def reduce_runtime_tool_result(
             packet,
             phase=RuntimePhase.WAITING_CLARIFICATION,
             focus=focus,
-            resume_phase=RuntimePhase.PLAN,
+            resume_phase=RuntimePhase.UNDERSTAND,
             resume_focus=packet.focus,
             reason="user_clarification_required",
             **common,
@@ -510,11 +545,15 @@ def resume_runtime_work_packet(
         return packet
     return _next(
         packet,
-        phase=packet.resume_phase or RuntimePhase.PLAN,
+        phase=packet.resume_phase or RuntimePhase.UNDERSTAND,
         resume_phase=None,
         resume_focus="",
         goal_revision=packet.goal_revision + 1,
         focus=str(focus or packet.focus).strip(),
+        semantic_plan={},
+        material_manifest={},
+        active_datasource_ids=(),
+        active_fields_by_datasource={},
         latest_diagnostic={},
         reason="clarification_answered",
     )
@@ -619,16 +658,14 @@ def record_program_result(
             latest_diagnostic={},
             reason="formal_program_accepted",
         )
-    diagnostics = result.get("diagnostics") if isinstance(result, dict) else None
-    requires_probe = isinstance(diagnostics, dict) and diagnostics.get("violated_contract") == "formal_tool_received_probe_program"
     return _next(
         workspace,
-        phase=RuntimePhase.PROBE if requires_probe else RuntimePhase.REPAIR,
+        phase=RuntimePhase.REPAIR,
         program_revision=workspace.program_revision + 1,
         diagnostic_revision=workspace.diagnostic_revision + 1,
         latest_program=dict(program),
         latest_diagnostic=dict(result or {}),
-        reason="formal_program_requires_probe" if requires_probe else "formal_program_requires_repair",
+        reason="formal_program_requires_repair",
     )
 
 

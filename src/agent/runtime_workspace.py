@@ -57,7 +57,7 @@ class RuntimeDatasourceContextInput(BaseModel):
 
     include_relationships: bool = Field(
         default=False,
-        description="Include declared relationships and exact Preparation business lineage, bindings and safety rationale for these sources.",
+        description="Include these sources' Schema relationships and verified join-safety details.",
     )
 
 
@@ -128,7 +128,7 @@ def _source_detail(
     detail_schema: dict[str, Any] = {
         key: copy.deepcopy(value)
         for key, value in schema.items()
-        if key in {"title", "description", "type", "required"}
+        if key in {"title", "description", "type", "required", "semantic_enrichment_status"}
     }
     detail_schema["properties"] = {
         field_name: copy.deepcopy(properties[field_name])
@@ -145,30 +145,6 @@ def _source_detail(
     if missing:
         source_payload["unavailable_field_names"] = missing
     return source_payload
-
-
-def _business_lineage_detail(context: CustomContext, requested_ids: set[int]) -> dict:
-    snapshot = getattr(context, 'active_datasource_snapshot', {}) or {}
-    semantic = snapshot.get('analysis_semantic_context') or {}
-    if not isinstance(semantic, dict):
-        return {}
-    relationships = [
-        copy.deepcopy(item) for item in semantic.get('relationships') or []
-        if isinstance(item, dict) and requested_ids.intersection({
-            int(item.get('left_datasource_id') or 0), int(item.get('right_datasource_id') or 0),
-        })
-    ]
-    relationship_ids = {item.get('relationship_id') for item in relationships if item.get('relationship_id')}
-    lineage = []
-    for item in semantic.get('insight_lineage') or []:
-        if not isinstance(item, dict):
-            continue
-        ids = {int(value) for value in item.get('datasource_ids') or []}
-        ids.update(int(binding.get('datasource_id') or 0)
-                   for binding in item.get('fact_bindings') or [] if isinstance(binding, dict))
-        if requested_ids.intersection(ids) or relationship_ids.intersection(item.get('relationship_ids') or []):
-            lineage.append(copy.deepcopy(item))
-    return {'insight_lineage': lineage, 'relationships': relationships}
 
 
 @tool(args_schema=RuntimeDatasourceContextInput)
@@ -218,6 +194,4 @@ def read_runtime_datasource_context(
         "unavailable_datasource_ids": invalid_ids,
         "selected_datasource_ids": sorted(sources),
     }
-    if include_relationships:
-        result['business_context'] = _business_lineage_detail(runtime.context, set(requested_ids).intersection(sources))
     return result

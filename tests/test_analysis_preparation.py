@@ -743,7 +743,7 @@ def test_semantic_reference_definitions_reach_model_and_survive_resume(monkeypat
     prepared = PreparationResult(
         intent=_intent(),
         selection=DatasourceSelectionContract.model_validate(selection_payload),
-        business_context=_business_context(), selected_snapshot=snapshot,
+        business_context=BusinessContextContract(), selected_snapshot=snapshot,
         query_capabilities=("sql",),
     )
     restored = PreparationResult.from_resume_payload(prepared.resume_payload())
@@ -761,7 +761,7 @@ def test_semantic_reference_definitions_reach_model_and_survive_resume(monkeypat
     monkeypatch.setattr(agent, "get_history_messages", lambda *_, **__: [])
     messages = agent.build_prompt_messages(
         "Analyze the settled business", namespace_id=1, conversation_id=1,
-        datasource_snapshot_override=prompt_snapshot, context_mode="fresh_analysis",
+        datasource_snapshot_override=restored.runtime_prompt_snapshot(), context_mode="fresh_analysis",
     )
     model_text = "\n".join(message.content for message in messages)
     assert definition["description"] in model_text
@@ -1271,16 +1271,133 @@ def test_insight_lineage_discards_probe_result_echoes():
     assert lineage.question_id == "question_1"
 
 
-def test_business_context_models_question_lineage_without_report_plan():
-    properties = set(BusinessContextContract.model_json_schema()["properties"])
-    assert "analytical_facets" not in properties
-    assert "scope_boundaries" not in properties
+def test_business_context_llm_contract_only_enriches_datasource_schema():
+    properties = set(prep.DatasourceSchemaEnrichmentDraft.model_json_schema()["properties"])
     assert properties == {
+        "field_semantics",
         "relationships",
-        "insight_lineage",
         "unresolved_relationships",
         "probe_requests",
     }
+
+
+def test_schema_enrichment_is_the_only_runtime_carrier_for_field_meaning():
+    context = BusinessContextContract(field_semantics=[
+        prep.DatasourceFieldSemanticsContract(
+            datasource_id=11,
+            field="status",
+            business_meaning="合同当前状态",
+            value_meanings={"active": "执行中"},
+            confidence="confirmed",
+        ),
+    ])
+    enriched = enrich_selected_datasource_schemas(
+        _snapshot(), selection=_selection(), business_context=context,
+    )
+    preparation = PreparationResult(
+        intent=_intent(), selection=_selection(),
+        business_context=context, selected_snapshot=enriched,
+        query_capabilities=("sql",), probe_observations=(),
+        explicit_time_range=None,
+    )
+    handoff = preparation.prompt_snapshot()
+    semantic = handoff["analysis_semantic_context"]
+    assert "insight_lineage" not in semantic
+    assert "relationships" not in semantic
+    field = handoff["selected_datasource_snapshot"][0]["metadata_schema"]["properties"]["status"]
+    assert field["semantic_interpretation"]["business_meaning"] == "合同当前状态"
+    assert field["semantic_interpretation"]["value_meanings"] == {"active": "执行中"}
+    assert field["semantic_interpretation"]["origin"] == "preparation_model"
+    assert field["semantic_interpretation"]["confidence"] == "inferred"
+    assert field["semantic_interpretation"]["model_confidence"] == "confirmed"
+    runtime_view = preparation.runtime_prompt_snapshot()
+    runtime_field = runtime_view["selected_datasource_snapshot"][0]["metadata_schema"]["properties"]["status"]
+    assert runtime_field["semantic_interpretation"] == field["semantic_interpretation"]
+
+
+def test_exact_single_source_still_receives_schema_enrichment(monkeypatch):
+    snapshot = _snapshot()
+    snapshot["selected_datasource_ids"] = [11]
+    snapshot["selected_datasource_snapshot"] = snapshot["selected_datasource_snapshot"][:1]
+    selection = _selection().model_copy(update={"selected_datasource_ids": [11]})
+    workflow = prep.AnalysisPreparationWorkflow(
+        user_query="分析合同状态", context_mode="fresh_analysis",
+        expected_time_range={}, datasource_snapshot=snapshot,
+        conversation_context={}, runtime_config=None,
+        execution_context={"exact_datasource_scope": True},
+        cancelled=None, stage_callback=None,
+    )
+    calls = []
+
+    def fake_invoke_contract(*, output_model, **kwargs):
+        calls.append(output_model)
+        assert kwargs["payload"]["output_schema"] == output_model.model_json_schema()
+        return prep.DatasourceSchemaEnrichmentDraft(field_semantics=[
+            prep.DatasourceFieldSemanticsContract(
+                datasource_id=11, field="status",
+                business_meaning="合同状态", confidence="confirmed",
+            ),
+        ])
+
+    monkeypatch.setattr(prep, "_invoke_contract", fake_invoke_contract)
+    result = workflow.business_context({
+        "selection": selection,
+        "selected_snapshot": snapshot,
+        "selected_schemas": compact_datasource_snapshot(snapshot)["selected_datasource_snapshot"],
+        "query_capabilities": ("sql",),
+    })
+    assert calls == [prep.DatasourceSchemaEnrichmentDraft]
+    schema = result["selected_snapshot"]["selected_datasource_snapshot"][0]["metadata_schema"]
+    assert schema["properties"]["status"]["semantic_interpretation"]["business_meaning"] == "合同状态"
+
+
+@pytest.mark.parametrize("model_confidence,expected", [
+    ("confirmed", "inferred"), ("inferred", "inferred"), ("unknown", "unknown"),
+])
+def test_model_interpretation_preserves_source_definition_and_assessment(model_confidence, expected):
+    import copy
+
+    snapshot = _snapshot()
+    source_definition = {
+        "type": "string", "description": "Record lifecycle code",
+        "enum": ["active", "closed"],
+        "semantic_enrichment": {
+            "business_meaning": "Lifecycle state", "confidence": "confirmed",
+            "value_meanings": {"active": "In force", "closed": "Closed"},
+        },
+    }
+    snapshot["selected_datasource_snapshot"][0]["metadata_schema"] = {
+        "properties": {"status": copy.deepcopy(source_definition)},
+    }
+    original = copy.deepcopy(snapshot)
+    context = BusinessContextContract(field_semantics=[prep.DatasourceFieldSemanticsContract(
+        datasource_id=11, field="status", business_meaning="Operational health",
+        value_meanings={"active": "Healthy"}, confidence=model_confidence,
+    )])
+    enriched = enrich_selected_datasource_schemas(snapshot, selection=_selection(), business_context=context)
+    definition = enriched["selected_datasource_snapshot"][0]["metadata_schema"]["properties"]["status"]
+    interpretation = definition["semantic_interpretation"]
+    assert {key: definition[key] for key in source_definition} == source_definition
+    assert snapshot == original
+    assert interpretation["business_meaning"] == "Operational health"
+    assert interpretation["value_meanings"] == {"active": "Healthy"}
+    assert interpretation["model_confidence"] == model_confidence
+    assert interpretation["confidence"] == expected
+    assert interpretation["origin"] == "preparation_model"
+    interpretation["value_meanings"]["active"] = "Changed"
+    assert context.field_semantics[0].value_meanings["active"] == "Healthy"
+
+
+def test_empty_model_interpretation_does_not_add_confidence_only_metadata():
+    enriched = enrich_selected_datasource_schemas(
+        _snapshot(), selection=_selection(),
+        business_context=BusinessContextContract(field_semantics=[prep.DatasourceFieldSemanticsContract(
+            datasource_id=11, field="status", confidence="confirmed",
+        )]),
+    )
+    definition = enriched["selected_datasource_snapshot"][0]["metadata_schema"]["properties"]["status"]
+    assert "semantic_interpretation" not in definition
+    assert "semantic_enrichment" not in definition
 
 
 def test_compact_datasource_snapshot_preserves_complete_field_semantics():
@@ -1935,7 +2052,7 @@ def test_preparation_result_exposes_only_enriched_selected_schema_to_formal_anal
             "fields": ["customer_id"],
             "business_reason": "客户标识尚不能可靠补充客户归属",
         }],
-        "business_impact": "当前数据无法可靠补充客户归属，因此不按客户分类下结论。",
+        "reason": "合同与客户关系覆盖尚未确认",
     }
     runtime_bindings = prompt_snapshot["analysis_semantic_context"]["insight_lineage"][0][
         "fact_bindings"
@@ -2345,10 +2462,12 @@ def test_prepare_analysis_runs_advisory_flow_without_failure_route(monkeypatch):
     outputs = {
         prep.IntentContract: _intent(),
         prep.DatasourceSelectionContract: _canonical_flow_selection(),
-        prep.BusinessContextContract: _canonical_flow_context(),
-        prep.BusinessContextDraftContract: prep.BusinessContextDraftContract.model_validate(
-            _canonical_flow_context().model_dump(exclude={"semantic_resolutions"})
-        ),
+        prep.DatasourceSchemaEnrichmentDraft: prep.DatasourceSchemaEnrichmentDraft.model_validate(
+            _canonical_flow_context().model_dump(exclude={"insight_lineage"})
+        ).model_copy(update={"field_semantics": [prep.DatasourceFieldSemanticsContract(
+            datasource_id=11, field="status", business_meaning="合同状态",
+            confidence="confirmed",
+        )]}),
     }
     stages = []
 
@@ -2372,17 +2491,21 @@ def test_prepare_analysis_runs_advisory_flow_without_failure_route(monkeypatch):
     prompt_snapshot = result.prompt_snapshot()
     assert prompt_snapshot["selected_datasource_ids"] == [11, 12]
     assert "preparation_envelope" not in prompt_snapshot
-    relationships = prompt_snapshot["analysis_semantic_context"]["relationships"]
+    assert "insight_lineage" not in prompt_snapshot["analysis_semantic_context"]
+    assert "relationships" not in prompt_snapshot["analysis_semantic_context"]
+    relationships = prompt_snapshot["selected_datasource_snapshot"][0]["metadata_schema"]["relationships"]
     assert len(relationships) == 1
     assert relationships[0]["joinability"] == "unknown"
+    status = prompt_snapshot["selected_datasource_snapshot"][0]["metadata_schema"]["properties"]["status"]
+    assert status["semantic_interpretation"]["business_meaning"] == "合同状态"
 
 
 def test_business_context_validation_failure_preserves_normalized_candidate(monkeypatch):
     outputs = {
         prep.IntentContract: _intent(),
         prep.DatasourceSelectionContract: _canonical_flow_selection(),
-        prep.BusinessContextDraftContract: prep.BusinessContextDraftContract.model_validate(
-            _canonical_flow_context().model_dump(exclude={"semantic_resolutions"})
+        prep.DatasourceSchemaEnrichmentDraft: prep.DatasourceSchemaEnrichmentDraft.model_validate(
+            _canonical_flow_context().model_dump(exclude={"insight_lineage"})
         ),
     }
     original_validate = prep.validate_business_context
@@ -2414,10 +2537,30 @@ def test_business_context_validation_failure_preserves_normalized_candidate(monk
     )
 
     semantic_context = result.prompt_snapshot()["analysis_semantic_context"]
-    assert validation_calls == 2
-    assert semantic_context["relationships"]
-    assert semantic_context["insight_lineage"]
-    assert semantic_context["relationships"][0]["joinability"] == "unknown"
+    assert validation_calls > 1
+    assert "relationships" not in semantic_context
+    assert "insight_lineage" not in semantic_context
+
+
+def test_schema_enrichment_keeps_valid_items_when_another_binding_is_invalid():
+    candidate = BusinessContextContract(
+        field_semantics=[
+            prep.DatasourceFieldSemanticsContract(datasource_id=11, field='status', business_meaning='合同状态'),
+            prep.DatasourceFieldSemanticsContract(datasource_id=11, field='missing', business_meaning='不存在的字段'),
+        ],
+        relationships=[_business_context().relationships[0].model_copy(update={
+            'evidence_basis': 'probe', 'joinability': 'joinable', 'observation_id': 'invented',
+        })],
+    )
+    result = prep.AnalysisPreparationWorkflow._retain_valid_schema_enrichment(
+        candidate, schemas=_snapshot()['selected_datasource_snapshot'],
+        selection=_selection(), observations=[],
+    )
+    assert [item.field for item in result.field_semantics] == ['status']
+    assert len(result.relationships) == 1
+    assert result.relationships[0].joinability == 'unknown'
+    assert result.relationships[0].evidence_basis == 'unresolved'
+    assert result.unresolved_relationships
 
 
 def test_semantic_selection_normalizes_to_canonical_preparation_state(monkeypatch):
@@ -3055,7 +3198,7 @@ def test_business_context_finalization_cannot_rebind_or_invent_probe_relationshi
     assert reconciled.insight_lineage[0].relationship_ids == ["contract_customer"]
 
 
-def test_business_context_finalizes_lineage_after_bounded_probe(monkeypatch):
+def test_business_context_merges_bounded_probe_into_source_schema(monkeypatch):
     draft = _canonical_flow_context().model_copy(update={
         "relationships": [
             _canonical_flow_context().relationships[0].model_copy(update={
@@ -3074,13 +3217,10 @@ def test_business_context_finalizes_lineage_after_bounded_probe(monkeypatch):
             related_fact_ids=["question_1_fact_1"],
         )],
     })
-    resolution = prep.BusinessContextProbeResolutionContract(
-        fact_resolutions=[prep.BusinessFactProbeResolutionContract(
-            fact_id="question_1_fact_1",
-            resolution_status="unchanged",
-        )]
+    schema_draft = prep.DatasourceSchemaEnrichmentDraft.model_validate(
+        draft.model_dump(exclude={"insight_lineage"})
     )
-    outputs = iter([_intent(), _canonical_flow_selection(), draft, resolution])
+    outputs = iter([_intent(), _canonical_flow_selection(), schema_draft])
     payloads = []
     stages = []
 
@@ -3123,15 +3263,15 @@ def test_business_context_finalizes_lineage_after_bounded_probe(monkeypatch):
         conversation_context={},
     )
 
-    assert stages[-1] == "business_context_probe_resolution"
-    assert len(payloads[-1]["probe_observations"]) == 1
-    assert payloads[-1]["affected_facts"][0]["fact_id"] == "question_1_fact_1"
-    assert "selected_datasources" not in payloads[-1]
-    assert "query_guidance" not in payloads[-1]
-    assert "business_context_draft" not in payloads[-1]
+    assert stages == ["intent_analysis", "select_datasources", "business_context"]
+    assert "selected_datasources" in payloads[-1]
+    assert "intent_context" not in payloads[-1]
     assert result.business_context.probe_requests == []
     assert result.business_context.relationships[0].joinability == "joinable"
-    assert result.business_context.insight_lineage[0].lineage_status == "direct"
+    assert result.business_context.insight_lineage == []
+    schema = result.prompt_snapshot()["selected_datasource_snapshot"][0]["metadata_schema"]
+    assert schema["relationships"][0]["joinability"] == "joinable"
+    assert schema["properties"]["status"]["observed_value_profile"]
 
 
 def test_business_context_only_refinalizes_consumable_probe_observations():
@@ -3259,7 +3399,7 @@ def test_probe_fact_resolution_removes_only_unsupported_observed_field():
     assert unresolved.unsupported_field_bindings[0].fields == ["status"]
 
 
-def test_relation_only_probe_reconciles_lineage_without_second_llm(monkeypatch):
+def test_relation_only_probe_updates_schema_without_second_llm(monkeypatch):
     resolved = _canonical_flow_context()
     draft = resolved.model_copy(update={
         "relationships": [resolved.relationships[0].model_copy(update={
@@ -3277,7 +3417,12 @@ def test_relation_only_probe_reconciles_lineage_without_second_llm(monkeypatch):
         })],
         "unresolved_relationships": ["contract to customer is unverified"],
     })
-    outputs = iter([_intent(), _canonical_flow_selection(), draft])
+    outputs = iter([
+        _intent(), _canonical_flow_selection(),
+        prep.DatasourceSchemaEnrichmentDraft.model_validate(
+            draft.model_dump(exclude={"insight_lineage"})
+        ),
+    ])
     calls = []
 
     def fake_invoke_contract(**kwargs):
@@ -3309,8 +3454,8 @@ def test_relation_only_probe_reconciles_lineage_without_second_llm(monkeypatch):
 
     assert calls == ["intent_analysis", "select_datasources", "business_context"]
     assert result.business_context.relationships[0].joinability == "joinable"
-    assert result.business_context.insight_lineage[0].lineage_status == "direct"
-    assert result.business_context.insight_lineage[0].unresolved_business_facts == []
+    assert result.business_context.insight_lineage == []
+    assert result.prompt_snapshot()["selected_datasource_snapshot"][0]["metadata_schema"]["relationships"][0]["joinability"] == "joinable"
 
 
 def test_business_context_normalizes_status_and_ignores_top_level_annotations():
@@ -3356,7 +3501,7 @@ def test_local_file_time_coverage_schema_probe_has_its_own_pandas_runtime(monkey
     assert observation["facts"]["max_value"].startswith("2025-03-04")
 
 
-def test_business_context_semantic_rejection_preserves_advisory_lineage(monkeypatch):
+def test_business_context_unverified_relation_does_not_become_joinable_schema(monkeypatch):
     invalid_schema_claim = _canonical_flow_context().model_copy(update={
         "relationships": [
             _canonical_flow_context().relationships[0].model_copy(update={
@@ -3370,7 +3515,9 @@ def test_business_context_semantic_rejection_preserves_advisory_lineage(monkeypa
             return _intent()
         if output_model is prep.DatasourceSelectionContract:
             return _canonical_flow_selection()
-        return invalid_schema_claim
+        return prep.DatasourceSchemaEnrichmentDraft.model_validate(
+            invalid_schema_claim.model_dump(exclude={"insight_lineage"})
+        )
 
     monkeypatch.setattr(prep, "_invoke_contract", fake_invoke_contract)
 
@@ -3386,8 +3533,9 @@ def test_business_context_semantic_rejection_preserves_advisory_lineage(monkeypa
     relationship = result.business_context.relationships[0]
     assert relationship.joinability == "unknown"
     assert relationship.evidence_basis == "unresolved"
-    assert result.business_context.insight_lineage[0].lineage_status == "partial"
-    assert result.business_context.insight_lineage[0].unresolved_business_facts
+    assert result.business_context.insight_lineage == []
+    schema_relationship = result.prompt_snapshot()["selected_datasource_snapshot"][0]["metadata_schema"]["relationships"][0]
+    assert schema_relationship["joinability"] == "unknown"
     assert result.probe_observations
 
 
@@ -3520,6 +3668,8 @@ def test_preparation_stage_failure_carries_uncertainty_to_formal_analysis(monkey
     assert "preparation_envelope" not in result.prompt_snapshot()
     assert set(result.selection.selected_datasource_ids) == {11, 12}
     assert result.business_context.unresolved_relationships
+    schemas = result.prompt_snapshot()["selected_datasource_snapshot"]
+    assert all(item["metadata_schema"]["semantic_enrichment_status"] == "unavailable" for item in schemas)
 
 
 def test_query_capabilities_are_loaded_from_selected_source_types():

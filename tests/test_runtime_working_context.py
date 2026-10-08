@@ -4,6 +4,8 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from langchain.agents.middleware import ModelRequest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
@@ -28,10 +30,12 @@ from agent.runtime_working_context import (
     resolve_runtime_material_plan,
     resolve_work,
     RuntimeMaterialPlanInput,
+    RuntimeSemanticPlanInput,
     RuntimeProbeRequestInput,
     RuntimeMaterialUnit,
     RuntimeWorkInput,
     plan_runtime_materials,
+    plan_runtime_semantics,
     request_runtime_probe,
     work_contracts,
 )
@@ -45,6 +49,48 @@ def call(name, identity, **args):
 
 def answer(identity, **payload):
     return ToolMessage(content=json.dumps(payload), tool_call_id=identity)
+
+
+@pytest.mark.parametrize('phase', list(RuntimePhase))
+def test_presentation_tool_is_available_only_in_expression_phase(phase):
+    from agent.tools import compose_analysis_presentation
+    packet = replace(new_runtime_work_packet(), phase=phase)
+    context = CustomContext(username='test', user_query='分析', namespace_id=1,
+                            runtime_work_packet=packet.to_dict())
+    request = build_working_request(ModelRequest(model=None, messages=[HumanMessage('分析')],
+        runtime=SimpleNamespace(context=context), tools=[compose_analysis_presentation]))
+    assert bool(request.tools) == (phase == RuntimePhase.EXPRESS)
+
+
+def test_datasource_purpose_description_is_structurally_separate_from_schema_evidence():
+    from agent.context_engineering_runtime import (
+        _runtime_datasource_detail_item,
+        _runtime_datasource_index_item,
+    )
+
+    row = {
+        'datasource_id': 18,
+        'datasource_name': 'Operations data',
+        'metadata_schema': {
+            'name': 'Operations data',
+            'description': 'Intended for capacity planning and maintenance analysis.',
+            'properties': {'rated_power': {'type': 'number', 'description': 'Design rating in kW'}},
+        },
+    }
+    index = _runtime_datasource_index_item(row)
+    detail = _runtime_datasource_detail_item(
+        row, requested_fields=('rated_power',), fallback_index=index,
+    )
+
+    assert 'description' not in index['schema_summary']
+    assert index['dataset_context'] == {
+        'description': 'Intended for capacity planning and maintenance analysis.',
+        'role': 'dataset_purpose_context',
+        'evidence_authority': 'context_only',
+    }
+    assert 'description' not in detail['metadata_schema']
+    assert detail['metadata_schema']['properties']['rated_power']['description'] == 'Design rating in kW'
+    assert detail['dataset_context'] == index['dataset_context']
 
 
 def test_work_tool_normalizes_json_containers_through_its_real_invocation():
@@ -65,6 +111,30 @@ def test_work_tool_normalizes_json_containers_through_its_real_invocation():
     for value in ('not json', 'null', '{"wrong": 11}'):
         with pytest.raises(ValidationError):
             RuntimeWorkInput.model_validate({'work': 'plan', 'focus': 'Compare', 'datasource_ids': value})
+
+
+def test_decision_rule_keeps_source_citations_separate_from_computed_inputs():
+    from agent.runtime_working_context import RuntimeDecisionCondition
+
+    decision = RuntimeDecisionCondition.model_validate({
+        'purpose': 'Compare with the supplied limit', 'basis': 'user',
+        'criterion': 'The user limit is 70 percent',
+        'source_references': [{'source': 'user', 'reference': 'current question',
+                               'excerpt': 'Use 70 percent as the limit.'}],
+        'condition': 'comparison.greater', 'when_true': 'Above the supplied limit',
+        'otherwise': 'Describe equal/below/missing using comparison.relation',
+        'supporting_fact_ids': ['current_ratio'],
+    })
+    dumped = decision.model_dump()
+    assert dumped['source_references'][0]['excerpt'] == 'Use 70 percent as the limit.'
+    assert dumped['supporting_fact_ids'] == ['current_ratio']
+    assert 'verified' not in dumped
+    # No semantic gate: mathematical comparisons need no external business rule.
+    mathematical = RuntimeDecisionCondition.model_validate({
+        'purpose': 'Compare two observed values', 'basis': 'mathematical',
+        'condition': 'comparison.equal', 'when_true': 'Equal', 'otherwise': 'Not equal or unknown',
+    })
+    assert mathematical.source_references == []
 
 
 def test_initial_work_selector_cannot_enter_an_execution_state():
@@ -175,6 +245,922 @@ def test_project_history_keeps_only_latest_control_revision():
     assert calls == ['new-select']
 
 
+def test_semantic_plan_covers_preparation_questions_and_has_one_canonical_work_view():
+    import pytest
+
+    context = CustomContext(username='test')
+    context.active_datasource_snapshot = {
+        'analysis_semantic_context': {
+            'business_questions': [{'question_id': 'q1'}, {'question_id': 'q2'}],
+        },
+    }
+    plan = {
+        'analysis_goal': 'Compare the two questions',
+        'questions': [
+            {'question_id': 'q1', 'analysis_focus': 'Count orders', 'decision_conditions': []},
+            {'question_id': 'q2', 'analysis_focus': 'Compare revenue', 'decision_conditions': []},
+        ],
+    }
+    assert RuntimeSemanticPlanInput.model_validate(plan).questions[0].question_id == 'q1'
+    result = plan_runtime_semantics.func(runtime=SimpleNamespace(context=context), **plan)
+    assert result['status'] == 'success'
+    assert len(result['semantic_plan']['questions']) == 2
+    incomplete = plan_runtime_semantics.func(
+        runtime=SimpleNamespace(context=context),
+        analysis_goal=plan['analysis_goal'],
+        questions=plan['questions'][:1],
+    )
+    assert incomplete['status'] == 'failed'
+
+    messages = [
+        call('plan_runtime_semantics', 'semantic', **plan),
+        answer('semantic', **result),
+    ]
+    projected, _ = project_history(messages, work='plan', semantic_plan_available=True)
+    assert len(projected) == 1
+    assert isinstance(projected[0], HumanMessage)
+    assert projected[0].name == 'runtime_memory'
+    completed = json.loads(projected[0].content)['runtime_recorded_history'][0]
+    assert completed['question_ids'] == ['q1', 'q2']
+    assert completed['status'] == 'success'
+    assert completed['tool_call_id'] == 'semantic'
+    assert messages[0].tool_calls[0]['args'] == plan
+    assert json.loads(messages[1].content)['semantic_plan'] == result['semantic_plan']
+    assert result['semantic_plan']['questions'][0]['analysis_focus'] == 'Count orders'
+
+
+def test_runtime_semantics_owns_fact_lineage_and_rejects_invented_schema_bindings():
+    context = CustomContext(username='test')
+    context.active_datasource_snapshot = {
+        'analysis_semantic_context': {
+            'business_questions': [{
+                'question_id': 'q1',
+                'required_business_facts': [
+                    {'fact_id': 'count', 'business_fact': 'Order count'},
+                    {'fact_id': 'rate', 'business_fact': 'Completion rate'},
+                ],
+            }],
+        },
+        'selected_datasource_snapshot': [{
+            'datasource_id': 7,
+            'metadata_schema': {
+                'properties': {'order_id': {'type': 'string'}},
+                'relationships': [{'relationship_id': 'r1'}],
+            },
+        }],
+    }
+    question = {
+        'question_id': 'q1', 'analysis_focus': 'Count and assess orders', 'decision_conditions': [],
+        'relationship_ids': ['r1'],
+        'facts': [
+            {'fact_id': 'count', 'meaning': 'Number of orders', 'status': 'direct',
+             'source_bindings': [{'datasource_id': 7, 'fields': ['order_id'], 'role': 'measure'}]},
+            {'fact_id': 'rate', 'meaning': 'Completion rate', 'status': 'unresolved',
+             'unresolved_reason': 'Completion status is not defined in the selected Schema'},
+        ],
+    }
+    result = plan_runtime_semantics.func(
+        runtime=SimpleNamespace(context=context), analysis_goal='Assess orders', questions=[question],
+    )
+    assert result['status'] == 'success'
+    assert result['semantic_plan']['questions'][0]['facts'][1]['status'] == 'unresolved'
+    renamed = plan_runtime_semantics.func(
+        runtime=SimpleNamespace(context=context), analysis_goal='Assess orders',
+        questions=[{**question, 'facts': [
+            {**question['facts'][0], 'fact_id': 'order_population'},
+            {**question['facts'][1], 'fact_id': 'completion_semantics'},
+        ]}],
+    )
+    assert renamed['status'] == 'success'
+    assert [fact['fact_id'] for fact in renamed['semantic_plan']['questions'][0]['facts']] == [
+        'order_population', 'completion_semantics',
+    ]
+    invented = plan_runtime_semantics.func(
+        runtime=SimpleNamespace(context=context), analysis_goal='Assess orders',
+        questions=[{**question, 'facts': [{**question['facts'][0], 'source_bindings': [
+            {'datasource_id': 7, 'fields': ['not_a_field'], 'role': 'measure'},
+        ]}, question['facts'][1]]}],
+    )
+    assert invented['status'] == 'failed'
+    assert 'not_a_field' in str(invented['problems'])
+
+
+@pytest.mark.parametrize('asynchronous', [False, True])
+def test_semantic_argument_feedback_keeps_all_errors_without_replaying_the_plan(asynchronous):
+    import asyncio
+    from agent.runtime_working_context import RuntimeWorkingContextMiddleware
+
+    context = CustomContext(username='test', active_datasource_snapshot={
+        'analysis_semantic_context': {'business_questions': [{'question_id': 'user_question'}]},
+    })
+    args = {'analysis_goal': 'Observe entities', 'questions': [{
+        'question_id': 'q1', 'analysis_focus': 'Observe entities',
+        'facts': [{'fact_id': f'f{i}', 'meaning': 'candidate-text-' + 'x' * 200,
+                   'status': 'derived'} for i in range(8)],
+    }]}
+    original = copy.deepcopy(args)
+    request = SimpleNamespace(
+        runtime=SimpleNamespace(context=context), state={'messages': []},
+        tool_call={'name': 'plan_runtime_semantics', 'id': 'invalid-semantics', 'args': args},
+    )
+    def handler(_):
+        raise AssertionError('Invalid arguments must not enter the tool handler')
+    async def async_handler(_):
+        return handler(_)
+    middleware = RuntimeWorkingContextMiddleware()
+    result = (asyncio.run(middleware.awrap_tool_call(request, async_handler))
+              if asynchronous else middleware.wrap_tool_call(request, handler))
+    assert isinstance(result, ToolMessage)
+    assert result.status == 'error'
+    assert result.tool_call_id == 'invalid-semantics'
+    payload = json.loads(result.content)
+    assert payload['status'] == 'failed'
+    assert len(payload['problems']) == 8
+    assert payload['expected_question_ids'] == ['user_question']
+    assert payload['problems'][0]['location'] == ['questions', 0, 'facts', 0]
+    assert 'dependencies or source bindings' in payload['problems'][0]['message']
+    assert 'candidate-text-' not in result.content
+    assert args == original
+    packet = runtime_work_packet_from_dict(context.runtime_work_packet)
+    assert packet.phase is RuntimePhase.UNDERSTAND
+    assert packet.semantic_plan == {}
+
+
+def test_single_question_identity_is_canonicalized_without_guessing_multiple_questions():
+    context = CustomContext(username='test')
+    context.active_datasource_snapshot = {
+        'analysis_semantic_context': {'business_questions': [{'question_id': 'question_1'}]},
+    }
+    result = plan_runtime_semantics.func(
+        runtime=SimpleNamespace(context=context), analysis_goal='Describe sources',
+        questions=[{'question_id': 'q1', 'analysis_focus': 'Describe sources'}],
+    )
+    assert result['status'] == 'success'
+    assert result['semantic_plan']['questions'][0]['question_id'] == 'question_1'
+    context.active_datasource_snapshot['analysis_semantic_context']['business_questions'].append(
+        {'question_id': 'question_2'},
+    )
+    result = plan_runtime_semantics.func(
+        runtime=SimpleNamespace(context=context), analysis_goal='Describe sources',
+        questions=[{'question_id': 'q1', 'analysis_focus': 'First'},
+                   {'question_id': 'q2', 'analysis_focus': 'Second'}],
+    )
+    assert result['status'] == 'failed'
+
+
+def test_semantic_tool_schema_uses_current_question_identities_without_changing_global_schema():
+    from agent.runtime_working_context import _semantic_plan_input_for_context
+
+    context = CustomContext(username='test')
+    context.active_datasource_snapshot = {
+        'analysis_semantic_context': {'business_questions': [
+            {'question_id': 'q1'}, {'question_id': 'q2'}, {'question_id': 'q1'},
+        ]},
+    }
+    schema = _semantic_plan_input_for_context(context).model_json_schema()
+    questions = schema['properties']['questions']
+    assert questions['minItems'] == questions['maxItems'] == 2
+    question_type = questions['items']['$ref'].split('/')[-1]
+    assert schema['$defs'][question_type]['properties']['question_id']['enum'] == ['q1', 'q2']
+    assert 'enum' not in RuntimeSemanticPlanInput.model_json_schema()['$defs']['RuntimeQuestionSemantics']['properties']['question_id']
+    context.active_datasource_snapshot = {}
+    from agent.runtime_working_context import RuntimeSemanticIntentInput
+    assert _semantic_plan_input_for_context(context) is RuntimeSemanticIntentInput
+
+
+def test_intent_tool_retains_original_formula_and_rule_sources_without_branch_prose():
+    from agent.runtime_working_context import semantic_plan_work_view
+
+    formula = 'Use the supplied quantity-weighted unit value: sum(value * quantity) / sum(quantity).'
+    source = {'source': 'user', 'reference': 'current request', 'excerpt': 'Compare against the supplied contractual limit.'}
+    payload = {
+        'analysis_goal': 'Assess the requested quantity',
+        'questions': [{
+            'question_id': 'q1', 'analysis_focus': 'Assess the requested quantity',
+            'calculation_rules': [{'purpose': 'Requested weighted value', 'definition': formula,
+                                   'basis': 'user', 'output_fact_ids': ['weighted_value']}],
+            'decision_conditions': [{'purpose': 'Contract comparison', 'basis': 'user',
+                                     'criterion': 'Use the supplied contractual limit.',
+                                     'source_references': [source], 'supporting_fact_ids': ['weighted_value']}],
+        }],
+    }
+    parsed = plan_runtime_semantics.args_schema.model_validate(payload).model_dump(exclude_unset=True)
+    saved = plan_runtime_semantics.func(runtime=SimpleNamespace(context=CustomContext(username='test')), **parsed)
+    assert saved['status'] == 'success'
+    for plan in (saved['semantic_plan'], semantic_plan_work_view(saved['semantic_plan'])):
+        question = plan['questions'][0]
+        assert question['calculation_rules'][0]['definition'] == formula
+        assert question['decision_conditions'][0]['source_references'] == [source]
+        assert not {'condition', 'when_true', 'otherwise'} & question['decision_conditions'][0].keys()
+
+
+def test_semantic_intent_handler_revalidates_the_public_intent_model_not_legacy_plan_objects():
+    from agent.runtime_working_context import RuntimeSemanticIntentInput
+
+    parsed = RuntimeSemanticIntentInput.model_validate({
+        'analysis_goal': 'Describe observed equipment',
+        'questions': [{
+            'question_id': 'q1',
+            'analysis_focus': 'Describe observed equipment',
+            'calculation_rules': [{
+                'purpose': 'Equipment distribution',
+                'definition': 'Summarize the complete observed equipment population',
+                'basis': 'analytical_derivation',
+            }],
+        }],
+    })
+    result = plan_runtime_semantics.func(
+        runtime=SimpleNamespace(context=CustomContext(username='test')),
+        analysis_goal=parsed.analysis_goal,
+        questions=parsed.questions,
+    )
+    assert result['status'] == 'success'
+    rule = result['semantic_plan']['questions'][0]['calculation_rules'][0]
+    assert rule['purpose'] == 'Equipment distribution'
+    assert 'output_fact_ids' not in rule
+
+
+def test_semantic_calculations_link_inputs_grain_identity_and_decisions_to_facts():
+    import pytest
+
+    question = {
+        'question_id': 'q1', 'analysis_focus': 'Count business entities',
+        'facts': [
+            {'fact_id': 'entity', 'meaning': 'Entity identity', 'status': 'direct',
+             'source_bindings': [{'datasource_id': 7, 'fields': ['entity_id'], 'role': 'dimension'}]},
+            {'fact_id': 'count', 'meaning': 'Distinct count', 'status': 'derived',
+             'derived_from_fact_ids': ['entity']},
+        ],
+        'calculation_rules': [{
+            'purpose': 'Distinct entities', 'definition': 'Count distinct nonempty identities',
+            'basis': 'analytical_derivation', 'input_fact_ids': ['entity'],
+            'output_fact_ids': ['count'],
+            'entity_key_fact_ids': ['entity'], 'group_by_fact_ids': [],
+        }],
+        'decision_conditions': [{
+            'purpose': 'Coverage', 'basis': 'mathematical', 'condition': 'count > 0',
+            'when_true': 'Describe observed population', 'otherwise': 'Describe absence',
+            'supporting_fact_ids': ['count'],
+        }],
+    }
+    plan = RuntimeSemanticPlanInput.model_validate({'analysis_goal': 'Coverage', 'questions': [question]})
+    rule = plan.questions[0].calculation_rules[0]
+    assert rule.group_by_fact_ids == []
+    assert rule.entity_key_fact_ids == ['entity']
+    assert rule.output_fact_ids == ['count']
+    assert RuntimeSemanticPlanInput.model_validate({
+        'analysis_goal': 'Coverage', 'questions': [{
+            **question, 'calculation_rules': [{
+                'purpose': 'Count', 'definition': 'Needs grouping confirmation', 'basis': 'unresolved',
+            }],
+        }],
+    }).questions[0].calculation_rules[0].group_by_fact_ids is None
+    for name in ('input_fact_ids', 'group_by_fact_ids', 'entity_key_fact_ids'):
+        with pytest.raises(ValueError, match='unknown fact references'):
+            RuntimeSemanticPlanInput.model_validate({'analysis_goal': 'Coverage', 'questions': [{
+                **question, 'calculation_rules': [{**question['calculation_rules'][0], name: ['missing']}],
+            }]})
+    with pytest.raises(ValueError, match='unknown fact references'):
+        RuntimeSemanticPlanInput.model_validate({'analysis_goal': 'Coverage', 'questions': [{
+            **question, 'decision_conditions': [{**question['decision_conditions'][0], 'supporting_fact_ids': ['missing']}],
+        }]})
+
+
+def test_calculation_results_are_declared_once_and_reused_by_later_rules_and_decisions():
+    question = {
+        'question_id': 'q1', 'analysis_focus': 'Weighted price comparison',
+        'facts': [{'fact_id': 'amount', 'meaning': 'Amount', 'status': 'direct',
+                   'source_bindings': [{'datasource_id': 7, 'fields': ['amount'], 'role': 'measure'}]},
+                  {'fact_id': 'quantity', 'meaning': 'Quantity', 'status': 'direct',
+                   'source_bindings': [{'datasource_id': 7, 'fields': ['quantity'], 'role': 'measure'}]}],
+        'calculation_rules': [
+            {'purpose': 'Totals', 'definition': 'Sum amount and quantity over the same population',
+             'basis': 'analytical_derivation', 'input_fact_ids': ['amount', 'quantity'],
+             'output_fact_ids': ['total_amount', 'total_quantity'], 'group_by_fact_ids': []},
+            {'purpose': 'Weighted price', 'definition': 'total_amount / total_quantity when quantity is nonzero',
+             'basis': 'analytical_derivation', 'input_fact_ids': ['total_amount', 'total_quantity'],
+             'output_fact_ids': ['price'], 'group_by_fact_ids': []},
+        ],
+        'decision_conditions': [{
+            'purpose': 'Whether a price can be stated', 'basis': 'mathematical',
+            'condition': 'total_quantity != 0', 'when_true': 'State the calculated weighted price',
+            'otherwise': 'The price is undefined for a zero denominator',
+            'supporting_fact_ids': ['total_quantity', 'price'],
+        }],
+    }
+    plan = RuntimeSemanticPlanInput.model_validate({'analysis_goal': 'Price', 'questions': [question]})
+    assert len(plan.questions[0].facts) == 2
+    assert plan.questions[0].calculation_rules[1].input_fact_ids == ['total_amount', 'total_quantity']
+    assert RuntimeSemanticPlanInput.model_validate(plan.model_dump()) == plan
+    for field in ('input_fact_ids', 'group_by_fact_ids', 'entity_key_fact_ids'):
+        changed = copy.deepcopy(question)
+        changed['calculation_rules'][1][field] = ['undefined']
+        with pytest.raises(ValueError, match='unknown fact references') as missing:
+            RuntimeSemanticPlanInput.model_validate({'analysis_goal': 'Price', 'questions': [changed]})
+        assert f'calculation_rules[1].{field}[0]' in str(missing.value)
+        assert 'undefined' in str(missing.value)
+    repeated = copy.deepcopy(question)
+    repeated['calculation_rules'][1]['output_fact_ids'] = ['total_amount']
+    with pytest.raises(ValueError, match='one producer'):
+        RuntimeSemanticPlanInput.model_validate({'analysis_goal': 'Price', 'questions': [repeated]})
+    with pytest.raises(ValueError) as conflict:
+        RuntimeSemanticPlanInput.model_validate({'analysis_goal': 'Price', 'questions': [repeated]})
+    assert 'total_amount' in str(conflict.value)
+    assert 'calculation_rules[0].output_fact_ids[0]' in str(conflict.value)
+    assert 'calculation_rules[1].output_fact_ids[0]' in str(conflict.value)
+    overwritten = copy.deepcopy(question)
+    overwritten['calculation_rules'][1]['output_fact_ids'] = ['amount']
+    with pytest.raises(ValueError, match='cannot overwrite') as overwritten_error:
+        RuntimeSemanticPlanInput.model_validate({'analysis_goal': 'Price', 'questions': [overwritten]})
+    assert '"amount"' in str(overwritten_error.value)
+    assert 'facts[0].fact_id' in str(overwritten_error.value)
+    assert 'calculation_rules[1].output_fact_ids[0]' in str(overwritten_error.value)
+
+
+def test_calculated_grouping_key_and_ratio_keep_one_definition_and_source_grounding():
+    question = {
+        'question_id': 'q1', 'analysis_focus': 'Annual distribution',
+        'facts': [{'fact_id': 'identity', 'meaning': 'Identity', 'status': 'direct',
+                   'source_bindings': [{'datasource_id': 7, 'fields': ['entity_id'], 'role': 'key'}]},
+                  {'fact_id': 'date', 'meaning': 'Event date', 'status': 'direct',
+                   'source_bindings': [{'datasource_id': 7, 'fields': ['event_date'], 'role': 'time'}]}],
+        'calculation_rules': [
+            {'purpose': 'Calendar year', 'definition': 'Extract calendar year from event date',
+             'basis': 'schema', 'input_fact_ids': ['date'], 'output_fact_ids': ['year']},
+            {'purpose': 'Population count', 'definition': 'Count distinct nonempty identities',
+             'basis': 'analytical_derivation', 'input_fact_ids': ['identity'],
+             'output_fact_ids': ['total'], 'entity_key_fact_ids': ['identity'], 'group_by_fact_ids': []},
+            {'purpose': 'Annual count', 'definition': 'Count distinct identities in each calendar year',
+             'basis': 'analytical_derivation', 'input_fact_ids': ['identity', 'year'],
+             'output_fact_ids': ['annual_count'], 'entity_key_fact_ids': ['identity'], 'group_by_fact_ids': ['year']},
+            {'purpose': 'Annual proportion', 'definition': 'annual_count / total * 100; undefined when total is zero',
+             'basis': 'analytical_derivation', 'input_fact_ids': ['annual_count', 'total'],
+             'output_fact_ids': ['annual_share'], 'group_by_fact_ids': ['year'], 'unit': '%'},
+        ],
+    }
+    plan = RuntimeSemanticPlanInput.model_validate({'analysis_goal': 'Distribution', 'questions': [question]})
+    assert plan.questions[0].calculation_rules[-1].group_by_fact_ids == ['year']
+    runtime = SimpleNamespace(context=CustomContext(username='test', active_datasource_snapshot={
+        'selected_datasource_ids': [7], 'selected_datasource_snapshot': [{
+            'datasource_id': 7, 'metadata_schema': {'properties': {'entity_id': {}, 'event_date': {}}},
+        }],
+    }))
+    result = plan_runtime_semantics.func(runtime=runtime, analysis_goal='Distribution', questions=[question])
+    assert result['status'] == 'success'
+    assert len(result['semantic_plan']['questions'][0]['facts']) == 2
+    invalid = copy.deepcopy(question)
+    invalid['facts'][1]['source_bindings'][0]['fields'] = ['foreign_field']
+    failure = plan_runtime_semantics.func(runtime=runtime, analysis_goal='Distribution', questions=[invalid])
+    assert failure['status'] == 'failed'
+    assert 'foreign_field' in str(failure['problems'])
+
+
+def test_decision_schema_distinguishes_computable_predicates_from_judgement_authority():
+    from agent.runtime_working_context import RuntimeDecisionCondition
+
+    properties = RuntimeDecisionCondition.model_json_schema()['properties']
+    assert 'not whether the predicate can be calculated' in properties['basis']['description']
+    assert 'actual supplied criterion' in properties['basis']['description']
+    assert 'not proof of health or safety' in properties['otherwise']['description']
+    assert 'not merely whether inputs exist' in properties['condition']['description']
+    assert 'not just a missing-input message' in properties['otherwise']['description']
+
+
+def test_source_bound_derived_fact_does_not_require_an_artificial_intermediate_fact():
+    import pytest
+    from agent.runtime_working_context import RuntimeSemanticFact
+
+    fact = RuntimeSemanticFact.model_validate({
+        'fact_id': 'year', 'meaning': 'Year extracted from installation date', 'status': 'derived',
+        'source_bindings': [{'datasource_id': 7, 'fields': ['installed_at'], 'role': 'derived_time'}],
+    })
+    assert fact.derived_from_fact_ids == []
+    assert fact.source_bindings[0].role == 'derived_time'
+    with pytest.raises(ValueError, match='dependencies or source bindings'):
+        RuntimeSemanticFact(fact_id='orphan', meaning='No known input', status='derived')
+
+
+def test_descriptive_source_role_cannot_bypass_real_schema_ownership():
+    context = CustomContext(username='test')
+    context.active_datasource_snapshot = {
+        'selected_datasource_ids': [7],
+        'selected_datasource_snapshot': [{
+            'datasource_id': 7, 'metadata_schema': {'properties': {'installed_at': {'type': 'string'}}},
+        }],
+    }
+    result = plan_runtime_semantics.func(
+        runtime=SimpleNamespace(context=context), analysis_goal='Installation distribution',
+        questions=[{'question_id': 'q1', 'analysis_focus': 'Years', 'facts': [{
+            'fact_id': 'year', 'meaning': 'Installation year', 'status': 'derived',
+            'source_bindings': [{'datasource_id': 7, 'fields': ['missing'], 'role': 'derived_time'}],
+        }]}],
+    )
+    assert result['status'] == 'failed'
+    assert any('unknown fields' in problem for problem in result['problems'])
+
+
+def test_semantic_field_binding_uses_full_schema_after_a_focused_projection():
+    context = CustomContext(username='test')
+    context.active_datasource_snapshot = {
+        'selected_datasource_ids': [7],
+        'selected_datasource_snapshot': [{
+            'datasource_id': 7, 'metadata_schema': {'properties': {'visible': {'type': 'string'}}},
+        }],
+    }
+    context.execution_datasource_snapshot = {
+        'selected_datasource_snapshot': [{
+            'datasource_id': 7,
+            'metadata_schema': {'properties': {
+                'visible': {'type': 'string'}, 'amount': {'type': 'number'},
+            }},
+        }],
+    }
+    result = plan_runtime_semantics.func(
+        runtime=SimpleNamespace(context=context), analysis_goal='Measure orders',
+        questions=[{'question_id': 'q1', 'analysis_focus': 'Measure orders', 'decision_conditions': [], 'facts': [{
+            'fact_id': 'f1', 'meaning': 'Order amount', 'status': 'direct',
+            'source_bindings': [{'datasource_id': 7, 'fields': ['amount'], 'role': 'measure'}],
+        }]}],
+    )
+    assert result['status'] == 'success'
+
+
+@pytest.mark.parametrize('legacy_branches', [False, True])
+def test_semantic_fact_links_survive_material_planning_probe_and_repair_views(legacy_branches):
+    context = CustomContext(username='test')
+    context.active_datasource_snapshot = {
+        'analysis_semantic_context': {'business_questions': [{'question_id': 'q1'}]},
+        'selected_datasource_ids': [7],
+        'selected_datasource_snapshot': [{
+            'datasource_id': 7, 'metadata_schema': {'properties': {'entity_id': {'type': 'string'}}},
+        }],
+    }
+    plan = {'analysis_goal': 'Distinct entities', 'questions': [{
+        'question_id': 'q1', 'analysis_focus': 'Count entities',
+        'facts': [{'fact_id': 'identity', 'meaning': 'Business identity', 'status': 'direct',
+                   'source_bindings': [{'datasource_id': 7, 'fields': ['entity_id'], 'role': 'dimension'}]}],
+        'calculation_rules': [{'purpose': 'Count summary record', 'definition': 'Return distinct_count as the count of distinct entity identities',
+                               'basis': 'analytical_derivation', 'input_fact_ids': ['identity'],
+                               'output_fact_ids': ['count'],
+                               'result_fields': {'distinct_count': 'Count distinct identity; unit entities'},
+                               'group_by_fact_ids': [], 'entity_key_fact_ids': ['identity']}],
+        'decision_conditions': [{
+            'purpose': 'Observed population', 'basis': 'mathematical', 'condition': 'count.distinct_count > 0',
+            'criterion': 'Compare the observed count with zero, not a business health threshold.',
+            'when_true': 'Describe the observed entity population.',
+            'otherwise': 'Describe the empty population without inventing a trend.',
+            'supporting_fact_ids': ['count'],
+        }],
+    }]}
+    if not legacy_branches:
+        for decision in plan['questions'][0]['decision_conditions']:
+            for field in ('condition', 'when_true', 'otherwise'):
+                decision.pop(field)
+        plan = plan_runtime_semantics.args_schema.model_validate(plan).model_dump(exclude_unset=True)
+    result = plan_runtime_semantics.func(runtime=SimpleNamespace(context=context), **plan)
+    assert result['status'] == 'success'
+    stored_decision = result['semantic_plan']['questions'][0]['decision_conditions'][0]
+    assert all((field in stored_decision) == legacy_branches
+               for field in ('condition', 'when_true', 'otherwise'))
+    messages = [HumanMessage('Count entities'), call('plan_runtime_semantics', 'semantic', **plan),
+                answer('semantic', **result)]
+    tools = [plan_runtime_semantics, plan_runtime_materials]
+
+    def check_view(work):
+        from agent.runtime_driver_state import reduce_runtime_tool_result
+
+        packet = new_runtime_work_packet(workspace_id='semantic-handoff', focus='Count entities')
+        calls = {}
+        for message in messages:
+            if isinstance(message, AIMessage):
+                calls.update({item['id']: item for item in message.tool_calls})
+            elif isinstance(message, ToolMessage):
+                paired = calls[message.tool_call_id]
+                packet = reduce_runtime_tool_result(
+                    packet, tool_name=paired['name'], tool_call_id=paired['id'],
+                    arguments=paired['args'], result=json.loads(message.content),
+                )
+        context.runtime_work_packet = packet.to_dict()
+        view = build_working_request(ModelRequest(
+            model=None, messages=copy.deepcopy(messages), runtime=SimpleNamespace(context=context), tools=tools,
+        ))
+        assert f'"work": "{work}"' in view.system_message.content
+        assert ('"entity_key_fact_ids": ["identity"]' in view.system_message.content) == legacy_branches
+        assert ('"output_fact_ids": ["count"]' in view.system_message.content) == legacy_branches
+        assert ('"group_by_fact_ids": []' in view.system_message.content) == legacy_branches
+        assert ('Describe the observed entity population.' in view.system_message.content) == legacy_branches
+        assert ('Describe the empty population without inventing a trend.' in view.system_message.content) == legacy_branches
+        assert ('"supporting_fact_ids": ["count"]' in view.system_message.content) == legacy_branches
+        assert 'Count distinct identity; unit entities' in view.system_message.content
+        assert 'Compare the observed count with zero, not a business health threshold.' in view.system_message.content
+        semantic_tool = next(item for item in view.tools if item.name == 'plan_runtime_semantics')
+        schema = semantic_tool.args_schema.model_json_schema()
+        name = schema['properties']['questions']['items']['$ref'].split('/')[-1]
+        assert schema['$defs'][name]['properties']['question_id']['enum'] == ['q1']
+        decision_schema = schema['$defs'][name]['properties']['decision_conditions']['items']['$ref'].split('/')[-1]
+        assert not {'condition', 'when_true', 'otherwise'} & schema['$defs'][decision_schema]['properties'].keys()
+        calculation_schema = schema['$defs'][name]['properties']['calculation_rules']['items']['$ref'].split('/')[-1]
+        assert not {'input_fact_ids', 'output_fact_ids', 'group_by_fact_ids', 'entity_key_fact_ids'} & schema['$defs'][calculation_schema]['properties'].keys()
+
+    check_view('plan')
+    manifest = plan_runtime_materials.func(focus='Count entities',
+        material_units=[{'question_ids': ['q1'], 'fact_ids': ['identity'], 'datasource_id': 7,
+                         'field_names': ['entity_id'], 'purpose': 'Read identities'}])
+    messages += [call('plan_runtime_materials', 'materials', **{k: manifest[k] for k in
+                  ('focus', 'material_units', 'probe_required', 'probe_focus')}), answer('materials', **manifest)]
+    check_view('implement')
+    messages += [call('request_runtime_probe', 'request', focus='Check identity format'),
+                 answer('request', tool='request_runtime_probe', status='success', work='probe', focus='Check identity format'),
+                 call('probe_analysis_data', 'probe', code='inspect_identity()'),
+                 answer('probe', status='observation', diagnostics={'probe_fact_ledger': {
+                     'observations': [{'query_key': 'identity', 'columns': ['entity_id']}],
+                 }})]
+    check_view('implement')
+    messages += [call('submit_analysis_program', 'program', code='count_entities()'),
+                 answer('program', status='failed', error_type='runtime_error')]
+    check_view('repair')
+
+
+def test_semantic_work_view_omits_only_reconstructible_defaults():
+    from agent.runtime_working_context import semantic_plan_work_view
+
+    typed = RuntimeSemanticPlanInput(
+        analysis_goal='Compare weighted costs', questions=[{
+            'question_id': 'q1', 'analysis_focus': 'Costs', 'population': 'Selected transactions',
+            'facts': [{'fact_id': 'amount', 'meaning': 'Transaction amount', 'status': 'direct',
+                       'source_bindings': [{'datasource_id': 7, 'fields': ['amount'], 'role': 'measure'}]}],
+            'calculation_rules': [{
+                'purpose': 'Summary', 'definition': 'Aggregate the selected transactions',
+                'basis': 'schema', 'input_fact_ids': ['amount'], 'output_fact_ids': ['summary'],
+                'group_by_fact_ids': [],
+                'result_fields': {'total': 'sum(amount), currency', 'average': 'mean(amount), currency'},
+            }],
+            'decision_conditions': [{
+                'purpose': 'Compare total with zero', 'basis': 'mathematical',
+                'criterion': 'Observable relation to zero', 'condition': 'summary.total == 0',
+                'when_true': 'Report zero total, not an empty population.',
+                'otherwise': 'Describe the actual total.', 'supporting_fact_ids': ['summary'],
+            }],
+            'unknowns': [{'kind': 'business_clarification', 'issue': 'Missing target cost',
+                          'consequence': 'Cannot classify performance against a target.'}],
+        }],
+    )
+    full = typed.model_dump(exclude={'progress_summary'})
+    before = copy.deepcopy(full)
+    view = semantic_plan_work_view(full)
+    assert full == before
+    assert RuntimeSemanticPlanInput.model_validate(view).model_dump(exclude={'progress_summary'}) == full
+    assert len(json.dumps(view)) < len(json.dumps(full))
+    question = view['questions'][0]
+    assert question['calculation_rules'][0]['group_by_fact_ids'] == []
+    assert question['calculation_rules'][0]['result_fields'] == {'total': 'sum(amount), currency', 'average': 'mean(amount), currency'}
+    assert question['decision_conditions'][0]['criterion'] == 'Observable relation to zero'
+    assert question['unknowns'] == full['questions'][0]['unknowns']
+
+    extended = copy.deepcopy(full)
+    extended['questions'][0]['future_semantic_note'] = 'Keep this future extension unchanged'
+    assert semantic_plan_work_view(extended) == extended
+    incomplete = {'analysis_goal': 'Incomplete plan under correction', 'questions': [{'question_id': 'q1'}]}
+    assert semantic_plan_work_view(incomplete) == incomplete
+
+
+def test_semantic_work_view_preserves_explicit_absence_for_model_consumer():
+    from agent.runtime_working_context import semantic_plan_work_view
+
+    plan = {
+        'analysis_goal': 'Describe observations',
+        'questions': [{
+            'question_id': 'q1', 'analysis_focus': 'Describe observations',
+            'decision_conditions': [],
+            'calculation_rules': [{
+                'purpose': 'Aggregate', 'definition': 'Sum observed values',
+                'basis': 'analytical_derivation', 'group_by_fact_ids': None,
+            }],
+        }],
+    }
+    before = copy.deepcopy(plan)
+    view = semantic_plan_work_view(plan)
+    assert plan == before
+    assert view['questions'][0]['decision_conditions'] == []
+    assert 'group_by_fact_ids' in view['questions'][0]['calculation_rules'][0]
+    assert view['questions'][0]['calculation_rules'][0]['group_by_fact_ids'] is None
+
+
+def test_semantic_work_view_preserves_empty_dependencies_and_criterion_sources():
+    from agent.runtime_working_context import semantic_plan_work_view
+
+    plan = {
+        'analysis_goal': 'Describe the selected records',
+        'questions': [{
+            'question_id': 'q1', 'analysis_focus': 'Observed distribution',
+            'facts': [], 'relationship_ids': [], 'unknowns': [],
+            'calculation_rules': [{
+                'purpose': 'Count records', 'definition': 'Count rows in the selected population',
+                'basis': 'analytical_derivation', 'input_fact_ids': [],
+                'entity_key_fact_ids': [], 'output_fact_ids': ['count'],
+                'result_fields': {}, 'group_by_fact_ids': [],
+            }],
+            'decision_conditions': [{
+                'purpose': 'Describe missing judgement basis', 'basis': 'unresolved',
+                'source_references': [], 'supporting_fact_ids': ['count'],
+                'condition': 'No supplied benchmark',
+                'when_true': 'No business classification is available',
+                'otherwise': 'Describe the actual record count',
+            }],
+        }],
+    }
+    before = copy.deepcopy(plan)
+    view = semantic_plan_work_view(plan)
+    assert plan == before
+    assert view == plan
+    assert RuntimeSemanticPlanInput.model_validate(view).questions[0].decision_conditions[0].basis == 'unresolved'
+
+
+def test_semantic_work_view_does_not_invent_unsupplied_boundary_fields():
+    from agent.runtime_working_context import semantic_plan_work_view
+
+    plan = {
+        'analysis_goal': 'Describe records',
+        'questions': [{'question_id': 'q1', 'analysis_focus': 'Records'}],
+    }
+    assert semantic_plan_work_view(plan) == plan
+
+
+def test_numeric_interpretation_reference_is_optional_and_work_scoped():
+    context = CustomContext(username='test')
+    reference = 'execution.numeric_interpretation'
+    assert reference not in work_contracts(context, 'implement')
+    assert reference in work_contracts(context, 'implement', [reference])
+    assert reference in work_contracts(context, 'repair', [reference])
+    assert reference not in work_contracts(context, 'understand', [reference])
+
+
+def test_semantic_implementation_bindings_resolve_producers_without_certifying_text():
+    from agent.runtime_working_context import semantic_implementation_bindings
+
+    plan = {'questions': [{
+        'question_id': 'q1',
+        'facts': [{'fact_id': 'category'}, {'fact_id': 'distribution', 'status': 'derived'}],
+        'calculation_rules': [{'output_fact_ids': ['distribution', 'total']}],
+        'decision_conditions': [
+            {'basis': 'unresolved', 'supporting_fact_ids': ['distribution'],
+             'otherwise': 'An unsupported healthy classification'},
+            {'basis': 'mathematical', 'supporting_fact_ids': ['total']},
+            {'basis': 'schema', 'supporting_fact_ids': ['category']},
+        ],
+    }]}
+    before = copy.deepcopy(plan)
+    view = semantic_implementation_bindings(plan)[0]
+    assert plan == before
+    assert view['result_definitions'] == {
+        'category': 'facts[0]', 'distribution': 'calculation_rules[0]',
+        'total': 'calculation_rules[0]',
+    }
+    assert [item['mode'] for item in view['decision_execution']] == [
+        'factual_only', 'mathematical_comparison', 'declared_business_rule',
+    ]
+    assert view['decision_execution'][0]['inputs'] == {'distribution': 'calculation_rules[0]'}
+    assert 'healthy' not in str(view)
+    assert semantic_implementation_bindings({}) == []
+
+
+def test_semantic_implementation_bindings_keep_question_namespaces_separate():
+    from agent.runtime_working_context import semantic_implementation_bindings
+
+    views = semantic_implementation_bindings({'questions': [
+        {'question_id': 'a', 'facts': [{'fact_id': 'count'}]},
+        {'question_id': 'b', 'calculation_rules': [{'output_fact_ids': ['count']}],
+         'decision_conditions': [{'basis': 'unresolved', 'supporting_fact_ids': ['missing']}]},
+    ]})
+    assert views[0]['result_definitions']['count'] == 'facts[0]'
+    assert views[1]['result_definitions']['count'] == 'calculation_rules[0]'
+    assert views[1]['decision_execution'][0]['inputs']['missing'] is None
+
+
+def test_semantic_source_scope_is_additive_selected_and_does_not_infer_bindings():
+    from agent.runtime_working_context import _merge_semantic_source_scope
+
+    plan = {'questions': [{'facts': [
+        {'fact_id': 'amount', 'source_bindings': [{'datasource_id': 7, 'fields': ['amount', 'unit']}]},
+        {'fact_id': 'label', 'source_bindings': [{'datasource_id': 8, 'fields': ['name']}]},
+        {'fact_id': 'unknown', 'source_bindings': []},
+        {'fact_id': 'outside', 'source_bindings': [{'datasource_id': 99, 'fields': ['secret']}]},
+    ]}]}
+    ids, fields = [7], {'7': ['date', 'amount']}
+    saved = copy.deepcopy((ids, fields, plan))
+    result = _merge_semantic_source_scope(ids, fields, plan, {7, 8})
+    assert result == ([7, 8], {'7': ['date', 'amount', 'unit'], '8': ['name']})
+    assert (ids, fields, plan) == saved
+    assert _merge_semantic_source_scope(ids, fields, {}, {7, 8}) == (ids, fields)
+
+
+@pytest.mark.parametrize('phase', [RuntimePhase.PLAN, RuntimePhase.IMPLEMENT, RuntimePhase.REPAIR, RuntimePhase.PROBE])
+def test_implementation_automatically_receives_semantic_bound_schema_without_reader(phase):
+    sources = [{
+        'datasource_id': identity, 'datasource_name': name, 'datasource_type': 'table',
+        'metadata_schema': {'properties': properties},
+    } for identity, name, properties in (
+        (7, 'facts', {'amount': {'type': 'number'},
+                      'unit': {'type': 'string', 'enum': ['kg', 't'], 'description': 'Calculation unit'},
+                      'unused': {'type': 'string'}}),
+        (8, 'labels', {'name': {'type': 'string', 'description': 'Readable entity label'}}),
+    )]
+    snapshot = {'selected_datasource_ids': [7, 8], 'selected_datasource_snapshot': sources}
+    semantics = {'analysis_goal': 'Compare records', 'questions': [{
+        'question_id': 'q1', 'analysis_focus': 'Compare records', 'facts': [
+            {'fact_id': 'amount', 'meaning': 'Input amount and calculation unit', 'status': 'direct',
+             'source_bindings': [{'datasource_id': 7, 'fields': ['amount', 'unit'], 'role': 'measure'}]},
+            {'fact_id': 'label', 'meaning': 'Readable label', 'status': 'direct',
+             'source_bindings': [{'datasource_id': 8, 'fields': ['name'], 'role': 'context'}]},
+        ], 'decision_conditions': [],
+    }]}
+    packet = RuntimeWorkPacket(
+        workspace_id='current', revision=3, phase=phase, semantic_plan=semantics,
+        active_datasource_ids=(7,), active_fields_by_datasource={'7': ('amount',)},
+        material_manifest={'focus': 'Compare records', 'material_units': [
+            {'datasource_id': 7, 'field_names': ['amount']},
+        ]},
+    )
+    context = CustomContext(username='test', active_datasource_snapshot=copy.deepcopy(snapshot),
+                            execution_datasource_snapshot=copy.deepcopy(snapshot),
+                            runtime_work_packet=packet.to_dict())
+    original = copy.deepcopy(context.runtime_work_packet)
+    projected = build_working_request(ModelRequest(
+        model=None, messages=[HumanMessage('Compare records')],
+        runtime=SimpleNamespace(context=context), tools=[],
+    ))
+    envelope = json.loads(projected.system_message.content.split('</runtime-context-instructions>\n', 1)[1]
+                          .split('\n</runtime-datasource-envelope>', 1)[0])
+    details = {source['datasource_id']: source['metadata_schema']['properties']
+               for source in envelope['datasource_details']}
+    if phase == RuntimePhase.PROBE:
+        assert details == {7: {}}
+        assert 'semantic_implementation_bindings' not in projected.system_message.content
+    else:
+        assert details == {7: {field: sources[0]['metadata_schema']['properties'][field]
+                               for field in ('amount', 'unit')},
+                           8: sources[1]['metadata_schema']['properties']}
+    assert envelope['selected_datasource_ids'] == [7, 8]
+    if phase in {RuntimePhase.IMPLEMENT, RuntimePhase.REPAIR}:
+        assert 'semantic_implementation_bindings' in projected.system_message.content
+        assert '"amount": "facts[0]"' in projected.system_message.content
+        assert '"label": "facts[1]"' in projected.system_message.content
+    if phase == RuntimePhase.PLAN:
+        assert 'semantic_implementation_bindings' not in projected.system_message.content
+    assert context.runtime_work_packet == original
+    assert context.active_datasource_snapshot == snapshot
+
+
+def test_failed_semantic_revision_keeps_its_arguments_for_correction():
+    messages = [
+        call('plan_runtime_semantics', 'valid', analysis_goal='Orders', questions=[{
+            'question_id': 'q1', 'analysis_focus': 'Orders',
+        }]),
+        answer('valid', tool='plan_runtime_semantics', status='success', semantic_plan={'questions': []}),
+        call('plan_runtime_semantics', 'invalid', analysis_goal='Orders', questions=[{
+            'question_id': 'q1', 'analysis_focus': 'Orders', 'facts': [{'fact_id': 'new_fact'}],
+        }]),
+        answer('invalid', tool='plan_runtime_semantics', status='failed', problems=['missing binding']),
+    ]
+    projected, _ = project_history(messages, work='implement', semantic_plan_available=True)
+    failed_call = next(
+        item for message in projected if isinstance(message, AIMessage)
+        for item in message.tool_calls if item['id'] == 'invalid'
+    )
+    assert failed_call['args']['questions'][0]['facts'] == [{'fact_id': 'new_fact'}]
+
+
+@pytest.mark.parametrize('available', [False, True])
+def test_semantic_correction_replaces_older_failures_without_losing_pending_work(available):
+    messages = []
+    if available:
+        messages.extend([
+            call('plan_runtime_semantics', 'accepted', analysis_goal='Accepted', questions=[{
+                'question_id': 'q1', 'analysis_focus': 'Count'}]),
+            answer('accepted', tool='plan_runtime_semantics', status='success'),
+        ])
+    for index in range(3):
+        messages.extend([
+            call('plan_runtime_semantics', f'failed-{index}', analysis_goal=f'Candidate {index}',
+                 questions=[{'question_id': 'q1', 'analysis_focus': 'Count'}]),
+            answer(f'failed-{index}', tool='plan_runtime_semantics', status='failed',
+                   problems=[{'location': ['questions', 0], 'message': f'Problem {index}'}]),
+        ])
+    messages.extend([call('read_runtime_datasource_context', 'schema', datasource_ids=[7]),
+                     answer('schema', status='success', datasources=[]),
+                     call('plan_runtime_semantics', 'pending', analysis_goal='Next revision', questions=[{
+                         'question_id': 'q1', 'analysis_focus': 'Count'}])])
+    original = copy.deepcopy(messages)
+    projected, _ = project_history(messages, work='understand', semantic_plan_available=available)
+    projected_calls = {c['id']: c for m in projected if isinstance(m, AIMessage) for c in m.tool_calls}
+    assert set(projected_calls) == {'failed-2', 'schema', 'pending'}
+    assert projected_calls['failed-2']['args']['analysis_goal'] == 'Candidate 2'
+    tool_ids = {m.tool_call_id for m in projected if isinstance(m, ToolMessage)}
+    assert tool_ids == {'failed-2', 'schema'}
+    assert messages == original
+    if available:
+        completed = [json.loads(m.content)['runtime_recorded_history'][0] for m in projected
+                     if isinstance(m, HumanMessage) and m.name == 'runtime_memory']
+        assert completed[0]['tool_call_id'] == 'accepted'
+
+
+def test_semantic_correction_compacts_tool_transport_errors_but_not_unknown_results():
+    messages = [call('plan_runtime_semantics', 'error-1', analysis_goal='A'),
+                ToolMessage(content='Invalid tool argument', tool_call_id='error-1', status='error'),
+                call('plan_runtime_semantics', 'unknown', analysis_goal='B'),
+                ToolMessage(content='Unclassified result', tool_call_id='unknown'),
+                call('plan_runtime_semantics', 'error-2', analysis_goal='C'),
+                ToolMessage(content='Invalid tool argument', tool_call_id='error-2', status='error')]
+    projected, _ = project_history(messages, work='understand')
+    assert {c['id'] for m in projected if isinstance(m, AIMessage) for c in m.tool_calls} == {
+        'unknown', 'error-2'}
+    assert {m.tool_call_id for m in projected if isinstance(m, ToolMessage)} == {'unknown', 'error-2'}
+
+
+def test_completed_semantic_memory_preserves_parallel_tool_pairs_and_audit():
+    semantic = {'id': 'semantic', 'name': 'plan_runtime_semantics', 'type': 'tool_call',
+                'args': {'analysis_goal': 'Orders', 'questions': [
+                    {'question_id': 'q1', 'analysis_focus': 'Count orders'}]}}
+    other = {'id': 'other', 'name': 'read_runtime_reference', 'type': 'tool_call',
+             'args': {'reference_ids': ['query.local_file']}}
+    messages = [AIMessage(content='Plan and load references', tool_calls=[semantic, other]),
+                answer('semantic', tool='plan_runtime_semantics', status='success'),
+                answer('other', tool='read_runtime_reference', status='success', references=[])]
+    original = copy.deepcopy(messages)
+    projected, _ = project_history(messages, work='implement', semantic_plan_available=True)
+    assert isinstance(projected[0], HumanMessage)
+    assert [item['id'] for item in projected[1].tool_calls] == ['other']
+    assert [item.tool_call_id for item in projected if isinstance(item, ToolMessage)] == ['other']
+    assert json.loads(projected[0].content)['runtime_recorded_history'][0]['question_ids'] == ['q1']
+    assert messages == original
+
+
+@pytest.mark.parametrize('available', [False, True])
+def test_pending_semantic_call_is_never_rewritten_as_completed(available):
+    messages = [call('plan_runtime_semantics', 'pending', analysis_goal='Orders', questions=[{
+        'question_id': 'q1', 'analysis_focus': 'Count orders'}])]
+    projected, _ = project_history(messages, work='plan', semantic_plan_available=available)
+    assert projected[0].tool_calls == messages[0].tool_calls
+    RuntimeSemanticPlanInput.model_validate(projected[0].tool_calls[0]['args'])
+
+
+def test_completed_semantic_call_keeps_full_plan_without_canonical_delivery():
+    messages = [call('plan_runtime_semantics', 'accepted', analysis_goal='Orders', questions=[{
+        'question_id': 'q1', 'analysis_focus': 'Count orders'}]),
+        answer('accepted', tool='plan_runtime_semantics', status='success',
+               semantic_plan={'analysis_goal': 'Orders'})]
+    projected, _ = project_history(messages, work='implement', semantic_plan_available=False)
+    assert projected[0].tool_calls == messages[0].tool_calls
+    assert json.loads(projected[1].content)['semantic_plan'] == {'analysis_goal': 'Orders'}
+
+
+def test_canonical_packet_does_not_restore_a_stale_material_plan():
+    stale = {'focus': 'Old scope', 'material_units': [{
+        'datasource_id': 7, 'field_names': ['old_field'], 'purpose': 'Old work',
+    }]}
+    messages = [
+        HumanMessage('Use the clarified scope'),
+        call('plan_runtime_materials', 'old-plan', **stale),
+        answer('old-plan', tool='plan_runtime_materials', status='success', **stale),
+    ]
+    context = CustomContext(username='test', runtime_work_packet=RuntimeWorkPacket(
+        workspace_id='clarified', revision=2, phase=RuntimePhase.UNDERSTAND,
+        goal_revision=2, focus='Use the clarified scope',
+    ).to_dict())
+    result = build_working_request(ModelRequest(
+        model=None, messages=messages, runtime=SimpleNamespace(context=context), tools=[],
+    ))
+    assert '"runtime_material_plan": {}' in result.system_message.content
+    assert 'old_field' not in result.system_message.content
+
+
+def test_clarification_does_not_replay_invalidated_semantic_or_material_plans():
+    messages = [
+        HumanMessage('Analyze current orders'),
+        call('plan_runtime_semantics', 'semantic', analysis_goal='Old scope', questions=[
+            {'question_id': 'q1', 'analysis_focus': 'Old definition'},
+        ]),
+        answer('semantic', tool='plan_runtime_semantics', status='success', semantic_plan={
+            'analysis_goal': 'Old scope', 'questions': [{'question_id': 'q1'}],
+        }),
+        call('plan_runtime_materials', 'materials', focus='Old scope', material_units=[]),
+        answer('materials', tool='plan_runtime_materials', status='success', material_units=[]),
+    ]
+    projected, archived = project_history(
+        messages,
+        work='understand',
+        discard_invalidated_plans=True,
+        semantic_plan_available=False,
+        material_plan_available=False,
+    )
+    assert archived >= 2
+    assert [message for message in projected if isinstance(message, ToolMessage)] == []
+    assert all(
+        not message.tool_calls
+        for message in projected if isinstance(message, AIMessage)
+    )
+
+
 def test_tool_call_reasoning_is_not_replayed_beside_canonical_action():
     messages = [
         AIMessage(content='A long exploratory explanation already captured by the action.', tool_calls=[{
@@ -191,6 +1177,29 @@ def test_tool_call_reasoning_is_not_replayed_beside_canonical_action():
     assert projected[0].content == ''
     assert projected[0].tool_calls[0]['args']['focus'] == 'Analyze orders'
     assert json.loads(projected[1].content)['focus'] == 'Analyze orders'
+
+
+def test_expression_history_omits_consumed_definition_source_but_keeps_candidate_facts():
+    source = 'x' * 50000
+    messages = [
+        call('submit_analysis_program', 'formal', definition_source=source,
+             title='Analyze orders', used_datasource_ids=[12]),
+        answer('formal', status='presentation_pending', execution_id=91,
+               facts={'order_count': 12}, charts=[{'title': 'Orders'}]),
+    ]
+    original = copy.deepcopy(messages)
+
+    projected, archived = project_history(messages, work='express')
+
+    arguments = projected[0].tool_calls[0]['args']
+    assert arguments['definition_source'].startswith('[已执行的定义源码')
+    assert len(arguments['definition_source']) < 100
+    assert arguments['title'] == 'Analyze orders'
+    result = json.loads(projected[1].content)
+    assert result['facts'] == {'order_count': 12}
+    assert result['charts'] == [{'title': 'Orders'}]
+    assert archived == 1
+    assert messages == original
 
 
 def test_repair_references_only_exact_replayed_source_and_retains_diagnostics():
@@ -217,6 +1226,59 @@ def test_repair_references_only_exact_replayed_source_and_retains_diagnostics():
     assert messages == original
 
 
+def test_repair_target_references_exact_source_without_changing_authorization():
+    source = 'value = query()\nresult = value.sum()'
+    target = {
+        'location_domain': 'python_source', 'mode': 'line_patch',
+        'base_execution_id': 42, 'source_sha256': 'immutable-source-hash',
+        'line_count': 2,
+        'allowed_ranges': [
+            {'start_line': 2, 'end_line': 2, 'source': 'result = value.sum()', 'kind': 'Assign'},
+            {'start_line': 1, 'end_line': 1, 'source': 'unverified_source()', 'kind': 'Assign'},
+        ],
+    }
+    messages = [call('submit_analysis_program', 'p', code=source),
+                answer('p', status='failed', execution_id=42, repair_target=target)]
+    original = copy.deepcopy(messages)
+    projected, _ = project_history(messages, work='repair')
+    actual = json.loads(projected[1].content)['repair_target']
+    assert projected[0].tool_calls[0]['args']['code'] == source
+    for key in ('mode', 'base_execution_id', 'source_sha256', 'line_count'):
+        assert actual[key] == target[key]
+    assert actual['allowed_ranges'][0] == {
+        'start_line': 2, 'end_line': 2, 'kind': 'Assign',
+        'source_ref': {'tool_call_id': 'p', 'start_line': 2, 'end_line': 2},
+    }
+    assert actual['allowed_ranges'][1] == target['allowed_ranges'][1]
+    assert messages == original
+
+
+def test_rejected_patches_cannot_take_ownership_of_the_executed_base_source():
+    source = 'value = query()\nresult = value.sum()'
+    messages = [
+        call('submit_analysis_program', 'base', code=source),
+        answer('base', execution_id=42, status='failed', error_type='runtime_error'),
+        call('submit_analysis_program', 'rejected1', code='', base_execution_id=42,
+             patches=[{'start_line': 1, 'end_line': 1, 'replacement': 'bad_patch1'}]),
+        answer('rejected1', execution_id=42, status='failed', error_type='contract_error',
+               diagnostics={'new_execution_created': False, 'base_source_unchanged': True}),
+        call('submit_analysis_program', 'rejected2', code='', base_execution_id=42,
+             patches=[{'start_line': 1, 'end_line': 1, 'replacement': 'bad_patch2'}]),
+        answer('rejected2', execution_id=42, status='failed', error_type='contract_error',
+               diagnostics={'new_execution_created': False, 'base_source_unchanged': True}),
+    ]
+    original = copy.deepcopy(messages)
+    projected, _ = project_history(messages, work='repair')
+    calls = {item['id']: item for message in projected if isinstance(message, AIMessage)
+             for item in message.tool_calls}
+    assert calls['base']['args']['code'] == source
+    assert 'rejected2' in calls
+    assert 'rejected1' not in calls
+    assert any(isinstance(message, ToolMessage) and message.tool_call_id == 'base'
+               for message in projected)
+    assert messages == original
+
+
 def test_local_failures_drive_repair_and_successful_probe_continues_to_implementation():
     messages = [call('select_runtime_work', 's', work='implement', focus='Full report'),
                 answer('s', tool='select_runtime_work', status='success', work='implement', focus='Full report'),
@@ -227,6 +1289,166 @@ def test_local_failures_drive_repair_and_successful_probe_continues_to_implement
                      answer('p', error_type='probe_feedback', status='observation',
                             diagnostics={'probe_fact_ledger': {'observations': []}})])
     assert resolve_work(messages)[0] == 'repair'
+
+
+@pytest.mark.parametrize("patch_authorized", [False, True])
+def test_formal_tool_schema_matches_latest_repair_authorization(patch_authorized):
+    from agent.tools import submit_analysis_program
+
+    target = {'mode': 'line_patch', 'base_execution_id': 42} if patch_authorized else {}
+    messages = [
+        call('submit_analysis_program', 'formal', code='failed_program'),
+        answer('formal', status='failed', error_type='runtime_error', execution_id=42,
+               repair_target=target),
+    ]
+    result = build_working_request(ModelRequest(
+        model=None, messages=messages,
+        runtime=SimpleNamespace(context=CustomContext(username='test')),
+        tools=[submit_analysis_program],
+    ))
+    schema = result.tools[0].args_schema.model_json_schema()
+    assert ('patches' in schema['properties']) is patch_authorized
+    if not patch_authorized:
+        assert {'code', 'used_datasource_ids'} <= set(schema['required'])
+        assert not {'program', 'analysis_code', 'analysis_program'} & set(schema['properties'])
+        assert result.tools[0].args_schema(code='complete_program', used_datasource_ids='[1]').used_datasource_ids == [1]
+    assert 'patches' in submit_analysis_program.args_schema.model_json_schema()['properties']
+
+
+@pytest.mark.parametrize('target', [{}, {'mode': 'line_patch', 'base_execution_id': 42}])
+def test_definition_failure_keeps_actual_definition_submission_instead_of_legacy_full_source(target):
+    from agent.tools import submit_analysis_program
+    messages = [call('submit_analysis_program', 'formal', definition_source='def build_analysis(program, parameters): pass'),
+                answer('formal', status='failed', error_type='runtime_error', execution_id=42, repair_target=target)]
+    result = build_working_request(ModelRequest(
+        model=None, messages=messages, runtime=SimpleNamespace(context=CustomContext(username='test')),
+        tools=[submit_analysis_program],
+    ))
+    schema = result.tools[0].args_schema.model_json_schema()
+    assert 'definition_source' in schema['required']
+    assert 'code' not in schema['properties']
+    assert 'execution.definition' in result.system_message.content
+    assert '# execution.implementation' not in result.system_message.content
+
+
+def test_probe_diagnostic_without_formal_ancestor_cannot_switch_fresh_program_to_legacy():
+    from agent.tools import submit_analysis_program
+    messages = [call('probe_analysis_data', 'probe', code='observe_only'),
+                answer('probe', status='failed', error_type='runtime_error', execution_id=42)]
+    context = CustomContext(username='test', runtime_work_packet=RuntimeWorkPacket(
+        workspace_id='fresh-after-probe', revision=2, phase=RuntimePhase.REPAIR).to_dict())
+    request = build_working_request(ModelRequest(model=None, messages=messages,
+        runtime=SimpleNamespace(context=context), tools=[submit_analysis_program]))
+    schema = request.tools[0].args_schema.model_json_schema()
+    assert 'definition_source' in schema['required']
+    assert 'code' not in schema['properties']
+    assert '# execution.definition' in request.system_message.content
+    assert '# execution.implementation' not in request.system_message.content
+
+
+def test_fresh_implementation_defaults_to_host_scheduled_definition_contract():
+    from agent.runtime_driver_state import RuntimeWorkPacket
+    from agent.runtime_contract_registry import load_runtime_work_contract_text
+    from agent.tools import ExecutableAnalysisProgramInput, submit_analysis_program
+
+    context = CustomContext(username='test', runtime_work_packet=RuntimeWorkPacket(
+        workspace_id='new-analysis', revision=1, phase=RuntimePhase.IMPLEMENT,
+        focus='Build the analysis',
+    ).to_dict())
+    contract_ids = work_contracts(context, 'implement', definition_program=True)
+    assert 'execution.definition' in contract_ids
+    assert 'execution.implementation' not in contract_ids
+    schema = ExecutableAnalysisProgramInput.model_json_schema()
+    assert 'definition_source' in schema['required']
+    assert 'code' not in schema['properties']
+    prompt = load_runtime_work_contract_text(contract_ids, work='implement')
+    assert 'build_analysis(program, parameters)' in prompt
+    assert 'submit_analysis_program.definition_source' in prompt
+    request = build_working_request(ModelRequest(
+        model=None, messages=[HumanMessage('Analyze')],
+        runtime=SimpleNamespace(context=context), tools=[submit_analysis_program],
+    ))
+    assert 'execution.definition' in request.system_message.content
+    assert 'definition_source' in request.tools[0].args_schema.model_json_schema()['required']
+
+
+def test_express_work_receives_candidate_facts_and_only_authoring_or_clarification_tools():
+    from agent.tools import compose_analysis_presentation
+
+    packet = RuntimeWorkPacket(
+        workspace_id='candidate-workspace', revision=3, phase=RuntimePhase.EXPRESS,
+        focus='Explain the computed distribution', active_execution_id=41,
+        semantic_plan={'questions': [{
+            'question_id': 'q1', 'decision_conditions': [],
+        }]},
+    )
+    messages = [
+        HumanMessage('Summarize the complete distribution.'),
+        call('submit_analysis_program', 'calc', definition_source='def build_analysis(program, parameters): pass'),
+        answer('calc', tool='submit_analysis_program', status='presentation_pending', execution_id=41,
+               facts=[{'facts': {'years': {'row_count': 2, 'values': [{'year': 2022}, {'year': 2023}],
+                                           'values_truncated': False}}}]),
+    ]
+    request = ModelRequest(
+        model=None, messages=messages,
+        runtime=SimpleNamespace(context=CustomContext(
+            username='test', runtime_work_packet=packet.to_dict(),
+        )),
+        tools=[SimpleNamespace(name=name) for name in (
+            'submit_analysis_program', 'probe_analysis_data',
+            'compose_analysis_presentation', 'request_analysis_clarification',
+            'read_runtime_datasource_context',
+        )],
+    )
+
+    result = build_working_request(request)
+    assert {tool.name for tool in result.tools} == {
+        'compose_analysis_presentation', 'request_analysis_clarification',
+    }
+    assert '这是创作步骤，不是语义复核' in result.system_message.content
+    assert '"judgment_scope": "descriptive_only"' in result.system_message.content
+    candidate_messages = [message for message in result.messages
+                          if isinstance(message, ToolMessage) and message.tool_call_id == 'calc']
+    assert candidate_messages
+    assert '2022' in candidate_messages[0].content and '2023' in candidate_messages[0].content
+
+
+def test_reporting_scope_preserves_declared_decisions_without_creating_authority():
+    from agent.runtime_working_context import semantic_reporting_scope
+
+    assert semantic_reporting_scope({'questions': [{
+        'question_id': 'q1', 'decision_conditions': [],
+    }]}) == {'questions': [{
+        'question_id': 'q1', 'decision_conditions': [], 'judgment_scope': 'descriptive_only',
+    }]}
+    declared = {'purpose': 'Compare to supplied limit', 'basis': 'user', 'criterion': 'limit=70'}
+    assert semantic_reporting_scope({'questions': [{
+        'question_id': 'q1', 'decision_conditions': [declared],
+    }]}) == {'questions': [{
+        'question_id': 'q1', 'decision_conditions': [declared], 'judgment_scope': 'planned',
+    }]}
+
+
+@pytest.mark.parametrize("owner,available", [
+    ('plan_runtime_semantics', {'semantic_plan_available': True}),
+    ('plan_runtime_materials', {'material_plan_available': True}),
+])
+def test_successful_plan_retires_earlier_validation_failure_but_not_newer_failure(owner, available):
+    messages = [
+        call(owner, 'old_failure', analysis_goal='invalid old plan'),
+        ToolMessage(content='Error: invalid arguments', tool_call_id='old_failure'),
+        call(owner, 'accepted', analysis_goal='current plan'),
+        answer('accepted', tool=owner, status='success'),
+        call(owner, 'new_failure', analysis_goal='attempted revision'),
+        ToolMessage(content='Error: revision needs correction', tool_call_id='new_failure'),
+    ]
+    projected, _ = project_history(messages, work='implement', **available)
+    call_ids = {c['id'] for m in projected if isinstance(m, AIMessage) for c in m.tool_calls}
+    result_ids = {m.tool_call_id for m in projected if isinstance(m, ToolMessage)}
+    expected = {'new_failure'} if owner == 'plan_runtime_semantics' else {'accepted', 'new_failure'}
+    assert call_ids == result_ids == expected
+    assert len(messages) == 6
+    assert messages[1].content == 'Error: invalid arguments'
 
 
 def test_completed_probe_resumes_implementation_with_new_dependency_path_available():
@@ -415,7 +1637,7 @@ def test_stale_formal_probe_intent_does_not_reopen_probe_after_observation():
             'violated_contract': 'formal_tool_received_probe_program',
         }),
     ]
-    assert resolve_work(messages)[0] == 'implement'
+    assert resolve_work(messages)[0] == 'repair'
 
 
 def test_blocked_stale_probe_call_does_not_reopen_probe_repair():
@@ -743,6 +1965,40 @@ def test_implementation_view_reuses_canonical_schema_and_compacts_reader_transcr
     assert 'runtime datasource_details' in reader_result.content
 
 
+def test_full_replacement_with_parent_does_not_replay_the_parent_program():
+    from agent.runtime_working_context import _active_formal_program_chain
+
+    messages = [call('submit_analysis_program', 'old', code='old program'),
+                answer('old', execution_id=71, status='failed'),
+                call('submit_analysis_program', 'new', code='complete replacement', base_execution_id=71),
+                answer('new', execution_id=72, status='failed')]
+    assert _active_formal_program_chain(messages) == ('new', frozenset({'new'}))
+    messages += [call('submit_analysis_program', 'patch', code='', base_execution_id=72,
+                      patches=[{'start_line': 1, 'end_line': 1, 'replacement': 'fixed'}])]
+    assert _active_formal_program_chain(messages) == ('patch', frozenset({'new', 'patch'}))
+
+
+def test_understanding_schema_reads_are_delivered_once_from_the_canonical_workspace():
+    source = {'datasource_id': 12, 'metadata_schema': {'properties': {
+        'amount': {'type': 'number', 'description': 'Authoritative currency amount.'},
+    }}}
+    snapshot = {'selected_datasource_ids': [12], 'selected_datasource_snapshot': [source]}
+    context = CustomContext(username='test', active_datasource_snapshot=snapshot,
+                            execution_datasource_snapshot=copy.deepcopy(snapshot))
+    messages = [HumanMessage('Analyze amounts.'),
+                call('read_runtime_datasource_context', 'read', datasource_ids=[12]),
+                answer('read', tool='read_runtime_datasource_context', status='success', datasources=[source])]
+    original = copy.deepcopy(messages)
+    request = ModelRequest(model=None, messages=messages,
+                           runtime=SimpleNamespace(context=context))
+    view = build_working_request(request)
+    assert view.system_message.content.count('Authoritative currency amount.') == 1
+    reader = next(m for m in view.messages if isinstance(m, ToolMessage) and m.tool_call_id == 'read')
+    assert 'Authoritative currency amount.' not in reader.content
+    assert json.loads(reader.content)['datasource_ids'] == [12]
+    assert messages == original
+
+
 def test_runtime_never_exposes_the_generic_execution_worker():
     request = ModelRequest(
         model=None,
@@ -789,7 +2045,7 @@ def test_failed_probe_stays_in_probe_repair_until_a_structured_observation_exist
     assert [tool.name for tool in result.tools] == ['probe_analysis_data']
 
 
-def test_probe_source_sent_to_formal_tool_receives_probe_repair_context():
+def test_probe_source_sent_to_formal_tool_keeps_formal_repair_context():
     messages = [
         call('submit_analysis_program', 'misrouted', code='probe_data_with_sql("SELECT 1")'),
         answer('misrouted', status='failed', error_type='contract_error', diagnostics={
@@ -804,10 +2060,11 @@ def test_probe_source_sent_to_formal_tool_receives_probe_repair_context():
         )],
     )
     result = build_working_request(request)
-    assert resolve_work(messages)[0] == 'probe_repair'
-    assert 'execution.probe' in result.system_message.content
-    assert 'result.artifacts' not in result.system_message.content
-    assert [tool.name for tool in result.tools] == ['probe_analysis_data']
+    assert resolve_work(messages)[0] == 'repair'
+    assert 'execution.implementation' in result.system_message.content
+    assert 'result.artifacts' in result.system_message.content
+    assert 'submit_analysis_program' in [tool.name for tool in result.tools]
+    assert 'probe_analysis_data' not in [tool.name for tool in result.tools]
 
 
 def test_history_keeps_only_latest_unresolved_probe_for_repair():
@@ -946,6 +2203,22 @@ def test_patch_base_stays_until_replaced_by_a_full_program():
     result, count = project_history(messages)
     assert count == 0
     assert result[0].tool_calls[0]['args']['code'] == 'base'
+
+
+def test_actual_definition_is_the_canonical_program_memory_and_supersedes_old_versions():
+    from copy import deepcopy
+    definition = 'def build_analysis(program, parameters): pass'
+    messages = [call('submit_analysis_program', 'old', code='old()'), answer('old', status='failed'),
+                call('submit_analysis_program', 'actual', definition_source=definition), answer('actual', status='success')]
+    original = deepcopy(messages)
+    memory = build_working_memory_index(messages)
+    programs = memory.of_kind(WorkingMemoryKind.PROGRAM)
+    assert [item.source_event_id for item in programs if item.status == 'active'] == ['actual']
+    assert next(item for item in programs if item.source_event_id == 'old').superseded_by == 'actual'
+    projected, _ = project_history(messages, memory=memory, work='review')
+    assert any(isinstance(message, AIMessage) and any(call['args'].get('definition_source') == definition
+               for call in message.tool_calls) for message in projected)
+    assert messages == original
 
 
 def test_repair_view_keeps_only_active_patch_derivation_chain():
@@ -1457,6 +2730,47 @@ def test_request_compiler_removes_initial_full_contract_packet_before_current_wo
     assert 'Base' in result.system_message.content
 
 
+def test_request_compiler_separates_protocol_from_task_and_replaces_it_on_reprojection():
+    from unittest.mock import patch
+
+    context = CustomContext(username='test')
+    request = ModelRequest(
+        model=None, messages=[SystemMessage('Base'), HumanMessage('Analyze')],
+        runtime=SimpleNamespace(context=context),
+        tools=[SimpleNamespace(name='select_runtime_work')],
+    )
+    with patch('agent.runtime_working_context.load_runtime_work_contract_text',
+               return_value='Complete protocol including API examples'):
+        first = build_working_request(request)
+        second = build_working_request(ModelRequest(
+            model=None, messages=[first.system_message, HumanMessage('Analyze')],
+            runtime=SimpleNamespace(context=context), tools=request.tools,
+        ))
+
+    for result in (first, second):
+        content = result.system_message.content
+        assert content.count('<runtime-contracts>') == 1
+        assert content.count('Complete protocol including API examples') == 1
+        assert content.count('<runtime-working-context>') == 1
+        assert content.count('Base') == 1
+        assert content.index('</runtime-contracts>') < content.index('<runtime-working-context>')
+        task = content.split('<runtime-working-context>', 1)[1]
+        assert 'Complete protocol including API examples' not in task
+
+
+def test_model_turn_log_reads_model_response_messages():
+    from unittest.mock import patch
+    from langchain.agents.middleware.types import ModelResponse
+    from agent.runtime_working_context import RuntimeWorkingContextMiddleware
+
+    response = ModelResponse(result=[AIMessage(content='Ready', tool_calls=[{
+        'id': 'plan', 'name': 'plan_runtime_materials', 'args': {}, 'type': 'tool_call',
+    }])])
+    with patch('agent.runtime_working_context.logger.info') as log:
+        RuntimeWorkingContextMiddleware._log_model_turn('plan', 0, response)
+    assert log.call_args.args[-2:] == (5, ['plan_runtime_materials'])
+
+
 def test_request_compiler_keeps_literal_tag_mentions_in_semantic_prompt_prose():
     context = CustomContext(username='test')
     literal = 'The phrase `<runtime-working-context>` describes request state.'
@@ -1504,11 +2818,11 @@ def test_understanding_does_not_expose_code_tools_until_dependencies_loaded():
     request = ModelRequest(model=None, messages=[HumanMessage('Analyze')],
                            runtime=SimpleNamespace(context=CustomContext(username='test')),
                            tools=[SimpleNamespace(name=n) for n in (
-                               'select_runtime_work', 'probe_analysis_data', 'submit_analysis_program',
+                               'plan_runtime_semantics', 'select_runtime_work', 'probe_analysis_data', 'submit_analysis_program',
                                'read_runtime_reference', 'read_runtime_datasource_context',
                            )])
     result = build_working_request(request)
-    assert [t.name for t in result.tools] == ['select_runtime_work']
+    assert [t.name for t in result.tools] == ['plan_runtime_semantics', 'read_runtime_datasource_context']
     assert '"work": "understand"' in result.system_message.content
 
 
@@ -1739,7 +3053,7 @@ def test_actual_agent_loop_changes_tools_and_material_before_code_generation():
     from pydantic import Field
     from agent.runtime_working_context import (
         RuntimeWorkingContextMiddleware, plan_runtime_materials,
-        request_runtime_probe, select_runtime_work,
+        plan_runtime_semantics, request_runtime_probe,
     )
     from agent.runtime_workspace import read_runtime_datasource_context
 
@@ -1758,7 +3072,10 @@ def test_actual_agent_loop_changes_tools_and_material_before_code_generation():
         def _generate(self, messages, **kwargs):
             self.seen.append(messages)
             responses = [
-                call('select_runtime_work', 'select', work='plan', focus='Analyze equipment'),
+                call('plan_runtime_semantics', 'select', analysis_goal='Analyze equipment', questions=[{
+                    'question_id': 'q1', 'analysis_focus': 'Analyze equipment states', 'decision_conditions': [],
+                    'population': 'Equipment', 'time_basis': 'Current state',
+                }]),
                 call('plan_runtime_materials', 'plan', focus='Analyze equipment', material_units=[{
                     'question_ids': ['q1'], 'fact_ids': ['f1'], 'datasource_id': 1,
                     'field_names': ['state'], 'relationship_ids': [], 'purpose': 'Read state facts.',
@@ -1767,13 +3084,13 @@ def test_actual_agent_loop_changes_tools_and_material_before_code_generation():
                      field_names_by_datasource={'1': ['state']}),
                 call('request_runtime_probe', 'new_dependency', focus='Verify state values'),
                 call('probe_analysis_data', 'probe', code='inspect states'),
-                call('submit_analysis_program', 'execute', code='complete program'),
+                call('submit_analysis_program', 'execute', definition_source='def build_analysis(program, parameters): pass', used_datasource_ids=[1]),
                 AIMessage(content='finished'),
             ]
             return ChatResult(generations=[ChatGeneration(message=responses[len(self.seen) - 1])])
 
     @tool
-    def submit_analysis_program(code: str) -> dict:
+    def submit_analysis_program(definition_source: str, used_datasource_ids: list[int]) -> dict:
         """Submit test program."""
         return {'status': 'success'}
 
@@ -1785,7 +3102,7 @@ def test_actual_agent_loop_changes_tools_and_material_before_code_generation():
         }}}
 
     model = RecordingModel()
-    graph = create_agent(model=model, tools=[select_runtime_work, plan_runtime_materials,
+    graph = create_agent(model=model, tools=[plan_runtime_semantics, plan_runtime_materials,
                                            request_runtime_probe,
                                            submit_analysis_program, read_runtime_datasource_context,
                                            probe_analysis_data],
@@ -1808,8 +3125,12 @@ def test_actual_agent_loop_changes_tools_and_material_before_code_generation():
         {'messages': [HumanMessage('Analyze equipment')]},
         context=context,
     )
-    assert model.bound[0] == ['select_runtime_work']
-    assert model.bound[1] == ['plan_runtime_materials', 'read_runtime_datasource_context']
+    assert model.bound[0] == ['plan_runtime_semantics', 'read_runtime_datasource_context']
+    assert model.bound[1] == [
+        'plan_runtime_semantics', 'plan_runtime_materials',
+        'read_runtime_datasource_context',
+    ]
+    assert 'runtime_semantic_plan' in model.seen[1][0].content
     assert 'submit_analysis_program' in model.bound[2]
     assert 'read_runtime_datasource_context' in model.bound[2]
     assert 'submit_analysis_program' in model.bound[3]
@@ -2063,13 +3384,14 @@ def test_material_and_detail_read_memories_have_explicit_producer_types():
     messages = [
         answer('plan', tool='plan_runtime_materials', status='success', material_units=[{'datasource_id': 11}]),
         answer('read', tool='read_runtime_datasource_context', status='success',
-               datasources=[{'datasource_id': 11, 'metadata_schema': {'properties': {}}}],
-               business_context={'insight_lineage': [{'question_id': 'q1'}]}),
+               datasources=[{'datasource_id': 11, 'metadata_schema': {
+                   'properties': {'amount': {'semantic_enrichment': {'business_meaning': 'Revenue'}}},
+               }}]),
     ]
     index = build_working_memory_index(messages)
     assert len(index.of_kind(WorkingMemoryKind.MATERIAL_PLAN)) == 1
     assert len(index.of_kind(WorkingMemoryKind.SCHEMA_SOURCE)) == 1
-    assert len(index.of_kind(WorkingMemoryKind.PREPARATION_FACT)) == 1
+    assert not index.of_kind(WorkingMemoryKind.PREPARATION_FACT)
     assert not index.of_kind(WorkingMemoryKind.UNKNOWN)
 
 
@@ -2091,3 +3413,78 @@ def test_async_middleware_uses_the_same_projection():
         return projected
     result = asyncio.run(RuntimeWorkingContextMiddleware().awrap_model_call(request, handler))
     assert result.system_message.content == build_working_request(request).system_message.content
+
+
+def test_calculation_plan_preserves_grain_and_units_without_forcing_a_catalogue():
+    from agent.runtime_working_context import RuntimeQuestionSemantics
+
+    question = RuntimeQuestionSemantics(
+        question_id='q1', analysis_focus='Compare unit costs',
+        calculation_rules=[{
+            'purpose': 'Weighted unit cost', 'definition': 'sum(cost * quantity) / sum(quantity)',
+            'basis': 'analytical_derivation', 'input_grain': 'product and period',
+            'output_grain': 'product', 'unit': 'currency per item',
+        }],
+        decision_conditions=[{
+            'purpose': 'Compare weighted costs', 'basis': 'mathematical',
+            'condition': 'sum(quantity) > 0',
+            'when_true': 'Compare the calculated weighted costs.',
+            'otherwise': 'No valid quantity denominator; do not claim a cost difference.',
+        }],
+    )
+    restored = RuntimeQuestionSemantics.model_validate(question.model_dump())
+    assert restored.calculation_rules[0].unit == 'currency per item'
+    assert restored.calculation_rules[0].output_grain == 'product'
+    assert RuntimeQuestionSemantics(question_id='q2', analysis_focus='Describe fields', decision_conditions=[]).calculation_rules == []
+    schema = RuntimeQuestionSemantics.model_json_schema()
+    assert 'Runtime branches' in schema['properties']['decision_conditions']['description']
+    assert 'decision_conditions' not in schema['required']
+    assert restored.decision_conditions[0].otherwise.startswith('No valid')
+
+
+def test_local_file_work_view_exposes_the_query_entry_and_retains_loader_policy():
+    from agent.context_engineering_runtime import _build_datasource_prompt_item, _runtime_source_identity
+
+    for loader, helper in [('load_local_file', 'query_local_file'),
+                           ('load_local_file_low_memory', 'query_local_file_low_memory')]:
+        raw = {'datasource_id': 7, 'datasource_type': 'local_file', 'recommended_loader': loader,
+               'metadata_schema': {'properties': {'amount': {'type': 'number'}}}}
+        for view in [_build_datasource_prompt_item(raw), _runtime_source_identity(raw)]:
+            assert view['query_helper'] == helper
+            assert view['recommended_loader'] == loader
+        assert 'query_helper' not in raw
+
+
+def test_native_protocol_boundary_rejects_legacy_payload_before_worker_execution():
+    from agent.runtime_working_context import _program_protocol_argument_failure, _uses_native_definition
+    context = CustomContext(username='test')
+    pending = call('submit_analysis_program', 'new', code='save_analysis_result("legacy")', used_datasource_ids=[7])
+    request = SimpleNamespace(tool_call=pending.tool_calls[0], state={'messages': [HumanMessage('Analyze'), pending]},
+                              runtime=SimpleNamespace(context=context))
+    failure = _program_protocol_argument_failure(request)
+    assert failure.status == 'error'
+    assert json.loads(failure.content)['diagnostics']['new_execution_created'] is False
+    assert _uses_native_definition([pending, failure], 'repair')
+    request.tool_call = {**pending.tool_calls[0], 'args': {'definition_source': 'def build_analysis(program, parameters): pass', 'used_datasource_ids': [7]}}
+    assert _program_protocol_argument_failure(request) is None
+    request.tool_call['args']['code'] = 'legacy alongside definition'
+    assert _program_protocol_argument_failure(request).status == 'error'
+
+    for source in ('result = save_analysis_result()', 'def build_analysis(: pass'):
+        request.tool_call['args'] = {'definition_source': source, 'used_datasource_ids': [7]}
+        failure = _program_protocol_argument_failure(request)
+        assert failure.status == 'error'
+        payload = json.loads(failure.content)
+        assert payload['diagnostics']['new_execution_created'] is False
+        assert payload['problems'][0]['location'] == ['definition_source']
+
+
+def test_native_protocol_boundary_preserves_real_legacy_repair_ancestor():
+    from agent.runtime_working_context import _program_protocol_argument_failure
+    context = CustomContext(username='test')
+    old = call('submit_analysis_program', 'old', code='real existing program', used_datasource_ids=[7])
+    pending = call('submit_analysis_program', 'new', code='repaired existing program', used_datasource_ids=[7])
+    request = SimpleNamespace(tool_call=pending.tool_calls[0],
+                              state={'messages': [old, answer('old', status='failed', execution_id=1), pending]},
+                              runtime=SimpleNamespace(context=context))
+    assert _program_protocol_argument_failure(request) is None

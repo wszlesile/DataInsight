@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from copy import deepcopy
 from datetime import datetime
 from typing import Any
 
@@ -34,6 +35,8 @@ class LocalAnalysisRuntime:
             anchor_time=execution_anchor_time,
         )
         execution_context = dict(runtime_user_context or {})
+        if snapshot.semantic_delivery_requirements:
+            execution_context['semantic_delivery_requirements'] = deepcopy(snapshot.semantic_delivery_requirements)
         execution_context.setdefault('datasource_bindings', snapshot.datasource_bindings)
         result = self.execute_code(
             conversation_id=snapshot.conversation_id,

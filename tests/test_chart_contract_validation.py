@@ -47,8 +47,6 @@ from agent.tools import (  # noqa: E402
     _validate_analysis_scope_against_execution_history,
     _validate_explicit_time_range_guard,
     _validate_probe_observation_provenance,
-    _validate_report_extrema_selection_contract,
-    _validate_report_paired_metric_population_contract,
     _validate_runtime_helper_signature_contract,
     _validate_dataframe_subset_column_contract,
     _validate_query_dataframe_projection_contract,
@@ -3278,7 +3276,7 @@ result = save_analysis_result(...)
             previous_failure_payload={
                 "retry_type": "contract_error",
                 "diagnostics": {
-                    "violated_contract": "report_superlative_requires_explicit_extrema",
+                    "violated_contract": "runtime_helper_signature_mismatch",
                 },
             },
         )
@@ -4286,22 +4284,6 @@ else:
 
         self.assertIsNone(_validate_generated_code_contract(code))
 
-    def test_generated_code_diagnoses_but_does_not_reject_unproven_extremum(self) -> None:
-        code = '''
-execution_intent = "analysis"
-query_constraints = {"aggregation": {"metric": "contract_count"}}
-validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT status, COUNT(*) AS contract_count FROM t GROUP BY status")
-if validation is not None:
-    result = validation
-else:
-    data = load_data_with_sql("SELECT status, COUNT(*) AS contract_count FROM t GROUP BY status")
-    analysis_report = f"合同状态以 {data.iloc[0]['status']} 为主，共 {data.iloc[0]['contract_count']} 个。"
-    result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
-'''
-
-        self.assertIsNone(_validate_generated_code_contract(code))
-        advisory = _validate_report_extrema_selection_contract(ast.parse(code), code)
-        self.assertEqual(advisory.diagnostics['proof_state'], 'unknown')
 
     def test_generated_code_allows_explicit_extrema_row_in_report(self) -> None:
         code = '''
@@ -4318,6 +4300,49 @@ else:
 '''
 
         self.assertIsNone(_validate_generated_code_contract(code))
+
+    def test_mixed_extrema_template_cannot_block_a_sorted_program(self) -> None:
+        code = '''
+execution_intent = "analysis"
+query_constraints = {}
+validate_query_constraints(query_constraints=query_constraints, sql="SELECT value FROM t")
+data = load_data_with_sql("SELECT value FROM t")
+summary = data.sort_values("value", ascending=False)
+report = f"Highest: {summary.iloc[0]['value']}\\nSmallest: {summary.iloc[-1]['value']}"
+result = save_analysis_result(analysis_report=report, charts=[], tables=[])
+'''
+        self.assertIsNone(_validate_generated_code_contract(code))
+
+    def test_report_semantic_wording_does_not_create_static_retry_or_advisory(self) -> None:
+        calculations = '''
+data = load_data_with_sql("SELECT value, lower_limit, upper_limit, expiration_time, status FROM t")
+data["boundary_distance_ratio"] = min(
+    data.iloc[0]["value"] - data.iloc[0]["lower_limit"],
+    data.iloc[0]["upper_limit"] - data.iloc[0]["value"],
+) / (data.iloc[0]["upper_limit"] - data.iloc[0]["lower_limit"])
+summary = data.sort_values("boundary_distance_ratio", ascending=False)
+now = pd.Timestamp.now()
+upcoming_count = len(data[data["expiration_time"] >= now])
+active_pct = data["status"].value_counts(normalize=True).get("active", 0)
+'''
+        reports = [
+            'Highest: {summary.iloc[0]["boundary_distance_ratio"]}',
+            'The higher the ratio, the closer it is to the specification limit: {summary.iloc[0]["boundary_distance_ratio"]}',
+            '未来6个月内有 {upcoming_count} 个合同。',
+            '有效合同占比 {active_pct:.1%}（{upcoming_count} 个）。',
+        ]
+        for report in reports:
+            with self.subTest(report=report):
+                code = (
+                    'execution_intent = "analysis"\nquery_constraints = {}\n'
+                    'validate_query_constraints(query_constraints=query_constraints, sql="SELECT 1")\n'
+                    + calculations + '\nreport = f\'\'\'' + report + '\'\'\'\n'
+                    'result = save_analysis_result(analysis_report=report, charts=[], tables=[])\n'
+                )
+                advisories = []
+                self.assertIsNone(_validate_generated_code_contract(code, advisory_sink=advisories))
+                self.assertEqual(advisories, [])
+
 
     def test_generated_code_allows_sorted_positional_extrema_row_in_report(self) -> None:
         code = '''
@@ -4398,38 +4423,6 @@ else:
 
         self.assertIsNone(_validate_generated_code_contract(code))
 
-    def test_generated_code_rejects_reversed_nearest_boundary_direction(self) -> None:
-        code = '''
-execution_intent = "analysis"
-query_constraints = {"aggregation": {"metric": "boundary_distance"}}
-validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT value, lower_limit, upper_limit FROM tests")
-if validation is not None:
-    result = validation
-else:
-    data = load_data_with_sql("SELECT value, lower_limit, upper_limit FROM tests")
-    data["boundary_distance_ratio"] = None
-    for idx, row in data.iterrows():
-        data.at[idx, "boundary_distance_ratio"] = min(
-            row["value"] - row["lower_limit"],
-            row["upper_limit"] - row["value"],
-        ) / (row["upper_limit"] - row["lower_limit"])
-    ranked = data.sort_values("boundary_distance_ratio", ascending=False)
-    analysis_report = f"The higher the ratio, the closer it is to the specification limit. Highest risk: {ranked.iloc[0]['boundary_distance_ratio']}."
-    result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
-'''
-
-        retry = _validate_generated_code_contract(code)
-
-        self.assertIsNotNone(retry)
-        assert retry is not None
-        self.assertEqual(
-            retry.diagnostics["violated_contract"],
-            "bounded_interval_metric_direction_mismatch",
-        )
-        self.assertEqual(
-            retry.diagnostics["descending_sorts"][0]["field"],
-            "boundary_distance_ratio",
-        )
 
     def test_generated_code_allows_nearest_boundary_margin_ranked_ascending(self) -> None:
         code = '''
@@ -4473,30 +4466,6 @@ else:
 
         self.assertIsNone(_validate_generated_code_contract(code))
 
-    def test_generated_code_rejects_one_sided_filter_for_bounded_future_period(self) -> None:
-        code = '''
-execution_intent = "analysis"
-query_constraints = {"aggregation": {"metric": "contract_count"}}
-validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT expiration_time FROM t")
-if validation is not None:
-    result = validation
-else:
-    data = load_data_with_sql("SELECT expiration_time FROM t")
-    now = pd.Timestamp.now()
-    upcoming = data[data["expiration_time"] >= now]
-    upcoming_count = len(upcoming)
-    analysis_report = f"未来6个月内有 {upcoming_count} 个合同即将到期。"
-    result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
-'''
-
-        retry = _validate_generated_code_contract(code)
-
-        self.assertIsNotNone(retry)
-        assert retry is not None
-        self.assertEqual(
-            retry.diagnostics["violated_contract"],
-            "bounded_report_period_requires_two_date_boundaries",
-        )
 
     def test_generated_code_allows_two_sided_filter_for_bounded_future_period(self) -> None:
         code = '''
@@ -4517,34 +4486,6 @@ else:
 
         self.assertIsNone(_validate_generated_code_contract(code))
 
-    def test_generated_code_diagnoses_unproven_population_without_forcing_repair(self) -> None:
-        code = '''
-execution_intent = "analysis"
-query_constraints = {"aggregation": {"metric": "contract_count"}}
-validation = validate_query_constraints(query_constraints=query_constraints, sql="SELECT status, expiration_time FROM t")
-if validation is not None:
-    result = validation
-else:
-    data = load_data_with_sql("SELECT status, expiration_time FROM t")
-    status_share = data["status"].value_counts(normalize=True)
-    active_pct = status_share.get("active", 0)
-    data["days_to_expire"] = (pd.to_datetime(data["expiration_time"]) - pd.Timestamp.now()).dt.days
-    active_count = len(data[data["days_to_expire"] >= 0])
-    analysis_report = f"有效合同占比 {active_pct:.1%}（{active_count} 个）。"
-    result = save_analysis_result(analysis_report=analysis_report, charts=[], tables=[])
-'''
-
-        self.assertIsNone(_validate_generated_code_contract(code))
-        retry = _validate_report_paired_metric_population_contract(ast.parse(code), code)
-        self.assertEqual(retry.diagnostics['proof_state'], 'unknown')
-        self.assertEqual(
-            retry.diagnostics["findings"][0]["percentage_population_fields"],
-            ["status"],
-        )
-        self.assertEqual(
-            retry.diagnostics["findings"][0]["count_population_fields"],
-            ["expiration_time"],
-        )
 
     def test_generated_code_allows_paired_percentage_and_count_from_one_population(self) -> None:
         code = '''
@@ -5474,43 +5415,6 @@ The population is dispersed.
 
         self.assertEqual(_find_empty_markdown_leaf_sections(report), [])
 
-    def test_static_review_reports_multiple_independent_contracts_once(self) -> None:
-        code = '''
-execution_intent = "analysis"
-query_constraints = {}
-validate_query_constraints(query_constraints=query_constraints, sql="SELECT 1")
-frame = load_data_with_sql(sql="SELECT group_id, label, value, expiration_time FROM metrics")
-summary = frame.groupby("group_id").agg(
-    label=("label", "first"),
-    value=("value", "sum"),
-).reset_index().sort_values("value", ascending=True)
-now = pd.Timestamp.now()
-upcoming = frame[frame["expiration_time"] >= now]
-upcoming_count = len(upcoming)
-charts = [build_chart_result(
-    title="Distribution",
-    data=summary,
-    chart_type="bar",
-    category_field="label",
-    value_fields=["value"],
-)]
-report = f"## Report\\n\\n### Finding\\n\\n未来6个月内有 {upcoming_count} 个项目。分布以 {summary.iloc[0]['label']} 为主，共 {summary.iloc[0]['value']}。"
-result = save_analysis_result(analysis_report=report, charts=charts, tables=[])
-'''
-
-        retry = _validate_generated_code_contract(code)
-
-        self.assertIsNotNone(retry)
-        self.assertEqual(
-            retry.diagnostics["violated_contract"],
-            "multiple_static_contract_violations",
-        )
-        contracts = {
-            item["diagnostics"].get("violated_contract")
-            for item in retry.diagnostics["violations"]
-        }
-        self.assertIn("report_superlative_requires_explicit_extrema", contracts)
-        self.assertIn("bounded_report_period_requires_two_date_boundaries", contracts)
 
     def test_static_review_allows_point_scoped_metric_chart_and_table(self) -> None:
         code = r'''
@@ -5820,20 +5724,6 @@ query_constraints = {
 
         self.assertIsNotNone(retry)
 
-    def test_ranked_report_rows_are_proven_by_explicit_metric_sort(self) -> None:
-        code = '''
-ranked = summary.sort_values("revenue", ascending=False).reset_index(drop=True)
-report = (
-    f"营收以 {ranked.iloc[0]['product']} 为主，金额 {ranked.iloc[0]['revenue']}；"
-    f"其次是 {ranked.iloc[1]['product']}，金额 {ranked.iloc[1]['revenue']}；"
-    f"第三是 {ranked.iloc[2]['product']}，金额 {ranked.iloc[2]['revenue']}。"
-)
-'''
-        tree = ast.parse(code)
-
-        retry = _validate_report_extrema_selection_contract(tree, code)
-
-        self.assertIsNone(retry)
 
     def test_report_table_consistency_does_not_merge_unit_qualified_labels(self) -> None:
         result = StructuredResult(

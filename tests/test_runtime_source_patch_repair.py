@@ -8,11 +8,13 @@ from agent.invoker import _get_latest_failed_repair_target
 from agent.tools import (
     AnalysisRevisionIssue,
     ExePythonCodeInput,
+    FullProgramRequiredError,
     SourceCodePatch,
     SourcePatchResolutionError,
     _apply_source_code_patches,
     _augment_missing_mapping_key_feedback,
     _build_generated_code_error_context,
+    _build_analysis_logic_signature,
     _extend_query_dependency_ranges,
     _named_assignment_patch_range,
     _tool_error_message,
@@ -25,6 +27,270 @@ from agent.tools import (
 
 
 class RuntimeSourcePatchRepairTest(unittest.TestCase):
+    def test_valid_source_patch_respects_explicit_authorized_ranges(self):
+        source = 'value = 1\nreport = str(value)\n'
+        patch_item = SourceCodePatch(start_line=1, end_line=1, replacement='value = 2')
+        for allowed in ({(2, 2)}, set()):
+            with self.subTest(allowed=allowed):
+                with self.assertRaisesRegex(ValueError, 'repair_target.allowed_ranges'):
+                    _apply_source_code_patches(source, [patch_item], authorized_ranges=allowed)
+        self.assertEqual(
+            _apply_source_code_patches(source, [patch_item], authorized_ranges={(1, 1)}),
+            'value = 2\nreport = str(value)\n',
+        )
+        self.assertEqual(
+            _apply_source_code_patches(source, [patch_item]),
+            'value = 2\nreport = str(value)\n',
+        )
+
+    def test_assignment_repair_range_identifies_output_without_inference(self):
+        from agent.tools import _source_statement_patch_ranges
+
+        source = 'report = f"""Summary\n{missing_name}\n"""\nresult = save(report)\n'
+        ranges = _source_statement_patch_ranges(source, 2)
+        self.assertEqual(ranges[0]['defined_names'], ['report'])
+        self.assertEqual(ranges[0]['source'], '\n'.join(source.splitlines()[:3]))
+        self.assertEqual((ranges[0]['start_line'], ranges[0]['end_line']), (1, 3))
+        self.assertEqual(
+            _source_statement_patch_ranges('left, right = calculate()\n', 1)[0]['defined_names'],
+            ['left', 'right'],
+        )
+        self.assertEqual(
+            _source_statement_patch_ranges('frame["column"] = calculate()\n', 1)[0]['defined_names'],
+            [],
+        )
+
+    def test_located_report_formatting_failure_authorizes_statement_patch(self):
+        from agent.tools import _find_unrendered_report_placeholders, _locate_unrendered_placeholder_source
+
+        source = 'total = 10\nreport = """Count: {total}\nComplete report\n"""\nresult = report\n'
+        placeholders = _find_unrendered_report_placeholders('Count: {total}', generated_code=source)
+        context = _locate_unrendered_placeholder_source(source, placeholders)
+        for error_type in ('contract_error', 'result_contract_error'):
+            payload = json.loads(_tool_error_message(
+                tool_call_id='call', execution_id=17, error_type=error_type,
+                error_message='Unrendered expression', repair_instructions=[],
+                diagnostics={'violated_contract': 'unrendered_report_placeholder',
+                             'placeholders': placeholders},
+                code_error_context=context, current_failed_code=source,
+            ).content)
+            target = payload['repair_target']
+            self.assertEqual(target['source_sha256'], _build_analysis_logic_signature(source))
+            self.assertEqual([(r['start_line'], r['end_line']) for r in target['allowed_ranges']], [(2, 4)])
+            repaired = _apply_source_code_patches(source, [SourceCodePatch(
+                start_line=2, end_line=4,
+                replacement='report = f"""Count: {total}\nComplete report\n"""',
+            )])
+            namespace = {}
+            exec(compile(repaired, '<generated_analysis_code>', 'exec'), namespace)
+            self.assertEqual(namespace['report'], 'Count: 10\nComplete report\n')
+        unlocated = json.loads(_tool_error_message(
+            tool_call_id='call', execution_id=17, error_type='result_contract_error',
+            error_message='Unrendered expression', repair_instructions=[],
+            diagnostics={'violated_contract': 'unrendered_report_placeholder',
+                         'placeholders': placeholders}, current_failed_code=source,
+        ).content)
+        self.assertNotIn('repair_target', unlocated)
+
+    def test_type_error_exposes_consecutive_same_callable_repair_locations(self):
+        source = (
+            'lines = []\n'
+            'lines.append("first", "continuation")\n'
+            'lines.append("second", "continuation")\n'
+            'lines.append("third", "continuation", "ending")\n'
+            'lines.append("valid")\n'
+            'unrelated = 1\n'
+            'lines.append("later", "outside")\n'
+        )
+        try:
+            exec(compile(source, '<generated_analysis_code>', 'exec'), {})
+        except TypeError as error:
+            context = _build_generated_code_error_context(source, error, '')
+        self.assertEqual(context['line_no'], 2)
+        self.assertEqual(
+            [item['line_no'] for item in context['related_contexts']], [3, 4, 5],
+        )
+        self.assertTrue(all(item['confirmed_error'] is False for item in context['related_contexts']))
+        payload = json.loads(_tool_error_message(
+            tool_call_id='call', execution_id=17, error_type='library_api_signature_mismatch',
+            error_message='list.append signature mismatch', repair_instructions=[],
+            code_error_context=context, current_failed_code=source,
+        ).content)
+        self.assertEqual(
+            [item['start_line'] for item in payload['repair_target']['allowed_ranges']],
+            [2, 3, 4, 5],
+        )
+        repaired = _apply_source_code_patches(source, [
+            SourceCodePatch(start_line=line, end_line=line, replacement=f'lines.append("fixed {line}")')
+            for line in (2, 3, 4)
+        ])
+        self.assertIn('lines.append("valid")', repaired)
+        self.assertIn('lines.append("later", "outside")', repaired)
+        self.assertIn('不是已确认错误', payload['repair_instructions'][0])
+
+    def test_related_calls_do_not_cross_callables_or_rebindings(self):
+        from agent.tools import _consecutive_call_repair_contexts
+
+        for separator in ('other.append("ok")', 'lines = []', 'if True:\n    lines.append("nested")'):
+            source = 'lines.append("a", "b")\n' + separator + '\nlines.append("c", "d")\n'
+            self.assertEqual(_consecutive_call_repair_contexts(source, 1), [])
+        self.assertEqual(_consecutive_call_repair_contexts('value = lines.append("a", "b")', 1), [])
+
+    def test_complete_program_scope_is_required_in_the_patch_capable_tool_schema(self):
+        from pydantic import ValidationError
+        from agent.tools import SubmitAnalysisProgramInput
+
+        for source_key in ('code', 'program', 'analysis_code', 'analysis_program'):
+            with self.subTest(source_key=source_key):
+                with self.assertRaises(ValidationError):
+                    SubmitAnalysisProgramInput.model_validate({
+                        source_key: 'result = build_report()', 'base_execution_id': 17,
+                    })
+                request = SubmitAnalysisProgramInput.model_validate({
+                    source_key: 'result = build_report()', 'used_datasource_ids': '[7]',
+                    'base_execution_id': 17,
+                })
+                self.assertEqual(request.code, 'result = build_report()')
+                self.assertEqual(request.used_datasource_ids, [7])
+
+    def test_code_free_statement_patch_keeps_scope_inheritance(self):
+        from agent.tools import SubmitAnalysisProgramInput
+
+        request = SubmitAnalysisProgramInput.model_validate({
+            'base_execution_id': 17,
+            'patches': [{'start_line': 2, 'end_line': 2, 'replacement': 'value = 1'}],
+        })
+        self.assertEqual(request.code, '')
+        self.assertEqual(request.used_datasource_ids, [])
+        self.assertEqual(request.patches[0].replacement, 'value = 1')
+
+    def test_isolated_helper_signature_failure_authorizes_verified_statement_patch(self):
+        from agent.tools import _validate_runtime_helper_signature_contract
+
+        source = 'report = "Summary"\nresult = save_analysis_result(analysis_report=report, used_datasource_ids=[7])\n'
+        retry = _validate_runtime_helper_signature_contract(ast.parse(source), source)
+        self.assertIsNotNone(retry)
+        message = _tool_error_message(
+            tool_call_id='submit', execution_id=17, error_type=retry.retry_type,
+            error_message=retry.message, repair_instructions=retry.repair_instructions,
+            diagnostics=retry.diagnostics, code_error_context=retry.code_error_context,
+            current_failed_code=source,
+        )
+        payload = json.loads(message.content)
+        target = payload['repair_target']
+        self.assertEqual(target['base_execution_id'], 17)
+        self.assertEqual([(r['start_line'], r['end_line']) for r in target['allowed_ranges']], [(2, 2)])
+        self.assertEqual(target['source_sha256'], _build_analysis_logic_signature(source))
+
+    def test_combined_contract_failures_do_not_authorize_signature_only_patch(self):
+        from agent.tools import _merge_static_contract_retries, _validate_runtime_helper_signature_contract, request_retry
+
+        source = 'result = save_analysis_result(used_datasource_ids=[7])\n'
+        signature = _validate_runtime_helper_signature_contract(ast.parse(source), source)
+        combined = _merge_static_contract_retries([
+            signature,
+            request_retry(retry_type='contract_error', message='Missing query constraints'),
+        ])
+        message = _tool_error_message(
+            tool_call_id='submit', execution_id=17, error_type=combined.retry_type,
+            error_message=combined.message, repair_instructions=combined.repair_instructions,
+            diagnostics=combined.diagnostics, code_error_context=combined.code_error_context,
+            current_failed_code=source,
+        )
+        self.assertNotIn('repair_target', json.loads(message.content))
+
+    def test_rejected_patch_keeps_immutable_base_authorization_in_feedback(self):
+        source = 'value = query(\n    field="amount",\n)\nresult = value.sum()\n'
+        target = {
+            'location_domain': 'python_source', 'base_execution_id': 17,
+            'mode': 'line_patch', 'source_sha256': _build_analysis_logic_signature(source),
+            'line_count': 4,
+            'allowed_ranges': [{'start_line': 1, 'end_line': 3, 'source': source.split('result')[0].rstrip()}],
+        }
+        base = SimpleNamespace(
+            execution_status='failed', generated_code=source,
+            used_datasource_ids_json='[3]',
+            result_payload_json=json.dumps({'repair_target': target}),
+        )
+        session = MagicMock()
+        session.query.return_value.filter.return_value.first.return_value = base
+        with patch('config.database.SessionLocal', return_value=session):
+            with self.assertRaises(SourcePatchResolutionError) as caught:
+                _resolve_execute_python_source(
+                    conversation_id=1, turn_id=2, code='', used_datasource_ids=[],
+                    base_execution_id=17,
+                    patches=[SourceCodePatch(start_line=2, end_line=2, replacement='field="other",')],
+                )
+        error = caught.exception
+        self.assertEqual(error.repair_target, target)
+        runtime = SimpleNamespace(context=SimpleNamespace(conversation_id=1, turn_id=2), tool_call_id='patch')
+        with (
+            patch('agent.tools._resolve_execute_python_source', side_effect=error),
+            patch('agent.tools._raise_if_runtime_task_cancelled'),
+            patch('agent.tools._get_stream_emitter'),
+            patch('agent.tools._create_execution_record') as create,
+        ):
+            message = execute_python.func(runtime=runtime, base_execution_id=17)
+        payload = json.loads(message.content)
+        self.assertEqual(payload['repair_target'], target)
+        self.assertFalse(payload['diagnostics']['new_execution_created'])
+        create.assert_not_called()
+
+    def test_rejected_patch_cannot_retain_authorization_for_another_source(self):
+        message = _tool_error_message(
+            tool_call_id='patch', execution_id=17, error_type='contract_error',
+            error_message='patch rejected', repair_instructions=[], current_failed_code='value = 1',
+            retained_repair_target={
+                'mode': 'line_patch', 'base_execution_id': 17,
+                'source_sha256': _build_analysis_logic_signature('value = 2'),
+                'allowed_ranges': [{'start_line': 1, 'end_line': 1}],
+            },
+        )
+        self.assertNotIn('repair_target', json.loads(message.content))
+
+    def test_full_repair_can_name_its_failed_parent_without_becoming_a_patch(self):
+        session = MagicMock()
+        session.query.return_value.filter.return_value.first.return_value = SimpleNamespace(
+            execution_status='failed',
+        )
+        with patch('config.database.SessionLocal', return_value=session):
+            resolved = _resolve_execute_python_source(
+                conversation_id=1, turn_id=2, code='result = save_analysis_result()',
+                used_datasource_ids=[7], base_execution_id=17, patches=[],
+            )
+        self.assertEqual(resolved, ('result = save_analysis_result()', [7], 17, 'llm_generated'))
+        session.close.assert_called_once()
+
+    def test_full_repair_parent_must_belong_to_the_current_turn(self):
+        session = MagicMock()
+        session.query.return_value.filter.return_value.first.return_value = None
+        with patch('config.database.SessionLocal', return_value=session):
+            with self.assertRaisesRegex(ValueError, '不属于当前会话轮次'):
+                _resolve_execute_python_source(
+                    conversation_id=1, turn_id=2, code='result = save_analysis_result()',
+                    used_datasource_ids=[7], base_execution_id=17, patches=[],
+                )
+        session.close.assert_called_once()
+
+    def test_unavailable_patch_authorization_returns_only_full_program_guidance(self):
+        runtime = SimpleNamespace(
+            context=SimpleNamespace(conversation_id=1, turn_id=2),
+            tool_call_id='patch',
+        )
+        with (
+            patch('agent.tools._resolve_execute_python_source',
+                  side_effect=FullProgramRequiredError('Full program required')),
+            patch('agent.tools._raise_if_runtime_task_cancelled'),
+            patch('agent.tools._get_stream_emitter'),
+            patch('agent.tools._create_execution_record') as create,
+        ):
+            message = execute_python.func(runtime=runtime, base_execution_id=17)
+        payload = json.loads(message.content)
+        self.assertIn('base_execution_id=0', payload['repair_instructions'][0])
+        self.assertIn('patches=[]', payload['repair_instructions'][0])
+        self.assertNotIn('start_line', ' '.join(payload['repair_instructions']))
+        create.assert_not_called()
+
     def test_review_anchor_resolves_to_smallest_complete_statement(self):
         source = (
             'rate = revenue / cost\n'
@@ -308,6 +574,24 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
                 authorized_ranges={(1, 1)},
             )
 
+    def test_syntax_patch_range_feedback_distinguishes_authorization_from_ast_boundary(self):
+        source = 'value = items[\n# nearby explanation\nresult = 1\n'
+        with self.assertRaisesRegex(ValueError, '请求区间 1-2.*可用区间：1-1') as captured:
+            _apply_source_code_patches(
+                source,
+                [SourceCodePatch(start_line=1, end_line=2, replacement='value = items')],
+                authorized_ranges={(1, 1)},
+            )
+        self.assertIsInstance(captured.exception.__cause__, SyntaxError)
+        self.assertNotIn('不能从字典', str(captured.exception))
+        self.assertIn('完整 code', str(captured.exception))
+        repaired = _apply_source_code_patches(
+            source,
+            [SourceCodePatch(start_line=1, end_line=1, replacement='value = items')],
+            authorized_ranges={(1, 1)},
+        )
+        self.assertEqual(repaired, 'value = items\n# nearby explanation\nresult = 1\n')
+
     def test_resolver_applies_authorized_syntax_patch_to_stored_revision(self):
         source = (
             'items = [{"name": "A"}]\n'
@@ -354,6 +638,7 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
             execution_status='failed', generated_code='value = 1\n', used_datasource_ids_json='[3, 4]',
             result_payload_json=json.dumps({'repair_target': {
                 'base_execution_id': 17, 'mode': 'line_patch',
+                'allowed_ranges': [{'start_line': 1, 'end_line': 1}],
             }}),
         )
         session = MagicMock()
@@ -655,7 +940,25 @@ class RuntimeSourcePatchRepairTest(unittest.TestCase):
             [(item['start_line'], item['end_line']) for item in payload['repair_target']['allowed_ranges']],
             [(2, 2)],
         )
-        self.assertTrue(payload['minimal_patch_required'])
+        self.assertFalse(payload['minimal_patch_required'])
+
+    def test_multiline_string_syntax_error_keeps_context_without_authorizing_closing_line_patch(self):
+        code = 'execution_intent = "analysis"\ntext = f"""Report\n{values[\'amount]}\n"""\n'
+        retry = _validate_generated_code_contract(code)
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        context = retry.code_error_context
+        self.assertEqual([item['line_no'] for item in context['context_lines']], [2, 3, 4])
+        message = _tool_error_message(
+            tool_call_id='multi-syntax', execution_id=679,
+            error_type=retry.retry_type, error_message=retry.message,
+            repair_instructions=retry.repair_instructions, diagnostics=retry.diagnostics,
+            code_error_context=context, current_failed_code=code,
+        )
+        payload = json.loads(message.content)
+        self.assertNotIn('repair_target', payload)
+        self.assertEqual(payload['current_failed_code'], code)
+        self.assertFalse(payload['minimal_patch_required'])
 
     def test_structural_contract_error_does_not_offer_line_patch(self):
         message = _tool_error_message(

@@ -364,6 +364,12 @@ class InsightNsConversationService:
             InsightNsArtifact.created_at.asc(),
             InsightNsArtifact.id.asc(),
         ).all()
+        latest_evidence = None
+        if executions:
+            latest_evidence = self.session.query(InsightNsExecutionEvidence).filter(
+                InsightNsExecutionEvidence.execution_id == executions[-1].id,
+                InsightNsExecutionEvidence.is_deleted == 0,
+            ).first()
 
         return {
             "conversation": conversation.to_dict(),
@@ -372,7 +378,52 @@ class InsightNsConversationService:
             "executions": [execution.to_dict() for execution in executions],
             "latest_execution": executions[-1].to_dict() if executions else None,
             "artifacts": [self._artifact_to_view(artifact) for artifact in artifacts],
+            "evidence_compilation": ({
+                "status": latest_evidence.compilation_status,
+                "diagnostics": self._safe_json_loads(latest_evidence.diagnostics_json, {}),
+                "updated_at": latest_evidence.updated_at.isoformat() if latest_evidence.updated_at else None,
+            } if latest_evidence is not None else None),
             "progress": load_progress(self.session, conversation.id, turn.id),
+        }
+
+    def get_evidence_compilation_status(
+        self,
+        username: str,
+        conversation_id: Any,
+        turn_id: Any,
+    ) -> dict[str, Any] | None:
+        """Return only the small, pollable state for post-analysis Evidence."""
+        conversation = self._get_accessible_conversation(username, conversation_id)
+        if conversation is None:
+            return None
+        turn = self.session.query(InsightNsTurn).filter(
+            InsightNsTurn.id == to_int(turn_id, 0),
+            InsightNsTurn.conversation_id == conversation.id,
+            InsightNsTurn.is_deleted == 0,
+        ).first()
+        if turn is None:
+            return None
+        execution = self.session.query(InsightNsExecution).filter(
+            InsightNsExecution.conversation_id == conversation.id,
+            InsightNsExecution.turn_id == turn.id,
+            InsightNsExecution.is_deleted == 0,
+            InsightNsExecution.content_enabled == 1,
+        ).order_by(
+            InsightNsExecution.created_at.desc(),
+            InsightNsExecution.id.desc(),
+        ).first()
+        if execution is None:
+            return {"status": "unavailable", "diagnostics": {}, "updated_at": None}
+        evidence = self.session.query(InsightNsExecutionEvidence).filter(
+            InsightNsExecutionEvidence.execution_id == execution.id,
+            InsightNsExecutionEvidence.is_deleted == 0,
+        ).first()
+        if evidence is None:
+            return {"status": "unavailable", "diagnostics": {}, "updated_at": None}
+        return {
+            "status": evidence.compilation_status,
+            "diagnostics": self._safe_json_loads(evidence.diagnostics_json, {}),
+            "updated_at": evidence.updated_at.isoformat() if evidence.updated_at else None,
         }
 
     def resolve_evidence(

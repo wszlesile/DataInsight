@@ -57,7 +57,10 @@ def test_published_signature_matches_the_callable_including_keyword_only_paramet
     assert list(documented.parameters) == list(actual.parameters)
     for key, parameter in actual.parameters.items():
         assert documented.parameters[key].kind == parameter.kind
-        assert documented.parameters[key].default == parameter.default
+        if repr(parameter.default) == '<factory>':
+            assert documented.parameters[key].default == {}
+        else:
+            assert documented.parameters[key].default == parameter.default
     prompt = load_runtime_contract_text(pack.contract_id for pack in RUNTIME_CONTRACT_PACKS)
     assert prompt.count(f'`{source}`') == 1
 
@@ -381,7 +384,17 @@ def test_complete_examples_execute_real_validation_helpers_and_build_real_artifa
     monkeypatch.setattr(tools, 'load_data_with_sql', recorded_loader(data))
     monkeypatch.setattr(tools, 'load_local_file', lambda *a, **kw: recorded_loader(data)(''))
     namespace = tools._build_execution_namespace()
-    exec(example(filename, name, 'canonical-runtime-example'), namespace)
+    source_token = tools.CURRENT_LOCAL_FILE_DATASOURCES.set({
+        '123': {
+            'datasource_type': 'local_file',
+            'datasource_identifier': 'D:/path/selected_file.csv',
+        },
+    }) if name == 'local_file' else None
+    try:
+        exec(example(filename, name, 'canonical-runtime-example'), namespace)
+    finally:
+        if source_token is not None:
+            tools.CURRENT_LOCAL_FILE_DATASOURCES.reset(source_token)
     result = namespace['result']
     assert result.tables and result.charts
     assert result.query_snapshots
