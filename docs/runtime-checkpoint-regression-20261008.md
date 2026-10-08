@@ -27,3 +27,9 @@ Next regression includes non-file UNS sources. Type coverage must be confirmed f
 live UNS metadata; a conversation title alone does not establish source type. Runs
 use current local code and isolated result storage, with real remote read queries.
 Each case retains the full SSE trace, stage/model timings, artifacts and Evidence.
+
+Post-checkpoint regression is complete: seven isolated cases covering UNS types
+1/2/3/7/9, plus direct physical-source checks. Six analytical cases failed acceptance;
+cash-flow analysis is blocked by missing financial sources. The frontend production
+build also passed. See `runtime-cross-uns-regression-20261008.md` for the measured
+matrix, environment blockers and source/meaning propagation defects.
