@@ -550,8 +550,6 @@ class DatasourceSelectionContract(BaseModel):
                 *fact.semantic_reference_datasource_ids,
             ]
         }
-        if not covered_ids:
-            raise ValueError("selection requires at least one supported datasource")
         self.selected_datasource_ids = sorted(covered_ids)
         return self
 
@@ -2241,6 +2239,31 @@ def _schema_declares_relationship(
     )
 
 
+def merge_datasource_candidates(
+    bound_snapshot: dict[str, Any], discovered_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    """Extend the catalog while preserving the immutable turn source identity."""
+    rows_by_id: dict[int, dict[str, Any]] = {}
+    for snapshot, default_role in (
+        (discovered_snapshot, "semantic_candidate"),
+        (bound_snapshot, "conversation_candidate"),
+    ):
+        for item in snapshot.get("selected_datasource_snapshot") or []:
+            if not isinstance(item, dict):
+                continue
+            datasource_id = int(item.get("datasource_id") or item.get("id") or 0)
+            if datasource_id > 0:
+                rows_by_id[datasource_id] = {
+                    **copy.deepcopy(item),
+                    "source_role": item.get("source_role") or default_role,
+                }
+    return {
+        **bound_snapshot,
+        "selected_datasource_ids": list(rows_by_id),
+        "selected_datasource_snapshot": list(rows_by_id.values()),
+    }
+
+
 def build_datasource_catalog(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for item in snapshot.get("selected_datasource_snapshot") or []:
@@ -2264,6 +2287,11 @@ def build_datasource_catalog(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
                 or (schema.get("description") if isinstance(schema, dict) else "")
                 or ""
             ),
+            "source_role": item.get("source_role", "conversation_candidate"),
+            "schema_scope": item.get("schema_scope"),
+            "reference_target": copy.deepcopy(item.get("reference_target") or {}),
+            "uns_path": item.get("uns_path"),
+            "query_access": copy.deepcopy(item.get("query_access") or {}),
             "datasource_identifier": item.get("datasource_identifier"),
             "table_engine": item.get("table_engine"),
             "ts_query_source": item.get("ts_query_source"),
@@ -2329,6 +2357,8 @@ def build_datasource_discovery_catalog(
             "datasource_name": item.get("datasource_name"),
             "datasource_type": item.get("datasource_type"),
             "description": str(item.get("description") or "")[:180],
+            "source_role": item.get("source_role"),
+            "uns_path": item.get("uns_path"),
             "field_count": len(item.get("fields") or []),
             "matched_fields": matched_fields,
         })
@@ -3334,7 +3364,7 @@ class AnalysisPreparationWorkflow:
             if int(item.get("datasource_id") or 0) > 0
         }
         selected_ids = set(selection.selected_datasource_ids)
-        if not selected_ids or not selected_ids.issubset(available_ids):
+        if not selected_ids.issubset(available_ids):
             raise ValueError("selection references unavailable datasource IDs")
         coverage_by_question = {
             item.question_id: item
@@ -4444,7 +4474,9 @@ class AnalysisPreparationWorkflow:
                 ),
             )
             semantic_snapshot = _normalize_time_series_datasource_snapshot(
-                semantic_result.datasource_snapshot
+                merge_datasource_candidates(
+                    self.datasource_snapshot, semantic_result.datasource_snapshot,
+                )
             )
             catalog = build_datasource_catalog(semantic_snapshot)
             if not catalog:
@@ -4460,6 +4492,11 @@ class AnalysisPreparationWorkflow:
                 stage="semantic_selection",
                 payload={
                     "intent_context": intent.model_dump(),
+                    "user_query": self.user_query,
+                    "user_selected_sources": [
+                        item for item in catalog
+                        if item.get("source_role") == "user_selected"
+                    ],
                     "semantic_candidate_catalog": discovery_catalog,
                     "relationship_hints": list(relationship_hints),
                 },

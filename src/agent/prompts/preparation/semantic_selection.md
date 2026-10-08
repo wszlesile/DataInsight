@@ -28,3 +28,11 @@
 - 每个事实判断 `coverage_status=direct|partial|unresolved`。只有既没有可信事实来源、也不能由本轮已覆盖 canonical facts 推导时才是 `unresolved`；不得用相似名称或代理字段冒充。
 - 只为 `intent_context.business_questions[].required_business_facts` 提供覆盖，不把 `analytical_facets` 扩展成额外必选范围。
 - 不规划 JOIN、查询语句、指标算法、图表、表格、报告章节、结论或建议。
+
+- `user_query` 保留用户原始指称，`user_selected_sources` 提供用户选择的来源及完整字段和查询入口；它们是分析对象的身份依据。语义召回补充候选，不能把相似业务表推断为所选节点的物理映射。根据问题从选择范围中选用相关来源，不要求每个来源都参与每个事实。
+- UNS 路径是来源地址和目录层级，不是业务字段筛选条件。引用节点以给定查询入口和 Schema 为准，不能自行用同名业务表替换引用目标。
+- 目标来源不具备问题要求的字段时，将相应事实标为 partial 或 unresolved，说明缺口；有可靠关系时可选择补充来源，不能冒充目标来源。所有事实均无支持时允许空来源列表，不为满足非空要求选择无关表。
+
+- `schema_scope=declared_business_fields` 表示 UNS 定义提供业务字段，不保证枚举查询入口的全部物理列。缺少列声明不等于物理表不存在时间列或平台标识列。只根据已声明/已观测字段统计时明确该字段范围；同值重复不能称为物理完整行重复，未验证完整结构不能断言“无时间字段”。
+
+- `reference_target` 是平台给出的 UNS 引用目标身份，与业务表之间的 JOIN/relationships 不同；relationships 为空不能解释为引用节点没有引用目标。访问失败保留已知引用身份，报告实际失败原因，不将身份缺失或查询失败解释成数据为零。

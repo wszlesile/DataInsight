@@ -2569,6 +2569,8 @@ def test_semantic_selection_normalizes_to_canonical_preparation_state(monkeypatc
     )
 
     snapshot = _snapshot()
+    snapshot['selected_datasource_snapshot'][0]['source_role'] = 'user_selected'
+    discovered = prep.filter_datasource_snapshot(snapshot, [12])
     workflow = prep.AnalysisPreparationWorkflow(
         user_query='分析合同情况',
         context_mode='fresh_analysis',
@@ -2585,8 +2587,8 @@ def test_semantic_selection_normalizes_to_canonical_preparation_state(monkeypatc
         stage_callback=None,
     )
     semantic_result = SemanticDatasourceSelectionResult(
-        datasource_ids=(11, 12),
-        datasource_snapshot=snapshot,
+        datasource_ids=(12,),
+        datasource_snapshot=discovered,
         relationship_hints=({
             'source_datasource_id': 11,
             'target_datasource_id': 12,
@@ -2626,15 +2628,17 @@ def test_semantic_selection_normalizes_to_canonical_preparation_state(monkeypatc
 
     assert result['selection'].selected_datasource_ids == [11, 12]
     selected_rows = result['selected_snapshot']['selected_datasource_snapshot']
-    relation = selected_rows[0]['metadata_schema']['relationships'][0]
+    relation = next(row for row in selected_rows if row['datasource_id'] == 11)['metadata_schema']['relationships'][0]
     assert relation['target_datasource_id'] == 12
     assert relation['source_fields'] == ['customer_id']
     assert relation['target_fields'] == ['id']
     assert 'relationship_hints' not in result
     assert captured['stage'] == 'semantic_selection'
     assert 'semantic_candidate_catalog' in captured['payload']
+    assert captured['payload']['user_selected_sources'][0]['datasource_id'] == 11
+    assert captured['payload']['user_selected_sources'][0]['fields'] == ['contract_no', 'customer_id', 'amount', 'status']
     assert captured['payload']['intent_context'] == _intent().model_dump()
-    assert 'user_query' not in captured['payload']
+    assert captured['payload']['user_query'] == workflow.user_query
     assert captured['payload']['relationship_hints'] == list(
         semantic_result.relationship_hints
     )
@@ -3738,3 +3742,56 @@ def test_empty_fact_binding_without_matching_unresolved_fact_still_fails():
             ],
             "synthesis_path": "统计合同规模",
         })
+
+
+def test_candidate_merge_preserves_selected_identity_and_auxiliary_recall():
+    bound = _snapshot()
+    bound["selected_datasource_snapshot"][0].update(
+        source_role="user_selected", uns_path="plant/contracts",
+        query_access={"access_mode": "uns_get", "relation_expression": "uns_get('plant/contracts')"},
+    )
+    discovered = _snapshot()
+    discovered["selected_datasource_snapshot"][0]["datasource_identifier"] = "other.contracts"
+    discovered["selected_datasource_snapshot"].append({
+        "datasource_id": 13, "datasource_name": "labels", "datasource_type": "table",
+    })
+    result = prep.merge_datasource_candidates(bound, discovered)
+    rows = {row["datasource_id"]: row for row in result["selected_datasource_snapshot"]}
+    assert rows[11]["datasource_identifier"] == "dw.contracts"
+    assert rows[11]["source_role"] == "user_selected"
+    assert rows[11]["query_access"]["relation_expression"] == "uns_get('plant/contracts')"
+    assert rows[12]["source_role"] == "conversation_candidate"
+    assert rows[13]["source_role"] == "semantic_candidate"
+    rows[11]["query_access"]["relation_expression"] = "changed"
+    assert bound["selected_datasource_snapshot"][0]["query_access"]["relation_expression"] != "changed"
+
+
+def test_selection_can_represent_no_supported_business_facts():
+    selection = DatasourceSelectionContract(
+        question_coverage=[BusinessQuestionCoverageContract(
+            question_id="question_1", coverage_reason="No cashflow source",
+            fact_coverage=[BusinessFactCoverageContract(
+                fact_id="question_1_fact_1", coverage_status="unresolved",
+                coverage_reason="No cashflow source",
+            )],
+        )],
+        selection_reason="Available sources cannot answer the question",
+    )
+    assert selection.selected_datasource_ids == []
+    assert selection.question_coverage[0].coverage_status == "unresolved"
+
+
+def test_empty_selection_normalizes_without_substituting_unrelated_sources():
+    intent = _intent()
+    selection = DatasourceSelectionContract(
+        question_coverage=[BusinessQuestionCoverageContract(
+            question_id=question.question_id, coverage_reason="Unsupported",
+            fact_coverage=[BusinessFactCoverageContract(
+                fact_id=fact.fact_id, coverage_status="unresolved", coverage_reason="Unsupported",
+            ) for fact in question.required_business_facts],
+        ) for question in intent.business_questions],
+        selection_reason="Unsupported",
+    )
+    assert prep.AnalysisPreparationWorkflow._normalize_selection(
+        selection, prep.build_datasource_catalog(_snapshot()), intent,
+    ).selected_datasource_ids == []

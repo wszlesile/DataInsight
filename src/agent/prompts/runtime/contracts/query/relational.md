@@ -141,3 +141,7 @@ result = save_analysis_result(
 )
 ```
 <!-- runtime-prompt-omit-end -->
+
+- `schema_scope=declared_business_fields` 表示 UNS 定义提供业务字段，不保证枚举查询入口的全部物理列。缺少列声明不等于物理表不存在时间列或平台标识列。只根据已声明/已观测字段统计时明确该字段范围；同值重复不能称为物理完整行重复，未验证完整结构不能断言“无时间字段”。
+
+- `reference_target` 是平台给出的 UNS 引用目标身份，与业务表之间的 JOIN/relationships 不同；relationships 为空不能解释为引用节点没有引用目标。访问失败保留已知引用身份，报告实际失败原因，不将身份缺失或查询失败解释成数据为零。

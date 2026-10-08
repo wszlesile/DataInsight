@@ -53,13 +53,13 @@ API 不接收另写数值/行，不认证算法或业务解释；保留完整 Py
 
 ## 物理读取约束
 
-每条真实读取通过当前物理 helper 传入 query_constraints：time_range 为 None 或 {start,end,end_exclusive}；target_filters 为 {semantic_role,field_hint,value,match_mode} 对象列表；aggregation 为 None 或 {grain,metric}。实际 SQL、文件过滤、粒度和范围须与实际参数一致。目标总体成功查询但为空时使用 raise_no_data_error；技术失败不伪装为零值或无数据。部分路径为空保留成功路径并披露影响。
+每条真实读取通过当前物理 helper 传入 query_constraints：time_range 为 None 或 {start,end,end_exclusive}；target_filters 为 {semantic_role,field_hint,value,match_mode} 对象列表；aggregation 为 None 或 {"grain": "返回行的业务粒度", "metric": "实际聚合指标"}，grain 和 metric 均为字符串；不要把 register_query 的 tuple 粒度写入 query_constraints。实际 SQL、文件过滤、粒度和范围须与实际参数一致。目标总体成功查询但为空时使用 raise_no_data_error；技术失败不伪装为零值或无数据。部分路径为空保留成功路径并披露影响。
 
 <!-- runtime-core-sections -->
 
 ## 函数参考
 
-执行证据由 Runtime 同步记录，展示直接消费保存的计算结果。`results.view(result_id, columns=[...], rename={原字段:显示字段})` 只选列/改名并保留消费身份；现有表格和图表 helper 可直接读取该视图。保存结果视图的 copy()/sort_values() 保留宿主记录的消费身份；改写单元格或任意未登记变换不会继承它。新的汇总、比率或统计仍登记为 calculation；依赖和展示共享结果身份解析，可用实际计算 ID 或唯一的计划 result_id，不在展示函数中重新定义。`results.finding(...)` 保存比较/范围等展示操作，express 可引用它。查询、计算、展示回执用于追溯实际执行，不表示业务语义已验证。
+执行证据由 Runtime 同步记录，展示直接消费保存的计算结果。`results.view(result_id, columns=[...], rename={原字段:显示字段})` 只选列/改名并保留消费身份；现有表格和图表 helper 可直接读取该视图。保存结果视图的 copy()/sort_values() 保留宿主记录的消费身份；改写单元格或任意未登记变换不会继承它。新的汇总、比率或统计仍登记为 calculation；依赖和展示共享结果身份解析，可用实际计算 ID 或唯一的计划 result_id，不在展示函数中重新定义。`results.chart(result_id, helper="result", chart_kind="bar", category_field="类别列", value_field="数值列", title="标题")` 直接读取该保存结果，不接收 data 参数；需要分箱、汇总或新的统计表时，将该结果登记为 calculation，再用它的身份生成图表或表格。`results.finding(...)` 保存比较/范围等展示操作，express 可引用它。查询、计算、展示回执用于追溯实际执行，不表示业务语义已验证。
 
 <!-- runtime-helper-reference -->
 

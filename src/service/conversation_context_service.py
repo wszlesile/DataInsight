@@ -1295,7 +1295,7 @@ class ConversationContextService:
         if not normalized_ids:
             return []
 
-        rows = self.session.query(InsightDatasource).join(
+        rows = self.session.query(InsightDatasource, InsightNsRelDatasource.bind_source).join(
             InsightNsRelDatasource,
             InsightNsRelDatasource.datasource_id == InsightDatasource.id,
         ).filter(
@@ -1307,7 +1307,14 @@ class ConversationContextService:
 
         payload_map = {
             item["datasource_id"]: item
-            for item in (self._build_datasource_snapshot_item(datasource) for datasource in rows)
+            for datasource, bind_source in rows
+            for item in [{
+                **self._build_datasource_snapshot_item(datasource),
+                "source_role": (
+                    "user_selected" if bind_source in {"user_selected", "import_selected"}
+                    else "conversation_candidate"
+                ),
+            }]
         }
         return [payload_map[datasource_id] for datasource_id in normalized_ids if datasource_id in payload_map]
 
@@ -1481,6 +1488,8 @@ class ConversationContextService:
             # Selection routing needs source provenance, but runtime analysis does
             # not need the physical UNS identifier in its prompt context.
             "selection_origin": "uns" if uns_node_id else "external",
+            "uns_node_id": uns_node_id,
+            "uns_path": str(config_json.get("uns_path") or ""),
         }
         if datasource_type == "local_file":
             payload["recommended_loader"] = recommend_local_file_loader(
@@ -1488,6 +1497,10 @@ class ConversationContextService:
                 Config.LOCAL_FILE_LOW_MEMORY_THRESHOLD_BYTES,
             )
         if datasource_type == "table":
+            if str(config_json.get("uns_data_type") or "") in {"2", "7"}:
+                # UNS definitions enumerate business fields, not all physical
+                # platform columns returned by the query endpoint.
+                payload["schema_scope"] = "declared_business_fields"
             payload.update(build_table_runtime_metadata(config_json))
             payload["query_access"] = build_table_query_access(config_json)
         sheet_name = str(config_json.get("sheet_name") or "").strip()

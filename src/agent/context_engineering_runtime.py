@@ -899,7 +899,7 @@ def _runtime_query_contract(
 
 def _runtime_source_identity(row: dict[str, Any]) -> dict[str, Any]:
     keys = (
-        "datasource_id", "datasource_name", "datasource_type",
+        "datasource_id", "datasource_name", "datasource_type", "source_role", "uns_path", "schema_scope", "reference_target",
         "table_engine", "ts_query_source", "time_field", "sheet_name", "recommended_loader", "query_helper",
     )
     item = {

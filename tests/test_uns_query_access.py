@@ -95,6 +95,8 @@ def test_snapshot_persists_query_access_without_reselection():
     item = ConversationContextService(session=None)._build_datasource_snapshot_item(datasource)
 
     assert item["datasource_identifier"] == "public._dim_batch"
+    assert item["schema_scope"] == "declared_business_fields"
+    assert item["uns_node_id"] == "2066811253765967872"
     assert item["query_access"]["access_mode"] == "uns_get"
     assert item["query_access"]["uns_path"] == "生产数仓/批次质量上下文"
 
@@ -348,3 +350,30 @@ def test_static_contract_does_not_confuse_path_with_physical_alias_substring():
         code='sql = "SELECT COUNT(*) FROM uns_get(\'hhhhhhh\')"',
         selected_datasource_snapshot=snapshot,
     ) is None
+
+
+def test_runtime_identity_retains_selection_role_and_uns_address():
+    row = {
+        "datasource_id": 31, "datasource_type": "table", "datasource_name": "selected",
+        "source_role": "user_selected", "uns_path": "plant/node",
+        "query_access": {"access_mode": "uns_get", "relation_expression": "uns_get('plant/node')"},
+    }
+    identity = context_engineering_runtime._runtime_source_identity(row)
+    assert identity["source_role"] == "user_selected"
+    assert identity["uns_path"] == "plant/node"
+    assert identity["query_contract"]["relation_expression"] == "uns_get('plant/node')"
+
+
+def test_reference_target_identity_is_independent_of_business_relationships():
+    from utils.datasource_utils import build_table_runtime_metadata
+    metadata = build_table_runtime_metadata({
+        "table_engine": "relational", "uns_data_type": 7,
+        "refer_node_id": "target-id", "refer_alias": "_actual_target", "refer_data_type": 2,
+    })
+    assert metadata["reference_target"] == {
+        "uns_node_id": "target-id", "uns_alias": "_actual_target", "data_type": 2,
+    }
+    identity = context_engineering_runtime._runtime_source_identity({
+        "datasource_id": 31, "datasource_type": "table", **metadata,
+    })
+    assert identity["reference_target"] == metadata["reference_target"]

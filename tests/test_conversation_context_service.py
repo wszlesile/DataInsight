@@ -744,6 +744,7 @@ class ConversationContextServiceTestCase(unittest.TestCase):
 
         self.assertIsNotNone(runtime)
         self.assertEqual(runtime.active_datasource_snapshot['selected_datasource_ids'], [301])
+        self.assertEqual(runtime.active_datasource_snapshot['selected_datasource_snapshot'][0]['source_role'], 'user_selected')
         self.assertEqual(
             runtime.active_datasource_snapshot['selected_datasource_snapshot'][0]['datasource_name'],
             '产量表',

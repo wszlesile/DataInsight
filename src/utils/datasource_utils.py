@@ -120,6 +120,14 @@ def build_table_runtime_metadata(config_json: dict[str, Any] | None) -> dict[str
     payload: dict[str, Any] = {
         'table_engine': table_engine,
     }
+    if str(config.get('uns_data_type') or '') == '7':
+        payload['reference_target'] = {
+            key: value for key, value in {
+                'uns_node_id': str(config.get('refer_node_id') or '').strip(),
+                'uns_alias': str(config.get('refer_alias') or '').strip(),
+                'data_type': config.get('refer_data_type'),
+            }.items() if value not in (None, '')
+        }
     if table_engine == TABLE_ENGINE_TIME_SERIES:
         backend = normalize_ts_query_source(config.get('ts_query_source'))
         value_fields = _normalize_string_list(config.get('value_fields') or [])
