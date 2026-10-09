@@ -148,6 +148,50 @@ def test_multimeasure_aliases_bind_actual_inputs_without_certifying_python_seman
     assert compile_candidate(rt.StructuredResult.model_validate_json(candidate.model_dump_json())) == bundle
 
 
+def test_derived_daily_table_keeps_all_calculated_columns_bound_to_timeseries_query():
+    program = ExecutablePythonProgram()
+    source = pd.DataFrame({
+        'timeStamp': pd.date_range('2026-10-08', periods=39, freq='h'),
+        'value': [49.0 + (index % 5) for index in range(39)],
+    })
+    query = {
+        'query_key': 'hourly_series',
+        'query_constraints': {
+            'time_range': {'start': '2026-10-08', 'end': '2026-10-10', 'end_exclusive': True},
+            'time_series_query': {'mode': 'aggregate', 'window': '1 hour'},
+        },
+        'implementation': {'datasource_identifier': '__series_a'},
+        'execution': {'status': 'success', 'row_count': len(source), 'columns': list(source.columns)},
+    }
+    record_query_frame('hourly_series', source, query)
+    program.execution.add_query_source('hourly', source, grain=('timeStamp',))
+
+    def summarize_days(inputs, parameters):
+        frame = inputs.frame('hourly').copy()
+        frame['day'] = frame['timeStamp'].dt.strftime('%Y-%m-%d')
+        return frame.groupby('day', as_index=False).agg(
+            value_avg=('value', 'mean'), sample_count=('value', 'count'))
+
+    program.register_calculation(
+        PythonCalculation('daily_summary', summarize_days, ('hourly',),
+                          value_field='value_avg', output_grain=('day',)),
+        question_id='timeseries', result_id='daily_summary')
+    program.execution.run()
+    results = ExecutableResults(program.execution)
+    daily = results.view('daily_summary', rename={
+        'day': '日期', 'value_avg': '日均值', 'sample_count': '采样点数'})
+    table = rt.build_table_result(data=daily, title='时序日汇总')
+    rt.CURRENT_QUERY_SNAPSHOTS.set({'hourly_series': query})
+    saved = rt.save_analysis_result(tables=[table], defer_presentation=True)
+
+    bundle = compile_candidate(saved)
+    assert bundle['diagnostics']['unbound'] == []
+    assert {reference['column_key'] for reference in bundle['table_trace_refs']} == {
+        '日期', '日均值', '采样点数'}
+    assert {tuple(definition['query_refs']) for definition in bundle['evidence_definitions']} == {
+        ('hourly_series',)}
+
+
 @pytest.mark.parametrize('kind', ['query', 'table', 'chart', 'report', 'trace'])
 def test_saved_manifest_cannot_bind_changed_material(kind):
     candidate, _, _ = material()

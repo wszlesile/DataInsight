@@ -1509,6 +1509,98 @@ def _time_series_range_seconds(query_constraints: dict[str, Any]) -> float | Non
         return None
 
 
+def _time_series_coverage_context(
+    query_constraints: Any,
+    *,
+    as_of: datetime | None = None,
+) -> dict[str, Any]:
+    """Describe requested time coverage at execution time without judging prose or data quality."""
+    constraints = query_constraints if isinstance(query_constraints, dict) else {}
+    query = constraints.get('time_series_query')
+    if not isinstance(query, dict) or not query:
+        return {}
+    time_range = constraints.get('time_range')
+    if not isinstance(time_range, dict):
+        return {}
+    start = _parse_time_series_datetime(time_range.get('start'))
+    end = _parse_time_series_datetime(time_range.get('end'))
+    aggregation = constraints.get('aggregation')
+    aggregation = aggregation if isinstance(aggregation, dict) else {}
+    window_seconds = _parse_time_series_window_seconds(query.get('window') or aggregation.get('grain'))
+    if start is None or end is None:
+        return {}
+
+    evaluated_at = as_of or datetime.now()
+    if start.tzinfo is None:
+        if end.tzinfo is not None:
+            end = end.astimezone().replace(tzinfo=None)
+        if evaluated_at.tzinfo is not None:
+            evaluated_at = evaluated_at.astimezone().replace(tzinfo=None)
+    else:
+        end = end.replace(tzinfo=start.tzinfo) if end.tzinfo is None else end.astimezone(start.tzinfo)
+        evaluated_at = (
+            evaluated_at.replace(tzinfo=start.tzinfo)
+            if evaluated_at.tzinfo is None
+            else evaluated_at.astimezone(start.tzinfo)
+        )
+    try:
+        if end <= start:
+            return {}
+        effective_end = min(end, evaluated_at)
+    except TypeError:
+        return {}
+
+    partial_calendar_days: list[dict[str, Any]] = []
+    one_day = timedelta(days=1)
+    first_day = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    if start > first_day:
+        day_end = first_day + one_day
+        covered_end = min(end, day_end, evaluated_at)
+        if covered_end > start:
+            partial_calendar_days.append({
+                'date': first_day.date().isoformat(),
+                'coverage_start': start.isoformat(),
+                'coverage_end_at_execution': covered_end.isoformat(),
+                'covered_seconds_at_execution': max((covered_end - start).total_seconds(), 0.0),
+                'period_seconds': one_day.total_seconds(),
+                'state': 'partial_by_requested_range_or_execution_time',
+            })
+
+    last_observed_day = effective_end.replace(hour=0, minute=0, second=0, microsecond=0)
+    last_day_end = last_observed_day + one_day
+    if last_observed_day < effective_end < last_day_end and effective_end > start:
+        day_start = max(start, last_observed_day)
+        existing_dates = {item['date'] for item in partial_calendar_days}
+        if day_start < effective_end and last_observed_day.date().isoformat() not in existing_dates:
+            partial_calendar_days.append({
+                'date': last_observed_day.date().isoformat(),
+                'coverage_start': day_start.isoformat(),
+                'coverage_end_at_execution': effective_end.isoformat(),
+                'covered_seconds_at_execution': (effective_end - day_start).total_seconds(),
+                'period_seconds': one_day.total_seconds(),
+                'state': (
+                    'partial_at_execution_time'
+                    if end > evaluated_at and evaluated_at < last_day_end
+                    else 'partial_by_requested_range'
+                ),
+            })
+
+    return {
+        'basis': 'requested_range_vs_execution_time',
+        'execution_as_of': evaluated_at.isoformat(),
+        'requested_range': {
+            'start': start.isoformat(),
+            'end': end.isoformat(),
+            'end_exclusive': bool(time_range.get('end_exclusive', True)),
+        },
+        'effective_end_at_execution': effective_end.isoformat(),
+        'requested_end_after_execution': end > evaluated_at,
+        **({'window_seconds': window_seconds} if window_seconds is not None else {}),
+        'partial_calendar_days': partial_calendar_days,
+        'data_completeness': 'not_inferred_from_time_coverage',
+    }
+
+
 def _time_series_native_window_seconds(code: str, source: str) -> float | None:
     if source == 'vxbase':
         pattern = r'\binterval\s*\(\s*[\'\"](?P<window>[^\'\"]+)[\'\"]'
@@ -3447,7 +3539,14 @@ def _mark_latest_query_snapshot_execution(
         execution["family_row_count"] = prior_rows + max(
             int(execution.get("row_count") or 0), 0
         )
-    execution["executed_at"] = datetime.now().isoformat()
+    execution_as_of = datetime.now().astimezone()
+    execution["executed_at"] = execution_as_of.replace(tzinfo=None).isoformat()
+    temporal_coverage = _time_series_coverage_context(
+        snapshot.get('query_constraints'),
+        as_of=execution_as_of,
+    )
+    if temporal_coverage:
+        execution['temporal_coverage'] = temporal_coverage
     snapshot["execution"] = execution
     snapshots[query_key] = snapshot
     CURRENT_QUERY_SNAPSHOTS.set(snapshots)

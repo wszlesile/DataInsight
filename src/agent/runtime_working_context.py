@@ -2338,7 +2338,7 @@ def _compact_query_fact(snapshot: dict) -> dict:
             key: execution.get(key)
             for key in (
                 'status', 'row_count', 'family_row_count', 'columns', 'effective_no_data',
-                'error_type', 'probe_profile',
+                'error_type', 'probe_profile', 'temporal_coverage',
             )
             if execution.get(key) not in (None, '', [], {})
         },
