@@ -1930,6 +1930,50 @@ result = save_analysis_result(analysis_report="Pattern distribution.", charts=[c
 
         self.assertEqual(canonical, [12])
 
+    def test_query_snapshots_map_timeseries_fragment_identifiers_to_sources(self) -> None:
+        result = StructuredResult(
+            analysis_report="时序趋势分析。",
+            query_snapshots={
+                "ts_trend": {
+                    "implementation": {
+                        "sql": "SELECT * FROM ts_query('timescale', '...')",
+                        "sql_context": {
+                            "fragments": [
+                                {
+                                    "kind": "time_series_sql",
+                                    "datasource_identifier": "__series_a",
+                                },
+                                {
+                                    "kind": "time_series_sql",
+                                    "datasource_identifiers": ["__series_b"],
+                                },
+                            ],
+                        },
+                    },
+                    "execution": {"status": "success"},
+                },
+                "cost_trend": {
+                    "implementation": {
+                        "sql": "",
+                        "datasource_identifier": "/app/data/uploads/cost.csv",
+                    },
+                    "execution": {"status": "success"},
+                },
+            },
+        )
+
+        canonical = _canonicalize_used_datasource_ids(
+            result,
+            declared_datasource_ids=[31],
+            selected_datasource_snapshot=[
+                {"datasource_id": 4, "datasource_identifier": "__series_a"},
+                {"datasource_id": 5, "datasource_identifier": "__series_b"},
+                {"datasource_id": 31, "datasource_identifier": "/app/data/uploads/cost.csv"},
+            ],
+        )
+
+        self.assertEqual(canonical, [4, 5, 31])
+
     def test_valid_analysis_result_terminates_the_agent_graph(self) -> None:
         message = _tool_success_message(
             tool_call_id="call-1",

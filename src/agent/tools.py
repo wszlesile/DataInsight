@@ -9030,6 +9030,18 @@ def _query_snapshot_table_names(query_snapshots: dict[str, Any]) -> set[str]:
             if identifier:
                 table_names.add(identifier)
                 table_names.add(identifier.rsplit('.', 1)[-1])
+        sql_context = implementation.get('sql_context')
+        fragments = sql_context.get('fragments') if isinstance(sql_context, dict) else None
+        for fragment in fragments if isinstance(fragments, list) else []:
+            if not isinstance(fragment, dict):
+                continue
+            identifiers = [fragment.get('datasource_identifier')]
+            identifiers.extend(fragment.get('datasource_identifiers') or [])
+            for raw_identifier in identifiers:
+                identifier = str(raw_identifier or '').strip().strip(chr(96) + '"[]').lower()
+                if identifier:
+                    table_names.add(identifier)
+                    table_names.add(identifier.rsplit('.', 1)[-1])
         sql = str(implementation.get('sql') or '').strip()
         if not sql:
             continue
