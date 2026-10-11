@@ -31,6 +31,9 @@ from service.evidence_assembly_service import EvidenceAssemblyService
 
 class ConversationContextServiceTestCase(unittest.TestCase):
     def setUp(self) -> None:
+        background = patch('service.history_summary_runner.enqueue_history_summary')
+        self.summary_enqueue = background.start()
+        self.addCleanup(background.stop)
         engine = create_engine("sqlite:///:memory:")
         Base.metadata.create_all(bind=engine)
         session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -86,7 +89,7 @@ class ConversationContextServiceTestCase(unittest.TestCase):
         ))
         self.session.commit()
         service = ConversationContextService(self.session)
-        service._refresh_memories = lambda _conversation: None
+        service._refresh_memories = lambda _conversation, **kwargs: None
 
         with patch.object(Config, "POST_ANALYSIS_EVIDENCE_ENABLED", True), patch.object(
             EvidenceAssemblyService,
@@ -104,6 +107,7 @@ class ConversationContextServiceTestCase(unittest.TestCase):
         evidence = self.session.query(InsightNsExecutionEvidence).one()
         self.assertEqual(evidence.compilation_status, "queued")
         self.assertEqual(result["turn"].status, "success")
+        self.summary_enqueue.assert_called_once_with(conversation.id, conversation.updated_at)
 
     def test_interactive_runtime_cannot_open_hidden_workflow_conversation(self) -> None:
         namespace = InsightNamespace(

@@ -2141,7 +2141,7 @@ def load_local_file(file_path: str, sheet_name: Optional[str] = None):
     except Exception:
         _mark_latest_query_snapshot_execution(status='failed', duration_ms=int((time.time() - start_time) * 1000))
         raise
-    _mark_latest_query_snapshot_execution(
+    data = _mark_latest_query_snapshot_execution(
         status='success',
         duration_ms=int((time.time() - start_time) * 1000),
         data=data,
@@ -2492,6 +2492,12 @@ def load_data_with_sql(
                     'error_type': error_type,
                 },
             )
+            # A missing tag is not a confirmed empty result. Only the driver's
+            # no-results outcome is consumable by a partial-source program.
+            if 'no results' in str(exc).lower():
+                query_key = str(CURRENT_LAST_QUERY_KEY.get() or '')
+                snapshot = (CURRENT_QUERY_SNAPSHOTS.get() or {}).get(query_key) or {}
+                raise PhysicalQueryNoDataError(str(exc), snapshot) from exc
         else:
             _mark_latest_query_snapshot_execution(
                 status='failed',
@@ -2499,7 +2505,7 @@ def load_data_with_sql(
                 diagnostics={'error_type': error_type, 'error_message': str(exc)},
             )
         raise
-    _mark_latest_query_snapshot_execution(
+    data = _mark_latest_query_snapshot_execution(
         status='success',
         duration_ms=int((time.time() - start_time) * 1000),
         data=data,
@@ -3167,11 +3173,17 @@ def _register_query_snapshot(
     }
     existing = snapshots.get(query_key)
     if isinstance(existing, dict):
+        existing_implementation = existing.get("implementation") or {}
+        # Query identity contains declared SQL/scope, not observations added
+        # after execution (physical_execution, paging receipts, etc.).
+        implementation_fields = snapshot["implementation"]
         comparable_existing = {
             "query_constraints": existing.get("query_constraints") or {},
             "analysis_scope": existing.get("analysis_scope") or {},
             "query_scope": existing.get("query_scope") or {},
-            "implementation": existing.get("implementation") or {},
+            "implementation": {
+                key: existing_implementation.get(key) for key in implementation_fields
+            },
         }
         comparable_new = {
             "query_constraints": snapshot["query_constraints"],
@@ -3190,6 +3202,10 @@ def _register_query_snapshot(
                 ],
             )
         snapshot["execution"] = existing.get("execution") or snapshot["execution"]
+        snapshot["implementation"].update({
+            key: value for key, value in existing_implementation.items()
+            if key not in implementation_fields
+        })
     snapshots[query_key] = snapshot
     CURRENT_QUERY_SNAPSHOTS.set(snapshots)
     CURRENT_LAST_QUERY_KEY.set(query_key)
@@ -3492,14 +3508,14 @@ def _mark_latest_query_snapshot_execution(
     row_count: int | None = None,
     columns: list[str] | None = None,
     diagnostics: dict[str, Any] | None = None,
-) -> None:
+) -> Any:
     query_key = str(query_key or CURRENT_LAST_QUERY_KEY.get() or '').strip()
     if not query_key:
-        return
+        return data
     snapshots = dict(CURRENT_QUERY_SNAPSHOTS.get() or {})
     snapshot = snapshots.get(query_key)
     if not isinstance(snapshot, dict):
-        return
+        return data
     execution = dict(snapshot.get("execution") or {})
     execution["status"] = status
     if duration_ms >= 0:
@@ -3551,7 +3567,13 @@ def _mark_latest_query_snapshot_execution(
     snapshots[query_key] = snapshot
     CURRENT_QUERY_SNAPSHOTS.set(snapshots)
 
-    record_query_frame(query_key, data, snapshot)
+    if status == 'success' and data is not None:
+        import pandas as pd
+        if isinstance(data, pd.DataFrame):
+            from analysis_runtime.provenance import ResultViewFrame
+            data = ResultViewFrame(data)
+        record_query_frame(query_key, data, snapshot)
+    return data
 
 
 def _probe_profile_scalar(value: Any) -> Any:
@@ -4015,6 +4037,14 @@ class NoDataFoundError(Exception):
         self.reason = normalized_reason
         self.detail_lines = normalized_details
         super().__init__(normalized_reason)
+
+
+class PhysicalQueryNoDataError(NoDataFoundError):
+    """A physical loader confirmed emptiness; retain that query's exact receipt."""
+
+    def __init__(self, reason: str, snapshot: dict[str, Any]):
+        super().__init__(reason)
+        self.snapshot = copy.deepcopy(snapshot)
 
 
 class QueryConstraintRetrySignal(Exception):
@@ -7160,7 +7190,7 @@ def validate_query_constraints(
     parameter_code = json.dumps(effective_query_params, ensure_ascii=False, default=str) \
         if effective_query_params is not None else ""
     filter_fragments = [
-        str(sql or '').strip(),
+        _bound_sql_contract_view(sql, effective_query_params).strip(),
         parameter_code,
         context_filter_code,
         *[str(item or '').strip() for item in (filter_expressions or [])],
@@ -7281,6 +7311,52 @@ def query_data_with_sql(
         numeric_columns=numeric_columns,
         text_columns=text_columns,
     )
+
+
+def _bound_sql_contract_view(sql, params):
+    """Expose actual DB-API bindings to existing scope checks, never execution.
+
+    Token positions preserve parameter order and skip literals/comments.
+    Unsupported bindings keep the original view; the physical driver remains
+    authoritative. No SQL, parameters or business predicates are rewritten.
+    """
+    original = str(sql or '')
+    if params is None:
+        return original
+    try:
+        from sqlglot import Dialect, exp
+        from sqlglot.tokens import TokenType
+        tokens = Dialect.get_or_raise('postgres').tokenize(original)
+        replacements = []
+        position = 0
+        for index, token in enumerate(tokens):
+            if token.token_type != TokenType.MOD:
+                continue
+            if (index and tokens[index - 1].token_type == TokenType.MOD
+                    and tokens[index - 1].end + 1 == token.start):
+                continue
+            match = re.match(r'%\(([A-Za-z_][A-Za-z0-9_]*)\)s|%s', original[token.start:])
+            if match is None:
+                continue
+            if match.group(1):
+                if not isinstance(params, dict):
+                    return original
+                value = params[match.group(1)]
+            else:
+                if not isinstance(params, (list, tuple)):
+                    return original
+                value = params[position]
+                position += 1
+            replacements.append((token.start, token.start + len(match.group(0)),
+                                 exp.convert(value).sql(dialect='postgres')))
+        if isinstance(params, (list, tuple)) and position != len(params):
+            return original
+        view = original
+        for start, end, value in reversed(replacements):
+            view = view[:start] + value + view[end:]
+        return view
+    except Exception:
+        return original
 
 
 def _normalize_sql_query_parameters(
@@ -7998,8 +8074,11 @@ def save_analysis_result(
                          'preserve all planned calculations, queries and analytical scope. '
                          + json.dumps(unresolved, ensure_ascii=False))
 
+    # Normalize before JSON detachment so the runtime-owned consumption receipt
+    # can be matched to the exact artifact digest. Normalizers return detached,
+    # JSON-safe payloads; the final copy below preserves the existing contract.
     normalized_charts = _copy_jsonable(
-        _normalize_chart_items(charts=_copy_jsonable(charts or [], [])),
+        _normalize_chart_items(charts=charts or []),
         [],
     ) if output_format == "standard" else []
     # A conditional analytic branch may legitimately produce no rows even when
@@ -8011,9 +8090,12 @@ def save_analysis_result(
         if _chart_has_renderable_data(chart)
     ]
     normalized_tables = _copy_jsonable(
-        _normalize_table_items(tables=_copy_jsonable(tables or [], [])),
+        _normalize_table_items(tables=tables or []),
         [],
     ) if output_format == "standard" else []
+    if normalized_tables:
+        from analysis_runtime.provenance import refresh_table_consumption
+        normalized_tables = [refresh_table_consumption(table) for table in normalized_tables]
     original_report = analysis_report if output_format == 'standard' else output_text
     delivery_coverage = execution_delivery_coverage(normalized_tables, normalized_charts,
         original_report if str(original_report) == report_text else '')
@@ -8286,6 +8368,9 @@ class FindingReportBlock(BaseModel):
     kind: Literal['finding']
     trace_execution_id: str
     finding_id: str
+    component: Literal['difference', 'maximum', 'minimum', 'population_count', 'valid_count', 'missing_count'] | None = Field(
+        default=None, description='留空消费完整发现；填组件名消费该发现已保存的单个值，不重新计算。')
+    precision: int = Field(default=2, ge=0, le=12)
 
 
 class ValueReportBlock(BaseModel):
@@ -8314,7 +8399,7 @@ class ComposeBoundPresentationInput(BaseModel):
     model_config = {'extra': 'forbid'}
     execution_id: int = Field(description='当前待表达候选的 execution_id。')
     report_text: str = Field(description='完整自由 Markdown/text。在计算值或已执行发现的位置写 {{ref_id}}，宿主原位替换；保留段落、标题、表格和完整叙述。')
-    report_refs: dict[str, ValueReportBlock | FindingReportBlock] = Field(default_factory=dict,
+    report_refs: dict[str, ValueReportBlock | FindingReportBlock] = Field(
         description='ref_id 到当前候选 value/finding 引用的映射。ref_id 使用字母开头的英文标识符。value 使用实际 fact_id、从 0 开始的 row_index、field；precision 仅格式化，不缩放或重算。')
 
 
@@ -11504,48 +11589,33 @@ def _inspect_sql_preparation_relationship(
     right_columns = ", ".join(right_fields)
     left_non_null = " AND ".join(f"{field} IS NOT NULL" for field in left_fields)
     right_non_null = " AND ".join(f"{field} IS NOT NULL" for field in right_fields)
-    left_non_null_qualified = " AND ".join(
-        f"l.{field} IS NOT NULL" for field in left_fields
-    )
-    right_non_null_qualified = " AND ".join(
-        f"r.{field} IS NOT NULL" for field in right_fields
-    )
+    keys = [f"__relationship_key_{index}" for index in range(len(left_fields))]
+    left_projection = ", ".join(f"{field} AS {key}" for field, key in zip(left_fields, keys))
+    right_projection = ", ".join(f"{field} AS {key}" for field, key in zip(right_fields, keys))
     join_condition = " AND ".join(
-        f"l.{left_field} = r.{right_field}"
-        for left_field, right_field in zip(left_fields, right_fields)
+        f"l.{key} = r.{key}" for key in keys
     )
-    left_matched_columns = ", ".join(f"l.{field}" for field in left_fields)
-    right_matched_columns = ", ".join(f"r.{field}" for field in right_fields)
+    # Aggregate each complete population once. Coverage needs key existence,
+    # not the potentially multiplicative join of the original source rows.
     sql = f"""
+WITH left_keys AS (
+    SELECT {left_projection}, COUNT(*) AS rows_per_key
+    FROM {left_identifier} WHERE {left_non_null} GROUP BY {left_columns}
+), right_keys AS (
+    SELECT {right_projection}, COUNT(*) AS rows_per_key
+    FROM {right_identifier} WHERE {right_non_null} GROUP BY {right_columns}
+)
 SELECT
-    (SELECT COUNT(*) FROM (
-        SELECT {left_columns} FROM {left_identifier}
-        WHERE {left_non_null} GROUP BY {left_columns}
-    ) left_distinct) AS left_distinct_key_count,
-    (SELECT COUNT(*) FROM (
-        SELECT {right_columns} FROM {right_identifier}
-        WHERE {right_non_null} GROUP BY {right_columns}
-    ) right_distinct) AS right_distinct_key_count,
-    (SELECT COUNT(*) FROM (
-        SELECT DISTINCT {left_matched_columns}
-        FROM {left_identifier} l
-        JOIN {right_identifier} r ON {join_condition}
-        WHERE {left_non_null_qualified}
-    ) matched_left) AS matched_left_key_count,
-    (SELECT COUNT(*) FROM (
-        SELECT DISTINCT {right_matched_columns}
-        FROM {left_identifier} l
-        JOIN {right_identifier} r ON {join_condition}
-        WHERE {right_non_null_qualified}
-    ) matched_right) AS matched_right_key_count,
-    COALESCE((SELECT MAX(rows_per_key) FROM (
-        SELECT COUNT(*) AS rows_per_key FROM {left_identifier}
-        WHERE {left_non_null} GROUP BY {left_columns}
-    ) left_frequency), 0) AS left_max_rows_per_key,
-    COALESCE((SELECT MAX(rows_per_key) FROM (
-        SELECT COUNT(*) AS rows_per_key FROM {right_identifier}
-        WHERE {right_non_null} GROUP BY {right_columns}
-    ) right_frequency), 0) AS right_max_rows_per_key
+    (SELECT COUNT(*) FROM left_keys) AS left_distinct_key_count,
+    (SELECT COUNT(*) FROM right_keys) AS right_distinct_key_count,
+    (SELECT COUNT(*) FROM left_keys l WHERE EXISTS (
+        SELECT 1 FROM right_keys r WHERE {join_condition}
+    )) AS matched_left_key_count,
+    (SELECT COUNT(*) FROM right_keys r WHERE EXISTS (
+        SELECT 1 FROM left_keys l WHERE {join_condition}
+    )) AS matched_right_key_count,
+    COALESCE((SELECT MAX(rows_per_key) FROM left_keys), 0) AS left_max_rows_per_key,
+    COALESCE((SELECT MAX(rows_per_key) FROM right_keys), 0) AS right_max_rows_per_key
 """
     numeric_columns = [
         "left_distinct_key_count",
@@ -15315,6 +15385,7 @@ def _build_probe_fact_ledger(
             'columns': execution.get('columns') or [],
             'probe_profile': execution.get('probe_profile') or {},
             'error_type': execution.get('error_type'),
+            'error_message': execution.get('error_message'),
         }
         observations.append({
             key: value for key, value in observation.items()
@@ -15338,7 +15409,7 @@ def _build_probe_fact_ledger(
             for key in (
                 'query_key', 'datasource_id', 'datasource_name', 'datasource_identifiers',
                 'status', 'row_count',
-                'columns', 'value_samples', 'distinct_values', 'value_profile', 'error_type',
+                'columns', 'value_samples', 'distinct_values', 'value_profile', 'error_type', 'error_message',
             )
             if raw.get(key) not in (None, '', [], {})
         }
@@ -15369,7 +15440,7 @@ def _build_probe_fact_ledger(
             continue
         observations.append({
             key: value for key, value in outcome.items()
-            if key in {'query_key', 'status', 'row_count', 'effective_no_data', 'columns', 'error_type'}
+            if key in {'query_key', 'status', 'row_count', 'effective_no_data', 'columns', 'error_type', 'error_message'}
             and value not in (None, '', [], {})
         })
         projection_semantics_by_index.append([])
@@ -15720,6 +15791,7 @@ def _build_expression_fact_view(traces: list[dict[str, Any]] | None) -> list[dic
     """Expose actual computed facts to the authoring pass with explicit truncation."""
     output: list[dict[str, Any]] = []
     remaining_chars = 24000
+    remaining_method_chars = 6000
     for trace in traces or []:
         if not isinstance(trace, dict):
             continue
@@ -15732,7 +15804,7 @@ def _build_expression_fact_view(traces: list[dict[str, Any]] | None) -> list[dic
                 continue
             source_scopes[str(source_id)] = {
                 key: _copy_jsonable(raw_source.get(key), None)
-                for key in ('query_keys', 'grain', 'row_count', 'binding', 'transform_kind', 'parents')
+                for key in ('query_keys', 'grain', 'row_count', 'binding', 'transform_kind', 'parents', 'observations')
                 if raw_source.get(key) not in (None, '', [], {})
             }
         trace_item = {
@@ -15749,6 +15821,24 @@ def _build_expression_fact_view(traces: list[dict[str, Any]] | None) -> list[dic
             'decision_count': len(decisions),
             'decisions_truncated': len(decisions) > 50,
         }
+        # Requested executed findings are the reporting handoff, so retain
+        # them before optional raw-row and implementation views use the budget.
+        for finding_id, finding in (trace.get('findings') or {}).items():
+            # The canonical finding stays in the candidate. Its rendered text
+            # already includes the comparison values; do not send a second
+            # copy of all ranked rows to the expression model.
+            item = _copy_jsonable({key: value for key, value in finding.items()
+                if key not in {'rows', 'source_scopes'}}, {})
+            size = len(json.dumps(item, ensure_ascii=False, separators=(',', ':')))
+            if size <= remaining_chars:
+                trace_item['findings'][finding_id] = item
+                remaining_chars -= size
+            else:
+                # References remain available even if a complete distribution
+                # cannot fit the model view; the host renders the full finding.
+                trace_item['findings'][finding_id] = {
+                    key: item.get(key) for key in ('finding_id', 'fact_id', 'kind', 'field', 'category_field')}
+                trace_item['findings'][finding_id]['view_truncated'] = True
         for fact_id, raw_fact in facts.items():
             if not isinstance(raw_fact, dict):
                 continue
@@ -15797,6 +15887,20 @@ def _build_expression_fact_view(traces: list[dict[str, Any]] | None) -> list[dic
                 item['values_truncated'] = bool(values)
                 encoded_size = len(json.dumps(item, ensure_ascii=False, separators=(',', ':')))
             if encoded_size <= remaining_chars:
+                implementation = raw_definition.get('implementation')
+                if isinstance(implementation, dict):
+                    source = str(implementation.get('source') or '')
+                    size = min(len(source), 2000, remaining_method_chars)
+                    item['executed_method'] = {
+                        'name': implementation.get('name'),
+                        'code_sha256': implementation.get('code_sha256'),
+                        'source_status': implementation.get('source_status'),
+                        'source': source[:size],
+                        'source_truncated': size < len(source),
+                        'closure_names': _copy_jsonable(implementation.get('closure_names') or [], []),
+                        'semantics_verification': 'not_evaluated',
+                    }
+                    remaining_method_chars -= size
                 trace_item['facts'][str(fact_id)] = item
                 remaining_chars -= encoded_size
             else:
@@ -15804,22 +15908,6 @@ def _build_expression_fact_view(traces: list[dict[str, Any]] | None) -> list[dic
                     'state': raw_fact.get('state'), 'row_count': len(values),
                     'values': [], 'values_truncated': bool(values),
                 }
-        for finding_id, finding in (trace.get('findings') or {}).items():
-            # The canonical finding stays in the candidate. Its rendered text
-            # already includes the comparison values; do not send a second
-            # copy of all ranked rows to the expression model.
-            item = _copy_jsonable({key: value for key, value in finding.items()
-                if key not in {'rows', 'source_scopes'}}, {})
-            size = len(json.dumps(item, ensure_ascii=False, separators=(',', ':')))
-            if size <= remaining_chars:
-                trace_item['findings'][finding_id] = item
-                remaining_chars -= size
-            else:
-                # References remain available even if a complete distribution
-                # cannot fit the model view; the host renders the full finding.
-                trace_item['findings'][finding_id] = {
-                    key: item.get(key) for key in ('finding_id', 'fact_id', 'kind', 'field', 'category_field')}
-                trace_item['findings'][finding_id]['view_truncated'] = True
         output.append(trace_item)
     return output
 
@@ -15919,8 +16007,12 @@ def _presentation_candidate_message(
         'query_receipts': [
             {
                 'query_key': str(query_key),
+                'query_constraints': _copy_jsonable(snapshot.get('query_constraints') or {}, {}),
+                'analysis_scope': _copy_jsonable(snapshot.get('analysis_scope') or {}, {}),
+                'query_scope': _copy_jsonable(snapshot.get('query_scope') or {}, {}),
                 'status': str((snapshot.get('execution') or {}).get('status') or ''),
                 'loaded_row_count': (snapshot.get('execution') or {}).get('row_count'),
+                'temporal_coverage': _copy_jsonable((snapshot.get('execution') or {}).get('temporal_coverage') or {}, {}),
                 'columns': list((snapshot.get('execution') or {}).get('columns') or [])[:24],
             }
             for query_key, snapshot in (candidate.query_snapshots or {}).items()
@@ -15931,6 +16023,9 @@ def _presentation_candidate_message(
             'This is authorship, not a review. Do not re-query or invent calculations. '
             'For a population count, use a calculation fact input_rows value (rows actually supplied to that calculation); '
             'loaded_row_count in a query receipt is the physical loader result and may include rows excluded downstream. '
+            'executed_method is the actual callback implementation, not semantic certification; '
+            'read it with saved method/condition fields to understand what a statistic establishes. '
+            'source_scopes.observations preserves physically confirmed empty sources alongside successful sources. '
             'A fact with values_truncated=true is only a sample; never present it as a complete population.'
         ),
     }
@@ -18116,8 +18211,16 @@ def compose_analysis_presentation(
                 return _presentation_error_message(runtime.tool_call_id, execution_id,
                     'presentation_output_shape_invalid', '引用正文只能用于 standard/text，且不能同时提交其他完整报告。')
             from analysis_runtime.findings import compose_referenced_report
+            # Normalize the authored template before calculating reference spans.
+            # Any later text rewrite would invalidate the saved consumption offsets.
+            prepared_report = _strip_structural_empty_report_lines(report_text)
+            if output_format == 'standard':
+                from service.report_presentation_service import normalize_report_presentation
+                prepared_report = normalize_report_presentation(prepared_report,
+                    getattr(context, 'execution_datasource_snapshot', {}) or
+                    getattr(context, 'active_datasource_snapshot', {}))
             try:
-                rendered, bindings = compose_referenced_report(candidate.semantic_execution_traces, report_text, report_refs or {})
+                rendered, bindings = compose_referenced_report(candidate.semantic_execution_traces, prepared_report, report_refs or {})
             except (KeyError, ValueError) as error:
                 return _presentation_error_message(runtime.tool_call_id, execution_id,
                     'presentation_reference_invalid', str(error))
@@ -18134,8 +18237,16 @@ def compose_analysis_presentation(
                 return _presentation_error_message(runtime.tool_call_id, execution_id,
                     'presentation_output_shape_invalid', '报告块只能用于 standard/text，且不能同时提交另一个完整报告。')
             from analysis_runtime.findings import compose_bound_report
+            prepared_blocks = report_blocks
+            if output_format == 'standard':
+                from service.report_presentation_service import normalize_report_presentation
+                source_snapshot = (getattr(context, 'execution_datasource_snapshot', {}) or
+                    getattr(context, 'active_datasource_snapshot', {}))
+                prepared_blocks = [block.model_copy(update={'text': normalize_report_presentation(
+                    block.text, source_snapshot)}) if isinstance(block, NarrativeReportBlock) else block
+                    for block in report_blocks]
             try:
-                bound_text, bindings = compose_bound_report(candidate.semantic_execution_traces, report_blocks)
+                bound_text, bindings = compose_bound_report(candidate.semantic_execution_traces, prepared_blocks)
             except (KeyError, TypeError, ValueError):
                 return _presentation_error_message(runtime.tool_call_id, execution_id,
                     'presentation_finding_reference_invalid', '报告块必须引用当前候选唯一存在的执行发现。')
@@ -18150,18 +18261,20 @@ def compose_analysis_presentation(
                     runtime.tool_call_id, execution_id, 'presentation_output_shape_invalid',
                     'standard 输出只能提交 analysis_report。',
                 )
-            report_text = _strip_structural_empty_report_lines(analysis_report)
+            report_text = (analysis_report if candidate.report_finding_bindings
+                           else _strip_structural_empty_report_lines(analysis_report))
             if not report_text:
                 return _presentation_error_message(
                     runtime.tool_call_id, execution_id, 'missing_report',
                     'analysis_report 不能为空。',
                 )
             from service.report_presentation_service import normalize_report_presentation
-            report_text = normalize_report_presentation(
-                report_text,
-                getattr(context, 'execution_datasource_snapshot', {}) or
-                getattr(context, 'active_datasource_snapshot', {}),
-            )
+            if not candidate.report_finding_bindings:
+                report_text = normalize_report_presentation(
+                    report_text,
+                    getattr(context, 'execution_datasource_snapshot', {}) or
+                    getattr(context, 'active_datasource_snapshot', {}),
+                )
             candidate.analysis_report = report_text
         elif output_format == 'text':
             if analysis_report or output_json is not None or not str(output_text or '').strip():
@@ -18169,7 +18282,8 @@ def compose_analysis_presentation(
                     runtime.tool_call_id, execution_id, 'presentation_output_shape_invalid',
                     'text 输出必须只提交非空 output_text。',
                 )
-            candidate.analysis_report = str(output_text).strip()
+            candidate.analysis_report = (str(output_text) if candidate.report_finding_bindings
+                                         else str(output_text).strip())
             candidate.output_payload = candidate.analysis_report
         elif output_format == 'json':
             if analysis_report or output_text or not isinstance(output_json, dict):

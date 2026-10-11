@@ -12,26 +12,7 @@ SELECT * FROM ts_query('<ts_query_source>', '<escaped_inner_sql>')
 
 内部表名来自当前来源 `query_contract.datasource_identifier`，字段来自同一来源 `query_contract.allowed_fields/value_fields`。
 
-## 查询模式
-
-每条正式时序查询在 `query_constraints.time_series_query` 先声明语义，再写对应方言：
-
-```python
-# 原始值
-{"mode":"raw","decision_source":"analysis_choice"}
-# 采样/插值
-{"mode":"sample","window":"1m","interpolation":"previous","decision_source":"explicit_user"}
-# 统计聚合
-{"mode":"aggregate","window":"1m","aggregations":[{"field":"value","method":"avg"}],"decision_source":"explicit_user"}
-```
-
-- `decision_source` 仅为 `explicit_user/system_policy/analysis_choice`。
-- 用户明确要求 raw、采样/插值或均值/最大/最小等统计时采用对应模式。短时间只要求历史趋势且未指定采样/统计时保持 raw。
-- 范围超过一天且用户未指定模式时，使用原生采样或统计控制点数并披露窗口和方法；不能用 `LIMIT` 冒充降采样。
-- 采样、插值和统计必须由时序库原生完成，不能先取全部原始点后用 pandas `resample/floor/groupby/mean/max/min` 替代。
-- 必须有时间范围，开始/结束真实出现在内部 SQL。时间字面量使用 Asia/Shanghai 偏移，例如 `+08:00`，不用 `Z`。
-- 时序来源可能有多个值字段。按问题选择相关 `value_fields`，不能只默认第一个字段。
-- 好值通常按 `quality_field == 0`；用户明确分析全部质量或坏值时才放宽。
+<!-- time-series-mode-semantics -->
 
 ## Timescale
 

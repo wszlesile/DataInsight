@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import hashlib
+import time
 from dataclasses import dataclass
 from contextlib import contextmanager
 from pathlib import Path
@@ -227,12 +229,38 @@ class SuposKernelApi:
         if not database_conn_info.is_ready():
             raise ValueError("数据库连接信息尚未初始化，请先完成一次用户认证")
 
-        with self.borrow_database_connection() as dbapi_connection:
-            with dbapi_connection.cursor() as cursor:
-                cursor.execute(sql, params or None)
-                rows = cursor.fetchall()
-                columns = [desc[0] for desc in (cursor.description or [])]
-                return columns, rows
+        started = time.perf_counter()
+        phase_started = started
+        phase = 'connection'
+        timings = {}
+        row_count = None
+        status = 'failed'
+        try:
+            with self.borrow_database_connection() as dbapi_connection:
+                timings[phase] = time.perf_counter() - phase_started
+                with dbapi_connection.cursor() as cursor:
+                    phase = 'execute'
+                    phase_started = time.perf_counter()
+                    cursor.execute(sql, params or None)
+                    timings[phase] = time.perf_counter() - phase_started
+                    phase = 'fetch'
+                    phase_started = time.perf_counter()
+                    rows = cursor.fetchall()
+                    timings[phase] = time.perf_counter() - phase_started
+                    columns = [desc[0] for desc in (cursor.description or [])]
+                    row_count = len(rows)
+                    status = 'success'
+                    return columns, rows
+        finally:
+            if status != 'success':
+                timings[phase] = time.perf_counter() - phase_started
+            logger.info(
+                '[SuposKernel] FedQuery read timing sql_hash=%s status=%s phase=%s '
+                'connection_seconds=%.3f execute_seconds=%.3f fetch_seconds=%.3f rows=%s total_seconds=%.3f',
+                hashlib.sha256(str(sql).encode('utf-8')).hexdigest(), status, phase,
+                timings.get('connection', 0), timings.get('execute', 0), timings.get('fetch', 0),
+                row_count, time.perf_counter() - started,
+            )
 
     @contextmanager
     def borrow_database_connection(self):

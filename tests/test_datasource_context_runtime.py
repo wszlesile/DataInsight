@@ -67,7 +67,8 @@ def test_datasource_context_keeps_full_snapshot_for_preparation_to_narrow(monkey
     assert payload["runtime_capabilities"]["query_execution"] == {
         "max_rows_per_sql_result": 10000,
         "capacity_scope": "each physical load_data_with_sql execution",
-        "relational_sql_dialect": "mysql_compatible",
+        "relational_sql_dialect": "fedquery_portable_subset",
+        "relational_identifier_quote": '"',
         "relational_sql_profile": "fedquery_portable_subset",
         "operation_capabilities": {"string_aggregation": "unsupported"},
         "full_population_strategies": [
@@ -192,7 +193,8 @@ def test_datasource_context_compacts_only_redundant_schema_indexes(monkeypatch):
         "datasource_identifier": "dw.contract",
         "allowed_fields_ref": "metadata_schema.properties",
         "all_schema_properties_allowed": True,
-        "sql_dialect": "mysql_compatible",
+        "sql_dialect": "fedquery_portable_subset",
+        "identifier_quote": '"',
         "sql_profile": "fedquery_portable_subset",
         "operation_capabilities": {"string_aggregation": "unsupported"},
     }

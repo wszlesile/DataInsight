@@ -296,6 +296,66 @@ def test_material_and_probe_scope_return_with_the_parent_focus():
     assert packet.probe_ledgers == ({},)
 
 
+@pytest.mark.parametrize('resume_phase', [RuntimePhase.IMPLEMENT, RuntimePhase.REPAIR])
+def test_failed_query_observation_keeps_probe_repair_and_original_resume_scope(resume_phase):
+    packet = replace(new_runtime_work_packet(workspace_id='w', focus='Check format'),
+                     phase=RuntimePhase.PROBE, resume_phase=resume_phase,
+                     resume_focus='Analyze full population',
+                     active_datasource_ids=(12,), active_fields_by_datasource={'12': ('time',)},
+                     resume_datasource_ids=(12, 13),
+                     resume_fields_by_datasource={'12': ('time', 'amount'), '13': ('name',)})
+    failed = {'query_key': 'format', 'status': 'query_error', 'error_type': 'runtime_error'}
+    ledger = {'observations': [failed]}
+    repaired = reduce_runtime_tool_result(packet, tool_name='probe_analysis_data',
+        tool_call_id='failed-probe', arguments={},
+        result={'status': 'observation', 'diagnostics': {'probe_fact_ledger': ledger}})
+    assert repaired.phase is RuntimePhase.PROBE_REPAIR
+    assert repaired.resume_phase is resume_phase
+    assert repaired.resume_focus == packet.resume_focus
+    assert repaired.resume_fields_by_datasource == packet.resume_fields_by_datasource
+    assert repaired.active_fields_by_datasource == packet.active_fields_by_datasource
+    assert repaired.probe_ledgers[-1] == ledger
+    assert repaired.latest_diagnostic['query_failures'] == [failed]
+    resumed = reduce_runtime_tool_result(repaired, tool_name='probe_analysis_data',
+        tool_call_id='working-probe', arguments={},
+        result={'status': 'observation', 'diagnostics': {'probe_fact_ledger': {
+            'observations': [{'status': 'success', 'row_count': 2}]}}})
+    assert resumed.phase is resume_phase
+    assert resumed.focus == packet.resume_focus
+    assert resumed.active_fields_by_datasource == packet.resume_fields_by_datasource
+
+
+@pytest.mark.parametrize('observations', [[], [{'status': 'no_data', 'row_count': 0}],
+    [{'status': 'failed'}, {'status': 'success'}], [{'status': 'success', 'row_count': 0}]])
+def test_empty_or_mixed_probe_observations_do_not_become_technical_repair(observations):
+    packet = replace(new_runtime_work_packet(workspace_id='w'), phase=RuntimePhase.PROBE,
+                     resume_phase=RuntimePhase.IMPLEMENT)
+    resumed = reduce_runtime_tool_result(packet, tool_name='probe_analysis_data',
+        tool_call_id='probe', arguments={}, result={'status': 'observation',
+        'diagnostics': {'probe_fact_ledger': {'observations': observations}}})
+    assert resumed.phase is RuntimePhase.IMPLEMENT
+
+
+def test_physical_query_failure_takes_priority_over_generated_probe_observation():
+    packet = replace(new_runtime_work_packet(workspace_id='w'), phase=RuntimePhase.PROBE,
+                     resume_phase=RuntimePhase.REPAIR)
+    result = {'status': 'observation', 'diagnostics': {
+        '_query_execution_outcomes': [{'query_key': 'physical', 'status': 'failed'}],
+        'probe_fact_ledger': {'observations': [{'status': 'success'}],
+                             'confirmed_facts': [{'statement': 'generated declaration'}]}}}
+    repaired = reduce_runtime_tool_result(packet, tool_name='probe_analysis_data',
+        tool_call_id='failed', arguments={}, result=result)
+    assert repaired.phase is RuntimePhase.PROBE_REPAIR
+    assert repaired.latest_diagnostic['query_failures'][0]['query_key'] == 'physical'
+
+
+def test_legacy_probe_result_does_not_advance_on_all_failed_reads():
+    packet = record_material_manifest(new_workspace(), manifest(probe_required=True))
+    failed = record_probe_result(packet, {'status': 'observation', 'diagnostics': {
+        'probe_fact_ledger': {'observations': [{'status': 'query_error'}]}}})
+    assert failed.phase is RuntimePhase.PROBE
+
+
 def test_all_unavailable_probe_paths_block_runtime_instead_of_entering_implementation():
     packet = reduce_runtime_tool_result(
         new_runtime_work_packet(workspace_id="w", focus="Analyze"),

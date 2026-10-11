@@ -570,7 +570,7 @@ def test_save_analysis_result_keeps_backend_query_snapshots_only():
         tables=[],
     )
     assert set(result.query_snapshots) == {"q_completion"}
-    assert "evidence" not in result.model_dump_json().lower()
+    assert result.runtime_evidence == {}
 
 
 def test_parameterized_query_constraints_validate_bound_time_range():

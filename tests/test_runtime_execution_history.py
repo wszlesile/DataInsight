@@ -49,6 +49,31 @@ def query_fact(rows=0, status='success', physical=True):
     }
 
 
+def test_query_identity_excludes_execution_observations_and_retains_receipts():
+    from copy import deepcopy
+
+    token = tools.CURRENT_QUERY_SNAPSHOTS.set({})
+    last = tools.CURRENT_LAST_QUERY_KEY.set('')
+    try:
+        declaration = {'query_key': 'readings', 'sql': 'SELECT value FROM readings',
+                       'query_constraints': {'time_range': None, 'target_filters': [], 'aggregation': None}}
+        assert tools._register_query_snapshot(**declaration) is None
+        snapshot = tools.CURRENT_QUERY_SNAPSHOTS.get()['readings']
+        snapshot['implementation']['physical_execution'] = True
+        snapshot['implementation']['physical_executions'] = [{'row_count': 2}]
+        snapshot['execution'] = {'status': 'success', 'row_count': 2}
+        completed = deepcopy(snapshot)
+        assert tools._register_query_snapshot(**declaration) is None
+        assert tools.CURRENT_QUERY_SNAPSHOTS.get()['readings'] == completed
+        changed = dict(declaration, sql='SELECT value FROM readings WHERE value > 2')
+        retry = tools._register_query_snapshot(**changed)
+        assert retry is not None
+        assert tools.CURRENT_QUERY_SNAPSHOTS.get()['readings'] == completed
+    finally:
+        tools.CURRENT_QUERY_SNAPSHOTS.reset(token)
+        tools.CURRENT_LAST_QUERY_KEY.reset(last)
+
+
 def test_all_history_readers_exclude_other_tasks_future_and_deleted_executions(history):
     add, _ = history
     add(1, task=9, snapshots={'old': query_fact()})
@@ -365,6 +390,44 @@ def test_probe_feedback_snapshot_compaction_keeps_scope_but_omits_replayed_sql()
     assert compact['q']['implementation']['datasource_identifiers'] == ['demo']
     assert 'sql' not in compact['q']['implementation']
     assert 'projection_semantics' not in compact['q']['implementation']
+
+
+@pytest.mark.parametrize('boundary', ['snapshot', 'helper', 'outcome'])
+def test_failed_probe_error_survives_worker_and_working_view_projection(boundary):
+    from langchain_core.messages import AIMessage
+    from agent.runtime_working_context import collect_runtime_facts, resolve_work
+
+    failure = {
+        'query_key': 'failed_query', 'status': 'query_error',
+        'error_type': 'runtime_error',
+        'error_message': 'invalid sql:syntax error at or near ","',
+    }
+    snapshots = {}
+    diagnostics = {}
+    if boundary == 'snapshot':
+        snapshots = {'failed_query': {
+            'query_key': 'failed_query',
+            'implementation': {'sql': 'SELECT `category`, COUNT(*) FROM demo'},
+            'execution': failure,
+        }}
+    else:
+        diagnostics['query_observations' if boundary == 'helper'
+                    else '_query_execution_outcomes'] = [failure]
+    message = tools._tool_error_message(
+        tool_call_id='failed-probe', execution_id=11,
+        error_type='probe_feedback', error_message='Probe completed',
+        repair_instructions=[], diagnostics=diagnostics, query_snapshots=snapshots,
+    )
+    action = AIMessage(content='', tool_calls=[{
+        'id': 'failed-probe', 'name': 'probe_analysis_data',
+        'args': {'code': 'SELECT `category`, COUNT(*) FROM demo'},
+        'type': 'tool_call',
+    }])
+    messages = [action, message]
+    assert resolve_work(messages)[0] == 'probe_repair'
+    _, _, probe_facts = collect_runtime_facts(messages)
+    observations = next(iter(probe_facts.values()))['observations']
+    assert observations[0]['error_message'] == failure['error_message']
 
 
 def test_implicit_probe_feedback_preserves_worker_outcomes_without_replaying_stdout():

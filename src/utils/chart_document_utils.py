@@ -2,8 +2,10 @@ import json
 import math
 import re
 from collections import defaultdict
+from copy import deepcopy
 from datetime import date, datetime, time
 from typing import Any
+from pandas import Period
 
 from utils.chart_spec_utils import finalize_chart_spec, normalize_chart_spec
 
@@ -298,14 +300,20 @@ def build_chart_suite(
     resolved_top_n = _to_positive_int(top_n) or min(DEFAULT_TOP_N, max(category_count, 1))
     suite: list[dict[str, Any]] = []
 
+    def build_suite_chart(**options):
+        # Dataset normalization is a display boundary, not a new producer.
+        # Retain the actual input receipt while reusing the normalized rows.
+        from analysis_runtime.provenance import bind_chart_frame
+        chart = build_chart_result(data=rows, **options)
+        return bind_chart_frame(chart, data, options)
+
     want_line = include_line if include_line is not None else temporal
     want_bar = include_bar if include_bar is not None else True
     want_pie = include_pie if include_pie is not None else (single_series and not temporal and category_count <= 8)
 
-    if temporal and want_line:
-        suite.append(build_chart_result(
+    if want_line:
+        suite.append(build_suite_chart(
             chart_kind="line",
-            data=rows,
             title=_compose_chart_title(title, "趋势"),
             description=_compose_chart_description(description, "展示变化趋势。"),
             category_field=category_field,
@@ -322,9 +330,8 @@ def build_chart_suite(
     if want_bar:
         bar_sort_field = sort_field or (category_field if temporal else value_field)
         bar_sort_order = "asc" if temporal else sort_order
-        suite.append(build_chart_result(
+        suite.append(build_suite_chart(
             chart_kind="bar",
-            data=rows,
             title=_compose_chart_title(title, "对比"),
             description=_compose_chart_description(description, "突出各项对比关系。"),
             category_field=category_field,
@@ -339,9 +346,8 @@ def build_chart_suite(
         ))
 
     if want_pie:
-        suite.append(build_chart_result(
+        suite.append(build_suite_chart(
             chart_kind="pie",
-            data=rows,
             title=_compose_chart_title(title, "占比"),
             description=_compose_chart_description(description, "展示整体构成占比。"),
             category_field=category_field,
@@ -355,9 +361,8 @@ def build_chart_suite(
         ))
 
     if not suite:
-        suite.append(build_chart_result(
+        suite.append(build_suite_chart(
             chart_kind="bar",
-            data=rows,
             title=title,
             description=description,
             category_field=category_field,
@@ -531,7 +536,9 @@ def normalize_chart_document(
     if not isinstance(chart_document, dict):
         raise ValueError("chart_document must be a dict.")
 
-    document = json.loads(json.dumps(chart_document, ensure_ascii=False))
+    # Dataset cells are normalized below; they may still contain native pandas
+    # values here. Detach without requiring serialization before normalization.
+    document = deepcopy(chart_document)
     chart_kind = _normalize_chart_kind(document.get("chart_kind") or document.get("chart_type"))
     dataset = _normalize_dataset(document.get("dataset") or document.get("data"))
 
@@ -1164,6 +1171,8 @@ def _normalize_row(row: dict[str, Any], columns: list[str]) -> dict[str, Any]:
 
 
 def _normalize_cell_value(value: Any) -> Any:
+    if isinstance(value, Period):
+        return str(value)
     if hasattr(value, "item"):
         try:
             value = value.item()

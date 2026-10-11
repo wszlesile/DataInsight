@@ -154,13 +154,31 @@ def compose_bound_report(traces, blocks):
             if len(matches) != 1:
                 raise ValueError('Finding reference must resolve uniquely in the current execution candidate')
             trace, finding = matches[0]
-            text = finding['text']
+            component = block.get('component')
+            if component is None:
+                text = finding['text']
+            else:
+                precision = block.get('precision', 2)
+                if (component not in {'difference', 'maximum', 'minimum', 'population_count',
+                                     'valid_count', 'missing_count'} or component not in finding
+                        or type(precision) is not int or not 0 <= precision <= 12):
+                    raise ValueError('Finding component requires an existing saved value and valid precision')
+                text = _cell(finding[component], precision)
             bindings.append({'execution_token': trace['execution_token'],
                              'finding_id': finding['finding_id'], 'fact_id': finding['fact_id'],
                              'field': finding.get('field'), 'finding_kind': finding['kind'],
                              'block_index': block_index,
                              'start': offset, 'end': offset + len(text), 'text': text,
                              'business_status': 'not_evaluated'})
+            if component is not None:
+                bindings[-1]['finding_component'] = component
+                bindings[-1]['presentation_operation'] = {
+                    'kind': 'display_finding_component', 'finding_id': finding['finding_id'],
+                    'operation': finding['kind'], 'component': component, 'precision': precision,
+                    'unit': ('个百分点' if component == 'difference' and finding.get('unit') == '%'
+                             else finding.get('unit', '') if component in {'difference', 'maximum', 'minimum'}
+                             else ''),
+                }
         else:
             raise ValueError('Unknown report block kind')
         parts.append(text)

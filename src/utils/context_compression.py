@@ -1,11 +1,38 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from collections import OrderedDict
+from threading import Lock
 from typing import Any
 
 from config import Config
 
 ELLIPSIS_MARKER = "\n...[omitted]..."
+
+
+class HistoryCompressionCache:
+    """Bounded reuse of successful summaries for immutable producer inputs."""
+    def __init__(self, max_entries=128):
+        self._entries = OrderedDict()
+        self._lock = Lock()
+        self._max_entries = max_entries
+
+    def get(self, key):
+        with self._lock:
+            value = self._entries.get(key)
+            if value is not None:
+                self._entries.move_to_end(key)
+            return value
+
+    def put(self, key, summary):
+        with self._lock:
+            self._entries[key] = summary
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+
+history_compression_cache = HistoryCompressionCache()
 
 
 def clip_text(text: str, max_chars: int, *, keep_head_ratio: float = 0.75) -> str:

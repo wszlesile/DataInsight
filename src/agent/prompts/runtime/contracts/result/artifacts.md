@@ -45,7 +45,7 @@ result = save_analysis_result(
 
 - 使用 `build_table_result(...)`；返回值直接放入 `tables`，没有 `.table` 属性。
 - `columns[*].key` 对应真实字段，`label` 是用户可读业务名，不使用底层编码、临时变量或 `Metric`。
-- 每个业务指标使用独立数值列，维度使用独立维度列；同一数值列不能跨行混装金额、数量和比率。
+- 可比较的分组结果中，每个业务指标使用独立数值列，维度使用独立维度列。独立指标可以纵向展示：用 `results.metric_table` 保留各行实际字段身份，并在标签中说明各自单位；不能把这些行当成同一指标比较或作图。
 - 空表不进入结果。有限明细说明展示范围，总体结论仍基于完整统计口径。
 - `data` 可传 DataFrame 或 records，不能与 `rows` 同时传入。Helper 返回字典包装，直接加入 `tables`，没有 `.table` 属性。
 - 报告内嵌 Markdown 表格优先用 `build_markdown_table(...)`；需要业务表头时 `columns` 使用 `{"key":"真实字段","label":"业务名称"}`。

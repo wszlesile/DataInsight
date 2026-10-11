@@ -5,6 +5,49 @@ from agent import tools as runtime_tools
 from dto import DatabaseConnInfo
 
 
+@pytest.mark.parametrize('failure_phase', [None, 'connection', 'execute', 'fetch'])
+def test_query_timing_preserves_results_errors_and_hides_query_material(monkeypatch, failure_phase):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import importlib
+    module = importlib.import_module('api.SuposkernelApi')
+    api = SuposKernelApi()
+    monkeypatch.setattr(api, 'get_database_conn_info', lambda: _conn_info())
+    error = RuntimeError('original failure')
+    cursor = MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.description = [('amount',)]
+    cursor.fetchall.return_value = [(7,)]
+    if failure_phase == 'execute':
+        cursor.execute.side_effect = error
+    if failure_phase == 'fetch':
+        cursor.fetchall.side_effect = error
+    @contextmanager
+    def borrowed():
+        if failure_phase == 'connection':
+            raise error
+        yield SimpleNamespace(cursor=lambda: cursor)
+    monkeypatch.setattr(api, 'borrow_database_connection', borrowed)
+    log = MagicMock()
+    monkeypatch.setattr(module.logger, 'info', log)
+    sql = "SELECT private_column FROM secret_table WHERE account = %s"
+    if failure_phase:
+        with pytest.raises(RuntimeError) as caught:
+            api.query_rows(sql, ['private account'])
+        assert caught.value is error
+    else:
+        assert api.query_rows(sql, ['private account']) == (['amount'], [(7,)])
+    template, *arguments = log.call_args.args
+    rendered = template % tuple(arguments)
+    assert 'status=' + ('failed' if failure_phase else 'success') in rendered
+    assert 'phase=' + (failure_phase or 'fetch') in rendered
+    assert 'sql_hash=' in rendered
+    assert 'secret_table' not in rendered
+    assert 'private account' not in rendered
+    assert 'original failure' not in rendered
+
+
 class FakeHttpResponse:
     def __init__(self, status_code, payload=None):
         self.status_code = status_code

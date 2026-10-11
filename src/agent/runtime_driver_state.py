@@ -371,6 +371,20 @@ def reduce_runtime_tool_result(
             )
         ledger = diagnostics.get("probe_fact_ledger") if isinstance(diagnostics, dict) else None
         if status in {"success", "observation"} and isinstance(ledger, dict):
+            failures = failed_probe_queries(diagnostics, ledger)
+            if failures:
+                return _next(
+                    packet,
+                    phase=RuntimePhase.PROBE_REPAIR,
+                    probe_revision=packet.probe_revision + 1,
+                    diagnostic_revision=packet.diagnostic_revision + 1,
+                    probe_ledgers=(*packet.probe_ledgers, dict(ledger)),
+                    latest_diagnostic={"error_type": "probe_query_failure",
+                                       "query_failures": failures,
+                                       "call_id": str(tool_call_id or "")},
+                    reason="probe_queries_require_repair",
+                    **common,
+                )
             return _next(
                 packet,
                 phase=packet.resume_phase or RuntimePhase.IMPLEMENT,
@@ -613,6 +627,23 @@ def _requested_material_scope(
     )
 
 
+def failed_probe_queries(diagnostics: dict, ledger: dict) -> list[dict]:
+    """All attempted reads failed technically; receiving a ledger is not success.
+
+    Successful/empty and mixed-path observations retain their established
+    decision path. This is execution status, never a judgment of Probe semantics.
+    """
+    outcomes = diagnostics.get('_query_execution_outcomes')
+    if not isinstance(outcomes, list) or not outcomes:
+        outcomes = ledger.get('observations')
+    if not isinstance(outcomes, list) or not outcomes:
+        return []
+    if not all(isinstance(item, dict) and item.get('status') in {'failed', 'query_error'}
+               for item in outcomes):
+        return []
+    return [dict(item) for item in outcomes]
+
+
 def record_probe_result(
     workspace: RuntimeWorkspace,
     result: dict[str, Any],
@@ -622,7 +653,8 @@ def record_probe_result(
         raise ValueError("Probe result is only valid while Runtime is probing.")
     diagnostics = result.get("diagnostics") if isinstance(result, dict) else None
     ledger = diagnostics.get("probe_fact_ledger") if isinstance(diagnostics, dict) else None
-    if result.get("status") == "observation" and isinstance(ledger, dict):
+    if (result.get("status") == "observation" and isinstance(ledger, dict)
+            and not failed_probe_queries(diagnostics, ledger)):
         return _next(
             workspace,
             phase=RuntimePhase.IMPLEMENT,

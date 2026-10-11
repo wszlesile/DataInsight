@@ -6,11 +6,11 @@ import pandas as pd
 import pytest
 
 import agent.tools as rt
-from analysis_runtime.executable_program import ExecutablePythonProgram, ExecutableResults
-from analysis_runtime.provenance import record_query_frame
+from analysis_runtime.executable_program import ExecutablePythonProgram, ExecutableResults, register_program_source
+from analysis_runtime.provenance import ResultViewFrame, record_query_frame
 from analysis_runtime.runtime_evidence import compile_runtime_evidence, finalize_runtime_evidence
 from analysis_runtime.semantic_execution import PythonCalculation
-from utils.chart_document_utils import build_multi_metric_chart_result
+from utils.chart_document_utils import build_chart_result, build_multi_metric_chart_result
 
 
 @pytest.fixture(autouse=True)
@@ -52,6 +52,31 @@ def compile_candidate(candidate):
     return compile_runtime_evidence(candidate.runtime_evidence, traces=candidate.semantic_execution_traces,
         queries=candidate.query_snapshots, tables=candidate.tables, charts=candidate.charts,
         report=candidate.analysis_report)
+
+
+def test_finding_components_keep_distinct_evidence_boundaries_after_persistence():
+    from analysis_runtime.findings import compose_referenced_report
+    candidate, results, calls = material()
+    results.finding('span', 'summary', kind='range', field='amount', category_field='group')
+    traces = [results._execution.trace()]
+    refs = {component: {'kind': 'finding', 'trace_execution_id': 'executable-analysis',
+                       'finding_id': 'span', 'component': component}
+            for component in ['maximum', 'difference']}
+    report, bindings = compose_referenced_report(traces,
+        '最大值 {{maximum}}；差值 {{difference}}。', refs)
+    candidate.semantic_execution_traces = traces
+    candidate.analysis_report = report
+    candidate.report_finding_bindings = bindings
+    candidate.runtime_evidence = finalize_runtime_evidence(candidate.runtime_evidence,
+        traces=traces, queries=candidate.query_snapshots, tables=candidate.tables,
+        charts=candidate.charts, report=report, bindings=bindings)
+    restored = rt.StructuredResult.model_validate_json(candidate.model_dump_json())
+    bundle = compile_candidate(restored)
+    assert report == '最大值 5；差值 3。'
+    assert calls == [1]
+    assert len(bundle['report_trace_refs']) == 2
+    assert len({ref['evidence_key'] for ref in bundle['report_trace_refs']}) == 2
+    assert {ref['presentation_binding']['component'] for ref in bundle['report_trace_refs']} == {'maximum', 'difference'}
 
 
 def test_missing_calculated_cells_keep_candidate_identity_after_json_persistence():
@@ -132,6 +157,304 @@ def test_result_copy_and_sort_preserve_consumption_but_modified_data_cannot_inhe
     assert fact_view_receipt(forged) is None
 
 
+def test_query_source_chart_keeps_query_and_display_view_lineage_without_formula_claims():
+    program = ExecutablePythonProgram()
+    source = pd.DataFrame({
+        'timeStamp': pd.date_range('2026-10-08', periods=8, freq='min'),
+        'value': list(range(8)),
+    })
+    query = {
+        'query_key': 'series',
+        'implementation': {'datasource_identifier': '__series__'},
+        'execution': {'status': 'success', 'row_count': 8, 'columns': list(source.columns)},
+    }
+    record_query_frame('series', source, query)
+    program.execution.add_query_source('series_source', source, grain=('timeStamp',))
+    results = ExecutableResults(program.execution)
+    view = results.source_table('series_source')
+    view['display_time'] = pd.to_datetime(view['timeStamp'])
+    view = view.sort_values('timeStamp').reset_index(drop=True).iloc[::2].copy()
+    chart = build_chart_result(
+        chart_kind='line', data=view, title='趋势',
+        category_field='timeStamp', value_field='value',
+    )
+    rt.CURRENT_QUERY_SNAPSHOTS.set({'series': query})
+    saved = rt.save_analysis_result(charts=[chart], defer_presentation=True)
+
+    bundle = compile_candidate(saved)
+    assert bundle['diagnostics']['unbound'] == []
+    assert len(bundle['chart_trace_refs']) == 1
+    definition = bundle['evidence_definitions'][0]
+    assert definition['metric_name'] == 'value'
+    assert definition['query_refs'] == ['series']
+    assert definition['calculation']['lineage_verification'] == 'query_bound'
+    assert definition['calculation']['formula_semantics_verification'] == 'not_evaluated'
+    operation = bundle['chart_trace_refs'][0]['presentation_binding']
+    assert operation['view']['kind'] == 'iloc'
+    assert operation['view']['input']['kind'] == 'reset_index'
+
+
+@pytest.mark.parametrize('copied', [False, True])
+def test_chart_suite_retains_actual_query_consumer_across_dataset_normalization(copied):
+    from utils.chart_document_utils import build_chart_suite
+    program = ExecutablePythonProgram()
+    source = pd.DataFrame({'ts': pd.date_range('2026-10-08', periods=8, freq='min').strftime('%Y-%m-%d %H:%M:%S'), 'amount': list(range(8))})
+    query = {'query_key': 'windows', 'implementation': {},
+             'execution': {'status': 'success', 'row_count': 8, 'columns': list(source.columns)}}
+    record_query_frame('windows', source, query)
+    program.execution.add_query_source('windows', source, grain=('ts',))
+    view = ExecutableResults(program.execution).table('windows').sort_values('ts').reset_index(drop=True)
+    if copied:
+        view = pd.DataFrame(view)
+    charts = build_chart_suite(data=view, title='Window amounts', category_field='ts', value_field='amount',
+                               include_line=True, include_bar=True, include_pie=False, limit=4)
+    rt.CURRENT_QUERY_SNAPSHOTS.set({'windows': query})
+    saved = rt.save_analysis_result(charts=charts, defer_presentation=True)
+    bundle = compile_candidate(saved)
+    assert len(saved.charts) == 2
+    assert len(bundle['chart_trace_refs']) == (0 if copied else 2)
+    if not copied:
+        assert bundle['status'] == 'complete'
+        assert all(item['query_refs'] == ['windows'] for item in bundle['evidence_definitions'])
+        assert all(item['calculation']['lineage_verification'] == 'query_bound' for item in bundle['evidence_definitions'])
+    else:
+        assert bundle['status'] == 'partial'
+
+
+@pytest.mark.parametrize('operation,bound', [('copy', True), ('astype', True), ('numeric', True), ('multiply', False), ('foreign', False)])
+def test_query_chart_alias_records_actual_series_operation_without_value_matching(operation, bound):
+    program = ExecutablePythonProgram()
+    source = pd.DataFrame({'time': ['2026-10-11 10:00', '2026-10-11 10:01'], 'amount': ['3', '5']})
+    query = {'query_key': 'series', 'implementation': {},
+             'execution': {'status': 'success', 'row_count': 2, 'columns': list(source.columns)}}
+    record_query_frame('series', source, query)
+    program.execution.add_query_source('series', source)
+    view = ExecutableResults(program.execution).table('series')
+    if operation == 'copy':
+        alias = view['amount']
+    elif operation == 'astype':
+        alias = view['amount'].astype(float)
+    elif operation == 'numeric':
+        alias = pd.to_numeric(view['amount'], errors='coerce')
+    elif operation == 'foreign':
+        alias = pd.Series([3, 5])
+    else:
+        alias = pd.to_numeric(view['amount'], errors='coerce') * 2
+    view['display_amount'] = alias
+    chart = build_chart_result(chart_kind='line', data=view, title='Amounts',
+                               category_field='time', value_field='display_amount')
+    rt.CURRENT_QUERY_SNAPSHOTS.set({'series': query})
+    saved = rt.save_analysis_result(charts=[chart], defer_presentation=True)
+    bundle = compile_candidate(saved)
+    assert len(bundle['chart_trace_refs']) == (1 if bound else 0)
+    if bound:
+        assert bundle['evidence_definitions'][0]['metric_name'] == 'amount'
+        assert bundle['chart_trace_refs'][0]['value_field'] == 'display_amount'
+        assert bundle['chart_trace_refs'][0]['presentation_binding']['view']['kind'] == 'column_assignment'
+
+
+@pytest.mark.parametrize('operation', ['rename', 'numeric_alias'])
+def test_saved_query_view_presentation_addresses_saved_fields_then_upstream_columns(operation):
+    program = ExecutablePythonProgram()
+    source = ResultViewFrame({'time': ['a', 'b'], 'amount': ['3', '5']})
+    query = {'query_key': 'raw', 'implementation': {},
+             'execution': {'status': 'success', 'row_count': 2, 'columns': list(source.columns)}}
+    rt.CURRENT_QUERY_SNAPSHOTS.set({'raw': query})
+    record_query_frame('raw', source, query)
+    if operation == 'rename':
+        projected = source.rename(columns={'amount': 'saved_amount'})
+    else:
+        projected = source.copy()
+        projected['saved_amount'] = pd.to_numeric(projected['amount'], errors='coerce')
+        projected = projected[['time', 'saved_amount']]
+    register_program_source(program.execution, 'saved_source', projected, ('time',))
+    view = ExecutableResults(program.execution).table('saved_source')
+    view = view.rename(columns={'saved_amount': 'display_amount'})
+    chart = build_chart_result(chart_kind='line', data=view, title='Amounts',
+                               category_field='time', value_field='display_amount')
+    table = rt.build_table_result(title='Amounts', data=view,
+        columns=[{'key': 'display_amount', 'label': 'Amount'}])
+    saved = rt.save_analysis_result(charts=[chart], tables=[table], defer_presentation=True)
+    bundle = compile_candidate(saved)
+    assert bundle['status'] == 'complete'
+    assert len(bundle['chart_trace_refs']) == len(bundle['table_trace_refs']) == 1
+    graph = saved.runtime_evidence['graph'][0]
+    assert graph['field_origins']['saved_amount'] == [{'query_key': 'raw', 'field': 'amount'}]
+    assert saved.charts[0]['_semantic_execution_binding']['field_bindings']['display_amount'] == 'saved_amount'
+
+
+@pytest.mark.parametrize('projection', [['time', 'display_amount'], pd.Index(['time', 'display_amount'])])
+def test_numeric_round_and_column_projection_keep_query_receipt_without_binding_arithmetic(projection):
+    program = ExecutablePythonProgram()
+    source = pd.DataFrame({'time': [1, 2], 'amount': ['3.456', 'bad']})
+    query = {'query_key': 'projected', 'implementation': {},
+             'execution': {'status': 'success', 'row_count': 2, 'columns': list(source.columns)}}
+    record_query_frame('projected', source, query)
+    program.execution.add_query_source('projected', source)
+    view = ExecutableResults(program.execution).table('projected')
+    view['display_amount'] = pd.to_numeric(view['amount'], errors='coerce').round(2)
+    projected = view[projection]
+    chart = build_chart_result(chart_kind='line', data=projected, title='Amounts',
+                               category_field='time', value_field='display_amount')
+    rt.CURRENT_QUERY_SNAPSHOTS.set({'projected': query})
+    bundle = compile_candidate(rt.save_analysis_result(charts=[chart], defer_presentation=True))
+    assert len(bundle['chart_trace_refs']) == 1
+    assert bundle['evidence_definitions'][0]['metric_name'] == 'amount'
+    operation = bundle['chart_trace_refs'][0]['presentation_binding']['view']
+    assert operation['kind'] == 'column_projection'
+    assert operation['input']['source_series_operation']['kind'] == 'round'
+    assert projected['display_amount'].iloc[0] == 3.46
+    assert pd.isna(projected['display_amount'].iloc[1])
+    projected['display_amount'] = projected['display_amount'] * 2
+    changed = build_chart_result(chart_kind='line', data=projected, title='Changed',
+                                category_field='time', value_field='display_amount')
+    assert compile_candidate(rt.save_analysis_result(charts=[changed], defer_presentation=True))['chart_trace_refs'] == []
+
+
+def test_numeric_conversion_capture_leaves_ordinary_and_orphaned_series_behavior_unchanged():
+    import gc
+    from analysis_runtime.provenance import enable_runtime_evidence
+    enable_runtime_evidence()
+    wrapper = pd.to_numeric
+    enable_runtime_evidence()
+    assert pd.to_numeric is wrapper
+    ordinary = pd.Series(['3', 'bad'])
+    pd.testing.assert_series_equal(pd.to_numeric(ordinary, errors='coerce'), wrapper.__wrapped__(ordinary, errors='coerce'))
+    program = ExecutablePythonProgram()
+    source = pd.DataFrame({'amount': ['3', 'bad']})
+    query = {'query_key': 'orphan', 'implementation': {},
+             'execution': {'status': 'success', 'row_count': 2, 'columns': ['amount']}}
+    record_query_frame('orphan', source, query)
+    program.execution.add_query_source('orphan', source)
+    view = ExecutableResults(program.execution).table('orphan')
+    series = view['amount']
+    del view
+    gc.collect()
+    pd.testing.assert_series_equal(pd.to_numeric(series, errors='coerce'), wrapper.__wrapped__(series, errors='coerce'))
+
+
+def test_query_source_chart_does_not_bind_a_field_after_that_field_is_replaced():
+    program = ExecutablePythonProgram()
+    source = pd.DataFrame({'timeStamp': [1, 2], 'value': [3, 5]})
+    query = {'query_key': 'series', 'implementation': {},
+             'execution': {'status': 'success', 'row_count': 2, 'columns': list(source.columns)}}
+    record_query_frame('series', source, query)
+    program.execution.add_query_source('series_source', source)
+    results = ExecutableResults(program.execution)
+    view = results.source_table('series_source')
+    view['value'] = view['value'] * 10
+    chart = build_chart_result(chart_kind='line', data=view, title='趋势',
+                               category_field='timeStamp', value_field='value')
+    rt.CURRENT_QUERY_SNAPSHOTS.set({'series': query})
+    saved = rt.save_analysis_result(charts=[chart], defer_presentation=True)
+    bundle = compile_candidate(saved)
+    assert bundle['chart_trace_refs'] == []
+    assert any(item['reason'] == 'no_runtime_consumption' for item in bundle['diagnostics']['unbound'])
+
+
+def test_query_loader_safe_views_bind_only_fields_retained_from_successful_snapshot():
+    program = ExecutablePythonProgram()
+    raw = pd.DataFrame({'timeStamp': pd.date_range('2026-10-08', periods=8, freq='min'),
+                        'value': list(range(8))})
+    query = {'query_key': 'series', 'implementation': {},
+             'execution': {'status': 'success', 'row_count': 8, 'columns': list(raw.columns)}}
+    rt.CURRENT_QUERY_SNAPSHOTS.set({'series': query})
+    loaded = ResultViewFrame(raw)
+    record_query_frame('series', loaded, query)
+    view = loaded.copy()
+    view['bucket'] = pd.to_datetime(view['timeStamp']).dt.floor('5min')
+    view = view.sort_values('timeStamp').reset_index(drop=True).iloc[::2].copy()
+    register_program_source(program.execution, 'series_source', view, ())
+    results = ExecutableResults(program.execution)
+    chart_data = results.source_table('series_source')
+    chart = build_chart_result(chart_kind='line', data=chart_data, title='趋势',
+                               category_field='timeStamp', value_field='value')
+    saved = rt.save_analysis_result(charts=[chart], defer_presentation=True)
+
+    bundle = compile_candidate(saved)
+    assert bundle['chart_trace_refs']
+    definition = bundle['evidence_definitions'][0]
+    assert definition['metric_name'] == 'value'
+    assert definition['query_refs'] == ['series']
+    assert definition['calculation']['lineage_verification'] == 'query_bound'
+    assert definition['calculation']['formula_semantics_verification'] == 'not_evaluated'
+    assert definition['transformations'][0]['view']['kind'] == 'query_source'
+
+
+def test_query_backed_table_preserves_named_cast_and_rounding_views():
+    program = ExecutablePythonProgram()
+    source = pd.DataFrame({'day': pd.date_range('2026-10-08', periods=2, tz='Asia/Shanghai'),
+                           'value': [1.234, 5.678]})
+    query = {'query_key': 'daily', 'implementation': {},
+             'execution': {'status': 'success', 'row_count': 2, 'columns': list(source.columns)}}
+    rt.CURRENT_QUERY_SNAPSHOTS.set({'daily': query})
+    record_query_frame('daily', source, query)
+    program.execution.add_query_source('daily_source', source)
+    results = ExecutableResults(program.execution)
+    view = results.source_table('daily_source').rename(columns={'value': 'metric'})
+    view['metric'] = view['metric'].astype('float64').round(1)
+    table = rt.build_table_result(title='逐日', data=view)
+    saved = rt.save_analysis_result(tables=[table], defer_presentation=True)
+
+    bundle = compile_candidate(saved)
+    assert {ref['column_key'] for ref in bundle['table_trace_refs']} == {'day', 'metric'}
+    assert {item['metric_name'] for item in bundle['evidence_definitions']} == {'day', 'value'}
+    assert all(item['query_refs'] == ['daily'] for item in bundle['evidence_definitions'])
+    assert bundle['diagnostics']['unbound'] == []
+
+
+@pytest.mark.parametrize('cast_mode', ['series_type', 'frame_type', 'frame_mapping', 'extension_dtype'])
+def test_query_backed_cast_receipts_survive_json_persistence(cast_mode):
+    program = ExecutablePythonProgram()
+    source = pd.DataFrame({'value': [1, 2]})
+    query = {'query_key': 'rows', 'implementation': {},
+             'execution': {'status': 'success', 'row_count': 2, 'columns': ['value']}}
+    rt.CURRENT_QUERY_SNAPSHOTS.set({'rows': query})
+    record_query_frame('rows', source, query)
+    program.execution.add_query_source('source', source)
+    view = ExecutableResults(program.execution).source_table('source')
+    if cast_mode == 'series_type':
+        view['value'] = view['value'].astype(str)
+    elif cast_mode == 'frame_type':
+        view = view.astype(float)
+    elif cast_mode == 'frame_mapping':
+        view = view.astype({'value': float})
+    else:
+        view['value'] = view['value'].astype(pd.StringDtype())
+    saved = rt.save_analysis_result(tables=[rt.build_table_result(title='明细', data=view)],
+                                    defer_presentation=True)
+    restored = rt.StructuredResult.model_validate_json(saved.model_dump_json())
+    bundle = compile_candidate(restored)
+    json.dumps(bundle)
+    assert {ref['column_key'] for ref in bundle['table_trace_refs']} == {'value'}
+    assert bundle['evidence_definitions'][0]['query_refs'] == ['rows']
+    assert bundle['diagnostics']['unbound'] == []
+
+
+def test_inserted_display_column_preserves_query_fields_without_certifying_new_values():
+    program = ExecutablePythonProgram()
+    source = pd.DataFrame({'value': [111., 222.]})
+    query = {'query_key': 'rows', 'implementation': {},
+             'execution': {'status': 'success', 'row_count': 2, 'columns': ['value']}}
+    rt.CURRENT_QUERY_SNAPSHOTS.set({'rows': query})
+    record_query_frame('rows', source, query)
+    program.execution.add_query_source('source', source)
+    view = ExecutableResults(program.execution).source_table('source').copy()
+    view.insert(0, 'ordinal', range(1, len(view) + 1))
+    chart_view = view.copy()
+    chart_view['ordinal'] = chart_view['ordinal'].astype(str)
+    table = rt.build_table_result(title='明细', data=view)
+    chart = build_chart_result(chart_kind='bar', data=chart_view, title='数值',
+                               category_field='ordinal', value_field='value')
+    saved = rt.save_analysis_result(tables=[table], charts=[chart], defer_presentation=True)
+    restored = rt.StructuredResult.model_validate_json(saved.model_dump_json())
+    bundle = compile_candidate(restored)
+    assert {ref['column_key'] for ref in bundle['table_trace_refs']} == {'value'}
+    assert len(bundle['chart_trace_refs']) == 1
+    assert all(item['metric_name'] == 'value' for item in bundle['evidence_definitions'])
+    assert all(item['query_refs'] == ['rows'] for item in bundle['evidence_definitions'])
+
+
 def test_multimeasure_aliases_bind_actual_inputs_without_certifying_python_semantics():
     candidate, results, calls = material(3)
     bundle = compile_candidate(candidate)
@@ -144,7 +467,9 @@ def test_multimeasure_aliases_bind_actual_inputs_without_certifying_python_seman
     assert amount['calculation']['lineage_verification'] == 'execution_recorded'
     assert amount['calculation']['formula_semantics_verification'] == 'not_evaluated'
     assert bundle['diagnostics']['model_calls'] == 0
-    assert candidate.runtime_evidence['graph'][0]['planned_results'][0]['result_id'] == 'summary'
+    calculation_node = next(node for node in candidate.runtime_evidence['graph']
+                            if node['fact_id'] == 'calc')
+    assert calculation_node['planned_results'][0]['result_id'] == 'summary'
     assert compile_candidate(rt.StructuredResult.model_validate_json(candidate.model_dump_json())) == bundle
 
 

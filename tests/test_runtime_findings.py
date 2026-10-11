@@ -22,6 +22,36 @@ def make_results(values, labels=None, unit=''):
     return program, ExecutableResults(program.execution), calls
 
 
+def test_registered_comparison_is_executed_before_artifacts_without_repeating_calculation():
+    program, _, calls = make_results([19.4, 17.2, 12.3], ['A', 'B', 'C'], '%')
+    program.register_finding('between_objects', ('question', 'planned'), kind='range',
+                             field='amount', category_field='item')
+    observed = []
+    def present(results, parameters):
+        observed.append(program.execution.trace()['findings']['between_objects'])
+        return {'charts': [], 'tables': []}
+    program.register_presentation(present)
+    assert program.deliver({}) == {'charts': [], 'tables': []}
+    assert len(calls) == 1
+    assert observed[0]['difference'] == pytest.approx(7.1)
+    assert observed[0]['scope']['output_grain'] == ('item',)
+    assert observed[0]['highest_labels'] == ['A']
+    assert observed[0]['lowest_labels'] == ['C']
+    assert observed[0]['unit'] == '%'
+    assert observed[0]['business_status'] == 'not_evaluated'
+
+
+def test_registered_finding_keeps_identity_unique_and_defers_actual_field_resolution():
+    program, _, calls = make_results([2, 3], ['A', 'B'])
+    program.register_finding('range', 'planned', kind='range', field='absent', category_field='item')
+    assert calls == []
+    with pytest.raises(ValueError, match='new nonempty identity'):
+        program.register_finding('range', 'planned', kind='ranking', category_field='item')
+    program.register_presentation(lambda results, parameters: {'charts': [], 'tables': []})
+    with pytest.raises(ValueError, match='fields must exist'):
+        program.deliver({})
+
+
 def test_findings_consume_once_keep_ties_missing_values_and_the_full_population():
     program, results, calls = make_results([5, None, 5, 2], ['A', 'missing', 'B', 'C'])
     rank = results.finding('rank', 'planned', kind='ranking', category_field='item')
@@ -94,6 +124,25 @@ def test_bound_report_uses_current_candidate_and_keeps_narrative_without_recalcu
         compose_bound_report([program.execution.trace(), program.execution.trace()], blocks)
 
 
+def test_inline_finding_component_consumes_saved_difference_without_full_sentence_or_recalculation():
+    from analysis_runtime.findings import compose_referenced_report
+    program, results, calls = make_results([19.4, 12.3], ['A', 'B'], '%')
+    results.finding('range', 'planned', kind='range', category_field='item')
+    reference = {'kind': 'finding', 'trace_execution_id': 'executable-analysis',
+                 'finding_id': 'range', 'component': 'difference', 'precision': 2}
+    report, bindings = compose_referenced_report([program.execution.trace()],
+        '两者相差 {{gap}} 个百分点。', {'gap': reference})
+    assert report == '两者相差 7.1 个百分点。'
+    assert calls == [1]
+    assert bindings[0]['finding_component'] == 'difference'
+    assert bindings[0]['presentation_operation']['unit'] == '个百分点'
+    assert report[bindings[0]['start']:bindings[0]['end']] == '7.1'
+    results.finding('rank', 'planned', kind='ranking', category_field='item')
+    reference['finding_id'] = 'rank'
+    with pytest.raises(ValueError, match='existing saved value'):
+        compose_referenced_report([program.execution.trace()], '{{gap}}', {'gap': reference})
+
+
 @pytest.mark.parametrize('output_format', ['standard', 'text'])
 @pytest.mark.parametrize('authoring', ['blocks', 'inline'])
 def test_presentation_tool_finalizes_current_candidate_blocks_and_preserves_artifacts(monkeypatch, output_format, authoring):
@@ -129,8 +178,8 @@ def test_presentation_tool_finalizes_current_candidate_blocks_and_preserves_arti
     context = SimpleNamespace(runtime_work_packet=packet.to_dict(), conversation_id=1,
         output_contract={'type': output_format}, execution_datasource_snapshot={}, active_datasource_snapshot={})
     finding = rt.FindingReportBlock(kind='finding', trace_execution_id='executable-analysis', finding_id='rank')
-    arguments = ({'report_blocks': [rt.NarrativeReportBlock(kind='text', text='结果：\n\n'), finding]}
-                 if authoring == 'blocks' else {'report_text': '结果：\n\n{{ranking}}', 'report_refs': {'ranking': finding}})
+    arguments = ({'report_blocks': [rt.NarrativeReportBlock(kind='text', text='\n  范围 1 ~ 2，结果：\n\n'), finding]}
+                 if authoring == 'blocks' else {'report_text': '\n  范围 1 ~ 2，结果：\n\n{{ranking}}\n', 'report_refs': {'ranking': finding}})
     response = rt.compose_analysis_presentation.func(runtime=SimpleNamespace(context=context, tool_call_id='compose'),
         execution_id=99, **arguments)
     import json
@@ -139,6 +188,10 @@ def test_presentation_tool_finalizes_current_candidate_blocks_and_preserves_arti
     assert '| 1 | 1 | 5 |' in saved.analysis_report
     assert saved.tables == candidate.tables
     assert saved.report_finding_bindings[0]['finding_id'] == 'rank'
+    for binding in saved.report_finding_bindings:
+        assert saved.analysis_report[binding['start']:binding['end']] == binding['text']
+    if output_format == 'standard':
+        assert '1～2' in saved.analysis_report
     assert not saved.presentation_pending
     assert session.committed
 

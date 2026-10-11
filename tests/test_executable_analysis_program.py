@@ -35,21 +35,89 @@ def test_host_saves_nonstandard_outputs_from_the_same_native_definition_port(out
     assert result.output_payload == value
 
 
-def test_presentation_distinguishes_query_sources_from_calculated_result_tables():
+def test_presentation_reads_registered_sources_without_recomputing_or_mutating_them():
     from analysis_runtime.executable_program import ExecutablePythonProgram, ExecutableResults
 
     program = ExecutablePythonProgram()
     program.execution.add_source('equipment', pd.DataFrame({'id': [1]}), query_key='equipment-query')
     results = ExecutableResults(program.execution)
-    with pytest.raises(ValueError, match=r"registered query source.*use source_table\(\)"):
-        results.table('equipment')
+    frame = results.table('equipment')
+    assert frame['id'].tolist() == [1]
+    frame.loc[0, 'id'] = 9
     assert results.source_table('equipment')['id'].tolist() == [1]
+    from analysis_runtime.provenance import fact_view_receipt
+    unbound_view = results.view('equipment', rename={'id': 'Record'})
+    assert unbound_view['Record'].tolist() == [1]
+    assert fact_view_receipt(unbound_view) is None
+    assert not program.execution._facts
+    with pytest.raises(KeyError):
+        results.table('unknown')
 
 
-def test_worker_preserves_bound_findings_and_filtered_scope_for_parameterized_reruns(tmp_path):
+def test_presentation_source_read_retains_actual_query_binding_through_a_view(tmp_path):
+    path = tmp_path / 'records.csv'
+    path.write_text('id,amount\n1,2\n2,5\n', encoding='utf-8')
+    source = f'''def build_analysis(program, parameters):
+    def load(parameters):
+        return query_local_file(query_key='records-query', file_path={path.as_posix()!r},
+            query_constraints={{'time_range': None, 'target_filters': [], 'aggregation': None}})
+    def present(results, parameters):
+        view = results.view('records', columns=['id', 'amount'], rename={{'amount': 'Amount'}})
+        return {{'tables': [build_table_result(data=view, title='Records',
+            columns=[{{'key': 'id', 'label': 'Record'}}, {{'key': 'Amount', 'label': 'Amount'}}])]}}
+    program.register_query('records', load, grain=('id',))
+    program.register_presentation(present)
+'''
+    _, result = run_worker(source, defer_presentation=True)
+    trace = result.semantic_execution_traces[0]
+    assert not trace['facts']
+    assert trace['sources']['records']['query_keys'] == ['records-query']
+    bindings = result.runtime_evidence['consumptions']
+    assert bindings
+    nodes = {node['node_id']: node for node in result.runtime_evidence['graph']}
+    assert all(nodes[binding['node_id']]['operation'] == 'QuerySource' for binding in bindings)
+    assert {binding['source_field'] for binding in bindings} == {'id', 'amount'}
+
+
+@pytest.mark.parametrize('entry', [
+    'build_analysis(program, parameters)',
+    'output = program.deliver(parameters)',
+    'result = save_analysis_result(tables=[])',
+])
+def test_definition_port_rejects_execution_entries_before_any_query_runs(entry):
+    from analysis_runtime.executable_program import compile_python_analysis_definition
+
+    source = 'def build_analysis(program, parameters):\n    pass\n' + entry
+    with pytest.raises(ValueError, match='host.*exactly once'):
+        compile_python_analysis_definition(source)
+
+
+def test_compiled_complete_program_cannot_be_resubmitted_as_a_definition():
+    from analysis_runtime.executable_program import compile_python_analysis_definition
+
+    source = '''def build_analysis(program, parameters):
+    def present(results, parameters):
+        return {'tables': []}
+    program.register_presentation(present)
+'''
+    code = compile_python_analysis_definition(source, defer_presentation=True)
+    with pytest.raises(ValueError, match='complete executable script through code'):
+        compile_python_analysis_definition(code, defer_presentation=True)
+
+
+@pytest.mark.parametrize('finding_owner', ['presentation', 'definition'])
+def test_worker_preserves_bound_findings_and_filtered_scope_for_parameterized_reruns(tmp_path, finding_owner):
     from analysis_runtime.findings import compose_bound_report
     path = tmp_path / 'records.csv'
     path.write_text('id,month,item,amount\n1,03,A,2\n2,03,B,5\n3,04,A,8\n', encoding='utf-8')
+    finding_calls = (
+        "results.finding('rank', 'summary', kind='ranking', category_field='item')\n"
+        "        results.finding('scope', 'summary', kind='scope')"
+        if finding_owner == 'presentation' else 'pass')
+    finding_registration = (
+        "program.register_finding('rank', 'summary', kind='ranking', category_field='item')\n"
+        "    program.register_finding('scope', 'summary', kind='scope')"
+        if finding_owner == 'definition' else 'pass')
     source = f'''def build_analysis(program, parameters):
     def load(parameters):
         frame = query_local_file(query_key='records', file_path={path.as_posix()!r},
@@ -58,13 +126,13 @@ def test_worker_preserves_bound_findings_and_filtered_scope_for_parameterized_re
     def calculate(inputs, parameters):
         return inputs.frame('records').groupby('item', as_index=False)['amount'].sum()
     def present(results, parameters):
-        results.finding('rank', 'summary', kind='ranking', category_field='item')
-        results.finding('scope', 'summary', kind='scope')
+        {finding_calls}
         return {{'tables': [build_table_result(data=results.table('summary'), title='金额',
             columns=[{{'key': 'item', 'label': '对象'}}, {{'key': 'amount', 'label': '金额'}}])]}}
     program.register_query('records', load, grain=('id',))
     program.register_calculation(PythonCalculation('summary', calculate, ('records',),
         value_field='amount', output_grain=('item',)), question_id='q')
+    {finding_registration}
     program.register_presentation(present)
 '''
     _, march = run_worker(source, {'month': '03'}, defer_presentation=True)
@@ -105,6 +173,37 @@ def test_presentation_resolves_planned_result_identity_to_its_calculation():
     assert 'total' not in status
 
 
+def test_unqualified_table_identity_cannot_hide_a_conflicting_planned_result():
+    from analysis_runtime.executable_program import ExecutablePythonProgram, ExecutableResults
+    from analysis_runtime.semantic_execution import PythonCalculation
+
+    program = ExecutablePythonProgram()
+    program.execution.add_source('input', pd.DataFrame({'amount': [3, 5]}), query_key='query')
+    program.register_calculation(
+        PythonCalculation('total', lambda inputs, parameters: inputs.frame('input')['amount'].sum(),
+                          ('input',)), question_id='q', result_id='shared')
+    program.execution.run()
+    program.execution.add_source('shared', pd.DataFrame({'amount': [7]}), query_key='detail-query')
+    results = ExecutableResults(program.execution)
+    with pytest.raises(ValueError, match='ambiguous'):
+        results.table('shared')
+    assert results.table(('q', 'shared'))['value'].tolist() == [8]
+    assert results.source_table('shared')['amount'].tolist() == [7]
+
+
+def test_source_field_error_reports_all_missing_and_available_fields_without_values():
+    from analysis_runtime.semantic_execution import SemanticExecution
+    execution = SemanticExecution('diagnostic')
+    with pytest.raises(ValueError) as error:
+        execution.add_source('input', pd.DataFrame({'actual': [987654321]}),
+                             query_key='query', grain=('missing_a', 'missing_b'))
+    message = str(error.value)
+    assert "missing_fields=['missing_a', 'missing_b']" in message
+    assert "available_fields=['actual']" in message
+    assert 'row_count=1' in message
+    assert '987654321' not in message
+
+
 def test_extrema_resolves_planned_result_identity_to_its_calculation():
     from analysis_runtime.executable_program import ExecutablePythonProgram
     from analysis_runtime.semantic_execution import PythonCalculation
@@ -131,6 +230,87 @@ def test_extrema_resolves_planned_result_identity_to_its_calculation():
 
     program.register_presentation(present)
     assert program.deliver({}) == {'state': 'true', 'labels': ['B']}
+
+
+@pytest.mark.parametrize('values,kind,complete,labels', [
+    ([2., 5., 5.], 'tied', True, ['B', 'C']),
+    ([None, 5., 5.], 'all_equal', False, ['B', 'C']),
+    ([None, None, None], 'empty', False, []),
+])
+def test_query_extrema_consume_saved_rows_once_without_creating_a_calculation(values, kind, complete, labels):
+    from analysis_runtime.executable_program import ExecutablePythonProgram
+    program = ExecutablePythonProgram()
+    calls = []
+    def load(parameters):
+        calls.append(1)
+        return pd.DataFrame({'label': ['A', 'B', 'C'], 'amount': values}, dtype=None).astype({'amount': 'float64'})
+    program.register_query('native_aggregate', load, grain=('label',))
+    with pytest.raises(ValueError, match='require field'):
+        program.register_extrema('unspecified', 'native_aggregate')
+    program.register_extrema('peak', 'native_aggregate', field='amount')
+    program.register_presentation(lambda results, parameters: {
+        'state': results.decision_state('peak'),
+        'labels': results.matches('peak')['label'].tolist(),
+        'report': results.extrema('peak', 'label'),
+    })
+    delivered = program.deliver({})
+    assert calls == [1]
+    assert delivered['state']['kind'] == kind
+    assert delivered['state']['complete_inputs'] is complete
+    assert delivered['labels'] == labels
+    assert program.execution.trace()['facts'] == {}
+    assert program.execution.trace()['decisions']['peak']['value_field'] == 'amount'
+
+
+def test_native_query_extrema_worker_retains_source_evidence_in_matching_rows(tmp_path):
+    from analysis_runtime.runtime_evidence import compile_runtime_evidence
+    path = tmp_path / 'windows.csv'
+    path.write_text('label,amount\nA,2\nB,5\nC,5\n', encoding='utf-8')
+    source = f'''def build_analysis(program, parameters):
+    def load(parameters):
+        return query_local_file(query_key='native', file_path={path.as_posix()!r},
+            query_constraints={{'time_range': None, 'target_filters': [], 'aggregation': None}})
+    def present(results, parameters):
+        return {{'tables': [build_table_result(data=results.matches('peak'), title='Peaks',
+            columns=[{{'key': 'label', 'label': 'Label'}}, {{'key': 'amount', 'label': 'Amount'}}])]}}
+    program.register_query('windows', load, grain=('label',))
+    program.register_extrema('peak', 'windows', field='amount')
+    program.register_presentation(present)
+'''
+    _, result = run_worker(source, defer_presentation=True)
+    trace = result.semantic_execution_traces[0]
+    assert trace['facts'] == {}
+    assert result.tables[0]['rows'] == [{'label': 'B', 'amount': 5}, {'label': 'C', 'amount': 5}]
+    bundle = compile_runtime_evidence(result.runtime_evidence, traces=result.semantic_execution_traces,
+        queries=result.query_snapshots, tables=result.tables, charts=result.charts, report=result.analysis_report)
+    assert bundle['status'] == 'complete'
+    assert len(bundle['table_trace_refs']) == 2
+    assert all(item['query_refs'] == ['native'] for item in bundle['evidence_definitions'])
+    assert bundle['table_trace_refs'][0]['presentation_binding']['view']['kind'] == 'extrema_selection'
+    from analysis_runtime.semantic_evidence import build_semantic_execution_catalog
+    decision = next(node for node in build_semantic_execution_catalog(result.semantic_execution_traces,
+        result.query_snapshots) if node['kind'] == 'executed_decision')
+    assert decision['fact_node_id'] is None
+    assert decision['verification'] == 'query_bound'
+    assert decision['source_query_node_ids'] == ['native']
+    assert decision['source_field'] == 'amount'
+
+
+def test_expression_candidate_preserves_actual_query_scope_without_business_certification():
+    import json
+    snapshot = {'query_constraints': {'time_series_query': {'mode': 'sample', 'window': '1m'}},
+        'analysis_scope': {'time_range': {'start': '2026-10-11T10:00:00+08:00', 'end': '2026-10-11T11:00:00+08:00'}},
+        'query_scope': {'scope_status': 'explicit', 'aggregation': {'grain': '1m', 'metric': 'representative observation'}},
+        'execution': {'status': 'success', 'row_count': 61, 'columns': ['ts', 'amount'],
+            'temporal_coverage': {'status': 'elapsed_only'}}}
+    candidate = rt.StructuredResult(analysis_report='', query_snapshots={'sample': snapshot})
+    payload = json.loads(rt._presentation_candidate_message(tool_call_id='submit', execution_id=42, candidate=candidate).content)
+    receipt = payload['query_receipts'][0]
+    for key in ('query_constraints', 'analysis_scope', 'query_scope'):
+        assert receipt[key] == snapshot[key]
+    assert receipt['temporal_coverage'] == snapshot['execution']['temporal_coverage']
+    receipt['query_constraints']['time_series_query']['mode'] = 'aggregate'
+    assert candidate.query_snapshots['sample']['query_constraints']['time_series_query']['mode'] == 'sample'
 
 
 def test_calculation_callback_receives_dataframes_keyed_by_declared_input_source_ids():
@@ -335,6 +515,182 @@ def test_candidate_stays_running_until_post_execution_expression_is_saved(monkey
         assert finalized.presentation_pending is False
         assert finalized.semantic_execution_traces == candidate.semantic_execution_traces
     engine.dispose()
+
+
+def test_loader_returned_query_feedback_preserves_control_signal_before_downstream_execution():
+    from analysis_runtime.executable_program import ExecutablePythonProgram
+    feedback = rt.RetryResult(retry_type='invalid_query_constraints', message='Original query feedback',
+                              diagnostics={'query_key': 'original', 'field': 'actual'})
+    program = ExecutablePythonProgram()
+    program.register_query('query', lambda parameters: feedback)
+    called = []
+    program.register_presentation(lambda results, parameters: called.append('present'))
+    with pytest.raises(rt.QueryConstraintRetrySignal) as caught:
+        program.deliver({})
+    assert caught.value.retry_result is feedback
+    assert called == []
+
+
+def test_expression_receives_actual_method_with_bounded_source_without_losing_values():
+    trace = {'execution_id': 'method-run', 'facts': {
+        f'fact_{i}': {'values': [{'value': i}], 'definition': {
+            'implementation': {'name': 'calculate', 'source_status': 'captured',
+                               'source': 'x' * 3000, 'code_sha256': str(i), 'closure_names': []}}}
+        for i in range(5)
+    }}
+    view = rt._build_expression_fact_view([trace])[0]['facts']
+    assert [fact['values'][0]['value'] for fact in view.values()] == list(range(5))
+    assert sum(len(fact['executed_method']['source']) for fact in view.values()) == 6000
+    assert all(fact['executed_method']['source_truncated'] for fact in view.values())
+    assert all(fact['executed_method']['semantics_verification'] == 'not_evaluated'
+               for fact in view.values())
+
+
+def test_expression_preserves_requested_comparison_before_large_raw_fact_views():
+    finding = {'finding_id': 'comparison', 'fact_id': 'computed', 'kind': 'range',
+               'field': 'measure', 'category_field': 'entity', 'difference': 7.1,
+               'scope': {'output_grain': ['entity']}, 'text': 'Executed object comparison',
+               'business_status': 'not_evaluated'}
+    trace = {'execution_id': 'run', 'facts': {
+        f'raw_{index}': {'values': [{'raw': 'x' * 1000}] * 100, 'definition': {}}
+        for index in range(40)}, 'findings': {'comparison': finding}}
+    view = rt._build_expression_fact_view([trace])[0]
+    assert view['findings']['comparison'] == finding
+    assert any(fact['values_truncated'] for fact in view['facts'].values())
+
+
+def test_bound_authoring_explicitly_submits_reference_mapping_without_semantic_checks():
+    schema = rt.ComposeBoundPresentationInput.model_json_schema()
+    assert 'report_refs' in schema['required']
+    # An empty mapping is legitimate for an explanation with no metric cells.
+    empty = rt.ComposeBoundPresentationInput(execution_id=1, report_text='No observable state.', report_refs={})
+    assert empty.report_refs == {}
+    historical = rt.ComposeAnalysisPresentationInput(execution_id=1, analysis_report='Saved narrative')
+    assert historical.report_refs == {}
+
+
+def test_vertical_metric_table_keeps_distinct_cell_origins_through_worker_persistence(tmp_path):
+    from analysis_runtime.runtime_evidence import compile_runtime_evidence
+    path = tmp_path / 'records.csv'
+    path.write_text('id\n1\n2\n3\n', encoding='utf-8')
+    source = f'''def build_analysis(program, parameters):
+    def load(parameters):
+        return query_local_file(query_key='records', file_path={path.as_posix()!r},
+            query_constraints={{'time_range': None, 'target_filters': [], 'aggregation': None}})
+    def calculate(inputs, parameters):
+        n = len(inputs.frame('records'))
+        return pd.DataFrame([{{'left': n, 'right': n, 'missing': float('nan')}}])
+    def present(results, parameters):
+        return {{'tables': [results.metric_table('summary',
+            fields={{'left': 'Same label', 'right': 'Same label', 'missing': 'Unknown'}},
+            title='Saved statistics', value_precision=2)]}}
+    program.register_query('records', load)
+    program.register_calculation(PythonCalculation('summary', calculate, ('records',),
+        value_field='left', unit='units'), question_id='q')
+    program.register_presentation(present)
+'''
+    _, result = run_worker(source, defer_presentation=True)
+    table = result.tables[0]
+    assert [row['metric_field'] for row in table['rows']] == ['left', 'right', 'missing']
+    assert table['rows'][0]['value'] == table['rows'][1]['value'] == 3
+    evidence = compile_runtime_evidence(result.runtime_evidence,
+        traces=result.semantic_execution_traces, queries=result.query_snapshots,
+        tables=result.tables, charts=result.charts, report=result.analysis_report)
+    assert evidence['status'] == 'complete'
+    refs = evidence['table_trace_refs']
+    assert len(refs) == 3
+    assert len({ref['evidence_key'] for ref in refs}) == 3
+    assert [ref['row_selector'] for ref in refs] == [
+        {'metric_field': 'left'}, {'metric_field': 'right'}, {'metric_field': 'missing'}]
+    assert all(ref['row_scope'] == 'selector' and ref['column_key'] == 'value' for ref in refs)
+    definitions = {item['metric_name']: item for item in evidence['evidence_definitions']}
+    assert definitions['left']['unit'] == 'units'
+    assert definitions['right']['unit'] == ''
+    assert definitions['missing']['unit'] == ''
+    assert result.semantic_execution_coverage['results'][0]['table_indices'] == [0]
+
+
+def test_vertical_metric_table_rejects_missing_cells_and_ignores_forged_binding():
+    from analysis_runtime.executable_program import ExecutablePythonProgram, ExecutableResults
+    from analysis_runtime.provenance import artifact_consumption
+    program = ExecutablePythonProgram()
+    program.execution.add_source('source', pd.DataFrame({'amount': [3]}), query_key='source')
+    program.register_calculation(rt.PythonCalculation('summary',
+        lambda inputs, parameters: pd.DataFrame([{'a': 3, 'b': 3}]), ('source',), value_field='a'),
+        question_id='q')
+    program.execution.run()
+    results = ExecutableResults(program.execution)
+    with pytest.raises(ValueError, match='existing saved row'):
+        results.metric_table('summary', fields={'absent': 'Value'}, title='Missing')
+    with pytest.raises(ValueError, match='existing saved row'):
+        results.metric_table('summary', fields={'a': 'Value'}, title='Missing', row=1)
+    table = results.metric_table('summary', fields={'a': 'A', 'b': 'B'}, title='Values')['table']
+    table['_semantic_execution_binding']['cell_bindings'][1]['source_field'] = 'a'
+    assert artifact_consumption(table, 'table')['cell_bindings'][1]['source_field'] == 'b'
+    table['rows'][1]['value'] = 4
+    assert artifact_consumption(table, 'table') is None
+
+
+@pytest.mark.parametrize('message,recordable', [
+    ('No results', True), ('unknown tag', False), ('authorization failed', False),
+    ('relation does not exist', False),
+])
+def test_partial_source_query_records_only_confirmed_physical_empty_results(monkeypatch, message, recordable):
+    from analysis_runtime.executable_program import ExecutablePythonProgram
+    from analysis_runtime.semantic_evidence import _source_details
+    from analysis_runtime.runtime_evidence import build_runtime_evidence
+    rt.CURRENT_QUERY_SNAPSHOTS.set({})
+    rt.CURRENT_LAST_QUERY_KEY.set('')
+    rt.CURRENT_EXECUTION_INTENT.set('analysis')
+    def load_failure(sql, params=None):
+        raise RuntimeError(message)
+    monkeypatch.setattr(rt, '_load_data_with_fed_query', load_failure)
+    # Use the physical loader to exercise its real snapshot/error ownership.
+    def load(parameters):
+        return rt.load_data_with_sql('SELECT value FROM missing_source')
+    program = ExecutablePythonProgram()
+    program.register_query('missing', load, grain=('ts',), on_no_data='record')
+    program.register_query('available', lambda parameters: pd.DataFrame({'value': [3]}))
+    program.register_presentation(lambda results, parameters: {
+        'available': results.table('available')['value'].tolist(),
+        'missing': results.source_observations('missing'),
+    })
+    if not recordable:
+        with pytest.raises(RuntimeError, match=message):
+            program.deliver({})
+        assert not program.execution.has_source('missing')
+        return
+    output = program.deliver({})
+    assert output['available'] == [3]
+    assert output['missing']['status'] == 'no_data'
+    assert output['missing']['declared_grain'] == ['ts']
+    assert list(program.execution.source_table('missing').columns) == []
+    trace = program.execution.trace()
+    assert trace['sources']['missing']['binding'] == 'query_no_data'
+    snapshots = rt.CURRENT_QUERY_SNAPSHOTS.get()
+    lineage = _source_details('missing', trace['sources'], snapshots)
+    assert lineage['reason'] is None and lineage['field_origins'] == {}
+    view = rt._build_expression_fact_view([trace])[0]
+    assert view['source_scopes']['missing']['observations']['status'] == 'no_data'
+    evidence = build_runtime_evidence([trace], snapshots, [{'columns': [], 'rows': []}], [], '', {})
+    node = next(node for node in evidence['graph'] if node['operation'] == 'QueryNoData')
+    assert node['query_refs'] == lineage['query_ids']
+    assert node['observations']['status'] == 'no_data'
+    snapshots[next(iter(snapshots))]['execution']['row_count'] = 2
+    assert _source_details('missing', trace['sources'], snapshots)['reason']
+
+
+def test_required_source_empty_query_still_raises(monkeypatch):
+    from analysis_runtime.executable_program import ExecutablePythonProgram
+    rt.CURRENT_QUERY_SNAPSHOTS.set({})
+    rt.CURRENT_LAST_QUERY_KEY.set('')
+    monkeypatch.setattr(rt, '_load_data_with_fed_query',
+                        lambda **kwargs: (_ for _ in ()).throw(RuntimeError('No results')))
+    program = ExecutablePythonProgram()
+    program.register_query('required', lambda parameters: rt.load_data_with_sql('SELECT value FROM source'))
+    program.register_presentation(lambda results, parameters: {})
+    with pytest.raises(rt.PhysicalQueryNoDataError):
+        program.deliver({})
 
 
 def test_expression_fact_view_preserves_small_ties_and_marks_large_values_as_samples():

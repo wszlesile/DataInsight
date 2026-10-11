@@ -31,6 +31,35 @@ def _source_details(source_id, sources, query_snapshots, visiting=()):
                     *{snapshot_digest(item): item for parent in parents.values() for item in parent['transformations']}.values(),
                     {'kind': source['transform_kind'], 'definition': deepcopy(source['transform']),
                      'observations': deepcopy(source.get('observations') or {})}]}
+    if source.get('binding') == 'query_view':
+        receipt = source.get('query_view_receipt') or {}
+        query_key = receipt.get('query_key')
+        snapshot = query_snapshots.get(query_key) or {}
+        execution = snapshot.get('execution') or {}
+        if not snapshot or execution.get('status') != 'success':
+            return {'reason': 'successful_query_snapshot_missing'}
+        if receipt.get('snapshot_digest') != snapshot_digest(snapshot):
+            return {'reason': 'query_snapshot_changed_since_input_capture'}
+        available = set(execution.get('columns') or [])
+        mapping = receipt.get('field_mapping') or {}
+        origins = {field: [{'query_key': query_key, 'field': source_field}]
+                   for field, source_field in mapping.items() if source_field in available}
+        return {'reason': None, 'query_ids': [query_key], 'field_origins': origins,
+                'transformations': [{'kind': 'query_result_view',
+                                     'definition': deepcopy(receipt.get('view_operation') or {}),
+                                     'observations': {'query_row_count': receipt.get('query_row_count'),
+                                                      'view_row_count': source.get('row_count')}}]}
+    if source.get('binding') == 'query_no_data':
+        receipt = source.get('no_data_receipt') or {}
+        query_key = receipt.get('query_key')
+        snapshot = query_snapshots.get(query_key) or {}
+        execution = snapshot.get('execution') or {}
+        if (not (snapshot.get('implementation') or {}).get('physical_execution')
+                or execution.get('status') != 'no_data' or execution.get('row_count') != 0
+                or receipt.get('snapshot_digest') != snapshot_digest(snapshot)):
+            return {'reason': 'physical_no_data_query_receipt_missing_or_changed'}
+        return {'reason': None, 'query_ids': [query_key], 'field_origins': {},
+                'transformations': [], 'observations': deepcopy(source.get('observations') or {})}
     if source.get('binding') != 'query_frame':
         return {'reason': 'transformed_or_declared_source_has_no_query_receipt'}
     receipt = source.get('query_receipt') or {}
@@ -95,9 +124,15 @@ def build_semantic_execution_catalog(traces, query_snapshots):
                           'business_semantics_verification': 'not_evaluated'})
         for decision_id, decision in (trace.get('decisions') or {}).items():
             fact_id = decision.get('fact_id')
+            source_input = fact_id in sources and fact_id not in facts
+            lineage = _source_details(fact_id, sources, query_snapshots) if source_input else {}
             nodes.append({'node_id': f'{prefix}_decision_{decision_id}', 'kind': 'executed_decision',
-                          'decision_id': decision_id, 'fact_node_id': f'{prefix}_fact_{fact_id}',
-                          'verification': statuses.get(fact_id, 'unresolved'),
+                          'decision_id': decision_id, 'fact_node_id': None if source_input else f'{prefix}_fact_{fact_id}',
+                          **({'source_id': fact_id, 'source_field': decision.get('value_field'),
+                              'source_query_node_ids': lineage.get('query_ids', [])} if source_input else {}),
+                          'verification': ('query_bound' if not lineage.get('reason')
+                              and decision.get('value_field') in (lineage.get('field_origins') or {}) else 'unresolved')
+                              if source_input else statuses.get(fact_id, 'unresolved'),
                           'state': decision.get('state'), 'extrema_kind': decision.get('kind'),
                           'mode': decision.get('mode'), 'basis': 'mathematical',
                           'predicate': 'unique_between_comparable_items_extremum'})

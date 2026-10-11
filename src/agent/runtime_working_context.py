@@ -32,6 +32,7 @@ from agent.runtime_schema_memory import merge_schema_sources
 from agent.runtime_driver_state import (
     RUNTIME_WORK_PACKET_PAYLOAD_KEY,
     RuntimeWorkPacket,
+    failed_probe_queries,
     new_runtime_work_packet,
     reduce_runtime_tool_result,
     runtime_phase_from_work,
@@ -695,6 +696,7 @@ class RuntimeIntentQuestion(RuntimeQuestionSemantics):
     def discard_legacy_execution_links_from_new_intents(cls, value):
         if not isinstance(value, dict):
             return value
+        value = copy.deepcopy(value)
         decisions = value.get('decision_conditions') or []
         legacy_branch_fields = {'condition', 'when_true', 'otherwise'}
         if not any(isinstance(item, dict) and legacy_branch_fields & item.keys() for item in decisions):
@@ -728,7 +730,7 @@ class RuntimeIntentCalculationRule(RuntimeCalculationRequirement):
         if not isinstance(value, dict):
             return value
         legacy_fields = {'input_fact_ids', 'output_fact_ids', 'group_by_fact_ids', 'entity_key_fact_ids'}
-        allowed = {'purpose', 'definition', 'basis', 'result_fields'}
+        allowed = set(RuntimeCalculationRequirement.model_fields)
         if legacy_fields & value.keys():
             allowed |= legacy_fields
         return {key: item for key, item in value.items() if key in allowed}
@@ -750,9 +752,7 @@ class RuntimeIntentDecision(RuntimeDecisionIntent):
         if not isinstance(value, dict):
             return value
         legacy_branch_fields = {'condition', 'when_true', 'otherwise'}
-        allowed = {
-            'purpose', 'basis', 'criterion', 'source_references',
-        }
+        allowed = set(RuntimeDecisionIntent.model_fields)
         if legacy_branch_fields & value.keys():
             allowed |= legacy_branch_fields | {'supporting_fact_ids'}
         return {key: item for key, item in value.items() if key in allowed}
@@ -830,6 +830,7 @@ def semantic_implementation_bindings(plan: dict) -> list[dict]:
                 continue
             basis = decision.get('basis')
             mode = ('mathematical_comparison' if basis == 'mathematical' else
+                    'analytical_calculation' if basis == 'analytical_derivation' else
                     'declared_business_rule' if basis in {'user', 'conversation_rule', 'schema'} else
                     'factual_only')
             decisions.append({
@@ -843,6 +844,17 @@ def semantic_implementation_bindings(plan: dict) -> list[dict]:
         bindings.append({
             'question_id': question.get('question_id'),
             'result_definitions': symbols,
+            # New intents deliberately have no second result-ID graph. Keep
+            # their calculation requirements addressable independently of the
+            # historical output_fact_ids catalogue above.
+            'calculation_requirements': [
+                {'path': f'calculation_rules[{index}]',
+                 'execution_owner': 'formal_program',
+                 **{key: copy.deepcopy(rule[key]) for key in
+                    RuntimeCalculationRequirement.model_fields if key in rule}}
+                for index, rule in enumerate(question.get('calculation_rules') or [])
+                if isinstance(rule, dict)
+            ],
             'decision_execution': decisions,
         })
     return bindings
@@ -1604,6 +1616,12 @@ def _is_structured_probe_observation(payload: dict | None) -> bool:
     has_query_snapshots = isinstance(payload.get('query_snapshots'), dict) and bool(
         payload.get('query_snapshots')
     )
+    ledger = diagnostics['probe_fact_ledger'] if has_fact_ledger else {}
+    if not has_fact_ledger and has_query_snapshots:
+        ledger = {'observations': [snapshot.get('execution', {})
+            for snapshot in payload['query_snapshots'].values() if isinstance(snapshot, dict)]}
+    if failed_probe_queries(diagnostics if isinstance(diagnostics, dict) else {}, ledger):
+        return False
     # Older Runtime payloads did not set ``status`` on a successful Probe but
     # did carry the same durable facts. Preserve that compatibility while
     # never promoting an explicit failure to an observation.
@@ -1704,7 +1722,10 @@ def work_contracts(context, work, references=(), *, definition_program=False):
         clarification_mode=context.clarification_mode,
     )
     if work in {'understand', 'plan'}:
+        time_series_semantics = 'query.time_series' in required
         required = tuple(item for item in required if item.startswith(('context.', 'interaction.')))
+        if time_series_semantics:
+            required = (*required, 'context.time_series')
         if work == 'understand':
             required = tuple(dict.fromkeys([*required, 'execution.semantic_planning']))
         else:
@@ -1717,15 +1738,19 @@ def work_contracts(context, work, references=(), *, definition_program=False):
     elif work in {'implement', 'repair'}:
         required = tuple(
             ('execution.definition' if definition_program else 'execution.implementation')
-            if item == 'execution.core' else item
+            if item == 'execution.core' else
+            'result.visualizations' if definition_program and item == 'result.artifacts' else item
             for item in required
         )
     elif work == 'express':
+        time_series_semantics = 'query.time_series' in required
         required = tuple(
             item for item in required
             if item.startswith(('context.', 'interaction.', 'result.'))
         )
         required = tuple(dict.fromkeys([*required, 'execution.expression']))
+        if time_series_semantics:
+            required = (*required, 'context.time_series')
     elif work == 'review':
         required = tuple(
             item for item in required
@@ -1736,6 +1761,9 @@ def work_contracts(context, work, references=(), *, definition_program=False):
     # result/interaction mode. All query kinds remain available on request.
     output_id = {'standard': 'result.artifacts', 'text': 'result.text', 'json': 'result.json'}[
         context.output_contract.get('type', 'standard')]
+    if definition_program and work in {'implement', 'repair'} and output_id == 'result.artifacts':
+        output_id = 'result.visualizations'
+        references = tuple(output_id if item == 'result.artifacts' else item for item in references)
     def compatible_reference(item: str) -> bool:
         if item.startswith('result.') and item != output_id:
             return False
@@ -2080,6 +2108,8 @@ def project_history(
                 # Match the execution tool's accepted spellings and precedence.
                 # Only the outbound copy is normalized; audit source is intact.
                 source_keys = _execution_source_keys(call['name'])
+                source_port = ('definition_source' if call['name'] == 'submit_analysis_program'
+                               and call['args'].get('definition_source') else 'code')
                 source = (call['args'].get('definition_source')
                           if call['name'] == 'submit_analysis_program' else None)
                 source = source or next((call['args'][key] for key in source_keys if call['args'].get(key)), None)
@@ -2098,11 +2128,14 @@ def project_history(
                         )
                         archived += 1
                     else:
-                        for key in source_keys:
+                        for key in (*source_keys, 'definition_source'):
                             call['args'].pop(key, None)
-                        call['args']['code'] = source
+                        # A definition is host-invoked; a complete script owns
+                        # its entry point. History must preserve that boundary
+                        # rather than teaching repair to switch execution ports.
+                        call['args'][source_port] = source
                 if call['id'] in superseded_program_events:
-                    call['args']['code'] = f"[Superseded program: original retained under tool call {call['id']} in execution history.]"
+                    call['args'][source_port] = f"[Superseded program: original retained under tool call {call['id']} in execution history.]"
                     archived += 1
                 elif call['name'] == 'probe_analysis_data' and call['id'] in obsolete_probe_events:
                     # Do not leave an inert pseudo-code tool call in the
@@ -2338,7 +2371,7 @@ def _compact_query_fact(snapshot: dict) -> dict:
             key: execution.get(key)
             for key in (
                 'status', 'row_count', 'family_row_count', 'columns', 'effective_no_data',
-                'error_type', 'probe_profile', 'temporal_coverage',
+                'error_type', 'error_message', 'probe_profile', 'temporal_coverage',
             )
             if execution.get(key) not in (None, '', [], {})
         },
@@ -2404,7 +2437,7 @@ def _compact_probe_ledger(ledger: dict) -> dict:
             key: raw.get(key)
             for key in (
                 'query_key', 'datasource_id', 'datasource_identifiers', 'query_constraints', 'query_scope',
-                'status', 'row_count', 'effective_no_data', 'columns', 'error_type',
+                'status', 'row_count', 'effective_no_data', 'columns', 'error_type', 'error_message',
                 'probe_profile', 'value_profile', 'value_samples', 'distinct_values',
                 'projection_semantics', 'aggregate_facts', 'capacity_risks',
             )

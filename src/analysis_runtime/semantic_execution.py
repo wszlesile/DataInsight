@@ -16,7 +16,7 @@ import pandas as pd
 
 from analysis_runtime.calculations import _finite_number, summarize_extrema
 from analysis_runtime.expressions import _render_extrema_summary
-from analysis_runtime.provenance import frame_digest, query_receipt, register_execution, record_fact_view, callable_definition, snapshot_digest
+from analysis_runtime.provenance import frame_digest, query_receipt, query_view_receipt, register_execution, record_fact_view, callable_definition, snapshot_digest
 from analysis_runtime.provenance import parameter_digest
 from analysis_runtime.provenance import record_chart_consumption, record_report_fragment, compose_report
 
@@ -127,8 +127,12 @@ def _copy_frame(frame):
 
 
 def _fields(frame, names):
-    if any(name not in frame.columns for name in names):
-        raise ValueError('Definition references an absent field')
+    missing = [name for name in names if name not in frame.columns]
+    if missing:
+        raise ValueError(
+            f'Definition references an absent field: missing_fields={missing!r}, '
+            f'available_fields={list(frame.columns)!r}, row_count={len(frame)}'
+        )
 
 
 class SemanticExecution:
@@ -214,9 +218,9 @@ class SemanticExecution:
         finally:
             self._evaluating.remove(definition_id)
 
-    def define_extrema(self, decision_id, fact_id, *, mode='max'):
+    def define_extrema(self, decision_id, fact_id, *, mode='max', field=None):
         """Register a mathematical decision, not a second prose predicate."""
-        definition = (fact_id, mode)
+        definition = (fact_id, mode, field)
         if not decision_id or mode not in {'max', 'min'}:
             raise ValueError('Decision identity and max/min mode required')
         previous = self._decision_definitions.get(decision_id)
@@ -226,8 +230,10 @@ class SemanticExecution:
         return decision_id
 
     def decision(self, decision_id):
-        fact_id, mode = self._decision_definitions[decision_id]
-        return self.evaluate_extrema(decision_id, self.result(fact_id), mode=mode)
+        fact_id, mode, field = self._decision_definitions[decision_id]
+        identity = self.resolve_identity(fact_id)
+        self._ensure_input(identity)
+        return self._evaluate_extrema_input(decision_id, identity, mode=mode, field=field)
 
     def run(self):
         """Evaluate the registered program, sharing all intermediate results."""
@@ -285,6 +291,30 @@ class SemanticExecution:
         receipt = query_receipt(frame)
         self.add_source(source_id, frame, query_key=receipt['query_key'], grain=grain)
         self._sources[source_id]['query_receipt'] = receipt
+
+    def add_query_view_source(self, source_id, frame, receipt, *, grain=()):
+        """Bind a supported field-preserving view of an executed query frame."""
+        query_key = receipt.get('query_key')
+        if not query_key or not receipt.get('field_mapping'):
+            raise ValueError('Query view receipt must identify its source query and fields')
+        self.add_source(source_id, frame, query_key=query_key, grain=grain)
+        self._sources[source_id]['query_view_receipt'] = deepcopy(receipt)
+
+    def add_query_no_data_source(self, source_id, snapshot, *, grain=()):
+        """Retain a physical empty-query outcome without inventing result fields."""
+        execution = snapshot.get('execution') or {}
+        query_key = snapshot.get('query_key')
+        if (not query_key or not (snapshot.get('implementation') or {}).get('physical_execution')
+                or execution.get('status') != 'no_data' or execution.get('row_count') != 0):
+            raise ValueError('Empty source requires a physically executed no-data query receipt')
+        self.add_source(source_id, pd.DataFrame(), query_key=query_key)
+        self._sources[source_id]['no_data_receipt'] = {
+            'query_key': query_key, 'snapshot_digest': snapshot_digest(snapshot)}
+        self._sources[source_id]['observations'] = {
+            'status': 'no_data', 'row_count': 0, 'declared_grain': list(grain),
+            'error_type': execution.get('error_type'),
+            'columns_available': False,
+        }
 
     def add_source(self, source_id, frame, *, query_key=None, query_keys=(), grain=()):
         if source_id in self._source_definitions:
@@ -398,7 +428,22 @@ class SemanticExecution:
 
     def source_table(self, source_id):
         """Read an executed source without modifying the authoritative input."""
-        return _copy_frame(self._sources[source_id]['frame'])
+        source = self._sources[source_id]
+        from analysis_runtime.provenance import ResultViewFrame
+        output = ResultViewFrame(_copy_frame(source['frame']))
+        if source.get('query_receipt') or source.get('query_view_receipt'):
+            receipt = source.get('query_view_receipt') or {}
+            record_fact_view(output, self._token, source_id,
+                             # Presentation addresses this saved source's fields.
+                             # Its query view receipt separately maps those fields
+                             # to upstream query columns in the evidence graph.
+                             field_mapping=({field: field for field in receipt['field_mapping']}
+                                            if receipt.get('field_mapping') else None),
+                             operation={'kind': 'query_source',
+                                        'query_keys': list(source['query_keys']),
+                                        'row_count': len(output),
+                                        'source_view': deepcopy(receipt.get('view_operation'))})
+        return output
 
     def has_source(self, source_id):
         """Tell presentation callers whether an identity names a query source."""
@@ -657,12 +702,31 @@ class SemanticExecution:
                 'input_rows': fact['input_rows'], 'unit': fact['definition'].unit}
 
     def evaluate_extrema(self, decision_id, reference, *, mode='max'):
-        fact = self._fact(reference)
-        if isinstance(fact['definition'], PythonCalculation) and fact['definition'].value_kind != 'numeric':
+        self._fact(reference)
+        return self._evaluate_extrema_input(decision_id, reference.definition_id, mode=mode)
+
+    def _comparison_input(self, identity, field=None):
+        if identity in self._facts:
+            fact = self._facts[identity]
+            if field is not None and field != fact['value_field']:
+                raise ValueError('Calculated extrema consume the registered primary value field')
+            return {**fact, 'unit': fact['definition'].unit}
+        source = self._sources[identity]
+        if field is None:
+            raise ValueError('Query-source extrema require field=<actual numeric result column>')
+        _fields(source['frame'], (field,))
+        missing = sum(_finite_number(value) is None for value in source['frame'][field])
+        return {'frame': source['frame'], 'value_field': field, 'unit': '',
+                'missing_count': missing, 'state': 'empty' if source['frame'].empty
+                else 'partial' if missing else 'valid'}
+
+    def _evaluate_extrema_input(self, decision_id, identity, *, mode='max', field=None):
+        fact = self._comparison_input(identity, field)
+        if isinstance(fact.get('definition'), PythonCalculation) and fact['definition'].value_kind != 'numeric':
             raise ValueError('Object output is not a numeric comparison fact')
         if not decision_id:
             raise ValueError('Decision identity required')
-        definition = (reference.definition_id, mode)
+        definition = (identity, mode, fact['value_field'])
         previous = self._decisions.get(decision_id)
         if previous is not None:
             if previous['definition'] != definition:
@@ -676,7 +740,8 @@ class SemanticExecution:
         # The predicate is ONLY "has a unique between-item extremum".
         state = ('unknown' if summary['kind'] == 'empty' else 'not_applicable' if summary['kind'] == 'single'
                  else 'true' if summary['kind'] == 'unique' else 'false')
-        self._decisions[decision_id] = {'definition': definition, 'summary': summary, 'state': state}
+        self._decisions[decision_id] = {'definition': definition, 'summary': summary, 'state': state,
+            'input_scope': {key: fact[key] for key in ('value_field', 'unit', 'state', 'missing_count')}}
         return DecisionRef(self._token, decision_id)
 
     def _decision(self, reference):
@@ -689,19 +754,29 @@ class SemanticExecution:
         return {'state': decision['state'], 'kind': decision['summary']['kind'],
                 'basis': 'mathematical', 'predicate': 'unique_between_comparable_items_extremum',
                 'comparison_scope': 'valid_values',
-                'complete_inputs': self._facts[decision['definition'][0]]['missing_count'] == 0,
+                'complete_inputs': decision['input_scope']['missing_count'] == 0,
                 'valid_count': decision['summary']['valid_count'],
                 'missing_count': decision['summary']['missing_count']}
 
     def matches(self, reference):
-        return _copy_frame(self._decision(reference)['summary']['rows'])
+        from analysis_runtime.provenance import ResultViewFrame
+        decision = self._decision(reference)
+        identity, mode, field = decision['definition']
+        output = ResultViewFrame(_copy_frame(decision['summary']['rows']))
+        source = self._sources.get(identity)
+        if source is None or source.get('query_receipt') or source.get('query_view_receipt'):
+            mapping = ((source.get('query_view_receipt') or {}).get('field_mapping') if source else None)
+            record_fact_view(output, self._token, identity, field_mapping=mapping,
+                             operation={'kind': 'extrema_selection', 'mode': mode, 'field': field,
+                                        'decision_id': reference.decision_id, 'output_rows': len(output)})
+        return output
 
     def render_extrema(self, reference, label_field, *, value_label='', language='zh'):
         decision = self._decision(reference)
-        fact = self._facts[decision['definition'][0]]
+        fact = decision['input_scope']
         field_spans = []
         rendered = _render_extrema_summary(decision['summary'], label_field,
-            value_label=value_label or fact['value_field'], unit=fact['definition'].unit, language=language,
+            value_label=value_label or fact['value_field'], unit=fact['unit'], language=language,
             field_spans=field_spans)
         if fact['state'] == 'partial':
             rendered += (f" 计算明确排除了 {fact['missing_count']} 条缺失输入记录，结果不代表完整总体。" if language == 'zh'
@@ -717,9 +792,14 @@ class SemanticExecution:
                                 for key, value in self._result_bindings.items()],
             'sources': {key: {'query_keys': value['query_keys'], 'grain': value['grain'],
                               'row_count': len(value['frame']),
-                              'binding': 'executed_transform' if 'transform' in value else
-                                         'query_frame' if 'query_receipt' in value else 'declared',
+                              'columns': list(value['frame'].columns),
+                              'binding': 'query_no_data' if 'no_data_receipt' in value else
+                                         'executed_transform' if 'transform' in value else
+                                         'query_frame' if 'query_receipt' in value else
+                                         'query_view' if 'query_view_receipt' in value else 'declared',
                               'query_receipt': deepcopy(value.get('query_receipt')),
+                              'query_view_receipt': deepcopy(value.get('query_view_receipt')),
+                              'no_data_receipt': deepcopy(value.get('no_data_receipt')),
                               'transform': asdict(value['transform']) if 'transform' in value else None,
                               'transform_kind': type(value['transform']).__name__ if 'transform' in value else None,
                               'parents': value.get('parents', ()),
@@ -739,5 +819,6 @@ class SemanticExecution:
                       for key, value in self._facts.items()},
             'findings': deepcopy(self._findings),
             'decisions': {key: {'fact_id': value['definition'][0], 'mode': value['definition'][1],
+                                'value_field': value['definition'][2],
                                 'state': value['state'], 'kind': value['summary']['kind']}
                           for key, value in self._decisions.items()}}

@@ -51,6 +51,24 @@ def answer(identity, **payload):
     return ToolMessage(content=json.dumps(payload), tool_call_id=identity)
 
 
+@pytest.mark.parametrize('work', ['understand', 'plan'])
+def test_time_series_semantics_reaches_its_owner_before_dialect_implementation(work):
+    from agent.runtime_contract_registry import load_runtime_work_contract_text, load_runtime_contract_pack
+    context = CustomContext(username='test', active_datasource_snapshot={
+        'selected_datasource_snapshot': [{'datasource_type': 'table', 'table_engine': 'time_series',
+                                          'ts_query_source': 'vxbase'}]})
+    contracts = work_contracts(context, work)
+    assert 'context.time_series' in contracts
+    assert 'query.time_series' not in contracts
+    text = load_runtime_work_contract_text(contracts, work=work)
+    authoritative = load_runtime_contract_pack('query.time_series')
+    mode_section = authoritative.split('## 查询模式', 1)[1].split('## Timescale', 1)[0].strip()
+    assert mode_section in text
+    assert '## Vxbase' not in text
+    assert '## Timescale' not in text
+    assert 'context.time_series' not in work_contracts(CustomContext(username='test'), work)
+
+
 @pytest.mark.parametrize('phase', list(RuntimePhase))
 def test_presentation_tool_is_available_only_in_expression_phase(phase):
     from agent.tools import compose_analysis_presentation
@@ -922,6 +940,43 @@ def test_semantic_implementation_bindings_resolve_producers_without_certifying_t
     assert view['decision_execution'][0]['inputs'] == {'distribution': 'calculation_rules[0]'}
     assert 'healthy' not in str(view)
     assert semantic_implementation_bindings({}) == []
+
+
+def test_new_intent_keeps_calculation_boundaries_and_projects_requirements_without_result_ids():
+    from agent.runtime_working_context import (RuntimeSemanticIntentInput,
+        semantic_plan_work_view, semantic_implementation_bindings)
+    raw = {'analysis_goal': 'Describe historical behavior', 'questions': [{
+        'question_id': 'q1', 'analysis_focus': 'Trend and observation coverage',
+        'calculation_rules': [{
+            'purpose': 'Evaluate the observed sequence',
+            'definition': 'Use all returned observations and disclose unknown acquisition cadence',
+            'basis': 'analytical_derivation', 'input_grain': 'timestamped observation',
+            'output_grain': 'source and requested period', 'unit': 'source value per minute',
+            'result_fields': {'slope': 'OLS slope of observations over elapsed time'},
+            'output_fact_ids': ['obsolete_result'],
+        }],
+        'decision_conditions': [{'purpose': 'Describe observed trend',
+            'basis': 'analytical_derivation', 'criterion': 'Compute from actual ordered observations'}],
+    }]}
+    before = copy.deepcopy(raw)
+    saved = RuntimeSemanticIntentInput.model_validate(raw).model_dump()
+    assert raw == before
+    rule = semantic_plan_work_view(saved)['questions'][0]['calculation_rules'][0]
+    assert rule['input_grain'] == 'timestamped observation'
+    assert rule['output_grain'] == 'source and requested period'
+    assert rule['unit'] == 'source value per minute'
+    assert rule['result_fields'] == before['questions'][0]['calculation_rules'][0]['result_fields']
+    assert 'output_fact_ids' not in rule
+    projected = semantic_implementation_bindings(saved)[0]
+    assert projected['result_definitions'] == {}
+    assert projected['calculation_requirements'][0]['path'] == 'calculation_rules[0]'
+    assert projected['calculation_requirements'][0]['unit'] == rule['unit']
+    assert projected['calculation_requirements'][0]['definition'] == rule['definition']
+    assert projected['calculation_requirements'][0]['result_fields'] == rule['result_fields']
+    projected['calculation_requirements'][0]['result_fields']['slope'] = 'consumer mutation'
+    assert saved['questions'][0]['calculation_rules'][0]['result_fields'] == rule['result_fields']
+    assert projected['decision_execution'][0]['mode'] == 'analytical_calculation'
+    assert 'source value per minute' in str(semantic_plan_work_view(saved))
 
 
 def test_semantic_implementation_bindings_keep_question_namespaces_separate():
@@ -2067,6 +2122,24 @@ def test_probe_source_sent_to_formal_tool_keeps_formal_repair_context():
     assert 'probe_analysis_data' not in [tool.name for tool in result.tools]
 
 
+def test_native_implementation_owns_visualizations_and_expression_owns_report():
+    from agent.context_engineering_runtime import CustomContext
+    from agent.runtime_working_context import work_contracts
+    context = CustomContext(username='test', output_contract={'type': 'standard'})
+    for work in ('implement', 'repair'):
+        native = work_contracts(context, work, references=('result.artifacts',), definition_program=True)
+        assert 'result.visualizations' in native
+        assert 'result.artifacts' not in native
+        legacy = work_contracts(context, work, definition_program=False)
+        assert 'result.artifacts' in legacy
+    expression = work_contracts(context, 'express', definition_program=True)
+    assert 'result.artifacts' in expression
+    assert 'result.visualizations' not in expression
+    for output_type in ('text', 'json'):
+        context.output_contract = {'type': output_type}
+        assert f'result.{output_type}' in work_contracts(context, 'implement', definition_program=True)
+
+
 def test_history_keeps_only_latest_unresolved_probe_for_repair():
     messages = [
         call('probe_analysis_data', 'p1', code='first failed probe'),
@@ -2218,7 +2291,35 @@ def test_actual_definition_is_the_canonical_program_memory_and_supersedes_old_ve
     projected, _ = project_history(messages, memory=memory, work='review')
     assert any(isinstance(message, AIMessage) and any(call['args'].get('definition_source') == definition
                for call in message.tool_calls) for message in projected)
+    actual = next(call for message in projected if isinstance(message, AIMessage)
+                  for call in message.tool_calls if call['id'] == 'actual')
+    assert actual['args'] == {'definition_source': definition}
     assert messages == original
+
+
+@pytest.mark.parametrize('work', ['implement', 'repair', 'review'])
+def test_definition_history_preserves_host_execution_port_and_discards_ignored_aliases(work):
+    definition = 'def build_analysis(program, parameters): pass'
+    messages = [call('submit_analysis_program', 'current', definition_source=definition,
+                     code='ignored complete entry', program='ignored alias'),
+                answer('current', status='failed', execution_id=41, error_type='runtime_error')]
+    original = copy.deepcopy(messages)
+    projected, _ = project_history(messages, work=work)
+    actual = next(call for message in projected if isinstance(message, AIMessage)
+                  for call in message.tool_calls if call['id'] == 'current')
+    assert actual['args'] == {'definition_source': definition}
+    assert messages == original
+
+
+def test_superseded_definition_history_replaces_source_in_its_original_port():
+    messages = [call('submit_analysis_program', 'old', definition_source='old definition'),
+                answer('old', status='failed'),
+                call('submit_analysis_program', 'current', definition_source='current definition')]
+    projected, _ = project_history(messages)
+    old = projected[0].tool_calls[0]['args']
+    assert list(old) == ['definition_source']
+    assert 'Superseded' in old['definition_source']
+    assert 'old definition' not in str(projected)
 
 
 def test_repair_view_keeps_only_active_patch_derivation_chain():
@@ -2371,6 +2472,24 @@ def test_probe_code_is_archived_only_when_its_query_facts_are_captured():
         for message in projected
     )
     assert projected[1].tool_calls[0]['args']['code'] == 'failed probe source remains needed'
+
+
+@pytest.mark.parametrize('physical_outcomes', [False, True])
+def test_failed_probe_ledger_preserves_repair_source_in_history(physical_outcomes):
+    diagnostics = {'probe_fact_ledger': {'observations': [
+        {'query_key': 'q', 'status': 'failed'}]}}
+    if physical_outcomes:
+        diagnostics['_query_execution_outcomes'] = [{'query_key': 'q', 'status': 'query_error'}]
+        diagnostics['probe_fact_ledger']['observations'][0]['status'] = 'success'
+    messages = [call('probe_analysis_data', 'failed-probe', code='repair this query source'),
+        answer('failed-probe', tool='probe_analysis_data', status='observation', diagnostics=diagnostics)]
+    index = build_working_memory_index(messages)
+    assert any(item.kind == WorkingMemoryKind.EXECUTION_FAILURE for item in index.items)
+    assert not any(item.kind == WorkingMemoryKind.PROBE_OBSERVATION for item in index.items)
+    projected, _ = project_history(messages)
+    assert any(isinstance(message, AIMessage) and any(
+        tool['args'].get('code') == 'repair this query source' for tool in message.tool_calls)
+        for message in projected)
 
 
 def test_latest_probe_pair_survives_until_a_newer_execution():

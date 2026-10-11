@@ -2,7 +2,9 @@
 from dataclasses import field
 from datetime import datetime
 import copy
+import hashlib
 import re
+import time
 from typing import Any
 
 from sqlalchemy import func
@@ -25,6 +27,7 @@ from utils.context_compression import (
     build_llm_turn_summarizer,
     clip_text,
     summarize_turns_incrementally,
+    history_compression_cache,
 )
 from utils.datasource_utils import (
     build_table_query_access,
@@ -455,9 +458,11 @@ class ConversationContextService:
         if analysis_task_id and is_analysis_task_cancelled(task_pk=int(analysis_task_id or 0)):
             raise AnalysisTaskCancelled(CANCELLED_MESSAGE)
 
-        self._refresh_memories(conversation)
+        self._refresh_memories(conversation, refresh_summary=False)
         # Commit the successful analysis before queuing optional post-processing.
         self.session.commit()
+        from service.history_summary_runner import enqueue_history_summary
+        enqueue_history_summary(conversation.id, conversation.updated_at)
         if evidence_enabled:
             try:
                 EvidenceAssemblyService(self.session).enqueue_for_execution(
@@ -996,6 +1001,7 @@ class ConversationContextService:
         payload = self._build_rolling_summary_payload(
             conversation_id_int,
             max_turn_no=max_turn_no,
+            metadata_only=True,
         )
         return {
             "enabled": Config.CONTEXT_COMPRESSION_ENABLED,
@@ -1004,6 +1010,7 @@ class ConversationContextService:
             "covered_until_turn_no": payload.get("covered_until_turn_no", 0),
             "compressed_turn_count": len(payload.get("compressed_turn_summaries", []) or []),
             "summary_updated_at": payload.get("updated_at"),
+            "state": payload.get("compression_state", "ready"),
         }
 
     def build_runtime_analysis_state(
@@ -1538,14 +1545,12 @@ class ConversationContextService:
         self.session.flush()
         return artifact.to_dict()
 
-    def _refresh_memories(self, conversation: InsightNsConversation) -> None:
+    def _refresh_memories(self, conversation: InsightNsConversation, *, refresh_summary: bool = True) -> None:
         """刷新下一轮 Prompt 组装要使用的压缩记忆。"""
-        rolling_summary_payload = self._build_rolling_summary_payload(conversation.id)
-        summary_text = str(rolling_summary_payload.get("summary_text") or "")
-        conversation.summary_text = summary_text
-
-        # `rolling_summary` 保存自然语言压缩后的历史摘要。
-        self._upsert_memory(conversation.id, 'rolling_summary', rolling_summary_payload)
+        if refresh_summary:
+            rolling_summary_payload = self._build_rolling_summary_payload(conversation.id)
+            conversation.summary_text = str(rolling_summary_payload.get("summary_text") or "")
+            self._upsert_memory(conversation.id, 'rolling_summary', rolling_summary_payload)
 
         # `analysis_state` 保存下一轮继续分析时要读取的结构化状态。
         self._upsert_memory(
@@ -1558,6 +1563,8 @@ class ConversationContextService:
         self,
         conversation_id: int,
         max_turn_no: int | None = None,
+        *,
+        metadata_only: bool = False,
     ) -> dict[str, Any]:
         query = self.session.query(InsightNsTurn).filter(
             InsightNsTurn.conversation_id == conversation_id,
@@ -1607,11 +1614,60 @@ class ConversationContextService:
 
         compressed_turns = turns[:-keep_recent_turns] if len(turns) > keep_recent_turns else []
         compressed_payloads = self._build_turn_summary_payloads(conversation_id, compressed_turns)
-        summarizer = build_llm_turn_summarizer()
-        compressed_summary_text = summarize_turns_incrementally(
-            turn_payloads=compressed_payloads,
-            max_chars=Config.CONTEXT_COMPRESSION_MAX_SUMMARY_CHARS,
-            summarizer=summarizer,
+        compression_config = {
+            'version': 1,
+            'max_chars': Config.CONTEXT_COMPRESSION_MAX_SUMMARY_CHARS,
+            'use_llm': bool(Config.CONTEXT_COMPRESSION_USE_LLM),
+        }
+        memory = self.get_memory(conversation_id, 'rolling_summary')
+        previous = safe_json_loads(memory.content_json, {}) if memory is not None else {}
+        # Reuse only an exact producer input. A refreshed historical answer,
+        # changed source scope, or a different rerun history boundary must not
+        # inherit a summary of another set of turns.
+        reusable = (
+            isinstance(previous, dict)
+            and previous.get('compression_config') == compression_config
+            and previous.get('compression_reusable') is True
+            and previous.get('compressed_turn_summaries') == compressed_payloads
+            and isinstance(previous.get('compressed_summary_text'), str)
+        )
+        compression_key = (
+            Config.DB_HOST, Config.DB_PORT, Config.DB_NAME, conversation_id,
+            hashlib.sha256(dump_json({'config': compression_config, 'turns': compressed_payloads}).encode('utf-8')).hexdigest(),
+        )
+        # Prompt readers may ask for a bounded historical prefix through
+        # separate sessions. They must not overwrite the conversation's full
+        # durable memory, but identical prefixes still have one producer input.
+        cached_summary = history_compression_cache.get(compression_key)
+        if metadata_only and not reusable and cached_summary is None:
+            return {'covered_until_turn_no': 0, 'compressed_turn_summaries': [],
+                    'updated_at': None, 'compression_state': 'pending'}
+        compression_started = time.monotonic()
+        compression_reusable = reusable or cached_summary is not None
+        if reusable:
+            compressed_summary_text = previous['compressed_summary_text']
+        elif cached_summary is not None:
+            compressed_summary_text = cached_summary
+        else:
+            summarizer = build_llm_turn_summarizer() if compressed_payloads else None
+            compression_reusable = not compressed_payloads or not compression_config['use_llm']
+            def summarize_with_receipt(text):
+                nonlocal compression_reusable
+                candidate = summarizer(text)
+                compression_reusable = isinstance(candidate, str) and bool(candidate.strip())
+                return candidate
+            compressed_summary_text = summarize_turns_incrementally(
+                turn_payloads=compressed_payloads,
+                max_chars=Config.CONTEXT_COMPRESSION_MAX_SUMMARY_CHARS,
+                summarizer=summarize_with_receipt if summarizer is not None else None,
+            )
+        if compression_reusable:
+            history_compression_cache.put(compression_key, compressed_summary_text)
+        logger.info(
+            'conversation history compression: conversation_id=%s compressed_turns=%s '
+            'reused=%s elapsed_seconds=%.3f',
+            conversation_id, len(compressed_payloads), reusable or cached_summary is not None,
+            time.monotonic() - compression_started,
         )
         recent_text = self._build_summary_text(
             conversation_id,
@@ -1626,6 +1682,8 @@ class ConversationContextService:
             "summary_text": clip_text(summary_text, Config.CONTEXT_COMPRESSION_MAX_SUMMARY_CHARS),
             "compressed_summary_text": compressed_summary_text,
             "compressed_turn_summaries": compressed_payloads,
+            "compression_config": compression_config,
+            "compression_reusable": compression_reusable,
             "covered_until_turn_no": compressed_turns[-1].turn_no if compressed_turns else 0,
             "updated_at": _now().isoformat(),
         }

@@ -183,6 +183,18 @@ def test_implementation_inherits_authoritative_calculation_and_repair_sections()
     assert '<!-- runtime-core-sections -->' not in implementation
 
 
+def test_native_visualization_contract_inherits_all_chart_and_table_rules_without_legacy_save():
+    artifacts = load_runtime_contract_text(('result.artifacts',))
+    visualizations = load_runtime_contract_text(('result.visualizations',))
+    for title in ('图表', '表格'):
+        section = artifacts.split(f'## {title}\n', 1)[1].split('\n## ', 1)[0].strip()
+        assert section in visualizations
+    assert '<!-- runtime-artifact-sections -->' not in visualizations
+    assert 'save_analysis_result(' not in visualizations
+    assert 'build_chart_suite(' in visualizations
+    assert '## 报告' not in visualizations
+
+
 def test_implementation_contract_keeps_executable_file_filter_protocol():
     from agent.runtime_contract_registry import load_runtime_work_contract_text
 

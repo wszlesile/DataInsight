@@ -36,7 +36,8 @@ ANALYSIS_SIGNAL_PATTERN = re.compile(
 QUERY_EXECUTION_CAPABILITIES = {
     "max_rows_per_sql_result": 10000,
     "capacity_scope": "each physical load_data_with_sql execution",
-    "relational_sql_dialect": "mysql_compatible",
+    "relational_sql_dialect": "fedquery_portable_subset",
+    "relational_identifier_quote": '"',
     "relational_sql_profile": "fedquery_portable_subset",
     "operation_capabilities": {
         "string_aggregation": "unsupported",
@@ -292,6 +293,7 @@ def _build_datasource_prompt_item(item: dict[str, Any]) -> dict[str, Any]:
         query_contract["ts_query_source"] = payload.get("ts_query_source")
     elif payload.get("datasource_type") == "table":
         query_contract["sql_dialect"] = QUERY_EXECUTION_CAPABILITIES["relational_sql_dialect"]
+        query_contract["identifier_quote"] = QUERY_EXECUTION_CAPABILITIES["relational_identifier_quote"]
         query_contract["sql_profile"] = QUERY_EXECUTION_CAPABILITIES["relational_sql_profile"]
         query_contract["operation_capabilities"] = copy.deepcopy(
             QUERY_EXECUTION_CAPABILITIES["operation_capabilities"]

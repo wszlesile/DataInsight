@@ -58,6 +58,7 @@ RUNTIME_CONTRACT_PACKS: tuple[RuntimeContractPack, ...] = (
     )),
     RuntimeContractPack("execution.planning", "execution/planning.md", "洞察语义到数据访问材料的工作计划"),
     RuntimeContractPack("execution.semantic_planning", "execution/semantic_planning.md", "洞察问题的总体、时间和计算语义规划"),
+    RuntimeContractPack("context.time_series", "context/time_series.md", "时序原始值、采样与统计的业务语义；共享查询协议的模式定义"),
     RuntimeContractPack(
         "execution.expression", "execution/expression.md",
         "基于本次真实计算事实撰写最终表达",
@@ -136,6 +137,11 @@ RUNTIME_CONTRACT_PACKS: tuple[RuntimeContractPack, ...] = (
         "columns 必须是字典列表，data 传 DataFrame 或 records，不传 values.tolist()。常规图表使用"
         "`build_chart_result(chart_kind=..., data=已聚合DataFrame, category_field=..., value_field=...)`。"
     )),
+    RuntimeContractPack(
+        "result.visualizations", "result/visualizations.md", "正式定义的完整图表与表格产物", (
+            "build_table_result", "build_chart_result", "build_multi_metric_chart_result", "build_chart_suite",
+        ), initial_summary="正式定义只生成本次计算结果的完整图表与表格；报告由随后的 express 负责。",
+    ),
     RuntimeContractPack(
         "result.text", "result/text.md", "纯文本洞察结果",
         initial_summary="按输出契约生成已求值的纯文本洞察；结论、数值依据与边界必须来自本轮真实计算。",
@@ -346,6 +352,27 @@ def _load_runtime_contract_body(contract_id: str, include_examples: bool = False
     if pack is None:
         raise ValueError(f"Unknown Runtime contract pack: {normalized}")
     source = (CONTRACT_ROOT / pack.filename).read_text(encoding="utf-8")
+    if normalized == 'result.visualizations':
+        marker = '<!-- runtime-artifact-sections -->'
+        if source.count(marker) != 1:
+            raise ValueError('Visualization contract must inherit artifact sections once')
+        artifacts = (CONTRACT_ROOT / _PACK_BY_ID['result.artifacts'].filename).read_text(encoding='utf-8')
+        sections = []
+        for title in ('图表', '表格'):
+            section = next((part for part in re.split(r'(?m)(?=^## )', artifacts)
+                            if part.splitlines() and part.splitlines()[0] == f'## {title}'), None)
+            if section is None:
+                raise ValueError(f'Missing authoritative artifact section: {title}')
+            sections.append(section.strip())
+        source = source.replace(marker, '\n\n'.join(sections))
+    if normalized == 'query.time_series':
+        # The same mode definitions reach the semantic owner before SQL
+        # generation, and the implementation owner with its actual dialects.
+        marker = '<!-- time-series-mode-semantics -->'
+        if source.count(marker) != 1:
+            raise ValueError('Time-series query must inherit mode semantics once')
+        semantics = (CONTRACT_ROOT / _PACK_BY_ID['context.time_series'].filename).read_text(encoding='utf-8')
+        source = source.replace(marker, semantics.split('\n', 1)[1].strip())
     inherited_sections = {
         'execution.probe': ('Python 执行环境',),
         'execution.definition': ('Python 执行环境', '查询结果与计算语义', '可复跑分析参数'),
@@ -517,9 +544,9 @@ def load_runtime_work_contract_text(
     seen_helpers: set[str] = set()
     rendered = []
     active_non_code_contracts = {
-        "understand": {"execution.semantic_planning"},
-        "plan": {"execution.planning"},
-        "express": {"execution.expression"},
+        "understand": {"execution.semantic_planning", "context.time_series"},
+        "plan": {"execution.planning", "context.time_series"},
+        "express": {"execution.expression", "context.time_series"},
         "review": {"execution.result_review"},
     }.get(str(work or "").strip(), set())
     for contract_id in normalized_ids:

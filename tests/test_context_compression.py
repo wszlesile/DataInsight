@@ -1,7 +1,10 @@
 import sys
 import unittest
+import copy
+import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -11,6 +14,108 @@ if str(SRC_ROOT) not in sys.path:
 
 from service.conversation_context_service import ConversationContextService
 from utils.context_compression import clip_text, summarize_turns_incrementally
+
+
+def test_history_compression_reuses_only_identical_inputs_and_configuration(monkeypatch):
+    from config import Config
+    from utils.context_compression import HistoryCompressionCache
+    import service.conversation_context_service as context_module
+    monkeypatch.setattr(context_module, 'history_compression_cache', HistoryCompressionCache())
+    service = ConversationContextService(MagicMock())
+    turns = [SimpleNamespace(id=i, turn_no=i) for i in (1, 2, 3)]
+    service.session.query.return_value.filter.return_value.order_by.return_value.all.return_value = turns
+    payloads = [{'turn_id': 1, 'turn_no': 1, 'question': 'Question',
+                 'answer': 'Observed answer', 'used_datasource_ids': [7]}]
+    service._build_turn_summary_payloads = MagicMock(side_effect=lambda *args: copy.deepcopy(payloads))
+    service._build_summary_text = MagicMock(return_value='Current recent answer')
+    service.get_memory = MagicMock(return_value=None)
+    calls = []
+    def summarize(text):
+        calls.append(text)
+        return f'Summary {len(calls)}'
+    with patch.multiple(Config, CONTEXT_COMPRESSION_ENABLED=True,
+                        CONTEXT_COMPRESSION_TRIGGER_TURNS=2, CONTEXT_COMPRESSION_KEEP_RECENT_TURNS=2,
+                        CONTEXT_COMPRESSION_MAX_SUMMARY_CHARS=1000, CONTEXT_COMPRESSION_USE_LLM=True), \
+            patch('service.conversation_context_service.build_llm_turn_summarizer', return_value=summarize) as factory:
+        metadata = service.get_context_compression_metadata(1)
+        assert metadata['state'] == 'pending'
+        assert not calls
+        factory.assert_not_called()
+        first = service._build_rolling_summary_payload(1)
+        assert len(calls) == 1
+        assert service.get_context_compression_metadata(1)['state'] == 'ready'
+        assert len(calls) == 1
+        service.get_memory.return_value = SimpleNamespace(content_json=json.dumps(first))
+        service._build_summary_text.return_value = 'Refreshed recent answer'
+        reused = service._build_rolling_summary_payload(1)
+        assert len(calls) == 1
+        assert factory.call_count == 1
+        assert reused['compressed_summary_text'] == first['compressed_summary_text']
+        assert 'Refreshed recent answer' in reused['summary_text']
+        for field, value in [('answer', 'Changed historical answer'),
+                             ('used_datasource_ids', [8]), ('turn_id', 9)]:
+            payloads[0][field] = value
+            refreshed = service._build_rolling_summary_payload(1)
+            assert refreshed['compressed_summary_text'] != first['compressed_summary_text']
+        assert len(calls) == 4
+        payloads[:] = first['compressed_turn_summaries']
+        with patch.object(Config, 'CONTEXT_COMPRESSION_MAX_SUMMARY_CHARS', 800):
+            service._build_rolling_summary_payload(1)
+        assert len(calls) == 5
+        monkeypatch.setattr(context_module, 'history_compression_cache', HistoryCompressionCache())
+        service.get_memory.return_value = SimpleNamespace(content_json='{}')
+        service._build_rolling_summary_payload(1)
+        assert len(calls) == 6
+        # A historical rerun has a different prefix. Even an empty prefix
+        # must replace the full-history summary rather than reuse it.
+        service.get_memory.return_value = SimpleNamespace(content_json=json.dumps(first))
+        payloads.clear()
+        bounded = service._build_rolling_summary_payload(1)
+        assert bounded['compressed_summary_text'] == ''
+        assert len(calls) == 6
+
+
+def test_failed_history_compression_is_not_reused_when_the_model_recovers(monkeypatch):
+    from config import Config
+    from utils.context_compression import HistoryCompressionCache
+    import service.conversation_context_service as context_module
+    monkeypatch.setattr(context_module, 'history_compression_cache', HistoryCompressionCache())
+    service = ConversationContextService(MagicMock())
+    turns = [SimpleNamespace(id=i, turn_no=i) for i in (1, 2, 3)]
+    service.session.query.return_value.filter.return_value.order_by.return_value.all.return_value = turns
+    service._build_turn_summary_payloads = MagicMock(return_value=[
+        {'turn_id': 1, 'turn_no': 1, 'question': 'Question', 'answer': 'Answer'}])
+    service._build_summary_text = MagicMock(return_value='Recent')
+    service.get_memory = MagicMock(return_value=None)
+    model = MagicMock(side_effect=[RuntimeError('unavailable'), 'Recovered model summary'])
+    with patch.multiple(Config, CONTEXT_COMPRESSION_ENABLED=True,
+                        CONTEXT_COMPRESSION_TRIGGER_TURNS=2, CONTEXT_COMPRESSION_KEEP_RECENT_TURNS=2,
+                        CONTEXT_COMPRESSION_MAX_SUMMARY_CHARS=1000, CONTEXT_COMPRESSION_USE_LLM=True), \
+            patch('service.conversation_context_service.build_llm_turn_summarizer', return_value=model):
+        failed = service._build_rolling_summary_payload(1)
+        assert failed['compression_reusable'] is False
+        service.get_memory.return_value = SimpleNamespace(content_json=json.dumps(failed))
+        recovered = service._build_rolling_summary_payload(1)
+        assert recovered['compressed_summary_text'] == 'Recovered model summary'
+        assert recovered['compression_reusable'] is True
+        assert model.call_count == 2
+        # A new reader/session with no durable full-history match still reuses
+        # this exact successful historical prefix, without another model call.
+        service.get_memory.return_value = None
+        assert service._build_rolling_summary_payload(1)['compressed_summary_text'] == 'Recovered model summary'
+        assert model.call_count == 2
+
+
+def test_history_compression_cache_has_a_bounded_recent_input_lifecycle():
+    from utils.context_compression import HistoryCompressionCache
+    cache = HistoryCompressionCache(max_entries=2)
+    cache.put('a', 'A')
+    cache.put('b', 'B')
+    assert cache.get('a') == 'A'
+    cache.put('c', 'C')
+    assert cache.get('b') is None
+    assert cache.get('a') == 'A'
+    assert cache.get('c') == 'C'
 
 
 class ContextCompressionUtilsTestCase(unittest.TestCase):
